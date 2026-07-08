@@ -87,6 +87,22 @@ pub fn load(io: std.Io, gpa: std.mem.Allocator) LoadError!Config {
     return .{ .settings = settings, .api_key = api_key };
 }
 
+/// Load just the non-secret settings — defaults when the file is absent/malformed or
+/// `$HOME` is unset. The daemon (wayfinder #19) loads these once at startup; they never
+/// block the process from starting, and the secret is polled separately (self-heal).
+pub fn loadSettingsOnly(io: std.Io, gpa: std.mem.Allocator) Settings {
+    const home = homeDir() orelse return .{};
+    return loadSettings(io, gpa, home);
+}
+
+/// Re-read just the OpenAI secret — null while still absent. The daemon's self-heal
+/// supervisor (wayfinder #19) polls this until the key file (or exported env var) appears,
+/// then constructs the Transcription Session. Same sources + precedence as `load`.
+pub fn loadApiKeyOnly(io: std.Io, gpa: std.mem.Allocator) ?[:0]const u8 {
+    const home = homeDir() orelse return null;
+    return loadApiKey(io, gpa, home);
+}
+
 fn homeDir() ?[]const u8 {
     const h = std.c.getenv("HOME") orelse return null;
     const s = std.mem.span(h);

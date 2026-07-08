@@ -114,6 +114,12 @@ pub fn requestPostEventAccess() bool {
     return CGRequestPostEventAccess();
 }
 
+/// Silent preflight only — never prompts. The daemon's self-heal supervisor (#19) polls
+/// this so it re-checks the grant without re-triggering a TCC dialog every tick.
+pub fn postEventGranted() bool {
+    return CGPreflightPostEventAccess();
+}
+
 pub fn secureInputActive() bool {
     return IsSecureEventInputEnabled() != 0;
 }

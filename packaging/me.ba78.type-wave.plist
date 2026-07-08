@@ -26,6 +26,16 @@
   <key>RunAtLoad</key>
   <true/>
 
+  <!-- $HOME: config.zig locates ~/.config/type-wave via HOME (wayfinder #16/#19). GUI
+       (aqua) LaunchAgents normally inherit it, but set it explicitly so the daemon can
+       never wedge in not-configured on a stripped launchd environment. install.sh renders
+       __HOME__ to the absolute path. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+
   <!-- KeepAlive as a crash backstop ONLY (#10): respawn on abnormal exit, never on a
        clean exit. A deliberate `launchctl bootout` (clean stop) therefore stays down. -->
   <key>KeepAlive</key>

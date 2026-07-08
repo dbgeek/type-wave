@@ -93,6 +93,12 @@ pub const Tap = struct {
         return CGRequestListenEventAccess();
     }
 
+    /// Silent preflight only — never prompts. The daemon's self-heal supervisor (#19)
+    /// polls this to notice Input Monitoring being granted without re-prompting.
+    pub fn listenGranted() bool {
+        return CGPreflightListenEventAccess();
+    }
+
     /// Runs on the run-loop thread. Must stay fast (a slow callback makes the OS
     /// disable the tap) — it only records the edge and hands off to the caller.
     fn callback(_: CGEventTapProxy, etype: u32, event: CGEventRef, userInfo: ?*anyopaque) callconv(.c) CGEventRef {
@@ -137,10 +143,15 @@ pub const Tap = struct {
         }
     }
 
-    /// Create the tap, add it to the current run loop, enable it. `error.TapDisabled`
-    /// means Input Monitoring isn't granted yet (the tap is created but stays off —
-    /// the header's "returns NULL when denied" is stale; crib sheet §3/§5).
-    pub fn install(self: *Tap) !void {
+    /// Create the tap, add it to the current run loop, and enable it. Returns whether the
+    /// tap is actually **live** — `false` means it was created but stays disabled because
+    /// Input Monitoring isn't granted yet (the header's "returns NULL when denied" is
+    /// stale; crib sheet §3/§5). The daemon (wayfinder #19) keeps a created-but-disabled
+    /// tap and brings it live via `enable()` once the grant appears — so only a genuine
+    /// creation failure (null port) is an error here. Must run on the thread whose run
+    /// loop will service the tap (the daemon calls it on the main thread before its run
+    /// loop starts).
+    pub fn install(self: *Tap) error{TapCreateFailed}!bool {
         const mask: CGEventMask = 1 << 12; // CGEventMaskBit(kCGEventFlagsChanged)
         const port = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly, mask, callback, self);
         if (port == null) return error.TapCreateFailed;
@@ -148,7 +159,23 @@ pub const Tap = struct {
         const source = CFMachPortCreateRunLoopSource(null, port, 0);
         CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
         CGEventTapEnable(port, true);
-        if (!CGEventTapIsEnabled(port)) return error.TapDisabled;
+        return CGEventTapIsEnabled(port);
+    }
+
+    /// Re-enable the tap and report whether it took. The daemon's self-heal supervisor
+    /// calls this once Input Monitoring is granted after a created-but-disabled start
+    /// (wayfinder #19). Thread-safe: CGEventTapEnable just messages the event server, and
+    /// the run-loop source was already added by `install`. A `false` return means the
+    /// grant still isn't effective.
+    pub fn enable(self: *Tap) bool {
+        if (self.port == null) return false;
+        CGEventTapEnable(self.port, true);
+        return CGEventTapIsEnabled(self.port);
+    }
+
+    /// Whether the tap currently exists and is delivering events.
+    pub fn isEnabled(self: *Tap) bool {
+        return self.port != null and CGEventTapIsEnabled(self.port);
     }
 
     /// Block on the current run loop, servicing the tap. Never returns.

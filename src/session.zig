@@ -128,6 +128,16 @@ pub const Session = struct {
     /// keeps reconnects strictly *between* Utterances (maintenance skips while active).
     active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Set when the link drops (a genuine `.ready`→`.reconnecting` transition) *while an
+    /// Utterance is active*: the head audio already streamed live is gone server-side, so
+    /// committing the buffered tail would insert a truncated Final Transcript. The daemon
+    /// (wayfinder #19) reads this on Talk Key release to abandon the Utterance cleanly
+    /// (error cue, no Insertion) rather than commit a fragment. Reset by beginUtterance,
+    /// set in Handler.close. This is what distinguishes a real mid-hold drop (abandon)
+    /// from a press that merely *landed* during a reconnect (that path buffers-and-flushes
+    /// — wayfinder #17 — and never sets this, because no `.ready`→ transition occurs).
+    poisoned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     /// Session deadline in wall-clock ms (from `session.created`'s `expires_at`, or the
     /// conservative fallback). The maintenance thread cycles the session before it.
     expires_at_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
@@ -262,6 +272,12 @@ pub const Session = struct {
         return self.state.load(.acquire) == .ready;
     }
 
+    /// True when the link dropped mid-Utterance (see `poisoned`). The daemon checks this
+    /// on Talk Key release to abandon a would-be-truncated Utterance (wayfinder #19).
+    pub fn isPoisoned(self: *Session) bool {
+        return self.poisoned.load(.acquire);
+    }
+
     // ---- writes (all funnel through write_mu + the link_open guard) --------------
 
     /// Encode+send one Capture chunk as an input_audio_buffer.append. Caller decides
@@ -297,6 +313,7 @@ pub const Session = struct {
     pub fn beginUtterance(self: *Session) void {
         self.bytes_utt.store(0, .release);
         self.got_final.store(false, .release);
+        self.poisoned.store(false, .release); // fresh Utterance — no drop seen yet (#19)
         self.partial_len = 0;
         self.t0_ms = nowMs();
         {
@@ -664,7 +681,14 @@ pub const Handler = struct {
     pub fn close(self: *Handler) void {
         const s = self.session;
         s.read_ended.store(true, .release);
-        _ = s.state.cmpxchgStrong(.ready, .reconnecting, .monotonic, .monotonic);
+        // cmpxchg returns null on success (state WAS .ready and we flipped it). If that
+        // real ready→reconnecting transition happens with an Utterance in flight, its
+        // already-streamed head audio is lost server-side — poison the Utterance so the
+        // daemon abandons it cleanly instead of committing a truncated tail (#19). A
+        // press that merely landed during a reconnect finds state already non-ready here,
+        // so the cmpxchg no-ops and poisoned stays clear (its buffer-and-flush path — #17).
+        if (s.state.cmpxchgStrong(.ready, .reconnecting, .monotonic, .monotonic) == null and s.active.load(.acquire))
+            s.poisoned.store(true, .release);
         feedback.log("  [read loop ended]\n", .{});
     }
 };
