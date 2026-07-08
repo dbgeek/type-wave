@@ -76,6 +76,11 @@ const buffer_count = 3;
 
 pub const ChunkSink = *const fn (ctx: ?*anyopaque, pcm: []const u8) void;
 
+/// One RAW linear RMS sample (0..1 of full scale) per buffer — how loud the mic was
+/// over that 50 ms, not how tall a bar should be; the render side owns the mapping
+/// (wayfinder #26). Called on the audio queue's thread, ~20×/s while capturing.
+pub const LevelSink = *const fn (ctx: ?*anyopaque, rms: f32) void;
+
 pub const Capture = struct {
     queue: AudioQueueRef = null,
     /// The queue's buffers, held so `start` can re-arm the queue: `stop`'s immediate
@@ -86,6 +91,9 @@ pub const Capture = struct {
     buffers: [buffer_count]AudioQueueBufferRef = @splat(null),
     ctx: ?*anyopaque = null,
     on_chunk: ?ChunkSink = null,
+    /// Per-buffer mic level observer (the waveform HUD, wired by the daemon). Same
+    /// `ctx` as `on_chunk` — mirrors session.zig's TranscriptObserver shape.
+    on_level: ?LevelSink = null,
 
     /// Set once a nonzero sample is seen — the denial/silence detector, since
     /// mic-TCC denial yields zeros with noErr rather than an error (crib sheet §5.3).
@@ -114,6 +122,21 @@ pub const Capture = struct {
             }
         }
         if (self.on_chunk) |cb| cb(self.ctx, slice);
+        if (self.on_level) |cb| {
+            // RMS over the buffer's s16 samples, computed here on the audio thread —
+            // one number per buffer, so this costs one pass over 1200 samples.
+            const samples = std.mem.bytesAsSlice(i16, slice);
+            var acc: f64 = 0;
+            for (samples) |s| {
+                const x = @as(f64, @floatFromInt(s)) / 32768.0;
+                acc += x * x;
+            }
+            const rms: f32 = if (samples.len > 0)
+                @floatCast(@sqrt(acc / @as(f64, @floatFromInt(samples.len))))
+            else
+                0;
+            cb(self.ctx, rms);
+        }
         // Hand the buffer back. During `stop`'s reset this fails with
         // kAudioQueueErr_EnqueueDuringReset — expected: `start` re-arms the queue.
         _ = AudioQueueEnqueueBuffer(queue, buffer, 0, null);

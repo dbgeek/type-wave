@@ -285,15 +285,12 @@ const Daemon = struct {
     /// not-configured isn't re-logged every tick. 0xFF = nothing reported yet.
     last_missing: u8 = 0xFF,
 
-    /// Always-on live-transcript subscriber: partials/finals from the read-loop thread
+    /// Always-on live-transcript subscriber: Final Transcripts from the read-loop thread
     /// trampoline into the Coordinator. Installed at every Session.connect, before the read
-    /// loop starts — never mid-stream.
+    /// loop starts — never mid-stream. Partials are not subscribed — the HUD shows no text
+    /// (wayfinder #27); their log lives upstream in session.zig (#18).
     fn observer(self: *Daemon) session_mod.TranscriptObserver {
-        return .{ .ctx = self, .on_partial = obsPartial, .on_final = obsFinal };
-    }
-    fn obsPartial(ctx: ?*anyopaque, text: []const u8) void {
-        const self: *Daemon = @ptrCast(@alignCast(ctx.?));
-        self.coordinator.handle(.{ .partial = text });
+        return .{ .ctx = self, .on_final = obsFinal };
     }
     fn obsFinal(ctx: ?*anyopaque, text: []const u8) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
@@ -306,6 +303,14 @@ const Daemon = struct {
     fn audioSink(ctx: ?*anyopaque, pcm: []const u8) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
         self.transcription.appendAudio(pcm);
+    }
+
+    /// Capture level sink: one raw RMS per 50 ms buffer, straight to the HUD's queue —
+    /// no Coordinator traffic; levels are continuous telemetry, not lifecycle edges
+    /// (wayfinder #26). The HUD drops them unless it is showing `.recording`.
+    fn levelSink(ctx: ?*anyopaque, rms: f32) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx.?));
+        self.hud.pushLevel(rms);
     }
 
     // ---- tap callbacks: run on the run-loop thread, kept fast (filter, then trampoline) ----
@@ -434,6 +439,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     defer daemon.capture.deinit();
     daemon.capture.ctx = &daemon;
     daemon.capture.on_chunk = Daemon.audioSink;
+    daemon.capture.on_level = Daemon.levelSink;
 
     daemon.inserter.init();
     daemon.cues.init();
@@ -444,7 +450,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     if (settings.overlay) {
         if (daemon.hud.init()) {
             daemon.hud.startRenderPump();
-            feedback.log("  overlay HUD: on — the pill carries start/stop feedback; the error cue is kept\n", .{});
+            feedback.log("  overlay HUD: on — the waveform pill carries start/processing feedback; the error cue is kept\n", .{});
         } else {
             feedback.log("  overlay HUD: enabled but no display detected — sound-only feedback\n", .{});
         }

@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // `zig build test` — the Utterance Coordinator's lifecycle matrix plus the backfilled
-    // pure-function tests (parseEnvKey, formatSessionUpdate, backoffMs, utf8SafeTail),
+    // pure-function tests (parseEnvKey, formatSessionUpdate, backoffMs, levelToNorm),
     // aggregated through src/tests.zig. Same imports/frameworks as the exe, since the tested
     // files reference the websocket module and the macOS frameworks.
     const tests = b.addTest(.{

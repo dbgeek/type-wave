@@ -69,18 +69,19 @@ const OutRecord = struct {
     data: [out_payload_cap]u8,
 };
 
-/// A subscriber to the live transcript stream (wayfinder #22). The overlay HUD wires
-/// this so it can render Partial Transcripts as they stream and flash the Final
-/// Transcript. Both callbacks run on the **read-loop thread**, so they must be fast and
-/// thread-safe — the HUD only copies the text into a mutex-guarded buffer its own
-/// main-thread render pump reads (see hud.zig). `text` borrows the session's accumulator
-/// and is valid only for the duration of the call. Left null when there is no HUD
-/// (overlay disabled or headless), in which case partials are only logged, exactly as
-/// before (wayfinder #18).
+/// A subscriber to the live transcript stream (wayfinder #22). The daemon wires this so
+/// the Final Transcript reaches the Utterance Coordinator the moment it lands. The
+/// callbacks run on the **read-loop thread**, so they must be fast and thread-safe.
+/// `text` borrows the session's accumulator and is valid only for the duration of the
+/// call. Left null when nothing subscribes, in which case transcripts are only logged,
+/// exactly as before (wayfinder #18).
 pub const TranscriptObserver = struct {
     ctx: ?*anyopaque,
-    /// The accumulated Partial Transcript so far (grows as deltas arrive).
-    on_partial: *const fn (ctx: ?*anyopaque, text: []const u8) void,
+    /// The accumulated Partial Transcript so far (grows as deltas arrive). Optional:
+    /// the daemon no longer subscribes partials — the HUD shows no text (wayfinder
+    /// #27) — but the seam stays for any future consumer. Partials are always logged
+    /// (#18) regardless.
+    on_partial: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     /// The completed Final Transcript for the Utterance.
     on_final: *const fn (ctx: ?*anyopaque, text: []const u8) void,
 };
@@ -724,10 +725,10 @@ pub const Handler = struct {
                 @memcpy(s.partial[s.partial_len..][0..d.len], d);
                 s.partial_len += d.len;
             }
-            // Partial Transcript: always logged (#18); also streamed to the overlay HUD
-            // when one is subscribed (wayfinder #22) so the pill shows it live.
+            // Partial Transcript: always logged (#18). The HUD shows no text (#27), so
+            // nothing subscribes partials today; the observer hook stays for the future.
             feedback.log("  [{d:>6}ms] partial: {s}\n", .{ nowMs() - s.t0_ms, s.partial[0..s.partial_len] });
-            if (s.observer) |o| o.on_partial(o.ctx, s.partial[0..s.partial_len]);
+            if (s.observer) |o| if (o.on_partial) |f| f(o.ctx, s.partial[0..s.partial_len]);
         } else if (std.mem.eql(u8, typ, "conversation.item.input_audio_transcription.completed")) {
             const t = getStr(root, "transcript") orelse "";
             const n = @min(t.len, s.final.len);

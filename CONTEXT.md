@@ -13,7 +13,7 @@ The key held down to capture an Utterance; releasing it ends the Utterance.
 _Avoid_: hotkey, PTT key
 
 **Partial Transcript**:
-Provisional text emitted while an Utterance is still being spoken. Shown as feedback, may be revised, never inserted.
+Provisional text emitted while an Utterance is still being spoken. Logged, may be revised, never shown in the HUD, never inserted.
 _Avoid_: delta, interim result
 
 **Final Transcript**:

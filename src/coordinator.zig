@@ -36,13 +36,14 @@ const feedback = @import("feedback.zig");
 pub const InsertResult = enum { ok, failed };
 
 /// Everything that can happen *to* an Utterance, from whichever thread observed it.
-/// `partial`/`final` slices borrow the Transcription Session's accumulator and are valid
-/// only for the duration of the `handle` call — the feedback and insertion seams copy
-/// synchronously (exactly the memcpy the old worker did before releasing the guard).
+/// The `final` slice borrows the Transcription Session's accumulator and is valid only
+/// for the duration of the `handle` call — the insertion seam copies synchronously
+/// (exactly the memcpy the old worker did before releasing the guard). Partial
+/// Transcripts no longer reach the Coordinator at all: the HUD shows no text (#27),
+/// and their log lives upstream in session.zig (#18).
 pub const Event = union(enum) {
     press,
     release,
-    partial: []const u8,
     final: []const u8,
     deadline,
     inserted: InsertResult,
@@ -85,7 +86,6 @@ pub fn Coordinator(comptime Deps: type) type {
             switch (ev) {
                 .press => self.onPress(),
                 .release => self.onRelease(),
-                .partial => |t| self.onPartial(t),
                 .final => |t| self.onFinal(t),
                 .deadline => self.onDeadline(),
                 .inserted => |r| self.onInserted(r),
@@ -155,13 +155,6 @@ pub fn Coordinator(comptime Deps: type) type {
             }
         }
 
-        fn onPartial(self: *Self, text: []const u8) void {
-            // Feedback only, and only while an Utterance is live — a stray late partial
-            // for an abandoned Utterance must not repaint the pill.
-            if (self.phase == .capturing or self.phase == .awaiting_final)
-                self.deps.feedback.streaming(text);
-        }
-
         fn onFinal(self: *Self, text: []const u8) void {
             if (self.phase != .awaiting_final) return; // stale (abandoned, or not awaiting)
             self.deps.deadline.cancel();
@@ -172,7 +165,8 @@ pub fn Coordinator(comptime Deps: type) type {
                 self.phase = .idle;
                 return;
             }
-            self.deps.feedback.committed(text); // green flash; held until .inserted
+            // No feedback edge here: the processing dots have been up since `released`
+            // and hold until `.inserted` resolves (wayfinder #26/#27).
             self.deps.insertion.submit(text); // copies text; worker inserts, then .inserted
             self.phase = .inserting; // blocking: next hold waits (ADR-0001)
         }
@@ -271,27 +265,14 @@ const FakeDeadline = struct {
 
 const FakeFeedback = struct {
     listenings: usize = 0,
-    streamings: usize = 0,
     releaseds: usize = 0,
-    committeds: usize = 0,
     inserteds: usize = 0,
     abandoneds: usize = 0,
-    last_committed: [256]u8 = undefined,
-    last_committed_len: usize = 0,
     fn listening(self: *FakeFeedback) void {
         self.listenings += 1;
     }
-    fn streaming(self: *FakeFeedback, text: []const u8) void {
-        _ = text;
-        self.streamings += 1;
-    }
     fn released(self: *FakeFeedback) void {
         self.releaseds += 1;
-    }
-    fn committed(self: *FakeFeedback, text: []const u8) void {
-        self.committeds += 1;
-        @memcpy(self.last_committed[0..text.len], text);
-        self.last_committed_len = text.len;
     }
     fn inserted(self: *FakeFeedback) void {
         self.inserteds += 1;
@@ -347,8 +328,6 @@ test "1 happy path: press → release → final → inserted(ok)" {
     try expect(h.deadline.arms == 1);
     co.handle(.{ .final = "hello world" });
     try expect(h.deadline.cancels == 1);
-    try expect(h.feedback.committeds == 1);
-    try expectEqualStrings("hello world", h.feedback.last_committed[0..h.feedback.last_committed_len]);
     try expect(h.insertion.submits == 1);
     try expectEqualStrings("hello world", h.insertion.lastText());
     co.handle(.{ .inserted = .ok });
@@ -452,7 +431,6 @@ test "9 deadline before final abandons" {
     // a stale final afterwards is ignored
     co.handle(.{ .final = "too late" });
     try expect(h.insertion.submits == 0);
-    try expect(h.feedback.committeds == 0);
 }
 
 test "10 empty/failed final inserts nothing" {
@@ -463,7 +441,6 @@ test "10 empty/failed final inserts nothing" {
     co.handle(.{ .final = "" });
     try expect(h.deadline.cancels == 1);
     try expect(h.insertion.submits == 0);
-    try expect(h.feedback.committeds == 0);
     try expect(h.feedback.abandoneds == 1);
 }
 
@@ -477,7 +454,6 @@ test "11 stale final outside awaiting is ignored" {
     co.handle(.press);
     co.handle(.{ .final = "early" });
     try expect(h.insertion.submits == 0);
-    try expect(h.feedback.committeds == 0);
 }
 
 test "12 insert failure sounds the error path" {
