@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const websocket = @import("websocket");
+const feedback = @import("feedback.zig");
 
 pub const host = "api.openai.com";
 
@@ -334,7 +335,7 @@ pub const Session = struct {
             self.pending_len += pcm.len;
         } else if (!self.pending_overflow) {
             self.pending_overflow = true;
-            std.debug.print("  (buffered Capture hit {d}B during reconnect — truncating this Utterance)\n", .{self.pending.len});
+            feedback.log("  (buffered Capture hit {d}B during reconnect — truncating this Utterance)\n", .{self.pending.len});
         }
         _ = self.bytes_utt.fetchAdd(pcm.len, .monotonic); // count buffered audio too, so commit isn't suppressed
     }
@@ -342,10 +343,15 @@ pub const Session = struct {
     /// Commit the Utterance (Talk Key release). Suppresses empty commits, which error.
     /// If the link is not ready, the commit is deferred: markReadyAndFlush replays the
     /// buffered audio and sends the commit once the session reconnects.
-    pub fn commitUtterance(self: *Session) !void {
+    ///
+    /// Returns whether a Final Transcript should now be expected: `true` when a commit
+    /// was sent OR deferred (a transcript is coming), `false` when the Utterance held no
+    /// audio and was dropped — letting the caller sound the "no Insertion" error cue
+    /// immediately instead of waiting out the worker's transcript timeout (#18).
+    pub fn commitUtterance(self: *Session) !bool {
         if (self.bytes_utt.load(.acquire) == 0) {
-            std.debug.print("  (no audio captured — skipping commit)\n", .{});
-            return;
+            feedback.log("  (no audio captured — skipping commit)\n", .{});
+            return false;
         }
         self.pending_mu.lockUncancelable(self.io);
         defer self.pending_mu.unlock(self.io);
@@ -354,6 +360,7 @@ pub const Session = struct {
         } else {
             self.pending_commit = true; // flushed + committed on reconnect
         }
+        return true;
     }
 
     /// Session became READY (session.updated). Replay any buffered Capture in order,
@@ -365,7 +372,7 @@ pub const Session = struct {
         defer self.pending_mu.unlock(self.io);
 
         if (self.pending_len > 0) {
-            std.debug.print("  replaying {d}B buffered Capture\n", .{self.pending_len});
+            feedback.log("  replaying {d}B buffered Capture\n", .{self.pending_len});
             var off: usize = 0;
             while (off < self.pending_len) {
                 const chunk_end = @min(off + 2400, self.pending_len);
@@ -401,13 +408,13 @@ pub const Session = struct {
 
             const now = nowMs();
             if (self.read_ended.load(.acquire)) {
-                std.debug.print("  session: link dropped (read loop ended) — reconnecting\n", .{});
+                feedback.log("  session: link dropped (read loop ended) — reconnecting\n", .{});
                 self.reconnect();
                 continue;
             }
             const exp = self.expires_at_ms.load(.acquire);
             if (exp != 0 and now >= exp - expiry_margin_ms) {
-                std.debug.print("  session: approaching the 60-min cap — cycling the session\n", .{});
+                feedback.log("  session: approaching the 60-min cap — cycling the session\n", .{});
                 self.reconnect();
                 continue;
             }
@@ -415,7 +422,7 @@ pub const Session = struct {
                 if (self.last_pong_ms.load(.acquire) >= self.last_ping_ms) {
                     self.awaiting_pong = false; // pong arrived — healthy
                 } else {
-                    std.debug.print("  session: no pong within {d}ms — reconnecting\n", .{pong_timeout_ms});
+                    feedback.log("  session: no pong within {d}ms — reconnecting\n", .{pong_timeout_ms});
                     self.reconnect();
                     continue;
                 }
@@ -431,7 +438,7 @@ pub const Session = struct {
             if (!self.link_open) return;
             var empty: [0]u8 = .{};
             self.client.writePing(&empty) catch {
-                std.debug.print("  session: ping write failed — link down\n", .{});
+                feedback.log("  session: ping write failed — link down\n", .{});
                 _ = self.state.cmpxchgStrong(.ready, .reconnecting, .monotonic, .monotonic);
                 return;
             };
@@ -451,15 +458,15 @@ pub const Session = struct {
             self.openClient() catch |e| {
                 attempt += 1;
                 const backoff = backoffMs(attempt);
-                std.debug.print("  reconnect attempt {d} failed: {s} — retrying in {d}ms\n", .{ attempt, @errorName(e), backoff });
+                feedback.log("  reconnect attempt {d} failed: {s} — retrying in {d}ms\n", .{ attempt, @errorName(e), backoff });
                 self.sleepInterruptible(backoff);
                 continue;
             };
             if (self.waitReady(ready_wait_ms)) {
-                std.debug.print("  session: reconnected and READY\n", .{});
+                feedback.log("  session: reconnected and READY\n", .{});
                 return;
             }
-            std.debug.print("  reconnect: no session.updated within {d}ms — retrying\n", .{ready_wait_ms});
+            feedback.log("  reconnect: no session.updated within {d}ms — retrying\n", .{ready_wait_ms});
             self.closeCurrent();
             attempt += 1;
             self.sleepInterruptible(backoffMs(attempt));
@@ -507,7 +514,7 @@ pub const Session = struct {
         // This is the one path that carries the vendored library's teardown race, and
         // only on a dead link where the raced-over bytes are meaningless.
         if (!self.read_ended.load(.acquire)) {
-            std.debug.print("  session: close drain timed out — forcing the socket down\n", .{});
+            feedback.log("  session: close drain timed out — forcing the socket down\n", .{});
             self.client.close(.{}) catch {};
         }
         if (self.read_thread) |t| {
@@ -576,7 +583,7 @@ pub const Handler = struct {
     pub fn serverMessage(self: *Handler, data: []u8) !void {
         const s = self.session;
         const parsed = std.json.parseFromSlice(std.json.Value, s.alloc, data, .{}) catch {
-            std.debug.print("  [unparseable event] {s}\n", .{data});
+            feedback.log("  [unparseable event] {s}\n", .{data});
             return;
         };
         defer parsed.deinit();
@@ -592,32 +599,35 @@ pub const Handler = struct {
                 }
             }
             try s.sendControl(s.su_buf[0..s.su_len]);
-            std.debug.print("  session.created -> sent session.update\n", .{});
+            feedback.log("  session.created -> sent session.update\n", .{});
         } else if (std.mem.eql(u8, typ, "session.updated")) {
             s.markReadyAndFlush();
-            std.debug.print("  session.updated -> READY\n", .{});
+            feedback.log("  session.updated -> READY\n", .{});
         } else if (std.mem.eql(u8, typ, "conversation.item.input_audio_transcription.delta")) {
             const d = getStr(root, "delta") orelse "";
             if (s.partial_len + d.len <= s.partial.len) {
                 @memcpy(s.partial[s.partial_len..][0..d.len], d);
                 s.partial_len += d.len;
             }
-            std.debug.print("[{d:>6}ms] partial: {s}\n", .{ nowMs() - s.t0_ms, s.partial[0..s.partial_len] });
+            // Partial Transcript: logged, never shown (no HUD yet — #20).
+            feedback.log("  [{d:>6}ms] partial: {s}\n", .{ nowMs() - s.t0_ms, s.partial[0..s.partial_len] });
         } else if (std.mem.eql(u8, typ, "conversation.item.input_audio_transcription.completed")) {
             const t = getStr(root, "transcript") orelse "";
             const n = @min(t.len, s.final.len);
             @memcpy(s.final[0..n], t[0..n]);
             s.final_len = n;
-            std.debug.print("[{d:>6}ms] FINAL: {s}  ({d:.2}s audio)\n", .{ nowMs() - s.t0_ms, t, usageSeconds(root) });
+            feedback.log("  [{d:>6}ms] FINAL: {s}  ({d:.2}s audio)\n", .{ nowMs() - s.t0_ms, t, usageSeconds(root) });
             s.got_final.store(true, .release); // release: publishes final[0..final_len]
         } else if (std.mem.eql(u8, typ, "conversation.item.input_audio_transcription.failed")) {
-            std.debug.print("  transcription FAILED: {s}\n", .{errMessage(root)});
+            // Operational failure: drop this Utterance, keep the session (crib sheet §).
+            // final_len=0 makes the worker sound the "no Insertion" error cue (#18).
+            feedback.log("  transcription FAILED: {s}\n", .{errMessage(root)});
             s.final_len = 0; // nothing to insert
             s.got_final.store(true, .release);
         } else if (std.mem.eql(u8, typ, "error")) {
-            std.debug.print("  ERROR event: {s}\n", .{errMessage(root)});
+            feedback.log("  ERROR event: {s}\n", .{errMessage(root)});
         } else if (std.mem.eql(u8, typ, "input_audio_buffer.committed")) {
-            std.debug.print("[{d:>6}ms] committed (awaiting transcript)\n", .{nowMs() - s.t0_ms});
+            feedback.log("  [{d:>6}ms] committed (awaiting transcript)\n", .{nowMs() - s.t0_ms});
         }
         // else: item.created / item.added / etc. — ignored.
     }
@@ -644,7 +654,7 @@ pub const Handler = struct {
     pub fn serverClose(self: *Handler, data: []u8) !void {
         _ = data;
         _ = self;
-        std.debug.print("  session: server sent a close frame\n", .{});
+        feedback.log("  session: server sent a close frame\n", .{});
     }
 
     /// Read loop ended (drop, server close, or our drain). Flag it for the maintenance
@@ -655,6 +665,6 @@ pub const Handler = struct {
         const s = self.session;
         s.read_ended.store(true, .release);
         _ = s.state.cmpxchgStrong(.ready, .reconnecting, .monotonic, .monotonic);
-        std.debug.print("  [read loop ended]\n", .{});
+        feedback.log("  [read loop ended]\n", .{});
     }
 };

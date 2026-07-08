@@ -4,8 +4,17 @@
 //! single process: hold the Talk Key → CoreAudio Capture streams to the OpenAI
 //! Transcription Session → on release, the Final Transcript is inserted at the cursor
 //! of the Focused Target. Settings load from config (wayfinder #16); the session keeps
-//! itself warm and reconnects between Utterances (wayfinder #17). No feedback subsystem
-//! or self-healing yet — those are wayfinder #18–#19. `prototypes/` stays frozen.
+//! itself warm and reconnects between Utterances (wayfinder #17).
+//!
+//! Feedback & failure surfacing (wayfinder #18): sound cues frame each Utterance (start
+//! chime on press, stop chime on release, a distinct error chime whenever an Utterance
+//! yields no Insertion), every state transition + error is timestamped through
+//! feedback.log (→ ~/Library/Logs/type-wave.log under the LaunchAgent), and the
+//! operational-failure guards below degrade-and-recover rather than crash: a revoked
+//! Input Monitoring grant is re-enabled (and sounded if it stays dead), PostEvent is
+//! preflighted before each insert, mic silence is detected per-Utterance, and API
+//! failures drop the Utterance while keeping the session. The full connection state
+//! machine + headless assembly is wayfinder #19. `prototypes/` stays frozen.
 //!
 //! Threading, and why the slow work is off the tap callback:
 //!   - main thread     : installs the tap, then blocks in CFRunLoopRun servicing it.
@@ -31,6 +40,7 @@ const session_mod = @import("session.zig");
 const tapmod = @import("tap.zig");
 const insertmod = @import("insert.zig");
 const config = @import("config.zig");
+const feedback = @import("feedback.zig");
 
 const Session = session_mod.Session;
 
@@ -99,6 +109,7 @@ const App = struct {
     session: *Session,
     capture: *cap.Capture,
     inserter: *insertmod.Inserter,
+    cues: *feedback.Cues,
 
     /// From config (wayfinder #16): which key drives an Utterance, and how the Final
     /// Transcript is inserted. Read-only after startup.
@@ -122,12 +133,16 @@ const App = struct {
         self.recording = true;
         self.session.beginUtterance();
         self.capture.start() catch |e| {
-            std.debug.print("  capture.start failed: {}\n", .{e});
+            // Capture couldn't start (queue error / mic hardware gone): abort the Utterance
+            // and sound the failure rather than leaving a phantom recording (#18).
+            feedback.log("  capture.start failed: {s} — Utterance aborted\n", .{@errorName(e)});
             self.session.endUtterance();
             self.recording = false;
+            self.cues.err();
             return;
         };
-        std.debug.print("[REC ] speaking… release Right-Option to insert.\n", .{});
+        self.cues.start(); // chime only once we are actually listening
+        feedback.log("  [REC] listening — release the Talk Key to insert\n", .{});
     }
 
     fn onRelease(ctx: ?*anyopaque, key: tapmod.TalkKey) void {
@@ -137,10 +152,37 @@ const App = struct {
         self.recording = false;
         self.capture.stop(); // synchronous; final buffers flush (and forward) during this call
         self.session.endUtterance(); // stop forwarding before committing
-        self.session.commitUtterance() catch |e| std.debug.print("  commit error: {}\n", .{e});
+        self.cues.stop();
+        // Mic-silence detection: TCC denial yields all-zero PCM with no error, so the
+        // Utterance still "captures" bytes but heard nothing. Log it as the likely cause
+        // of the empty transcript the worker is about to sound the error cue for (#18).
         if (!self.capture.heardSound())
-            std.debug.print("  (warning: only silence captured — Microphone permission denied?)\n", .{});
-        self.insert_pending.store(true, .release);
+            feedback.log("  microphone captured only silence — is Microphone permission granted to this process?\n", .{});
+        const expecting = self.session.commitUtterance() catch |e| blk: {
+            feedback.log("  commit error: {s}\n", .{@errorName(e)});
+            break :blk false;
+        };
+        if (expecting) {
+            self.insert_pending.store(true, .release); // worker awaits the Final Transcript
+        } else {
+            // Nothing was committed (no audio) — no Insertion is coming, so sound it now
+            // rather than making the worker wait out its transcript timeout.
+            feedback.log("  Utterance produced no audio — nothing to insert\n", .{});
+            self.cues.err();
+        }
+    }
+
+    /// Tap self-heal outcome (wayfinder #18), from tap.zig's disabled-event handler on the
+    /// run-loop thread. A re-enable that didn't take means Input Monitoring was revoked;
+    /// surface it (log + error cue). The tap recovers automatically once the grant returns.
+    fn onTapDisabled(ctx: ?*anyopaque, by_timeout: bool, reenabled: bool) void {
+        const self: *App = @ptrCast(@alignCast(ctx.?));
+        if (reenabled) {
+            feedback.log("  Talk Key tap was disabled ({s}) and re-enabled\n", .{if (by_timeout) "OS timeout" else "user input"});
+        } else {
+            feedback.log("  Talk Key tap DISABLED and could not be re-enabled — Input Monitoring may be revoked; re-grant it to recover\n", .{});
+            self.cues.err();
+        }
     }
 
     // ---- worker thread: the blocking wait + the slow Insertion, off the callback ----
@@ -153,12 +195,15 @@ const App = struct {
                 continue;
             }
             if (!waitFor(&self.session.got_final, 15_000)) {
-                std.debug.print("  (no transcript within 15s — nothing inserted)\n", .{});
+                feedback.log("  no Final Transcript within 15s — nothing inserted\n", .{});
+                self.cues.err();
                 continue;
             }
             const n = self.session.final_len;
             if (n == 0) {
-                std.debug.print("  (empty transcript — nothing to insert)\n", .{});
+                // Empty/failed transcript (mic silence, transcription.failed, …).
+                feedback.log("  empty Final Transcript — nothing to insert\n", .{});
+                self.cues.err();
                 continue;
             }
             // NUL-terminate for insert.paste (it becomes an NSString).
@@ -166,7 +211,14 @@ const App = struct {
             @memcpy(buf[0..len], self.session.final[0..len]);
             buf[len] = 0;
             const z: [*:0]const u8 = @ptrCast(&buf);
-            self.inserter.insert(self.insert_method, z) catch |e| std.debug.print("  insert failed: {s}\n", .{explainInsert(e)});
+            self.inserter.insert(self.insert_method, z) catch |e| {
+                // PostEvent guard tripped (grant revoked) or the mechanism failed — the
+                // Final Transcript did not land, so sound the no-Insertion error (#18).
+                feedback.log("  insertion failed: {s}\n", .{explainInsert(e)});
+                self.cues.err();
+                continue;
+            };
+            feedback.log("  inserted {d} chars at the cursor\n", .{len});
         }
     }
 };
@@ -198,16 +250,16 @@ pub fn main() !void {
     // ---- TCC: request the two event grants up front, report status ----
     const listen_ok = tapmod.Tap.requestListenAccess();
     const post_ok = insertmod.requestPostEventAccess();
-    std.debug.print("TCC (attributed to THIS terminal for a foreground run):\n", .{});
-    std.debug.print("  Input Monitoring (Talk Key tap): {s}\n", .{if (listen_ok) "granted" else "NOT granted"});
-    std.debug.print("  PostEvent        (Insertion):    {s}\n", .{if (post_ok) "granted" else "NOT granted"});
+    feedback.log("TCC (attributed to THIS terminal for a foreground run):\n", .{});
+    feedback.log("  Input Monitoring (Talk Key tap): {s}\n", .{if (listen_ok) "granted" else "NOT granted"});
+    feedback.log("  PostEvent        (Insertion):    {s}\n", .{if (post_ok) "granted" else "NOT granted"});
     if (!listen_ok or !post_ok)
-        std.debug.print("  → grant the missing permission(s) to this terminal and re-run (a prompt may have appeared).\n", .{});
+        feedback.log("  → grant the missing permission(s) to this terminal and re-run (a prompt may have appeared).\n", .{});
     // (Microphone is prompted lazily on the first Capture start, attributed to the terminal.)
 
     // ---- Transcription Session: connect (starts the read loop + the warm-lifecycle
     //      maintenance thread internally) and wait until it is READY (wayfinder #17) ----
-    std.debug.print("\nconnecting to wss://{s}/v1/realtime …\n", .{session_mod.host});
+    feedback.log("connecting to wss://{s}/v1/realtime …\n", .{session_mod.host});
     const session = try Session.connect(io, alloc, cfg.api_key, .{
         .model = s.model,
         .language = s.language,
@@ -216,7 +268,7 @@ pub fn main() !void {
     });
 
     if (!session.waitReady(10_000)) {
-        std.debug.print("timed out waiting for session.updated — aborting.\n", .{});
+        feedback.log("timed out waiting for session.updated — aborting.\n", .{});
         exit(1);
     }
 
@@ -231,11 +283,16 @@ pub fn main() !void {
     var inserter = insertmod.Inserter{};
     inserter.init();
 
+    // ---- Feedback: register the sound cues (wayfinder #18) ----
+    var cues = feedback.Cues{};
+    cues.init();
+
     // ---- wire the shared state, spawn the worker ----
     var app = App{
         .session = session,
         .capture = &capture,
         .inserter = &inserter,
+        .cues = &cues,
         .talk_key = s.talk_key,
         .insert_method = s.insertion,
     };
@@ -247,12 +304,12 @@ pub fn main() !void {
         .ctx = &app,
         .on_press = App.onPress,
         .on_release = App.onRelease,
+        .on_disabled = App.onTapDisabled, // self-heal + surface a revoked Input Monitoring grant
     } };
     tap.install() catch |e| {
         switch (e) {
-            error.TapCreateFailed => std.debug.print("\nCGEventTapCreate returned NULL — cannot observe the Talk Key.\n", .{}),
-            error.TapDisabled => std.debug.print(
-                \\
+            error.TapCreateFailed => feedback.log("CGEventTapCreate returned NULL — cannot observe the Talk Key.\n", .{}),
+            error.TapDisabled => feedback.log(
                 \\The Talk Key tap was created but is DISABLED — Input Monitoring isn't
                 \\granted to this terminal yet. Grant it (see above) and re-run.
                 \\
@@ -268,8 +325,7 @@ pub fn main() !void {
     const watcher = try std.Thread.spawn(.{}, quitWatcher, .{CFRunLoopGetMain()});
     watcher.detach();
 
-    std.debug.print(
-        \\
+    feedback.log(
         \\Ready. HOLD {s}, speak, release — the transcript is inserted at the cursor.
         \\(Listen-only tap: {s} still works normally elsewhere.) Ctrl-C to quit.
         \\
@@ -277,8 +333,8 @@ pub fn main() !void {
 
     tap.run(); // CFRunLoopRun — blocks until the quit watcher stops the loop
 
-    std.debug.print("\nshutting down — closing the Transcription Session…\n", .{});
+    feedback.log("shutting down — closing the Transcription Session…\n", .{});
     session.shutdown(); // graceful websocket close (close frame + drain), then free the link
     session.deinit();
-    std.debug.print("bye.\n", .{});
+    feedback.log("bye.\n", .{});
 }

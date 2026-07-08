@@ -72,6 +72,11 @@ pub const Callbacks = struct {
     ctx: ?*anyopaque,
     on_press: *const fn (ctx: ?*anyopaque, key: TalkKey, keycode: i64, flags: u64) void,
     on_release: *const fn (ctx: ?*anyopaque, key: TalkKey) void,
+    /// The OS disabled the tap (a slow callback timeout, or certain user input) and we
+    /// tried to re-enable it. `reenabled` reports whether it took — `false` means the
+    /// tap is dead (Input Monitoring likely revoked) and the daemon should surface it
+    /// (wayfinder #18). Optional; runs on the run-loop thread, so keep it fast.
+    on_disabled: ?*const fn (ctx: ?*anyopaque, by_timeout: bool, reenabled: bool) void = null,
 };
 
 pub const Tap = struct {
@@ -93,9 +98,14 @@ pub const Tap = struct {
     fn callback(_: CGEventTapProxy, etype: u32, event: CGEventRef, userInfo: ?*anyopaque) callconv(.c) CGEventRef {
         const self: *Tap = @ptrCast(@alignCast(userInfo.?));
 
-        // The OS disables the tap on timeout / certain user input — re-enable it.
+        // The OS disables the tap on timeout / certain user input — re-enable it, then
+        // check it took. A revoked Input Monitoring grant makes the re-enable a no-op
+        // (CGEventTapIsEnabled stays false); report the outcome so the daemon can log +
+        // sound the failure and recover once the grant returns (wayfinder #18).
         if (etype == kCGEventTapDisabledByTimeout or etype == kCGEventTapDisabledByUserInput) {
             CGEventTapEnable(self.port, true);
+            if (self.cbs.on_disabled) |cb|
+                cb(self.cbs.ctx, etype == kCGEventTapDisabledByTimeout, CGEventTapIsEnabled(self.port));
             return event;
         }
         if (etype != kCGEventFlagsChanged) return event;
