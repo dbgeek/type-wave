@@ -78,6 +78,12 @@ pub const ChunkSink = *const fn (ctx: ?*anyopaque, pcm: []const u8) void;
 
 pub const Capture = struct {
     queue: AudioQueueRef = null,
+    /// The queue's buffers, held so `start` can re-arm the queue: `stop`'s immediate
+    /// AudioQueueStop resets the queue, which hands every buffer back through the
+    /// callback whose re-enqueue then fails with kAudioQueueErr_EnqueueDuringReset —
+    /// so after a stop the queue owns no buffers, and a restart without re-enqueueing
+    /// records nothing ("dictation works once", diagnosed 2026-07-08).
+    buffers: [buffer_count]AudioQueueBufferRef = @splat(null),
     ctx: ?*anyopaque = null,
     on_chunk: ?ChunkSink = null,
 
@@ -108,10 +114,13 @@ pub const Capture = struct {
             }
         }
         if (self.on_chunk) |cb| cb(self.ctx, slice);
-        _ = AudioQueueEnqueueBuffer(queue, buffer, 0, null); // hand the buffer back
+        // Hand the buffer back. During `stop`'s reset this fails with
+        // kAudioQueueErr_EnqueueDuringReset — expected: `start` re-arms the queue.
+        _ = AudioQueueEnqueueBuffer(queue, buffer, 0, null);
     }
 
-    /// Create the queue and enqueue buffers. Fires a TCC preflight but no prompt.
+    /// Create the queue and allocate its buffers (enqueueing is `start`'s job, so
+    /// every Utterance arms the queue the same way). Fires a TCC preflight but no prompt.
     pub fn init(self: *Capture) !void {
         const format = AudioStreamBasicDescription{
             .mSampleRate = 24000, // the queue's converter resamples from the device rate
@@ -127,25 +136,30 @@ pub const Capture = struct {
             return error.AudioQueueNewInput;
         errdefer _ = AudioQueueDispose(self.queue, 1);
 
-        var i: usize = 0;
-        while (i < buffer_count) : (i += 1) {
-            var buf: AudioQueueBufferRef = null;
-            if (AudioQueueAllocateBuffer(self.queue, buffer_bytes, &buf) != 0)
+        for (&self.buffers) |*buf| {
+            if (AudioQueueAllocateBuffer(self.queue, buffer_bytes, buf) != 0)
                 return error.AudioQueueAllocateBuffer;
-            if (AudioQueueEnqueueBuffer(self.queue, buf, 0, null) != 0)
-                return error.AudioQueueEnqueueBuffer;
         }
     }
 
-    /// First call performs input IO for real => microphone prompt (attributed to
-    /// the terminal for a CLI, crib sheet §5.1).
+    /// Arm the queue (enqueue all buffers — it owns none after init or a stop-reset)
+    /// and start it. First call performs input IO for real => microphone prompt
+    /// (attributed to the terminal for a CLI, crib sheet §5.1).
     pub fn start(self: *Capture) !void {
         self.nonzero_seen.store(false, .monotonic);
+        for (self.buffers) |buf| {
+            if (AudioQueueEnqueueBuffer(self.queue, buf, 0, null) != 0)
+                return error.AudioQueueEnqueueBuffer;
+        }
         if (AudioQueueStart(self.queue, null) != 0) return error.AudioQueueStart;
     }
 
     pub fn stop(self: *Capture) void {
-        _ = AudioQueueStop(self.queue, 1); // synchronous; pending callbacks fire during this call
+        // Synchronous; pending callbacks fire during this call, flushing (and
+        // forwarding) the tail audio. The implied reset then strips the queue of its
+        // buffers — the in-callback re-enqueue fails EnqueueDuringReset by design —
+        // and the next `start` re-arms it.
+        _ = AudioQueueStop(self.queue, 1);
     }
 
     pub fn heardSound(self: *Capture) bool {

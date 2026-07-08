@@ -59,4 +59,23 @@ pub fn build(b: *std.Build) void {
     install_agent.addFileArg(exe.getEmittedBin());
     const agent_step = b.step("install-agent", "Codesign + install the daemon as a headless LaunchAgent (macOS; see docs/packaging.md)");
     agent_step.dependOn(&install_agent.step);
+
+    // `zig build capture-check` — the live start/stop-cycle regression probe for the
+    // works-once Capture bug (src/capture_check.zig). Local-machine only: it performs
+    // real input IO, so it is a step rather than a `zig build test` test.
+    const check = b.addExecutable(.{
+        .name = "capture-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/capture_check.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    check.root_module.linkFramework("AudioToolbox", .{});
+    check.root_module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk}) });
+    check.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
+    const run_check = b.addRunArtifact(check);
+    const check_step = b.step("capture-check", "Run the Capture start/stop-cycle regression probe (live input IO)");
+    check_step.dependOn(&run_check.step);
 }
