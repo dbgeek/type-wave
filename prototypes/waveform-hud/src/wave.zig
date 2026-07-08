@@ -107,16 +107,17 @@ pub const Mode = enum { hidden, recording, processing };
 pub const Scheme = enum {
     red_pill_white_bars, // today's recording-red pill, white bars; green pill while processing
     dark_pill_tinted_bars, // charcoal pill always; the BARS carry the state colour
+    transparent_tinted_bars, // NO pill at all — just the bars floating over the screen
 };
 
 pub const AnimVariant = enum { wave, dots, breathe };
 
 pub const Look = struct {
-    pill_w: f64 = 420,
-    pill_h: f64 = 60,
-    bar_w: f64 = 5,
-    bar_gap: f64 = 3,
-    scheme: Scheme = .red_pill_white_bars,
+    pill_w: f64 = 250,
+    pill_h: f64 = 38,
+    bar_w: f64 = 3,
+    bar_gap: f64 = 2,
+    scheme: Scheme = .transparent_tinted_bars,
 };
 
 const pad_x: f64 = 20; // inner margin before the first / after the last bar
@@ -276,7 +277,7 @@ pub const Pill = struct {
         self.recolorIfNeeded(mode, variant);
 
         const look = self.look;
-        const max_h = look.pill_h - 22;
+        const max_h = look.pill_h * 0.72; // proportional headroom — holds up at 38 px too
         const row_w = @as(f64, @floatFromInt(self.nbars)) * (look.bar_w + look.bar_gap) - look.bar_gap;
         const x0 = (look.pill_w - row_w) / 2.0;
 
@@ -349,6 +350,7 @@ pub const Pill = struct {
         const recording_red = rgba(0.78, 0.16, 0.18, 0.95); // src/hud.zig's recording colour
         const committed_green = rgba(0.11, 0.44, 0.22, 0.95); // src/hud.zig's final colour
         const charcoal = rgba(0.10, 0.10, 0.12, 0.92);
+        const clear = rgba(0, 0, 0, 0);
         const white = rgba(1.0, 1.0, 1.0, 0.95);
         const tint_red = rgba(1.0, 0.38, 0.38, 1.0);
         const tint_green = rgba(0.30, 0.85, 0.45, 1.0);
@@ -362,9 +364,17 @@ pub const Pill = struct {
                 .recording => .{ charcoal, tint_red, tint_green },
                 else => .{ charcoal, tint_green, tint_green },
             },
+            .transparent_tinted_bars => switch (mode) {
+                .recording => .{ clear, tint_red, tint_green },
+                else => .{ clear, tint_green, tint_green },
+            },
         };
 
         msg1v(self.layer, "setBackgroundColor:", cgColor(pill_bg));
+        // A window shadow around an invisible pill draws a ghost outline — drop it
+        // for the transparent scheme (the bars are too thin to need one anyway).
+        msgBool(self.panel, "setHasShadow:", self.look.scheme != .transparent_tinted_bars);
+        msgv(self.panel, "invalidateShadow");
         msgFloat(self.layer, "setOpacity:", 1.0); // breathe re-modulates it per tick
 
         const dots_mode = (mode == .processing and variant == .dots);

@@ -282,9 +282,9 @@ fn addPumpTimer(hz: f64) void {
 
 // ---- stdin command driver --------------------------------------------------------
 const bar_presets = [_]struct { name: []const u8, w: f64, gap: f64 }{
+    .{ .name = "fine", .w = 3, .gap = 2 },
     .{ .name = "thin", .w = 4, .gap = 3 },
     .{ .name = "medium", .w = 6, .gap = 4 },
-    .{ .name = "chunky", .w = 10, .gap = 6 },
 };
 
 fn printStatus() void {
@@ -329,16 +329,23 @@ fn handle(ch: u8) void {
             s.look_dirty = true;
         },
         'c' => {
-            s.look.scheme = if (s.look.scheme == .red_pill_white_bars) .dark_pill_tinted_bars else .red_pill_white_bars;
+            s.look.scheme = switch (s.look.scheme) {
+                .transparent_tinted_bars => .red_pill_white_bars,
+                .red_pill_white_bars => .dark_pill_tinted_bars,
+                .dark_pill_tinted_bars => .transparent_tinted_bars,
+            };
             s.look_dirty = true;
         },
         'z' => {
-            if (s.look.pill_w == 420) {
+            if (s.look.pill_w == 250) {
                 s.look.pill_w = 300;
                 s.look.pill_h = 48;
-            } else {
+            } else if (s.look.pill_w == 300) {
                 s.look.pill_w = 420;
                 s.look.pill_h = 60;
+            } else {
+                s.look.pill_w = 250;
+                s.look.pill_h = 38;
             }
             s.look_dirty = true;
         },
@@ -414,17 +421,17 @@ pub fn main() void {
 
     std.debug.print(
         \\
-        \\Waveform HUD spike (wayfinder #25) — a pill with a scrolling waveform should be
-        \\at the bottom-centre of the screen, fed by a synthetic "talking" voice.
+        \\Waveform HUD spike (wayfinder #25) — a small transparent scrolling waveform
+        \\should be at the bottom-centre of the screen, fed by a synthetic "talking" voice.
         \\
         \\Commands (letter + Enter):
         \\  r  recording (scrolling waveform)      p  processing (green, post-release)
         \\  h  hide the pill                       t/w/s  synthetic voice: talk/whisper/silence
-        \\  m  toggle LIVE microphone input        1/2/3  bars: thin / medium / chunky
-        \\  c  toggle colour scheme                z  toggle pill size 420x60 / 300x48
-        \\  d  cycle processing animation          f  cycle render pump 20 -> 30 -> 60 Hz
-        \\     (wave / dots / breathe)             a  toggle CA implicit animations
-        \\  q  quit
+        \\  m  toggle LIVE microphone input        1/2/3  bars: fine / thin / medium
+        \\  c  cycle scheme (transparent /         z  cycle size 250x38 / 300x48 / 420x60
+        \\     red pill / dark pill)               f  cycle render pump 20 -> 30 -> 60 Hz
+        \\  d  cycle processing animation          a  toggle CA implicit animations
+        \\     (wave / dots / breathe)             q  quit
         \\
         \\React to: whisper visibility (w — bars must visibly move), scroll feel at 20 Hz
         \\vs 60 Hz (f) and with implicit animations (a), and which processing look wins (d).

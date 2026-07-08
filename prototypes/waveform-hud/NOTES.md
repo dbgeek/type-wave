@@ -48,16 +48,17 @@ over the Insertion after Talk Key release.
     cd prototypes/waveform-hud
     zig build run          # inside `nix develop`
 
-A pill appears bottom-centre, scrolling a synthetic "talking" voice. Commands
-(letter + Enter in the terminal):
+A small transparent waveform appears bottom-centre (250x38, fine bars, no pill
+background — the first-reaction defaults), scrolling a synthetic "talking"
+voice. Commands (letter + Enter in the terminal):
 
     r  recording (scrolling waveform)      p  processing (green, post-release)
     h  hide the pill                       t/w/s  synthetic voice: talk/whisper/silence
-    m  toggle LIVE microphone input        1/2/3  bars: thin / medium / chunky
-    c  toggle colour scheme                z  toggle pill size 420x60 / 300x48
-    d  cycle processing animation          f  cycle render pump 20 -> 30 -> 60 Hz
-       (wave / dots / breathe)             a  toggle CA implicit animations
-    q  quit
+    m  toggle LIVE microphone input        1/2/3  bars: fine / thin / medium
+    c  cycle scheme (transparent /         z  cycle size 250x38 / 300x48 / 420x60
+       red pill / dark pill)               f  cycle render pump 20 -> 30 -> 60 Hz
+    d  cycle processing animation          a  toggle CA implicit animations
+       (wave / dots / breathe)             q  quit
 
 `m` performs real input IO on first use → macOS Microphone prompt, attributed
 to the terminal (same TCC behaviour as the cli-dictation spike).
