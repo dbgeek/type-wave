@@ -1,0 +1,12 @@
+.{
+    .name = .waveform_hud,
+    .version = "0.0.0",
+    .fingerprint = 0xd6f1f1408c5aeb67,
+    .minimum_zig_version = "0.17.0-dev.1267+300116b02",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
