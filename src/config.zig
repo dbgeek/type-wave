@@ -39,6 +39,10 @@ pub const Settings = struct {
     delay: []const u8 = "low",
     noise_reduction: NoiseReduction = .near_field,
     insertion: insert.Method = .paste,
+    /// Show the live-partials overlay pill at the cursor (wayfinder #22). On by default;
+    /// set `.overlay = false` for sound-only feedback. A headless run (no display) also
+    /// degrades to sound-only on its own, so this never blocks startup.
+    overlay: bool = true,
 
     /// OpenAI input-audio noise reduction. `.off` sends JSON `null` (feature disabled).
     pub const NoiseReduction = enum { near_field, far_field, off };

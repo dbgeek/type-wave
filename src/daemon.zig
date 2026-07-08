@@ -42,7 +42,10 @@
 //!     (#18); PostEvent is preflighted per insert (Inserter); mic silence is detected.
 //!
 //! # Threads
-//!   - main thread      : installs the tap, then blocks in CFRunLoopRun servicing it.
+//!   - main thread      : installs the tap + the overlay HUD render pump (a CFRunLoopTimer,
+//!                         wayfinder #22), then blocks in CFRunLoopRun servicing both. All
+//!                         AppKit calls happen here (on the render pump); other threads only
+//!                         `hud.publish` into a mutex-guarded buffer the pump reads.
 //!   - run-loop thread   : the tap callback. onPress/onRelease. Kept fast (a slow callback
 //!                         makes the OS disable the tap) — only the cheap edge work.
 //!   - worker thread     : waits for the Final Transcript, then performs the Insertion.
@@ -60,6 +63,7 @@ const tapmod = @import("tap.zig");
 const insertmod = @import("insert.zig");
 const config = @import("config.zig");
 const feedback = @import("feedback.zig");
+const hud_mod = @import("hud.zig");
 
 const Session = session_mod.Session;
 
@@ -156,6 +160,11 @@ const Daemon = struct {
     capture: cap.Capture = .{},
     inserter: insertmod.Inserter = .{},
     cues: feedback.Cues = .{},
+    /// The live-partials overlay pill (wayfinder #22). Inactive until `hud.init()` succeeds
+    /// in run(); every method no-ops while inactive, so a disabled/headless daemon just
+    /// falls back to the sound cues. When active it takes over start/stop feedback (the
+    /// pill is the signal), leaving only the error cue audible.
+    hud: hud_mod.Hud = .{},
     tap: tapmod.Tap = undefined, // built in run()
 
     /// The warm Transcription Session, created by the supervisor once the API key is
@@ -184,6 +193,27 @@ const Daemon = struct {
         if (p == 0) return null;
         const sess: *Session = @ptrFromInt(p);
         return sess;
+    }
+
+    // ---- overlay HUD subscription (wayfinder #22) ----
+    // The session drives the pill's text: Partial Transcripts colour it red and stream
+    // live; the Final Transcript flashes it green (the worker then inserts and hides it).
+    // Both run on the read-loop thread and only `hud.publish` (mutex-guarded, no AppKit),
+    // so they are safe there. Handed to Session.connect only when the HUD is active.
+
+    fn onPartial(ctx: ?*anyopaque, text: []const u8) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx.?));
+        self.hud.publish(.recording, text);
+    }
+
+    fn onFinal(ctx: ?*anyopaque, text: []const u8) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx.?));
+        self.hud.publish(.final, text);
+    }
+
+    fn transcriptObserver(self: *Daemon) ?session_mod.TranscriptObserver {
+        if (!self.hud.active) return null; // no HUD ⇒ transcripts stay log-only (#18)
+        return .{ .ctx = self, .on_partial = onPartial, .on_final = onFinal };
     }
 
     // ---- tap callbacks: run on the run-loop thread, kept fast ----
@@ -217,7 +247,10 @@ const Daemon = struct {
             self.cues.err();
             return;
         };
-        self.cues.start(); // chime only once we are actually listening
+        // Signal "listening" only once Capture is actually up: the pill (red, awaiting the
+        // first Partial Transcript) supersedes the start chime when the overlay is on;
+        // otherwise the chime carries it (wayfinder #22).
+        if (self.hud.active) self.hud.publish(.recording, "") else self.cues.start();
         feedback.log("  [REC] listening — release the Talk Key to insert\n", .{});
     }
 
@@ -228,17 +261,21 @@ const Daemon = struct {
         self.hold_active = false;
 
         const sess = self.getSession() orelse {
+            self.hud.publish(.hidden, ""); // pill was up since press — take it down
             self.busy.store(false, .release); // session vanished mid-hold (shutdown) — release the guard
             return;
         };
         self.capture.stop(); // synchronous; final buffers flush (and forward) during this call
         sess.endUtterance(); // stop forwarding before committing
-        self.cues.stop();
+        // The pill stays up (showing the last partial) until the Final flashes or the
+        // Utterance resolves below; the stop chime only carries this when there's no pill.
+        if (!self.hud.active) self.cues.stop();
 
         // Link dropped mid-Utterance: the head audio already streamed live is gone, so
         // committing would insert a truncated tail. Abandon cleanly (grilled for #19).
         if (sess.isPoisoned()) {
             feedback.log("  Transcription Session dropped mid-Utterance — discarded; hold the Talk Key and say it again\n", .{});
+            self.hud.publish(.hidden, ""); // abandon: no truncated tail shown (error cue kept)
             self.cues.err();
             self.busy.store(false, .release);
             return;
@@ -257,6 +294,7 @@ const Daemon = struct {
         } else {
             // Nothing committed (no audio) — no Insertion is coming, so resolve now.
             feedback.log("  Utterance produced no audio — nothing to insert\n", .{});
+            self.hud.publish(.hidden, ""); // no Final coming — hide the pill now
             self.cues.err();
             self.busy.store(false, .release);
         }
@@ -290,6 +328,11 @@ const Daemon = struct {
     /// deadline), then insert. `busy` is cleared however this returns.
     fn processUtterance(self: *Daemon) void {
         defer self.busy.store(false, .release);
+        // Hide the pill however this resolves (inserted, empty, timed out, or insert-failed).
+        // On the happy path the Final Transcript is already flashing green — published by the
+        // read-loop's on_final — and the paste below holds it on screen; this takes it down
+        // once the Insertion is done (wayfinder #22).
+        defer self.hud.publish(.hidden, "");
 
         const sess = self.getSession() orelse return;
 
@@ -332,7 +375,7 @@ const Daemon = struct {
             // 1. Build the Transcription Session the moment the API key is present.
             if (self.getSession() == null) {
                 if (config.loadApiKeyOnly(self.io, self.alloc)) |key| {
-                    const sess = Session.connect(self.io, self.alloc, key, self.params) catch |e| {
+                    const sess = Session.connect(self.io, self.alloc, key, self.params, self.transcriptObserver()) catch |e| {
                         feedback.log("  supervisor: session connect failed: {s} — will retry\n", .{@errorName(e)});
                         continue;
                     };
@@ -395,8 +438,8 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     // Settings load always (defaults if absent); the secret is NOT required up front —
     // the supervisor waits for it (self-heal).
     const settings = config.loadSettingsOnly(io, alloc);
-    std.debug.print("config: talk_key={s} model=\"{s}\" language=\"{s}\" delay=\"{s}\" noise_reduction={s} insertion={s}\n", .{
-        @tagName(settings.talk_key), settings.model, settings.language, settings.delay, @tagName(settings.noise_reduction), @tagName(settings.insertion),
+    std.debug.print("config: talk_key={s} model=\"{s}\" language=\"{s}\" delay=\"{s}\" noise_reduction={s} insertion={s} overlay={}\n", .{
+        @tagName(settings.talk_key), settings.model, settings.language, settings.delay, @tagName(settings.noise_reduction), @tagName(settings.insertion), settings.overlay,
     });
 
     var daemon = Daemon{
@@ -421,6 +464,21 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
 
     daemon.inserter.init();
     daemon.cues.init();
+
+    // ---- overlay HUD (wayfinder #22): the live-partials pill. Built here, on the main
+    //      thread, so its CFRunLoopTimer render pump joins the SAME run loop the tap will
+    //      block on (daemon.tap.run → CFRunLoopRun). Off by config, or headless with no
+    //      display, both degrade to the sound cues (#18) without failing startup. ----
+    if (settings.overlay) {
+        if (daemon.hud.init()) {
+            daemon.hud.startRenderPump();
+            feedback.log("  overlay HUD: on — the pill carries start/stop feedback; the error cue is kept\n", .{});
+        } else {
+            feedback.log("  overlay HUD: enabled but no display detected — sound-only feedback\n", .{});
+        }
+    } else {
+        feedback.log("  overlay HUD: off (config.overlay=false) — sound-only feedback\n", .{});
+    }
 
     // ---- Talk Key tap: prompt for the two event grants once, then create the tap on THIS
     //      (main) run loop. A created-but-disabled tap is fine — the supervisor enables it

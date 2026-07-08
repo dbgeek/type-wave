@@ -31,4 +31,12 @@
     //   .paste     — clipboard swap + ⌘V (primary; best for terminals/Electron)
     //   .keystroke — synthetic Unicode typing (fallback)
     .insertion = .paste,
+
+    // Show the floating overlay pill (wayfinder #22): a translucent bottom-centre HUD
+    // that turns red and streams live Partial Transcripts while you hold the Talk Key,
+    // flashes green with the Final Transcript as it lands, then hides. When on, it takes
+    // over the start/stop feedback (the pill IS the signal), keeping only the error
+    // chime. Set false for sound-only feedback (all three chimes). A headless run with
+    // no display degrades to sound-only automatically.
+    .overlay = true,
 }

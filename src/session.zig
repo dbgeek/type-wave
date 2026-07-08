@@ -49,6 +49,22 @@ const close_drain_ms: i64 = 1_500;
 /// while the link is down accumulates here and is replayed on reconnect.
 const pending_cap: usize = 60 * 48_000;
 
+/// A subscriber to the live transcript stream (wayfinder #22). The overlay HUD wires
+/// this so it can render Partial Transcripts as they stream and flash the Final
+/// Transcript. Both callbacks run on the **read-loop thread**, so they must be fast and
+/// thread-safe — the HUD only copies the text into a mutex-guarded buffer its own
+/// main-thread render pump reads (see hud.zig). `text` borrows the session's accumulator
+/// and is valid only for the duration of the call. Left null when there is no HUD
+/// (overlay disabled or headless), in which case partials are only logged, exactly as
+/// before (wayfinder #18).
+pub const TranscriptObserver = struct {
+    ctx: ?*anyopaque,
+    /// The accumulated Partial Transcript so far (grows as deltas arrive).
+    on_partial: *const fn (ctx: ?*anyopaque, text: []const u8) void,
+    /// The completed Final Transcript for the Utterance.
+    on_final: *const fn (ctx: ?*anyopaque, text: []const u8) void,
+};
+
 /// The transcription knobs that vary by config (wayfinder #16), fed to the
 /// session.update built at connect time. Defaults reproduce the exact string proven
 /// live in #8. `noise_reduction` is null when disabled (emits JSON `null`).
@@ -103,6 +119,11 @@ pub const Session = struct {
     /// borrow the process-lifetime Config (wayfinder #16), so they outlive the session.
     api_key: []const u8,
     params: TranscriptionParams,
+
+    /// Optional live-transcript subscriber (the overlay HUD, wayfinder #22). Set once at
+    /// connect, before the read loop starts, so it is never installed mid-stream. Read
+    /// only on the read-loop thread (serverMessage). null ⇒ transcripts are only logged.
+    observer: ?TranscriptObserver = null,
 
     /// Guards ALL writes to the client. The library has no internal write lock
     /// (crib sheet §3.4): the read-loop thread (session.update, pongs), the audio
@@ -185,7 +206,7 @@ pub const Session = struct {
     /// markReadyAndFlush): the only nesting is pending_mu → write_mu, never the reverse.
     pending_mu: std.Io.Mutex = .init,
 
-    pub fn connect(io: std.Io, alloc: std.mem.Allocator, api_key: []const u8, params: TranscriptionParams) !*Session {
+    pub fn connect(io: std.Io, alloc: std.mem.Allocator, api_key: []const u8, params: TranscriptionParams, observer: ?TranscriptObserver) !*Session {
         const self = try alloc.create(Session);
         errdefer alloc.destroy(self);
         const pending = try alloc.alloc(u8, pending_cap);
@@ -197,6 +218,7 @@ pub const Session = struct {
             .client = undefined, // openClient establishes it
             .api_key = api_key,
             .params = params,
+            .observer = observer, // set before openClient starts the read loop — never mid-stream
             .pending = pending,
         };
         self.su_len = (try formatSessionUpdate(&self.su_buf, params)).len;
@@ -626,14 +648,19 @@ pub const Handler = struct {
                 @memcpy(s.partial[s.partial_len..][0..d.len], d);
                 s.partial_len += d.len;
             }
-            // Partial Transcript: logged, never shown (no HUD yet — #20).
+            // Partial Transcript: always logged (#18); also streamed to the overlay HUD
+            // when one is subscribed (wayfinder #22) so the pill shows it live.
             feedback.log("  [{d:>6}ms] partial: {s}\n", .{ nowMs() - s.t0_ms, s.partial[0..s.partial_len] });
+            if (s.observer) |o| o.on_partial(o.ctx, s.partial[0..s.partial_len]);
         } else if (std.mem.eql(u8, typ, "conversation.item.input_audio_transcription.completed")) {
             const t = getStr(root, "transcript") orelse "";
             const n = @min(t.len, s.final.len);
             @memcpy(s.final[0..n], t[0..n]);
             s.final_len = n;
             feedback.log("  [{d:>6}ms] FINAL: {s}  ({d:.2}s audio)\n", .{ nowMs() - s.t0_ms, t, usageSeconds(root) });
+            // Flash the Final Transcript on the overlay HUD (wayfinder #22) before releasing
+            // got_final; the daemon's worker then inserts it and hides the pill.
+            if (s.observer) |o| o.on_final(o.ctx, s.final[0..s.final_len]);
             s.got_final.store(true, .release); // release: publishes final[0..final_len]
         } else if (std.mem.eql(u8, typ, "conversation.item.input_audio_transcription.failed")) {
             // Operational failure: drop this Utterance, keep the session (crib sheet §).

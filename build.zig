@@ -32,7 +32,8 @@ pub fn build(b: *std.Build) void {
     m.linkFramework("CoreFoundation", .{}); // run loop, CFRelease
     m.linkFramework("Carbon", .{}); // IsSecureEventInputEnabled
     m.linkFramework("ApplicationServices", .{}); // umbrella (AX if ever needed)
-    m.linkFramework("AppKit", .{}); // NSPasteboard via the ObjC runtime
+    m.linkFramework("AppKit", .{}); // NSPasteboard (insert) + NSPanel/NSTextField/NSScreen (overlay HUD, #22) via the ObjC runtime
+    m.linkFramework("QuartzCore", .{}); // CALayer — the overlay HUD's rounded pill (wayfinder #22)
     m.linkSystemLibrary("objc", .{}); // -lobjc
 
     // Frameworks + libobjc.tbd live under the active SDK; point the linker at both.
