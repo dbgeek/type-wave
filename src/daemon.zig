@@ -190,9 +190,9 @@ const InsertionAdapter = struct {
     /// Coordinator seam (pub: called cross-file). Runs under the Coordinator's mutex; must
     /// not block — just memcpy.
     pub fn submit(self: *InsertionAdapter, text: []const u8) void {
-        const n = @min(text.len, self.job.len - 1);
-        @memcpy(self.job[0..n], text[0..n]);
-        self.job[n] = 0;
+        // Copy in + guarantee a single trailing space so back-to-back Insertions don't
+        // run their words together (insert.ensureTrailingSpace; CONTEXT.md, Insertion).
+        _ = insertmod.ensureTrailingSpace(&self.job, text);
         self.pending.store(true, .release); // publishes the job bytes to the worker
     }
 

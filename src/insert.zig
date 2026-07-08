@@ -142,6 +142,31 @@ pub fn procName(pid: i32, buf: []u8) []const u8 {
     return if (n <= 0) "" else buf[0..@intCast(n)];
 }
 
+/// Copy `text` into `dst`, guarantee it ends with exactly one trailing space, and
+/// NUL-terminate — so consecutive Insertions don't run their words together (CONTEXT.md,
+/// Insertion). Idempotent: a Final Transcript that already ends in whitespace is left as
+/// is (no double space). Empty in → empty out, so an abandoned Utterance never lands a
+/// lone space at the cursor. The copy is capped to leave room for the space + NUL, which
+/// keeps the content ≤ `dst.len - 1` bytes so `keystroke`'s UTF-16 dest can't overflow.
+/// `dst.len` must be ≥ 2 (the daemon's job buffer is 8193). Returns the NUL-terminated
+/// slice (handed to `insert`).
+pub fn ensureTrailingSpace(dst: []u8, text: []const u8) [:0]const u8 {
+    std.debug.assert(dst.len >= 2);
+    if (text.len == 0) {
+        dst[0] = 0;
+        return dst[0..0 :0];
+    }
+    // Reserve one byte for a possible space and one for the NUL terminator.
+    var n = @min(text.len, dst.len - 2);
+    @memcpy(dst[0..n], text[0..n]);
+    if (!std.ascii.isWhitespace(dst[n - 1])) {
+        dst[n] = ' ';
+        n += 1;
+    }
+    dst[n] = 0;
+    return dst[0..n :0];
+}
+
 pub const Inserter = struct {
     /// A tagged event source so our observer can recognise our own posts (§4).
     src: CGEventSourceRef = null,
@@ -237,3 +262,38 @@ pub const Inserter = struct {
         }
     }
 };
+
+// ---- tests: the trailing-space separator (pure, no OS) -----------------------
+
+const expectEqualStrings = std.testing.expectEqualStrings;
+
+test "ensureTrailingSpace appends one space to a bare transcript" {
+    var buf: [64]u8 = undefined;
+    const out = ensureTrailingSpace(&buf, "hello world");
+    try expectEqualStrings("hello world ", out);
+    try std.testing.expectEqual(@as(u8, 0), buf[out.len]); // NUL-terminated
+}
+
+test "ensureTrailingSpace is idempotent when the transcript already ends in whitespace" {
+    var buf: [64]u8 = undefined;
+    try expectEqualStrings("done ", ensureTrailingSpace(&buf, "done ")); // trailing space kept, not doubled
+    try expectEqualStrings("line\n", ensureTrailingSpace(&buf, "line\n")); // newline already separates
+}
+
+test "ensureTrailingSpace leaves empty in as empty out (no lone space)" {
+    var buf: [64]u8 = undefined;
+    const out = ensureTrailingSpace(&buf, "");
+    try expectEqualStrings("", out);
+    try std.testing.expectEqual(@as(u8, 0), buf[0]);
+}
+
+test "ensureTrailingSpace keeps content within dst so keystroke's UTF-16 dest can't overflow" {
+    // A transcript longer than the buffer: content (incl. the space) must stay ≤ dst.len-1,
+    // leaving the final byte for the NUL — the invariant keystroke's [N]u16 dest relies on.
+    var buf: [8]u8 = undefined; // room for 7 content bytes + NUL
+    const long = "abcdefghijkl";
+    const out = ensureTrailingSpace(&buf, long);
+    try std.testing.expect(out.len <= buf.len - 1);
+    try std.testing.expectEqual(@as(u8, ' '), out[out.len - 1]); // still ends with the separator
+    try std.testing.expectEqual(@as(u8, 0), buf[out.len]);
+}

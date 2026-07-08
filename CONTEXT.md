@@ -21,7 +21,8 @@ The committed text for a completed Utterance; the only text that is ever inserte
 _Avoid_: result, output
 
 **Insertion**:
-Placing a Final Transcript at the cursor of the Focused Target.
+Placing a Final Transcript at the cursor of the Focused Target. Every Insertion ends with
+a single trailing space, so consecutive Insertions don't run their words together.
 _Avoid_: typing, pasting (those name mechanisms, not the act)
 
 **Focused Target**:
