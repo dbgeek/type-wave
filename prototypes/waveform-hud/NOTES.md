@@ -67,13 +67,32 @@ React to: whisper visibility (`w`/`m`), scroll feel at 20 vs 60 Hz (`f`) and
 with implicit animations (`a`), bar preset (`1/2/3`), scheme (`c`), size (`z`),
 and which processing animation wins (`d`).
 
-## Verdict
+## Verdict (2026-07-08, three HITL rounds)
 
-_Pending the HITL run._
+- **Q1 — mechanism: CALayer-per-bar PROVEN.** Builds + links clean against the
+  pinned toolchain (AppKit / QuartzCore / AudioToolbox via the ObjC runtime,
+  zero shims) and ran live through every state, scheme, size, and variant
+  during the HITL rounds. A fixed row of plain CALayers poked from the render
+  pump carries both the scroll and the processing animation — no CAShapeLayer,
+  no view subclass, no `objc_allocateClassPair` needed.
+- **Q1b — pump rate: 20 Hz is enough.** The scroll reads fine at the daemon's
+  existing rate; CA implicit animations stay OFF (`CATransaction
+  setDisableActions:YES` per tick). No pump change for graduation.
+- **Look (decided):**
+  - **Size 420×60** — beat 300×48 and 250×38.
+  - **Transparent scheme** — no pill background, no window shadow; just the
+    bars floating over the screen. State is carried by colour: red-tinted bars
+    while recording.
+  - **Fine bars** — 3 px wide, 2 px gap (~76 bars at 420 px ≈ 3.8 s of
+    history at one level per 50 ms buffer).
+  - **Processing = DOTS** — bars vanish on release, three green dots bounce
+    until the Insertion resolves. (Wave/breathe rejected; breathe read as "no
+    animation" until exaggerated, dots were unmistakable.)
+- **Level mapping:** dBFS floor (−60 dB → flat, −10 dB → full) exercised
+  against the synthetic talk/whisper envelopes; whispers land at a visible
+  quarter-to-half height. Final say on the mapping + where it lives is ticket
+  #26; the live whisper check is on the #28 dogfood checklist.
 
-- **Q1 — mechanism:** builds + links clean against the pinned toolchain
-  (AppKit / QuartzCore / AudioToolbox via the ObjC runtime, zero shims); the
-  live run is the proof. _(fill in)_
-- **Q1b — pump rate:** _(fill in: 20 Hz enough? implicit anims on or off?)_
-- **Look:** _(fill in: bar preset, scheme, size, processing variant, history
-  depth / scroll feel)_
+**Disposition:** code stays in `prototypes/waveform-hud/`. `src/wave.zig` is
+the graduation crib for #27 (the panel recipe is already `src/hud.zig`'s; what
+graduates is the bar row, the recolour cache, and the dots animation).

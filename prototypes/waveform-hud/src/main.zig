@@ -87,7 +87,8 @@ const Shared = struct {
     source: Source = .talk,
     look: wave.Look = .{},
     look_dirty: bool = false,
-    variant: wave.AnimVariant = .wave,
+    variant: wave.AnimVariant = .dots, // the HITL winner
+
     implicit: bool = false,
     pump_hz: f64 = 20,
     pump_dirty: bool = false,
