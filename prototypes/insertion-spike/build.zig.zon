@@ -1,0 +1,12 @@
+.{
+    .name = .insertion_spike,
+    .version = "0.0.0",
+    .fingerprint = 0xbc3aaba58a71b7ca,
+    .minimum_zig_version = "0.17.0-dev.1267+300116b02",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
