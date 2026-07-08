@@ -22,13 +22,11 @@ This repo uses **GitHub Issues** on `dbgeek/type-wave`, operated via the `gh` CL
 
   ```sh
   gh issue list --state open \
-    --label "wayfinder:research" --label "wayfinder:prototype" \
-    --label "wayfinder:grilling" --label "wayfinder:task" \
-    --json number,title,labels,body \
-    --jq '.[] | select([.labels[].name] | index("wayfinder:claimed") | not)'
+    --search 'label:wayfinder:research,wayfinder:prototype,wayfinder:grilling,wayfinder:task -label:wayfinder:claimed' \
+    --json number,title,labels,body
   ```
 
-  (`gh issue list` with multiple `--label` flags ORs the wayfinder type labels.)
+  Comma-separated `label:` terms inside a single `--search` string OR together, and a leading `-label:` excludes. **Do not** use repeated `--label` flags for the type OR — current `gh` ANDs multiple `--label` flags, so `--label wayfinder:research --label wayfinder:task …` matches only issues carrying *all four* type labels (i.e. nothing) and the frontier comes back silently empty.
 - **Closing / resolution**: post the answer as a comment, close the issue, then edit the map's *Decisions so far* section to append one line: `- [<ticket title>](<issue url>) — <one-line gist>`.
 
   ```sh
