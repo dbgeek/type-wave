@@ -31,6 +31,12 @@ const insertmod = @import("insert.zig");
 
 const Session = session_mod.Session;
 
+// Force the __TEXT,__info_plist section (src/info_plist.zig) to be analysed and kept:
+// it carries the daemon's stable bundle identity + mic usage string (wayfinder #15).
+comptime {
+    _ = &@import("info_plist.zig").info_plist;
+}
+
 extern "c" fn usleep(usec: c_uint) c_int;
 // Abort paths exit the process; the OS reclaims the socket, so we never race the
 // read-loop thread by closing its fd underneath it. Graceful close is #17.

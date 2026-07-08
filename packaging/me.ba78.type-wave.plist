@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for the type-wave daemon (wayfinder #15).
+
+  This is a TEMPLATE: launchd plists do NOT expand ~ or $HOME, so paths must be
+  absolute. packaging/install.sh renders it by replacing __HOME__ with the real $HOME
+  and writes the result to ~/Library/LaunchAgents/me.ba78.type-wave.plist. Do not
+  install this file verbatim.
+
+  Run as a per-user LaunchAgent (the daemon becomes its own TCC-responsible process,
+  so the three grants attach to the signed binary, not to a launching terminal —
+  see docs/packaging.md and the #10 design).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>me.ba78.type-wave</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/bin/type-wave</string>
+  </array>
+
+  <!-- Start at login / when the agent is bootstrapped. -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- KeepAlive as a crash backstop ONLY (#10): respawn on abnormal exit, never on a
+       clean exit. A deliberate `launchctl bootout` (clean stop) therefore stays down. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <!-- Latency-sensitive (event tap + live audio): keep it off the throttled tier. -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <!-- Primary diagnostic surface (#10 / #18). Both streams land in one log. -->
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/type-wave.log</string>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/type-wave.log</string>
+</dict>
+</plist>

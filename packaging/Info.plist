@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Embedded into the type-wave binary's __TEXT,__info_plist Mach-O section (see
+  src/info_plist.zig). For a bare (non-.app) command-line tool this section IS the
+  effective Info.plist: macOS TCC reads CFBundleIdentifier from it to label the
+  daemon's permission grants, and reads NSMicrophoneUsageDescription for the mic
+  prompt. codesign also reads CFBundleIdentifier here. Keep the identifier stable —
+  changing it re-labels (and orphans) every existing TCC grant. See wayfinder #15 and
+  docs/packaging.md.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>me.ba78.type-wave</string>
+  <key>CFBundleName</key>
+  <string>type-wave</string>
+  <key>CFBundleExecutable</key>
+  <string>type-wave</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.0.0</string>
+  <key>CFBundleVersion</key>
+  <string>0</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>type-wave transcribes what you say into the focused text field while you hold the Talk Key.</string>
+</dict>
+</plist>
