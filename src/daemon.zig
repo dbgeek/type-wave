@@ -401,7 +401,7 @@ const Daemon = struct {
         self.last_missing = missing;
 
         feedback.log("  not-configured — waiting on:\n", .{});
-        if (!key_ok) feedback.log("    - OPENAI_API_KEY in ~/.config/type-wave/env (issue #7)\n", .{});
+        if (!key_ok) feedback.log("    - OpenAI API key — run:  ~/.local/bin/type-wave --set-key  (login keychain, #33); export OPENAI_API_KEY instead for a foreground run\n", .{});
         if (!im) feedback.log("    - Input Monitoring for type-wave (System Settings > Privacy & Security > Input Monitoring)\n", .{});
         if (!pe) feedback.log("    - Accessibility for type-wave (System Settings > Privacy & Security > Accessibility)\n", .{});
         self.cues.err();

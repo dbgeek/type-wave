@@ -1,28 +1,32 @@
-//! config.zig — the daemon's configuration (wayfinder #16): non-secret settings
-//! from a ZON file (`~/.config/type-wave/config.zon`) and the OpenAI secret from an
-//! env file (`~/.config/type-wave/env`).
+//! config.zig — the daemon's configuration (wayfinder #16, secret re-homed by #33):
+//! non-secret settings from a ZON file (`~/.config/type-wave/config.zon`) and the
+//! OpenAI secret from the login keychain (keychain.zig).
 //!
-//! WHY the secret is read from a file, not the environment: the daemon runs as a
-//! launchd LaunchAgent OUTSIDE `nix develop`, so the flake `shellHook` that exports
-//! OPENAI_API_KEY never fires for it (issue #7's caveat, re-flagged by #15). We parse
-//! the env file ourselves. For a foreground `nix develop` run the variable IS already
-//! exported, so we fall back to the process environment when the file is absent —
-//! dev ergonomics with no separate setup.
+//! Key precedence: **process env → keychain**. The exported OPENAI_API_KEY is the dev
+//! override — a foreground `nix develop` run has it in the environment, so unsigned
+//! `zig-out` builds never touch Security.framework (an ad-hoc binary is a stranger to
+//! the keychain item and would prompt — see keychain.zig). The installed signed daemon
+//! runs under launchd with no shell environment, so it reads the keychain item it
+//! created itself (`type-wave --set-key`), prompt-free.
+//!
+//! The legacy `~/.config/type-wave/env` file is retired as a source: a key still found
+//! there is auto-migrated into the keychain once (and the file can then be deleted).
 //!
 //! Resilience (issue #10's self-healing ethos): a missing OR malformed config.zon
 //! yields all defaults with a logged warning — a config typo must never keep the
-//! daemon from starting. The secret is the one hard stop: without it there is nothing
-//! to connect to, so `load` returns `error.NoApiKey` and main refuses to start.
+//! daemon from starting. A missing secret never stops startup either: the daemon's
+//! self-heal supervisor polls `loadApiKeyOnly` until a key appears.
 //!
-//! Lifetime: `Config` is a load-once, process-lifetime singleton. Its backing
-//! allocations are intentionally never freed — and `std.zon.parse.free` must NOT be
-//! called on `settings`: fields omitted from the file keep their struct-default value,
+//! Lifetime: settings are a load-once, process-lifetime singleton. Backing allocations
+//! are intentionally never freed — and `std.zon.parse.free` must NOT be called on the
+//! parsed `Settings`: fields omitted from the file keep their struct-default value,
 //! which points at a static string literal, and `free` would fault trying to release
 //! it (verified against this Zig nightly).
 
 const std = @import("std");
 const tap = @import("tap.zig");
 const insert = @import("insert.zig");
+const keychain = @import("keychain.zig");
 
 /// Non-secret settings. The field names + types ARE the accepted `config.zon` schema
 /// (std.zon parses the file straight into this struct). Every field has a default, so
@@ -58,38 +62,9 @@ pub const Settings = struct {
     }
 };
 
-pub const Config = struct {
-    settings: Settings,
-    /// NUL-terminated so it drops straight into the `Authorization: Bearer` header.
-    api_key: [:0]const u8,
-};
-
-pub const LoadError = error{NoApiKey};
-
 const config_rel = ".config/type-wave/config.zon";
 const env_rel = ".config/type-wave/env";
 const max_file = 64 * 1024;
-
-/// Load settings (defaults if the file is absent/unreadable/malformed) and the OpenAI
-/// secret (hard-required). `io` and `gpa` must outlive the process — see the lifetime
-/// note above; nothing here is freed.
-pub fn load(io: std.Io, gpa: std.mem.Allocator) LoadError!Config {
-    const home = homeDir() orelse {
-        std.debug.print("config: $HOME is not set — cannot locate ~/.config/type-wave.\n", .{});
-        return error.NoApiKey; // no home => no key file => nothing to connect to
-    };
-    const settings = loadSettings(io, gpa, home);
-    const api_key = loadApiKey(io, gpa, home) orelse {
-        std.debug.print(
-            \\config: no OPENAI_API_KEY found.
-            \\  Put it in ~/.config/type-wave/env as a line:  OPENAI_API_KEY=sk-...
-            \\  (chmod 600; see issue #7) — or export it into this shell for a foreground run.
-            \\
-        , .{});
-        return error.NoApiKey;
-    };
-    return .{ .settings = settings, .api_key = api_key };
-}
 
 /// Load just the non-secret settings — defaults when the file is absent/malformed or
 /// `$HOME` is unset. The daemon (wayfinder #19) loads these once at startup; they never
@@ -100,11 +75,11 @@ pub fn loadSettingsOnly(io: std.Io, gpa: std.mem.Allocator) Settings {
 }
 
 /// Re-read just the OpenAI secret — null while still absent. The daemon's self-heal
-/// supervisor (wayfinder #19) polls this until the key file (or exported env var) appears,
-/// then constructs the Transcription Session. Same sources + precedence as `load`.
+/// supervisor (wayfinder #19) polls this until a key appears (exported env var,
+/// keychain item, or a legacy env file to migrate), then constructs the Transcription
+/// Session. NUL-terminated so it drops straight into the `Authorization: Bearer` header.
 pub fn loadApiKeyOnly(io: std.Io, gpa: std.mem.Allocator) ?[:0]const u8 {
-    const home = homeDir() orelse return null;
-    return loadApiKey(io, gpa, home);
+    return loadApiKey(io, gpa);
 }
 
 fn homeDir() ?[]const u8 {
@@ -137,21 +112,76 @@ fn loadSettings(io: std.Io, gpa: std.mem.Allocator, home: []const u8) Settings {
     return parsed;
 }
 
-/// The secret: the env file first (the daemon's path), then the process environment
-/// (the `nix develop` foreground path). Returns null only when neither yields a key.
-fn loadApiKey(io: std.Io, gpa: std.mem.Allocator, home: []const u8) ?[:0]const u8 {
+/// The secret: process environment first (the dev override), then the keychain item.
+/// A keychain miss falls through to the one-time env-file migration. Returns null only
+/// when no source yields a key.
+fn loadApiKey(io: std.Io, gpa: std.mem.Allocator) ?[:0]const u8 {
+    if (apiKeyFromEnv(gpa)) |key| return key;
+    switch (keychain.readKey(gpa)) {
+        .key => |key| {
+            last_keychain_err = 0; // healthy again — a later failure re-logs
+            return key;
+        },
+        .absent => return migrateEnvFile(io, gpa),
+        .err => |st| {
+            logKeychainErrOnce(st);
+            return null;
+        },
+    }
+}
+
+/// Supervisor-thread-only (like the poll that calls it): the last keychain status logged,
+/// so a locked/denied keychain isn't re-reported every 3 s tick. 0 = nothing reported.
+var last_keychain_err: keychain.OSStatus = 0;
+
+fn logKeychainErrOnce(st: keychain.OSStatus) void {
+    if (st == last_keychain_err) return;
+    last_keychain_err = st;
+    var buf: [256]u8 = undefined;
+    std.debug.print(
+        "config: keychain read failed: {s} — treating the key as missing (will keep retrying; the item is never rewritten).\n",
+        .{keychain.describe(st, &buf)},
+    );
+}
+
+/// One-time migration (wayfinder #33): the keychain has no item, but the retired
+/// `~/.config/type-wave/env` file may still hold the key from the pre-keychain era. If it
+/// does, store it in the keychain and hand it to this run. Once the store succeeds the
+/// keychain hit wins every later lookup, so the file is never read again — that's what
+/// makes the migration one-time. A failed store still returns the key (the daemon should
+/// work today); the migration simply retries on a later poll or the next start.
+///
+/// ACL note: the migrating process becomes the item's creator, so this is meant to run in
+/// the installed signed daemon. Foreground dev runs export OPENAI_API_KEY and never get
+/// here (the env override wins above).
+fn migrateEnvFile(io: std.Io, gpa: std.mem.Allocator) ?[:0]const u8 {
+    const home = homeDir() orelse return null;
     var path_buf: [4096]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ home, env_rel }) catch return apiKeyFromEnv(gpa);
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ home, env_rel }) catch return null;
 
     const raw = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_file)) catch |e| {
         if (e != error.FileNotFound)
             std.debug.print("config: could not read {s}: {s}\n", .{ path, @errorName(e) });
-        return apiKeyFromEnv(gpa); // fall back to the exported env var
+        return null; // no legacy file (the normal case once migrated) => no key anywhere
     };
     defer gpa.free(raw);
+    const val = parseEnvKey(raw) orelse return null;
+    const key = gpa.dupeSentinel(u8, val, 0) catch return null;
 
-    if (parseEnvKey(raw)) |val| return gpa.dupeSentinel(u8, val, 0) catch null;
-    return apiKeyFromEnv(gpa);
+    const st = keychain.storeKey(key);
+    if (st == keychain.errSecSuccess) {
+        std.debug.print(
+            "config: migrated the API key from {s} into the login keychain — the file is no longer used and can be deleted.\n",
+            .{path},
+        );
+    } else {
+        var buf: [256]u8 = undefined;
+        std.debug.print(
+            "config: found the API key in {s} but storing it in the keychain failed: {s} — using it for this run; migration will retry.\n",
+            .{ path, keychain.describe(st, &buf) },
+        );
+    }
+    return key;
 }
 
 fn apiKeyFromEnv(gpa: std.mem.Allocator) ?[:0]const u8 {

@@ -94,12 +94,14 @@ prompts (and the entries in **System Settings → Privacy & Security**) are attr
   rationale).
 
 > **`OPENAI_API_KEY`.** A launchd process has no shell environment, so the daemon reads the
-> key from `~/.config/type-wave/env` directly ([config loading, #16](https://github.com/dbgeek/type-wave/issues/16))
-> — the rendered plist sets `HOME` so it can find that path. **No plist `EnvironmentVariables`
-> secret hack is needed** (that workaround was only for the pre-#16 skeleton); keep the key
-> solely in `~/.config/type-wave/env` (`chmod 600`), never in a committed plist. A missing
-> key is the one hard stop — the daemon logs `error.NoApiKey` and exits — so make sure that
-> file exists before you load the agent.
+> key from the **login keychain** ([#33](https://github.com/dbgeek/type-wave/issues/33);
+> service `me.ba78.type-wave`, account `openai-api-key`). Store it once via the installed
+> signed binary — `~/.local/bin/type-wave --set-key` — so the item's ACL keys to the stable
+> `type-wave dev` signature and every later read is prompt-free (see `src/keychain.zig`).
+> **No plist `EnvironmentVariables` secret hack is needed**; never put the key in a committed
+> plist. A key still sitting in the legacy `~/.config/type-wave/env` file is auto-migrated
+> into the keychain the first time the daemon looks for it (the log says when the file can
+> be deleted). A missing key is not fatal: the self-heal supervisor polls until one appears.
 
 ## Verify grant persistence across a rebuild (the point of #15)
 

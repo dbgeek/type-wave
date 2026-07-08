@@ -42,10 +42,8 @@ see [`CONTEXT.md`](./CONTEXT.md) for the precise definitions the code and docs u
 ## Quick start (foreground)
 
 ```sh
-# 1. Provide the OpenAI secret (kept out of the repo and dotfiles)
-mkdir -p ~/.config/type-wave
-printf 'OPENAI_API_KEY=sk-...\n' > ~/.config/type-wave/env
-chmod 600 ~/.config/type-wave/env
+# 1. Provide the OpenAI secret (the dev override for foreground runs)
+export OPENAI_API_KEY=sk-...
 
 # 2. Build and run the daemon in the foreground
 nix develop --command zig build run
@@ -57,8 +55,9 @@ hold Right-Option and speak. The daemon **self-heals**: a missing key or ungrant
 permission never crashes it — it logs what it's waiting on and goes live the moment the
 prerequisite appears.
 
-`nix develop` alone drops you into a dev shell with the pinned Zig on `PATH` and the
-API key exported from `~/.config/type-wave/env`.
+`nix develop` alone drops you into a dev shell with the pinned Zig on `PATH`; if a
+legacy `~/.config/type-wave/env` file exists, the shell sources it so the override is
+exported automatically.
 
 ## Configuration
 
@@ -79,8 +78,11 @@ cp packaging/config.example.zon ~/.config/type-wave/config.zon
 | `overlay` | `true` | The floating live-partials pill; `false` = sound-only |
 
 An absent or malformed `config.zon` falls back to all defaults, so a typo never keeps
-the daemon from starting. The OpenAI secret lives **only** in `~/.config/type-wave/env`
-(chmod 600), never in `config.zon` or a committed plist.
+the daemon from starting. The OpenAI secret lives in the **login keychain** (set it with
+`~/.local/bin/type-wave --set-key`), never in `config.zon` or a committed plist; an
+exported `OPENAI_API_KEY` overrides it for foreground dev runs. A key from the retired
+`~/.config/type-wave/env` file is migrated into the keychain automatically on first
+sight — the daemon logs when the file can be deleted.
 
 ## Install as a background daemon
 
@@ -89,12 +91,19 @@ stable code-signing identity — so its three permission grants **survive rebuil
 
 ```sh
 nix develop --command zig build install-agent
+
+# then store the API key in the login keychain, via the *installed signed* binary:
+~/.local/bin/type-wave --set-key
 ```
 
 This requires a one-time self-signed `type-wave dev` code-signing certificate and a
 `launchctl bootstrap` to start it. The full procedure — creating the identity, loading /
 unloading, granting permissions, and verifying grant persistence across a rebuild — is in
 [`docs/packaging.md`](./docs/packaging.md). Logs land in `~/Library/Logs/type-wave.log`.
+
+`--set-key` must run via `~/.local/bin/type-wave` (not `zig-out/`): the keychain item's
+ACL keys to its creator's code signature, so only the stable-signed binary gives the
+daemon prompt-free reads across rebuilds (`src/keychain.zig` has the full story).
 
 ## Development
 

@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) void {
             mod.linkFramework("ApplicationServices", .{}); // umbrella (AX if ever needed)
             mod.linkFramework("AppKit", .{}); // NSPasteboard (insert) + NSPanel/NSTextField/NSScreen (overlay HUD, #22)
             mod.linkFramework("QuartzCore", .{}); // CALayer — the overlay HUD's rounded pill (wayfinder #22)
+            mod.linkFramework("Security", .{}); // SecItem* — API key in the login keychain (wayfinder #33)
             mod.linkSystemLibrary("objc", .{}); // -lobjc
             mod.addFrameworkPath(.{ .cwd_relative = bb.fmt("{s}/System/Library/Frameworks", .{sdk_path}) });
             mod.addLibraryPath(.{ .cwd_relative = bb.fmt("{s}/usr/lib", .{sdk_path}) });

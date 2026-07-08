@@ -15,15 +15,17 @@
         devShells.default = pkgs.mkShell {
           packages = [ zig-overlay.packages.${system}.master ];
 
-          # Load the OpenAI API key from an out-of-repo secrets file
-          # (~/.config/type-wave/env, chmod 600) so the secret never enters
-          # this repo or the home-manager-managed dotfiles. See issue #7.
+          # Dev-shell convenience: make sure OPENAI_API_KEY is exported — the dev
+          # override for foreground runs (#33; the installed daemon reads the login
+          # keychain instead). A legacy ~/.config/type-wave/env file is still sourced
+          # if present so old setups keep working; the daemon itself no longer reads
+          # it (beyond a one-time migration into the keychain).
           shellHook = ''
-            if [ -f "$HOME/.config/type-wave/env" ]; then
+            if [ -z "''${OPENAI_API_KEY:-}" ] && [ -f "$HOME/.config/type-wave/env" ]; then
               . "$HOME/.config/type-wave/env"
             fi
             if [ -z "''${OPENAI_API_KEY:-}" ]; then
-              echo "type-wave: OPENAI_API_KEY not set - create ~/.config/type-wave/env (see issue #7)" >&2
+              echo "type-wave: OPENAI_API_KEY not exported - foreground runs need it (the installed daemon uses the keychain, issue #33)" >&2
             fi
           '';
         };
