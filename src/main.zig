@@ -3,9 +3,9 @@
 //! The minimal foreground loop that proves the two prototype halves compose in a
 //! single process: hold the Talk Key → CoreAudio Capture streams to the OpenAI
 //! Transcription Session → on release, the Final Transcript is inserted at the cursor
-//! of the Focused Target. Settings load from config (wayfinder #16); there is no
-//! feedback subsystem, warm/reconnect lifecycle, self-healing, or packaging yet —
-//! those are wayfinder #17–#19. `prototypes/` stays frozen as reference.
+//! of the Focused Target. Settings load from config (wayfinder #16); the session keeps
+//! itself warm and reconnects between Utterances (wayfinder #17). No feedback subsystem
+//! or self-healing yet — those are wayfinder #18–#19. `prototypes/` stays frozen.
 //!
 //! Threading, and why the slow work is off the tap callback:
 //!   - main thread     : installs the tap, then blocks in CFRunLoopRun servicing it.
@@ -15,6 +15,8 @@
 //!                        hands the blocking wait-for-final + ~400 ms paste to…
 //!   - worker thread    : waits for the Final Transcript, then performs the Insertion.
 //!   - read-loop thread : the websocket handler (session.zig), parses server events.
+//!   - maintenance thread: (session.zig) keepalive ping + expiry/drop reconnect.
+//!   - quit watcher     : waits for SIGINT/SIGTERM, then stops the run loop.
 //!   - AudioQueue thread: delivers Capture chunks, forwarded to the session.
 //! Cross-thread coordination is via the session's atomics + its write mutex.
 //!
@@ -39,9 +41,33 @@ comptime {
 }
 
 extern "c" fn usleep(usec: c_uint) c_int;
-// Abort paths exit the process; the OS reclaims the socket, so we never race the
-// read-loop thread by closing its fd underneath it. Graceful close is #17.
+// Fatal-startup paths still exit the process; the OS reclaims the socket. The normal
+// quit path is graceful now (SIGINT/SIGTERM -> stop the run loop -> session.shutdown,
+// which does the websocket close-frame drain — wayfinder #17).
 extern "c" fn exit(code: c_int) noreturn;
+
+const CFRunLoopRef = ?*anyopaque;
+extern "c" fn CFRunLoopGetMain() CFRunLoopRef;
+extern "c" fn CFRunLoopStop(rl: CFRunLoopRef) void;
+extern "c" fn signal(sig: c_int, handler: *const fn (c_int) callconv(.c) void) callconv(.c) usize;
+const SIGINT: c_int = 2;
+const SIGTERM: c_int = 15;
+
+/// Raised by the SIGINT/SIGTERM handler; the quit watcher polls it and stops the run
+/// loop so main can fall through to a graceful shutdown. The handler itself does only
+/// this async-signal-safe store.
+var g_quit = std.atomic.Value(bool).init(false);
+
+fn onSignal(_: c_int) callconv(.c) void {
+    g_quit.store(true, .release);
+}
+
+/// Waits for the quit signal, then stops the main run loop (CFRunLoopStop is documented
+/// thread-safe), unblocking `tap.run()` on the main thread.
+fn quitWatcher(loop: CFRunLoopRef) void {
+    while (!g_quit.load(.acquire)) _ = usleep(50_000);
+    CFRunLoopStop(loop);
+}
 
 /// Human-readable name for the configured Talk Key, for the startup banner.
 fn keyName(k: tapmod.TalkKey) []const u8 {
@@ -179,7 +205,8 @@ pub fn main() !void {
         std.debug.print("  → grant the missing permission(s) to this terminal and re-run (a prompt may have appeared).\n", .{});
     // (Microphone is prompted lazily on the first Capture start, attributed to the terminal.)
 
-    // ---- Transcription Session: connect + wait until it is READY ----
+    // ---- Transcription Session: connect (starts the read loop + the warm-lifecycle
+    //      maintenance thread internally) and wait until it is READY (wayfinder #17) ----
     std.debug.print("\nconnecting to wss://{s}/v1/realtime …\n", .{session_mod.host});
     const session = try Session.connect(io, alloc, cfg.api_key, .{
         .model = s.model,
@@ -187,13 +214,8 @@ pub fn main() !void {
         .delay = s.delay,
         .noise_reduction = s.noiseReductionType(),
     });
-    defer session.deinit();
 
-    var handler = session_mod.Handler{ .session = session };
-    const read_thread = try session.startReadLoop(&handler);
-    defer read_thread.join();
-
-    if (!waitFor(&session.ready, 10_000)) {
+    if (!session.waitReady(10_000)) {
         std.debug.print("timed out waiting for session.updated — aborting.\n", .{});
         exit(1);
     }
@@ -239,6 +261,13 @@ pub fn main() !void {
         exit(1);
     };
 
+    // Quit path: SIGINT/SIGTERM set a flag; the watcher stops the run loop so `tap.run()`
+    // returns and we shut the session down gracefully (websocket close-frame drain, #17).
+    _ = signal(SIGINT, onSignal);
+    _ = signal(SIGTERM, onSignal);
+    const watcher = try std.Thread.spawn(.{}, quitWatcher, .{CFRunLoopGetMain()});
+    watcher.detach();
+
     std.debug.print(
         \\
         \\Ready. HOLD {s}, speak, release — the transcript is inserted at the cursor.
@@ -246,5 +275,10 @@ pub fn main() !void {
         \\
     , .{ keyName(s.talk_key), keyName(s.talk_key) });
 
-    tap.run(); // CFRunLoopRun — blocks until Ctrl-C
+    tap.run(); // CFRunLoopRun — blocks until the quit watcher stops the loop
+
+    std.debug.print("\nshutting down — closing the Transcription Session…\n", .{});
+    session.shutdown(); // graceful websocket close (close frame + drain), then free the link
+    session.deinit();
+    std.debug.print("bye.\n", .{});
 }
