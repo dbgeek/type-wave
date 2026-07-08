@@ -1,0 +1,34 @@
+// type-wave settings (wayfinder #16).
+//
+// Copy to ~/.config/type-wave/config.zon and edit. EVERY field is optional — omit
+// any one to keep its default (the value shown here). An absent or malformed file
+// falls back to all defaults, so type-wave still starts.
+//
+// The OpenAI secret does NOT live here. Put it in ~/.config/type-wave/env (chmod 600):
+//     OPENAI_API_KEY=sk-...
+// (see issue #7). For a foreground `nix develop` run the exported env var is used
+// instead when that file is absent.
+.{
+    // Which held key starts/ends an Utterance:
+    //   .right_option / .left_option  — proven live (wayfinder #9)
+    //   .globe                        — the Fn / 🌐 key; observation is compile-verified
+    //                                   only and may clash with macOS's own Fn→Dictation
+    //                                   binding (wayfinder #6). Opt in at your own risk.
+    .talk_key = .right_option,
+
+    // OpenAI transcription knobs. Strings, so you can A/B a different model with no
+    // rebuild (wayfinder #11) — e.g. .model = "gpt-4o-mini-transcribe" (note: that
+    // model supports prompt biasing but loses live Partial Transcripts).
+    .model = "gpt-realtime-whisper",
+    .language = "en",
+    .delay = "low",
+
+    // Input noise reduction: .near_field (headset/handheld), .far_field (laptop mic),
+    // or .off (sends none).
+    .noise_reduction = .near_field,
+
+    // How the Final Transcript lands at the cursor:
+    //   .paste     — clipboard swap + ⌘V (primary; best for terminals/Electron)
+    //   .keystroke — synthetic Unicode typing (fallback)
+    .insertion = .paste,
+}

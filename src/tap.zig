@@ -36,6 +36,10 @@ const kCGEventSourceUserData: u32 = 42; // CGEventField
 const NX_DEVICELALTKEYMASK: u64 = 0x20;
 const NX_DEVICERALTKEYMASK: u64 = 0x40;
 
+// Fn/Globe surfaces only as this device-independent flag on a flagsChanged event —
+// it has no distinct keycode (wayfinder #6). CGEventTypes.h: kCGEventFlagMaskSecondaryFn.
+const kCGEventFlagMaskSecondaryFn: u64 = 0x800000;
+
 // Virtual keycodes for the two Option keys (Events.h).
 const kVK_Option: i64 = 0x3A; // left
 const kVK_RightOption: i64 = 0x3D;
@@ -58,7 +62,11 @@ extern var kCFRunLoopCommonModes: CFStringRef;
 extern "c" fn CGPreflightListenEventAccess() bool;
 extern "c" fn CGRequestListenEventAccess() bool;
 
-pub const TalkKey = enum { right_option, left_option };
+/// `globe` is the Fn / 🌐 key. Named `globe` (not `fn`) because `fn` is a Zig keyword;
+/// it is the "fn" option in the config vocabulary (wayfinder #16). Its observation is
+/// compile-verified only — live behaviour is unverified and may collide with macOS's
+/// own Fn→Dictation binding (wayfinder #6). right_option / left_option are proven live.
+pub const TalkKey = enum { right_option, left_option, globe };
 
 pub const Callbacks = struct {
     ctx: ?*anyopaque,
@@ -71,6 +79,7 @@ pub const Tap = struct {
     port: CFMachPortRef = null,
     right_down: bool = false,
     left_down: bool = false,
+    fn_down: bool = false,
 
     /// Preflight (silent), and prompt for Input Monitoring if absent. Returns the
     /// preflight result — a prompt fired on `false` won't flip this until re-run.
@@ -102,6 +111,9 @@ pub const Tap = struct {
         } else if (keycode == kVK_Option) {
             self.edge(.left_option, &self.left_down, (flags & NX_DEVICELALTKEYMASK) != 0, keycode, flags);
         }
+        // Fn/Globe has no keycode, so track it on every flagsChanged by its SecondaryFn
+        // bit (wayfinder #6). Edge-tracked, so the option branches above never spoof it.
+        self.edge(.globe, &self.fn_down, (flags & kCGEventFlagMaskSecondaryFn) != 0, keycode, flags);
         return event;
     }
 

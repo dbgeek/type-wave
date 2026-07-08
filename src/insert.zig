@@ -14,6 +14,10 @@ pub const InsertError = error{
     /// No kTCCServicePostEvent grant — CGEventPost is silently dropped. §7.
     PostEventDenied,
 };
+
+/// Which Insertion mechanism to use (wayfinder #16 config). `paste` is the proven
+/// primary (clipboard swap + ⌘V); `keystroke` is the synthetic-typing fallback.
+pub const Method = enum { paste, keystroke };
 // NB: Secure Event Input (crib sheet §6) is a *policy* concern, not a mechanism
 // one — whether it actually suppresses CGEventPost/Cmd-V is undocumented (§6,
 // spike item 4). So these functions just attempt the post; the caller decides
@@ -139,6 +143,23 @@ pub const Inserter = struct {
     pub fn init(self: *Inserter) void {
         self.src = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
         if (self.src != null) CGEventSourceSetUserData(self.src, tap.self_event_tag);
+    }
+
+    /// Insert `utf8` (NUL-terminated) via the configured mechanism (wayfinder #16).
+    /// The keystroke path converts to the UTF-16 that `keystroke` wants; malformed
+    /// UTF-8 (not expected from the transcription service) degrades to paste.
+    pub fn insert(self: *Inserter, method: Method, utf8: [*:0]const u8) InsertError!void {
+        switch (method) {
+            .paste => return self.paste(utf8),
+            .keystroke => {
+                const s = std.mem.span(utf8);
+                // The Final Transcript buffer is 8192 bytes and UTF-16 units never
+                // outnumber source bytes, so this dest can't overflow.
+                var u16buf: [8192]u16 = undefined;
+                const n = std.unicode.utf8ToUtf16Le(&u16buf, s) catch return self.paste(utf8);
+                return self.keystroke(u16buf[0..n]);
+            },
+        }
     }
 
     /// Primary mechanism: save clipboard → set transcript → Cmd-V → restore.

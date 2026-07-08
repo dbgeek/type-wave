@@ -15,11 +15,28 @@ const websocket = @import("websocket");
 
 pub const host = "api.openai.com";
 
-// Manual-commit transcription config (crib sheet §2). turn_detection:null is
-// mandatory for gpt-realtime-whisper and maps 1:1 onto hold-to-talk.
-pub const session_update =
-    \\{"type":"session.update","session":{"type":"transcription","audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"transcription":{"model":"gpt-realtime-whisper","language":"en","delay":"low"},"turn_detection":null,"noise_reduction":{"type":"near_field"}}}}}
-;
+/// The transcription knobs that vary by config (wayfinder #16), fed to the
+/// session.update built at connect time. Defaults reproduce the exact string proven
+/// live in #8. `noise_reduction` is null when disabled (emits JSON `null`).
+pub const TranscriptionParams = struct {
+    model: []const u8 = "gpt-realtime-whisper",
+    language: []const u8 = "en",
+    delay: []const u8 = "low",
+    noise_reduction: ?[]const u8 = "near_field",
+};
+
+/// Manual-commit transcription config (crib sheet §2). turn_detection:null is
+/// mandatory for gpt-realtime-whisper and maps 1:1 onto hold-to-talk. Built from
+/// `params`; with the defaults it is byte-identical to the #8-proven constant
+/// (a scratchpad check asserted this against the literal before it was inlined).
+pub fn formatSessionUpdate(buf: []u8, params: TranscriptionParams) ![]const u8 {
+    var nr_buf: [128]u8 = undefined;
+    const nr = if (params.noise_reduction) |t|
+        try std.fmt.bufPrint(&nr_buf, "{{\"type\":\"{s}\"}}", .{t})
+    else
+        "null";
+    return std.fmt.bufPrint(buf, "{{\"type\":\"session.update\",\"session\":{{\"type\":\"transcription\",\"audio\":{{\"input\":{{\"format\":{{\"type\":\"audio/pcm\",\"rate\":24000}},\"transcription\":{{\"model\":\"{s}\",\"language\":\"{s}\",\"delay\":\"{s}\"}},\"turn_detection\":null,\"noise_reduction\":{s}}}}}}}}}", .{ params.model, params.language, params.delay, nr });
+}
 
 const timeval = extern struct { sec: i64, usec: i32 };
 extern "c" fn gettimeofday(tv: *timeval, tz: ?*anyopaque) c_int;
@@ -65,7 +82,12 @@ pub const Session = struct {
     final: [8192]u8 = undefined,
     final_len: usize = 0,
 
-    pub fn connect(io: std.Io, alloc: std.mem.Allocator, api_key: []const u8) !*Session {
+    /// The config-built session.update, formatted once at connect (wayfinder #16) and
+    /// replayed on every `session.created` (the read-loop thread sends it).
+    su_buf: [2048]u8 = undefined,
+    su_len: usize = 0,
+
+    pub fn connect(io: std.Io, alloc: std.mem.Allocator, api_key: []const u8, params: TranscriptionParams) !*Session {
         const self = try alloc.create(Session);
         errdefer alloc.destroy(self);
 
@@ -81,6 +103,7 @@ pub const Session = struct {
             }),
         };
         errdefer self.client.deinit();
+        self.su_len = (try formatSessionUpdate(&self.su_buf, params)).len;
 
         // The library sends no Host header itself, so include it here alongside auth.
         var hdr_buf: [512]u8 = undefined;
@@ -104,7 +127,7 @@ pub const Session = struct {
     }
 
     fn sendControl(self: *Session, text: []const u8) !void {
-        var buf: [1024]u8 = undefined;
+        var buf: [2048]u8 = undefined; // fits the config-built session.update (su_buf)
         std.debug.assert(text.len <= buf.len);
         @memcpy(buf[0..text.len], text);
         self.write_mu.lockUncancelable(self.io);
@@ -213,7 +236,7 @@ pub const Handler = struct {
         const typ = getStr(root, "type") orelse return;
 
         if (std.mem.eql(u8, typ, "session.created")) {
-            try s.sendControl(session_update);
+            try s.sendControl(s.su_buf[0..s.su_len]);
             std.debug.print("  session.created -> sent session.update\n", .{});
         } else if (std.mem.eql(u8, typ, "session.updated")) {
             s.ready.store(true, .release);

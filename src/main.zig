@@ -1,11 +1,11 @@
 //! type-wave — daemon skeleton (wayfinder #14).
 //!
 //! The minimal foreground loop that proves the two prototype halves compose in a
-//! single process: hold Right-Option (the Talk Key) → CoreAudio Capture streams to
-//! the OpenAI Transcription Session → on release, the Final Transcript is inserted
-//! at the cursor of the Focused Target. Defaults are hardcoded; there is no config,
+//! single process: hold the Talk Key → CoreAudio Capture streams to the OpenAI
+//! Transcription Session → on release, the Final Transcript is inserted at the cursor
+//! of the Focused Target. Settings load from config (wayfinder #16); there is no
 //! feedback subsystem, warm/reconnect lifecycle, self-healing, or packaging yet —
-//! those are wayfinder #15–#19. `prototypes/` stays frozen as reference.
+//! those are wayfinder #17–#19. `prototypes/` stays frozen as reference.
 //!
 //! Threading, and why the slow work is off the tap callback:
 //!   - main thread     : installs the tap, then blocks in CFRunLoopRun servicing it.
@@ -28,6 +28,7 @@ const cap = @import("capture.zig");
 const session_mod = @import("session.zig");
 const tapmod = @import("tap.zig");
 const insertmod = @import("insert.zig");
+const config = @import("config.zig");
 
 const Session = session_mod.Session;
 
@@ -42,8 +43,14 @@ extern "c" fn usleep(usec: c_uint) c_int;
 // read-loop thread by closing its fd underneath it. Graceful close is #17.
 extern "c" fn exit(code: c_int) noreturn;
 
-/// The single Talk Key for the skeleton (map default; config is #16).
-const talk_key: tapmod.TalkKey = .right_option;
+/// Human-readable name for the configured Talk Key, for the startup banner.
+fn keyName(k: tapmod.TalkKey) []const u8 {
+    return switch (k) {
+        .right_option => "Right-Option",
+        .left_option => "Left-Option",
+        .globe => "Globe/Fn",
+    };
+}
 
 fn audioSink(ctx: ?*anyopaque, pcm: []const u8) void {
     const s: *Session = @ptrCast(@alignCast(ctx.?));
@@ -67,6 +74,11 @@ const App = struct {
     capture: *cap.Capture,
     inserter: *insertmod.Inserter,
 
+    /// From config (wayfinder #16): which key drives an Utterance, and how the Final
+    /// Transcript is inserted. Read-only after startup.
+    talk_key: tapmod.TalkKey,
+    insert_method: insertmod.Method,
+
     /// Touched only on the run-loop thread (onPress/onRelease never overlap), so it
     /// needs no atomic: guards against a repeat press before release.
     recording: bool = false,
@@ -78,8 +90,8 @@ const App = struct {
     // ---- tap callbacks: run on the run-loop thread, kept fast ----
 
     fn onPress(ctx: ?*anyopaque, key: tapmod.TalkKey, _: i64, _: u64) void {
-        if (key != talk_key) return;
         const self: *App = @ptrCast(@alignCast(ctx.?));
+        if (key != self.talk_key) return;
         if (self.recording) return;
         self.recording = true;
         self.session.beginUtterance();
@@ -93,8 +105,8 @@ const App = struct {
     }
 
     fn onRelease(ctx: ?*anyopaque, key: tapmod.TalkKey) void {
-        if (key != talk_key) return;
         const self: *App = @ptrCast(@alignCast(ctx.?));
+        if (key != self.talk_key) return;
         if (!self.recording) return;
         self.recording = false;
         self.capture.stop(); // synchronous; final buffers flush (and forward) during this call
@@ -128,7 +140,7 @@ const App = struct {
             @memcpy(buf[0..len], self.session.final[0..len]);
             buf[len] = 0;
             const z: [*:0]const u8 = @ptrCast(&buf);
-            self.inserter.paste(z) catch |e| std.debug.print("  insert failed: {s}\n", .{explainInsert(e)});
+            self.inserter.insert(self.insert_method, z) catch |e| std.debug.print("  insert failed: {s}\n", .{explainInsert(e)});
         }
     }
 };
@@ -147,12 +159,15 @@ pub fn main() !void {
 
     std.debug.print("type-wave — daemon skeleton (wayfinder #14)\n\n", .{});
 
-    // ---- secret: read directly from the env (config-from-file is #16) ----
-    const api_key_z = std.c.getenv("OPENAI_API_KEY") orelse {
-        std.debug.print("OPENAI_API_KEY not set. Run inside `nix develop` (see issue #7).\n", .{});
-        return error.NoApiKey;
+    // ---- config: settings from ~/.config/type-wave/config.zon (defaults if absent),
+    //      secret from ~/.config/type-wave/env or the env var (wayfinder #16) ----
+    const cfg = config.load(io, alloc) catch |e| switch (e) {
+        error.NoApiKey => return error.NoApiKey, // load() already logged how to fix it
     };
-    const api_key = std.mem.span(api_key_z);
+    const s = cfg.settings;
+    std.debug.print("config: talk_key={s} model=\"{s}\" language=\"{s}\" delay=\"{s}\" noise_reduction={s} insertion={s}\n", .{
+        @tagName(s.talk_key), s.model, s.language, s.delay, @tagName(s.noise_reduction), @tagName(s.insertion),
+    });
 
     // ---- TCC: request the two event grants up front, report status ----
     const listen_ok = tapmod.Tap.requestListenAccess();
@@ -166,7 +181,12 @@ pub fn main() !void {
 
     // ---- Transcription Session: connect + wait until it is READY ----
     std.debug.print("\nconnecting to wss://{s}/v1/realtime …\n", .{session_mod.host});
-    const session = try Session.connect(io, alloc, api_key);
+    const session = try Session.connect(io, alloc, cfg.api_key, .{
+        .model = s.model,
+        .language = s.language,
+        .delay = s.delay,
+        .noise_reduction = s.noiseReductionType(),
+    });
     defer session.deinit();
 
     var handler = session_mod.Handler{ .session = session };
@@ -190,7 +210,13 @@ pub fn main() !void {
     inserter.init();
 
     // ---- wire the shared state, spawn the worker ----
-    var app = App{ .session = session, .capture = &capture, .inserter = &inserter };
+    var app = App{
+        .session = session,
+        .capture = &capture,
+        .inserter = &inserter,
+        .talk_key = s.talk_key,
+        .insert_method = s.insertion,
+    };
     const worker = try std.Thread.spawn(.{}, App.workerLoop, .{&app});
     worker.detach();
 
@@ -215,10 +241,10 @@ pub fn main() !void {
 
     std.debug.print(
         \\
-        \\Ready. HOLD Right-Option, speak, release — the transcript is inserted at the cursor.
-        \\(Listen-only tap: Right-Option still works normally elsewhere.) Ctrl-C to quit.
+        \\Ready. HOLD {s}, speak, release — the transcript is inserted at the cursor.
+        \\(Listen-only tap: {s} still works normally elsewhere.) Ctrl-C to quit.
         \\
-    , .{});
+    , .{ keyName(s.talk_key), keyName(s.talk_key) });
 
     tap.run(); // CFRunLoopRun — blocks until Ctrl-C
 }
