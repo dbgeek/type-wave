@@ -35,3 +35,11 @@ _Avoid_: websocket (mechanism)
 **Capture**:
 The microphone audio stream feeding a Transcription Session.
 _Avoid_: recording
+
+**Utterance Coordinator**:
+The state machine that drives one Utterance from Talk Key press to a resolved
+Insertion, across the Capture / Transcription / Insertion / Feedback seams. It owns
+the lifecycle policy (the overlap guard, poison abandonment, the release-anchored
+deadline, empty/failed handling) and nothing else — it reaches every side effect
+through a seam it is handed, so it is exercised by feeding it events, not hardware.
+_Avoid_: controller, manager, orchestrator

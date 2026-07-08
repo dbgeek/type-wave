@@ -1,60 +1,50 @@
-//! daemon.zig — the headless type-wave daemon (wayfinder #19).
+//! daemon.zig — the headless type-wave daemon (wayfinder #19; lifecycle lifted into the
+//! Utterance Coordinator by the 2026-07-08 architecture review, candidate 1).
 //!
-//! The capstone that turns the proven modules into a real daily-driver background
-//! daemon: hold the Talk Key → CoreAudio Capture streams to the warm OpenAI
-//! Transcription Session → on release the Final Transcript is inserted at the cursor of
-//! the Focused Target — running headless under the LaunchAgent (wayfinder #15), settings
-//! and secret from config (#16), the session keeping itself warm and reconnecting between
-//! Utterances (#17), every transition and failure surfaced through feedback (#18).
+//! The capstone that turns the proven modules into a real daily-driver background daemon:
+//! hold the Talk Key → CoreAudio Capture streams to the warm OpenAI Transcription Session →
+//! on release the Final Transcript is inserted at the cursor of the Focused Target — running
+//! headless under the LaunchAgent (#15), settings and secret from config (#16), the session
+//! keeping itself warm and reconnecting between Utterances (#17), every transition and
+//! failure surfaced through feedback (#18) and the overlay HUD (#22).
 //!
-//! # Two orthogonal state machines
+//! # Where the logic lives now
 //!
-//! 1. **Configuration phase** (this file, the self-heal supervisor): `not-configured`
-//!    ⇄ `configured`. The gate is (an API key is present) AND (Input Monitoring granted)
-//!    AND (PostEvent granted). Missing prerequisites do NOT crash the daemon — under the
-//!    LaunchAgent's `KeepAlive={SuccessfulExit=false}` a non-zero exit would crash-loop.
-//!    Instead the supervisor thread polls (~3 s), builds the Transcription Session the
-//!    moment a key appears, brings the created-but-disabled Talk Key tap live the moment
-//!    Input Monitoring appears, and promotes the daemon to `configured` with zero manual
-//!    restart. `exit(0)` is reserved for a clean SIGTERM/bootout.
+//! The Utterance lifecycle — the overlap guard, poison-on-drop abandonment, the
+//! release-anchored deadline, empty/failed handling — used to be spread across this file's
+//! onPress / onRelease / workerLoop / processUtterance and coordinated through four
+//! cross-thread atomics. It is now the **Utterance Coordinator** (coordinator.zig): one
+//! synchronous state machine, tested by feeding it events. This file is what remains once
+//! that logic is gone: the *wiring* — it builds the real adapters that satisfy the
+//! Coordinator's four seams, trampolines real-world events into `coordinator.handle`, and
+//! runs the two supervisory state machines below.
 //!
+//! # Two orthogonal state machines still owned here
+//!
+//! 1. **Configuration phase** (this file, the self-heal supervisor): `not-configured` ⇄
+//!    `configured`. The gate is (API key present) AND (Input Monitoring granted) AND
+//!    (PostEvent granted). Missing prerequisites do NOT crash the daemon (the LaunchAgent's
+//!    KeepAlive would crash-loop); the supervisor polls (~3 s), builds the Transcription
+//!    Session the moment a key appears, and brings the created-but-disabled tap live the
+//!    moment Input Monitoring appears. `exit(0)` is reserved for a clean SIGTERM/bootout.
 //! 2. **Link state** (owned by session.zig): connecting / ready / reconnecting / closed.
-//!    The session self-manages it; the daemon only reads `isReady()` / `isPoisoned()`.
-//!
-//! # Utterance lifecycle & its edges (grilled for #19)
-//!
-//!   - **Overlap / rapid double-tap** — a `busy` span covers press → Insertion-done. A
-//!     press arriving while a prior Utterance is still resolving is dropped (logged), so
-//!     the worker's read of the shared Final Transcript never races a fresh beginUtterance.
-//!     `hold_active` (run-loop-thread-only) pairs press↔release so a *rejected* press's
-//!     release is a no-op.
-//!   - **Press mid-reconnect** — kept as #17's behavior: begin + buffer Capture locally +
-//!     defer the commit; markReadyAndFlush replays it in order on reconnect. NOT dropped.
-//!   - **Deferred/slow Insertion** — a single release-anchored deadline
-//!     (`insert_deadline_ms`): the worker begins within ms of release and waits that long
-//!     for the Final Transcript, covering both the live and the reconnect-spanning path.
-//!     Past it, the Utterance is dropped (error cue) so stale text never lands and `busy`
-//!     never blocks new Utterances indefinitely.
-//!   - **Link drop mid-Utterance** — session.zig poisons the Utterance (its head audio is
-//!     lost server-side); the daemon reads `isPoisoned()` on release and abandons it
-//!     cleanly (error cue, no truncated Insertion) instead of committing a fragment.
-//!   - **TCC revoked mid-Utterance** — the tap self-heals + surfaces via `onTapDisabled`
-//!     (#18); PostEvent is preflighted per insert (Inserter); mic silence is detected.
 //!
 //! # Threads
-//!   - main thread      : installs the tap + the overlay HUD render pump (a CFRunLoopTimer,
-//!                         wayfinder #22), then blocks in CFRunLoopRun servicing both. All
-//!                         AppKit calls happen here (on the render pump); other threads only
-//!                         `hud.publish` into a mutex-guarded buffer the pump reads.
-//!   - run-loop thread   : the tap callback. onPress/onRelease. Kept fast (a slow callback
-//!                         makes the OS disable the tap) — only the cheap edge work.
-//!   - worker thread     : waits for the Final Transcript, then performs the Insertion.
-//!   - supervisor thread : the self-heal loop (config phase above).
-//!   - read-loop thread  : the websocket handler (session.zig).
-//!   - maintenance thread: (session.zig) keepalive ping + expiry/drop reconnect.
+//!   - main / run-loop  : installs the tap + the overlay HUD render pump, then blocks in
+//!                        CFRunLoopRun. The tap callback trampolines press/release into the
+//!                        Coordinator (kept fast — a slow tap callback makes the OS disable
+//!                        the tap). All AppKit happens here.
+//!   - insert worker    : the InsertionAdapter — drains one insert job, performs the slow
+//!                        Insertion off the Coordinator's mutex, then reports `.inserted`.
+//!   - deadline timer   : the DeadlineAdapter — fires `.deadline` if a Final Transcript does
+//!                        not arrive within the release-anchored window.
+//!   - supervisor       : the self-heal loop (config phase above).
+//!   - read-loop        : (session.zig) delivers Partial/Final Transcripts into the
+//!                        Coordinator via the always-on observer.
+//!   - maintenance/sender: (session.zig) keepalive + reconnect; the outbound ring drain.
 //!   - quit watcher      : waits for SIGINT/SIGTERM, then stops the run loop.
-//!   - AudioQueue thread : delivers Capture chunks, forwarded to the session.
-//! Cross-thread coordination is via atomics + the session's write mutex.
+//!   - AudioQueue thread : delivers Capture chunks, forwarded to the current session.
+//! The Coordinator's single mutex serializes every lifecycle event across these threads.
 
 const std = @import("std");
 const cap = @import("capture.zig");
@@ -64,6 +54,8 @@ const insertmod = @import("insert.zig");
 const config = @import("config.zig");
 const feedback = @import("feedback.zig");
 const hud_mod = @import("hud.zig");
+const surface = @import("surface.zig");
+const coord = @import("coordinator.zig");
 
 const Session = session_mod.Session;
 
@@ -80,13 +72,13 @@ const SIGTERM: c_int = 15;
 /// Self-heal poll cadence. Fast enough that granting a permission / dropping in the key
 /// feels responsive, slow enough to be invisible in the log while waiting.
 const supervisor_tick_ms: usize = 3_000;
-/// Release-anchored Insertion deadline (grilled for #19): the worker starts within ms of
-/// Talk Key release, so this bounds both the live wait and a reconnect-spanning wait. Past
-/// it the Utterance is dropped rather than inserting stale text or blocking new Utterances.
-const insert_deadline_ms: usize = 15_000;
+/// Release-anchored Insertion deadline (grilled for #19): armed when the Coordinator enters
+/// `awaiting_final`, so it bounds both the live wait and a reconnect-spanning wait. Past it
+/// the Utterance is dropped rather than inserting stale text or blocking new Utterances.
+const insert_deadline_ms: i64 = 15_000;
 
 /// Raised by the SIGINT/SIGTERM handler (async-signal-safe store only); the quit watcher
-/// polls it and stops the run loop, and the supervisor polls it to end promptly.
+/// polls it and stops the run loop, and the supervisor + adapter threads poll it to end.
 var g_quit = std.atomic.Value(bool).init(false);
 
 fn onSignal(_: c_int) callconv(.c) void {
@@ -109,16 +101,6 @@ fn sleepInterruptible(ms: usize) void {
     }
 }
 
-fn waitFor(flag: *std.atomic.Value(bool), timeout_ms: usize) bool {
-    var waited: usize = 0;
-    while (!flag.load(.acquire)) {
-        _ = usleep(10_000);
-        waited += 10;
-        if (waited >= timeout_ms) return false;
-    }
-    return true;
-}
-
 /// Human-readable name for the configured Talk Key, for the log.
 fn keyName(k: tapmod.TalkKey) []const u8 {
     return switch (k) {
@@ -134,18 +116,147 @@ fn explainInsert(e: insertmod.InsertError) []const u8 {
     };
 }
 
-/// Capture chunk sink: forward PCM to the *current* session (created lazily by the
-/// supervisor). A press only starts Capture once a session exists (onPress guard), so the
-/// null case here is belt-and-braces for a chunk delivered during teardown.
-fn audioSink(ctx: ?*anyopaque, pcm: []const u8) void {
-    const self: *Daemon = @ptrCast(@alignCast(ctx.?));
-    const sess = self.getSession() orelse return;
-    sess.appendAudio(pcm);
+// ============================================================================
+// The real adapters satisfying the Utterance Coordinator's four outbound seams.
+// (Audio is Capture itself — it already fits the seam, so it needs no wrapper.)
+// ============================================================================
+
+/// Transcription seam: owns "the current warm Transcription Session" as a plain atomic
+/// pointer (0 = not created yet), hiding that indirection behind named methods. The
+/// supervisor `set`s it once the API key appears; the pointer never reverts to 0 for the
+/// process lifetime (reconnects reuse the same Session), so `available()` latches true.
+const TranscriptionAdapter = struct {
+    ptr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    fn set(self: *TranscriptionAdapter, sess: *Session) void {
+        self.ptr.store(@intFromPtr(sess), .release);
+    }
+    fn current(self: *TranscriptionAdapter) ?*Session {
+        const p = self.ptr.load(.acquire);
+        return if (p == 0) null else @ptrFromInt(p);
+    }
+    // ---- the Coordinator's seam (pub: called cross-file from the generic Coordinator) ----
+    pub fn available(self: *TranscriptionAdapter) bool {
+        return self.ptr.load(.acquire) != 0;
+    }
+    pub fn beginUtterance(self: *TranscriptionAdapter) void {
+        if (self.current()) |s| s.beginUtterance();
+    }
+    pub fn endUtterance(self: *TranscriptionAdapter) void {
+        if (self.current()) |s| s.endUtterance();
+    }
+    pub fn commitUtterance(self: *TranscriptionAdapter) !bool {
+        if (self.current()) |s| return s.commitUtterance();
+        return false;
+    }
+    pub fn isPoisoned(self: *TranscriptionAdapter) bool {
+        if (self.current()) |s| return s.isPoisoned();
+        return false;
+    }
+    // ---- used by the audio sink (Capture → current Session), not the Coordinator ----
+    fn appendAudio(self: *TranscriptionAdapter, pcm: []const u8) void {
+        if (self.current()) |s| s.appendAudio(pcm);
+    }
+};
+
+/// Insertion seam: `submit` copies the Final Transcript and hands it to this adapter's own
+/// worker thread. The slow paste (~400 ms of pasteboard settling) runs there — never on the
+/// Coordinator's mutex — because the tap callback shares that critical section and a slow
+/// callback makes the OS disable the tap. On completion the worker reports `.inserted`.
+const InsertionAdapter = struct {
+    inserter: *insertmod.Inserter,
+    method: insertmod.Method,
+
+    /// The single insert job (NUL-terminated for insert.paste's NSString). Written by
+    /// `submit` before the `pending` release-store; read by the worker after its acquire.
+    job: [8193]u8 = undefined,
+    pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// Trampoline back to the Coordinator (its concrete type is known only at the wiring
+    /// site, so the reverse edge is a type-erased fn-pointer, not a generic dep).
+    co_ctx: *anyopaque = undefined,
+    on_done: *const fn (*anyopaque, coord.InsertResult) void = undefined,
+
+    /// Coordinator seam (pub: called cross-file). Runs under the Coordinator's mutex; must
+    /// not block — just memcpy.
+    pub fn submit(self: *InsertionAdapter, text: []const u8) void {
+        const n = @min(text.len, self.job.len - 1);
+        @memcpy(self.job[0..n], text[0..n]);
+        self.job[n] = 0;
+        self.pending.store(true, .release); // publishes the job bytes to the worker
+    }
+
+    fn workerLoop(self: *InsertionAdapter) void {
+        while (!g_quit.load(.acquire)) {
+            if (!self.pending.swap(false, .acquire)) {
+                _ = usleep(2_000);
+                continue;
+            }
+            const z: [*:0]const u8 = @ptrCast(&self.job);
+            const result: coord.InsertResult = if (self.inserter.insert(self.method, z)) |_|
+                .ok
+            else |e| blk: {
+                feedback.log("  insertion failed: {s}\n", .{explainInsert(e)});
+                break :blk .failed;
+            };
+            if (result == .ok) feedback.log("  inserted at the cursor\n", .{});
+            self.on_done(self.co_ctx, result);
+        }
+    }
+};
+
+/// Deadline seam: a small timer thread. `arm` (Coordinator entering `awaiting_final`) sets
+/// a fire time; `cancel` (final arrived) clears it. The loop fires `.deadline` once if the
+/// window elapses while still armed — the cmpxchg makes a cancel/arm race lose cleanly, and
+/// the Coordinator ignores a stale `.deadline` anyway (phase guard).
+const DeadlineAdapter = struct {
+    fire_at: std.atomic.Value(i64) = std.atomic.Value(i64).init(0), // 0 = disarmed
+
+    co_ctx: *anyopaque = undefined,
+    on_fire: *const fn (*anyopaque) void = undefined,
+
+    pub fn arm(self: *DeadlineAdapter) void {
+        self.fire_at.store(session_mod.nowMs() + insert_deadline_ms, .release);
+    }
+    pub fn cancel(self: *DeadlineAdapter) void {
+        self.fire_at.store(0, .release);
+    }
+    fn timerLoop(self: *DeadlineAdapter) void {
+        while (!g_quit.load(.acquire)) {
+            const at = self.fire_at.load(.acquire);
+            if (at != 0 and session_mod.nowMs() >= at) {
+                if (self.fire_at.cmpxchgStrong(at, 0, .acq_rel, .monotonic) == null)
+                    self.on_fire(self.co_ctx);
+            }
+            _ = usleep(50_000);
+        }
+    }
+};
+
+// The Coordinator's dependency set, wired to the real adapters above.
+const RealDeps = struct {
+    audio: *cap.Capture,
+    transcription: *TranscriptionAdapter,
+    insertion: *InsertionAdapter,
+    deadline: *DeadlineAdapter,
+    feedback: *surface.Surface,
+};
+const Coord = coord.Coordinator(RealDeps);
+
+// Reverse-edge trampolines: the adapters' worker/timer threads carry the Coordinator as an
+// opaque pointer and re-enter it here (its concrete type is known at this wiring site).
+fn insertDoneTramp(ctx: *anyopaque, result: coord.InsertResult) void {
+    const co: *Coord = @ptrCast(@alignCast(ctx));
+    co.handle(.{ .inserted = result });
+}
+fn deadlineFireTramp(ctx: *anyopaque) void {
+    const co: *Coord = @ptrCast(@alignCast(ctx));
+    co.handle(.deadline);
 }
 
-/// The whole daemon: the long-lived pieces plus the state the tap callbacks, the worker,
-/// and the supervisor share. A single instance lives on `run`'s stack for the process
-/// lifetime; its address is handed to every thread and to the tap as its callback context.
+/// The whole daemon: the long-lived modules, the real adapters, and the Coordinator they
+/// feed. A single instance lives on `run`'s stack for the process lifetime; its address is
+/// handed to every thread and to the tap as its callback context, so it must not move.
 const Daemon = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -160,148 +271,59 @@ const Daemon = struct {
     capture: cap.Capture = .{},
     inserter: insertmod.Inserter = .{},
     cues: feedback.Cues = .{},
-    /// The live-partials overlay pill (wayfinder #22). Inactive until `hud.init()` succeeds
-    /// in run(); every method no-ops while inactive, so a disabled/headless daemon just
-    /// falls back to the sound cues. When active it takes over start/stop feedback (the
-    /// pill is the signal), leaving only the error cue audible.
     hud: hud_mod.Hud = .{},
     tap: tapmod.Tap = undefined, // built in run()
 
-    /// The warm Transcription Session, created by the supervisor once the API key is
-    /// present. Stored as a raw pointer bits value so the load/publish is a plain atomic
-    /// (0 = not yet created). Read by the tap callbacks, the worker, and audioSink.
-    session_ptr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-
-    /// Overlap guard (grilled for #19): true from an accepted press until the worker (or a
-    /// synchronous early-out) has fully resolved that Utterance's Insertion. A press while
-    /// set is dropped. Cross-thread (set on the run-loop thread, cleared by the worker) so
-    /// it is atomic.
-    busy: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Run-loop-thread-only (onPress/onRelease never overlap): marks that *this* hold was
-    /// accepted, so a release whose press was rejected (busy / not configured) is a no-op.
-    hold_active: bool = false,
-    /// Raised by onRelease, drained by the worker: "an Utterance was committed — wait for
-    /// its Final Transcript and insert it".
-    insert_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // ---- the Coordinator's real adapters + the Coordinator itself (wired in run()) ----
+    transcription: TranscriptionAdapter = .{},
+    insertion: InsertionAdapter = undefined,
+    deadline: DeadlineAdapter = .{},
+    feedback_surface: surface.Surface = undefined,
+    coordinator: Coord = undefined,
 
     /// Supervisor-thread-only: the last set of missing prerequisites reported, so
     /// not-configured isn't re-logged every tick. 0xFF = nothing reported yet.
     last_missing: u8 = 0xFF,
 
-    fn getSession(self: *Daemon) ?*Session {
-        const p = self.session_ptr.load(.acquire);
-        if (p == 0) return null;
-        const sess: *Session = @ptrFromInt(p);
-        return sess;
+    /// Always-on live-transcript subscriber: partials/finals from the read-loop thread
+    /// trampoline into the Coordinator. Installed at every Session.connect, before the read
+    /// loop starts — never mid-stream.
+    fn observer(self: *Daemon) session_mod.TranscriptObserver {
+        return .{ .ctx = self, .on_partial = obsPartial, .on_final = obsFinal };
     }
-
-    // ---- overlay HUD subscription (wayfinder #22) ----
-    // The session drives the pill's text: Partial Transcripts colour it red and stream
-    // live; the Final Transcript flashes it green (the worker then inserts and hides it).
-    // Both run on the read-loop thread and only `hud.publish` (mutex-guarded, no AppKit),
-    // so they are safe there. Handed to Session.connect only when the HUD is active.
-
-    fn onPartial(ctx: ?*anyopaque, text: []const u8) void {
+    fn obsPartial(ctx: ?*anyopaque, text: []const u8) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
-        self.hud.publish(.recording, text);
+        self.coordinator.handle(.{ .partial = text });
     }
-
-    fn onFinal(ctx: ?*anyopaque, text: []const u8) void {
+    fn obsFinal(ctx: ?*anyopaque, text: []const u8) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
-        self.hud.publish(.final, text);
+        self.coordinator.handle(.{ .final = text });
     }
 
-    fn transcriptObserver(self: *Daemon) ?session_mod.TranscriptObserver {
-        if (!self.hud.active) return null; // no HUD ⇒ transcripts stay log-only (#18)
-        return .{ .ctx = self, .on_partial = onPartial, .on_final = onFinal };
-    }
-
-    // ---- tap callbacks: run on the run-loop thread, kept fast ----
-
-    fn onPress(ctx: ?*anyopaque, key: tapmod.TalkKey, _: i64, _: u64) void {
+    /// Capture chunk sink: forward PCM to the current Session (created lazily by the
+    /// supervisor). A press only starts Capture once a session exists, so the null case is
+    /// belt-and-braces for a chunk delivered during teardown.
+    fn audioSink(ctx: ?*anyopaque, pcm: []const u8) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
-        if (key != self.talk_key) return;
-
-        // Overlap guard: previous Utterance still resolving — drop this press so we never
-        // reset the shared Final-Transcript state out from under the worker.
-        if (self.busy.load(.acquire)) {
-            feedback.log("  Talk Key pressed while the previous Utterance is still inserting — ignored\n", .{});
-            return;
-        }
-        // The tap can be live before the session exists (Input Monitoring granted, key not
-        // yet present). With no session there is nowhere to stream to.
-        const sess = self.getSession() orelse {
-            feedback.log("  Talk Key pressed but no Transcription Session yet (missing API key?) — ignored\n", .{});
-            self.cues.err();
-            return;
-        };
-
-        self.busy.store(true, .release);
-        self.hold_active = true;
-        sess.beginUtterance();
-        self.capture.start() catch |e| {
-            feedback.log("  capture.start failed: {s} — Utterance aborted\n", .{@errorName(e)});
-            sess.endUtterance();
-            self.hold_active = false;
-            self.busy.store(false, .release);
-            self.cues.err();
-            return;
-        };
-        // Signal "listening" only once Capture is actually up: the pill (red, awaiting the
-        // first Partial Transcript) supersedes the start chime when the overlay is on;
-        // otherwise the chime carries it (wayfinder #22).
-        if (self.hud.active) self.hud.publish(.recording, "") else self.cues.start();
-        feedback.log("  [REC] listening — release the Talk Key to insert\n", .{});
+        self.transcription.appendAudio(pcm);
     }
 
-    fn onRelease(ctx: ?*anyopaque, key: tapmod.TalkKey) void {
+    // ---- tap callbacks: run on the run-loop thread, kept fast (filter, then trampoline) ----
+
+    fn tapPress(ctx: ?*anyopaque, key: tapmod.TalkKey, _: i64, _: u64) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx.?));
+        if (key != self.talk_key) return; // key filtering stays in the adapter
+        self.coordinator.handle(.press);
+    }
+    fn tapRelease(ctx: ?*anyopaque, key: tapmod.TalkKey) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
         if (key != self.talk_key) return;
-        if (!self.hold_active) return; // press was rejected — nothing to end
-        self.hold_active = false;
-
-        const sess = self.getSession() orelse {
-            self.hud.publish(.hidden, ""); // pill was up since press — take it down
-            self.busy.store(false, .release); // session vanished mid-hold (shutdown) — release the guard
-            return;
-        };
-        self.capture.stop(); // synchronous; final buffers flush (and forward) during this call
-        sess.endUtterance(); // stop forwarding before committing
-        // The pill stays up (showing the last partial) until the Final flashes or the
-        // Utterance resolves below; the stop chime only carries this when there's no pill.
-        if (!self.hud.active) self.cues.stop();
-
-        // Link dropped mid-Utterance: the head audio already streamed live is gone, so
-        // committing would insert a truncated tail. Abandon cleanly (grilled for #19).
-        if (sess.isPoisoned()) {
-            feedback.log("  Transcription Session dropped mid-Utterance — discarded; hold the Talk Key and say it again\n", .{});
-            self.hud.publish(.hidden, ""); // abandon: no truncated tail shown (error cue kept)
-            self.cues.err();
-            self.busy.store(false, .release);
-            return;
-        }
-
-        // Mic-silence detection: TCC denial yields all-zero PCM with no error (#18).
-        if (!self.capture.heardSound())
-            feedback.log("  microphone captured only silence — is Microphone permission granted to this process?\n", .{});
-
-        const expecting = sess.commitUtterance() catch |e| blk: {
-            feedback.log("  commit error: {s}\n", .{@errorName(e)});
-            break :blk false;
-        };
-        if (expecting) {
-            self.insert_pending.store(true, .release); // worker awaits the Final Transcript; it clears busy
-        } else {
-            // Nothing committed (no audio) — no Insertion is coming, so resolve now.
-            feedback.log("  Utterance produced no audio — nothing to insert\n", .{});
-            self.hud.publish(.hidden, ""); // no Final coming — hide the pill now
-            self.cues.err();
-            self.busy.store(false, .release);
-        }
+        self.coordinator.handle(.release);
     }
 
     /// Tap self-heal outcome (#18): a re-enable that didn't take means Input Monitoring was
-    /// revoked; surface it. The tap recovers automatically once the grant returns.
+    /// revoked; surface it. The tap recovers automatically once the grant returns. This is a
+    /// tap-health event, not an Utterance event, so it does not go through the Coordinator.
     fn onTapDisabled(ctx: ?*anyopaque, by_timeout: bool, reenabled: bool) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
         if (reenabled) {
@@ -310,56 +332,6 @@ const Daemon = struct {
             feedback.log("  Talk Key tap DISABLED and could not be re-enabled — Input Monitoring may be revoked; re-grant it to recover\n", .{});
             self.cues.err();
         }
-    }
-
-    // ---- worker thread: the blocking wait + the slow Insertion, off the callback ----
-
-    fn workerLoop(self: *Daemon) void {
-        while (!g_quit.load(.acquire)) {
-            if (!self.insert_pending.swap(false, .acquire)) {
-                _ = usleep(2_000);
-                continue;
-            }
-            self.processUtterance();
-        }
-    }
-
-    /// Resolve one committed Utterance: wait for its Final Transcript (release-anchored
-    /// deadline), then insert. `busy` is cleared however this returns.
-    fn processUtterance(self: *Daemon) void {
-        defer self.busy.store(false, .release);
-        // Hide the pill however this resolves (inserted, empty, timed out, or insert-failed).
-        // On the happy path the Final Transcript is already flashing green — published by the
-        // read-loop's on_final — and the paste below holds it on screen; this takes it down
-        // once the Insertion is done (wayfinder #22).
-        defer self.hud.publish(.hidden, "");
-
-        const sess = self.getSession() orelse return;
-
-        if (!waitFor(&sess.got_final, insert_deadline_ms)) {
-            feedback.log("  no Final Transcript within {d}s — nothing inserted\n", .{insert_deadline_ms / 1000});
-            self.cues.err();
-            return;
-        }
-        const n = sess.final_len;
-        if (n == 0) {
-            // Empty/failed transcript (mic silence, transcription.failed, …).
-            feedback.log("  empty Final Transcript — nothing to insert\n", .{});
-            self.cues.err();
-            return;
-        }
-        // NUL-terminate for insert.paste (it becomes an NSString).
-        var buf: [8192]u8 = undefined;
-        const len = @min(n, buf.len - 1);
-        @memcpy(buf[0..len], sess.final[0..len]);
-        buf[len] = 0;
-        const z: [*:0]const u8 = @ptrCast(&buf);
-        self.inserter.insert(self.insert_method, z) catch |e| {
-            feedback.log("  insertion failed: {s}\n", .{explainInsert(e)});
-            self.cues.err();
-            return;
-        };
-        feedback.log("  inserted {d} chars at the cursor\n", .{len});
     }
 
     // ---- supervisor thread: the self-heal / not-configured → configured engine ----
@@ -373,13 +345,13 @@ const Daemon = struct {
             if (g_quit.load(.acquire)) return;
 
             // 1. Build the Transcription Session the moment the API key is present.
-            if (self.getSession() == null) {
+            if (!self.transcription.available()) {
                 if (config.loadApiKeyOnly(self.io, self.alloc)) |key| {
-                    const sess = Session.connect(self.io, self.alloc, key, self.params, self.transcriptObserver()) catch |e| {
+                    const sess = Session.connect(self.io, self.alloc, key, self.params, self.observer()) catch |e| {
                         feedback.log("  supervisor: session connect failed: {s} — will retry\n", .{@errorName(e)});
                         continue;
                     };
-                    self.session_ptr.store(@intFromPtr(sess), .release);
+                    self.transcription.set(sess);
                     feedback.log("  supervisor: API key found — Transcription Session connecting…\n", .{});
                 }
             }
@@ -387,7 +359,7 @@ const Daemon = struct {
             // 2. Grants — silent preflight (no re-prompt).
             const im = tapmod.Tap.listenGranted();
             const pe = insertmod.postEventGranted();
-            const key_ok = self.getSession() != null;
+            const key_ok = self.transcription.available();
 
             // 3. Bring the created-but-disabled tap live once Input Monitoring appears.
             if (im and !self.tap.isEnabled()) {
@@ -397,8 +369,8 @@ const Daemon = struct {
                     feedback.log("  supervisor: Input Monitoring looks granted but the tap won't enable — a daemon restart may be needed\n", .{});
             }
 
-            // 4. Configured? (PostEvent is also preflighted per-insert, so a later revoke
-            //    is caught there too; here it just gates the "READY" banner + reporting.)
+            // 4. Configured? (PostEvent is also preflighted per-insert, so a later revoke is
+            //    caught there too; here it just gates the "READY" banner + reporting.)
             const configured = key_ok and im and pe and self.tap.isEnabled();
             if (configured) {
                 if (!announced) {
@@ -413,8 +385,8 @@ const Daemon = struct {
         }
     }
 
-    /// Log the missing prerequisites once per distinct set (not every tick), with one
-    /// error cue so a headless user hears that the daemon is waiting on them.
+    /// Log the missing prerequisites once per distinct set (not every tick), with one error
+    /// cue so a headless user hears that the daemon is waiting on them.
     fn reportMissing(self: *Daemon, key_ok: bool, im: bool, pe: bool) void {
         var missing: u8 = 0;
         if (!key_ok) missing |= 1;
@@ -431,12 +403,13 @@ const Daemon = struct {
     }
 };
 
-/// Entry point: wire the modules, spawn the threads, and run the tap's run loop until a
-/// quit signal. Never exits non-zero for a *recoverable* condition (missing key/grants) —
-/// those are the supervisor's job — so the LaunchAgent never crash-loops on them.
+/// Entry point: wire the modules + adapters + Coordinator, spawn the threads, and run the
+/// tap's run loop until a quit signal. Never exits non-zero for a *recoverable* condition
+/// (missing key/grants) — those are the supervisor's job — so the LaunchAgent never
+/// crash-loops on them.
 pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
-    // Settings load always (defaults if absent); the secret is NOT required up front —
-    // the supervisor waits for it (self-heal).
+    // Settings load always (defaults if absent); the secret is NOT required up front — the
+    // supervisor waits for it (self-heal).
     const settings = config.loadSettingsOnly(io, alloc);
     std.debug.print("config: talk_key={s} model=\"{s}\" language=\"{s}\" delay=\"{s}\" noise_reduction={s} insertion={s} overlay={}\n", .{
         @tagName(settings.talk_key), settings.model, settings.language, settings.delay, @tagName(settings.noise_reduction), @tagName(settings.insertion), settings.overlay,
@@ -460,15 +433,14 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     try daemon.capture.init();
     defer daemon.capture.deinit();
     daemon.capture.ctx = &daemon;
-    daemon.capture.on_chunk = audioSink;
+    daemon.capture.on_chunk = Daemon.audioSink;
 
     daemon.inserter.init();
     daemon.cues.init();
 
-    // ---- overlay HUD (wayfinder #22): the live-partials pill. Built here, on the main
-    //      thread, so its CFRunLoopTimer render pump joins the SAME run loop the tap will
-    //      block on (daemon.tap.run → CFRunLoopRun). Off by config, or headless with no
-    //      display, both degrade to the sound cues (#18) without failing startup. ----
+    // ---- overlay HUD (wayfinder #22): built on the main thread so its CFRunLoopTimer render
+    //      pump joins the SAME run loop the tap will block on. Off by config, or headless
+    //      with no display, both degrade to the sound cues without failing startup. ----
     if (settings.overlay) {
         if (daemon.hud.init()) {
             daemon.hud.startRenderPump();
@@ -479,6 +451,22 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     } else {
         feedback.log("  overlay HUD: off (config.overlay=false) — sound-only feedback\n", .{});
     }
+
+    // ---- wire the real adapters, then the Coordinator that drives them ----
+    daemon.feedback_surface = .{ .cues = &daemon.cues, .hud = &daemon.hud };
+    daemon.insertion = .{ .inserter = &daemon.inserter, .method = daemon.insert_method };
+    daemon.coordinator = Coord.init(.{
+        .audio = &daemon.capture,
+        .transcription = &daemon.transcription,
+        .insertion = &daemon.insertion,
+        .deadline = &daemon.deadline,
+        .feedback = &daemon.feedback_surface,
+    });
+    // Reverse edges: the worker/timer threads re-enter the now-constructed Coordinator.
+    daemon.insertion.co_ctx = &daemon.coordinator;
+    daemon.insertion.on_done = insertDoneTramp;
+    daemon.deadline.co_ctx = &daemon.coordinator;
+    daemon.deadline.on_fire = deadlineFireTramp;
 
     // ---- Talk Key tap: prompt for the two event grants once, then create the tap on THIS
     //      (main) run loop. A created-but-disabled tap is fine — the supervisor enables it
@@ -492,8 +480,8 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
 
     daemon.tap = .{ .cbs = .{
         .ctx = &daemon,
-        .on_press = Daemon.onPress,
-        .on_release = Daemon.onRelease,
+        .on_press = Daemon.tapPress,
+        .on_release = Daemon.tapRelease,
         .on_disabled = Daemon.onTapDisabled,
     } };
     const tap_live = daemon.tap.install() catch |e| switch (e) {
@@ -505,8 +493,10 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     feedback.log("  Talk Key tap: {s}\n", .{if (tap_live) "live" else "created, waiting for Input Monitoring"});
 
     // ---- threads ----
-    const worker = try std.Thread.spawn(.{}, Daemon.workerLoop, .{&daemon});
+    const worker = try std.Thread.spawn(.{}, InsertionAdapter.workerLoop, .{&daemon.insertion});
     worker.detach();
+    const timer = try std.Thread.spawn(.{}, DeadlineAdapter.timerLoop, .{&daemon.deadline});
+    timer.detach();
     // The supervisor is JOINED at shutdown (below), so it can't race the session teardown.
     const supervisor = try std.Thread.spawn(.{}, Daemon.supervisorLoop, .{&daemon});
 
@@ -519,13 +509,13 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
 
     daemon.tap.run(); // CFRunLoopRun — blocks until the quit watcher stops the loop
 
-    // Quit: g_quit is set (that's why run() returned). Join the supervisor first so it is
-    // not mid-connect, then close the session gracefully (websocket close-frame drain,
-    // #17). We deliberately do NOT deinit the session: the process is exiting, the OS
-    // reclaims its memory, and skipping the free avoids any race with the detached worker
-    // that may still hold the pointer (same process-lifetime-singleton stance as config).
+    // Quit: g_quit is set (that's why run() returned). Join the supervisor first so it is not
+    // mid-connect, then close the session gracefully (websocket close-frame drain, #17). We
+    // deliberately do NOT deinit the session: the process is exiting, the OS reclaims its
+    // memory, and skipping the free avoids any race with the detached worker/timer that may
+    // still hold the pointer (same process-lifetime-singleton stance as config).
     feedback.log("shutting down…\n", .{});
     supervisor.join();
-    if (daemon.getSession()) |sess| sess.shutdown();
+    if (daemon.transcription.current()) |sess| sess.shutdown();
     feedback.log("bye.\n", .{});
 }

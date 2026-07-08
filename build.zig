@@ -16,6 +16,29 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Frameworks + libobjc.tbd live under the active SDK; point the linker at both.
+    const sdk = std.mem.trim(u8, b.run(&.{ "xcrun", "--show-sdk-path" }), " \r\n");
+
+    // Every module that reaches the OS-facing files needs the same framework/SDK wiring.
+    // Factored so the exe and the `zig build test` artifact stay in lockstep.
+    const linkFrameworks = struct {
+        fn apply(mod: *std.Build.Module, sdk_path: []const u8, bb: *std.Build) void {
+            // Transcription Session's vendored websocket rides std.crypto.tls (no extra
+            // framework); Capture's AudioQueue lives in AudioToolbox.
+            mod.linkFramework("AudioToolbox", .{});
+            // Talk Key tap + Insertion event synthesis.
+            mod.linkFramework("CoreGraphics", .{}); // CGEventTap, CGEvent*, CG*EventAccess
+            mod.linkFramework("CoreFoundation", .{}); // run loop, CFRelease
+            mod.linkFramework("Carbon", .{}); // IsSecureEventInputEnabled
+            mod.linkFramework("ApplicationServices", .{}); // umbrella (AX if ever needed)
+            mod.linkFramework("AppKit", .{}); // NSPasteboard (insert) + NSPanel/NSTextField/NSScreen (overlay HUD, #22)
+            mod.linkFramework("QuartzCore", .{}); // CALayer — the overlay HUD's rounded pill (wayfinder #22)
+            mod.linkSystemLibrary("objc", .{}); // -lobjc
+            mod.addFrameworkPath(.{ .cwd_relative = bb.fmt("{s}/System/Library/Frameworks", .{sdk_path}) });
+            mod.addLibraryPath(.{ .cwd_relative = bb.fmt("{s}/usr/lib", .{sdk_path}) });
+        }
+    }.apply;
+
     const m = exe.root_module;
     m.addImport("websocket", ws.module("websocket"));
 
@@ -24,22 +47,7 @@ pub fn build(b: *std.Build) void {
     // as an anonymous import so @embedFile can read its bytes from outside src/.
     m.addAnonymousImport("Info.plist", .{ .root_source_file = b.path("packaging/Info.plist") });
 
-    // Transcription Session's vendored websocket rides std.crypto.tls (no extra
-    // framework); Capture's AudioQueue lives in AudioToolbox.
-    m.linkFramework("AudioToolbox", .{});
-    // Talk Key tap + Insertion event synthesis.
-    m.linkFramework("CoreGraphics", .{}); // CGEventTap, CGEvent*, CG*EventAccess
-    m.linkFramework("CoreFoundation", .{}); // run loop, CFRelease
-    m.linkFramework("Carbon", .{}); // IsSecureEventInputEnabled
-    m.linkFramework("ApplicationServices", .{}); // umbrella (AX if ever needed)
-    m.linkFramework("AppKit", .{}); // NSPasteboard (insert) + NSPanel/NSTextField/NSScreen (overlay HUD, #22) via the ObjC runtime
-    m.linkFramework("QuartzCore", .{}); // CALayer — the overlay HUD's rounded pill (wayfinder #22)
-    m.linkSystemLibrary("objc", .{}); // -lobjc
-
-    // Frameworks + libobjc.tbd live under the active SDK; point the linker at both.
-    const sdk = std.mem.trim(u8, b.run(&.{ "xcrun", "--show-sdk-path" }), " \r\n");
-    m.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk}) });
-    m.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
+    linkFrameworks(m, sdk, b);
 
     b.installArtifact(exe);
 
@@ -47,6 +55,24 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Build and run type-wave (foreground skeleton)");
     run_step.dependOn(&run_cmd.step);
+
+    // `zig build test` — the Utterance Coordinator's lifecycle matrix plus the backfilled
+    // pure-function tests (parseEnvKey, formatSessionUpdate, backoffMs, utf8SafeTail),
+    // aggregated through src/tests.zig. Same imports/frameworks as the exe, since the tested
+    // files reference the websocket module and the macOS frameworks.
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    tests.root_module.addImport("websocket", ws.module("websocket"));
+    linkFrameworks(tests.root_module, sdk, b);
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run the unit tests (Coordinator lifecycle + pure functions)");
+    test_step.dependOn(&run_tests.step);
 
     // `zig build install-agent` — package the daemon as a signed headless LaunchAgent
     // (wayfinder #15): codesign the freshly-built binary with the stable "type-wave dev"

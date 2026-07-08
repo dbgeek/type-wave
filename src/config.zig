@@ -184,3 +184,33 @@ fn parseEnvKey(text: []const u8) ?[]const u8 {
     }
     return result;
 }
+
+// ---- tests (backfilled with the coordinator work, 2026-07-08) ----------------
+
+test "parseEnvKey reads a bare assignment" {
+    try std.testing.expectEqualStrings("sk-abc", parseEnvKey("OPENAI_API_KEY=sk-abc").?);
+}
+
+test "parseEnvKey accepts an export prefix" {
+    try std.testing.expectEqualStrings("sk-xyz", parseEnvKey("export OPENAI_API_KEY=sk-xyz").?);
+}
+
+test "parseEnvKey strips one layer of matching quotes" {
+    try std.testing.expectEqualStrings("sk-dq", parseEnvKey("OPENAI_API_KEY=\"sk-dq\"").?);
+    try std.testing.expectEqualStrings("sk-sq", parseEnvKey("OPENAI_API_KEY='sk-sq'").?);
+}
+
+test "parseEnvKey: last assignment wins, blanks and comments ignored" {
+    const text =
+        \\# a comment
+        \\
+        \\OPENAI_API_KEY=first
+        \\export OPENAI_API_KEY=second
+    ;
+    try std.testing.expectEqualStrings("second", parseEnvKey(text).?);
+}
+
+test "parseEnvKey ignores a near-miss key and an absent key" {
+    try std.testing.expect(parseEnvKey("OPENAI_API_KEY_OTHER=nope") == null);
+    try std.testing.expect(parseEnvKey("# nothing here\nFOO=bar") == null);
+}

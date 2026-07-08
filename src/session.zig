@@ -11,8 +11,13 @@
 //!   - A **maintenance thread** keeps the link healthy between Utterances: a keepalive
 //!     ping doubles as a drop probe, and the session is reconnected *only when idle* —
 //!     proactively before the 60-min `expires_at` cap, and on a detected drop.
-//!   - A Talk Key press while the session is not ready **buffers Capture locally** into
-//!     `pending` and replays it in order once ready, so the Utterance is not lost.
+//!   - A dedicated **sender thread** owns every data write: Capture appends and commits
+//!     are enqueued onto an outbound ring (a memcpy, never a socket write) and drained
+//!     in order once the session is ready. The AudioQueue and Talk Key tap threads thus
+//!     never block on TLS — a network stall parks the sender while the ring absorbs the
+//!     Utterance — and a press while the session is not ready simply accumulates in the
+//!     ring and replays on reconnect, deferred commit included, so the Utterance is not
+//!     lost.
 //!   - A **graceful websocket close** (client close frame + drain) that #8 deferred (it
 //!     exited the process instead, to dodge a read-thread teardown race). All stream
 //!     teardown now happens single-threaded, on the maintenance/shutdown thread *after*
@@ -45,9 +50,24 @@ const maint_tick_ms: i64 = 200;
 const ready_wait_ms: i64 = 10_000;
 /// How long `closeCurrent` waits for the peer's close reply before forcing the socket.
 const close_drain_ms: i64 = 1_500;
-/// Local Capture buffer: 60 s of 24 kHz mono s16le (24000·2·60). A press that lands
-/// while the link is down accumulates here and is replayed on reconnect.
-const pending_cap: usize = 60 * 48_000;
+/// Outbound ring geometry: each slot carries one Capture chunk (capture.zig's 2400 B =
+/// 50 ms) or one small control message. 60 s of Capture at 20 chunks/s — the same
+/// absorption the old local buffer gave a press that lands while the link is down —
+/// plus headroom for control records.
+const out_payload_cap: usize = 2400;
+const out_slot_count: usize = 60 * 20 + 8;
+/// Sender-thread poll cadence while the ring is empty (or the session is not ready).
+/// Well under the 50 ms Capture cadence, so a queued chunk never waits meaningfully.
+const sender_tick_ms: i64 = 5;
+
+/// One outbound record: a Capture chunk (base64-framed by the sender at write time) or
+/// a small control message (the commit / input_audio_buffer.clear JSON).
+const OutKind = enum(u8) { audio, control };
+const OutRecord = struct {
+    kind: OutKind,
+    len: u16,
+    data: [out_payload_cap]u8,
+};
 
 /// A subscriber to the live transcript stream (wayfinder #22). The overlay HUD wires
 /// this so it can render Partial Transcripts as they stream and flash the Final
@@ -126,21 +146,22 @@ pub const Session = struct {
     observer: ?TranscriptObserver = null,
 
     /// Guards ALL writes to the client. The library has no internal write lock
-    /// (crib sheet §3.4): the read-loop thread (session.update, pongs), the audio
-    /// thread (append), the maintenance thread (ping, close), and main (commit) all
-    /// write through this.
+    /// (crib sheet §3.4): the sender thread (Capture appends, commits), the read-loop
+    /// thread (session.update, pongs), and the maintenance thread (ping, close) all
+    /// write through this. The AudioQueue and tap threads never take it — they only
+    /// enqueue onto the outbound ring.
     write_mu: std.Io.Mutex = .init,
     /// True only while `client` is a live, handshaken socket safe to write to. Guarded
     /// by `write_mu`; every writer checks it, so a torn-down/reconnecting client is
     /// never written to. Cleared at the very start of `closeCurrent`.
     link_open: bool = false,
 
-    /// Lifecycle state. The read thread flips it to `.ready` (via markReadyAndFlush) and,
+    /// Lifecycle state. The read thread flips it to `.ready` (via markReady) and,
     /// on a drop, from `.ready` to `.reconnecting`; the maintenance thread drives the
-    /// reconnect. appendAudio reads it to choose live-stream vs. local-buffer.
+    /// reconnect. The sender thread reads it to decide whether to drain the outbound
+    /// ring or let records accumulate.
     state: std.atomic.Value(State) = std.atomic.Value(State).init(.connecting),
 
-    got_final: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     bytes_utt: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     /// True only between beginUtterance and endUtterance. The audio thread forwards
@@ -179,9 +200,9 @@ pub const Session = struct {
     partial: [8192]u8 = undefined,
     partial_len: usize = 0,
 
-    /// Final Transcript of the just-completed Utterance, retained for Insertion.
-    /// Written on the read-loop thread *before* got_final is released; a consumer
-    /// that reads it *after* observing got_final (acquire) sees the finished write.
+    /// Read-loop scratch for building the Final Transcript slice handed to the observer's
+    /// `on_final` (the Utterance Coordinator subscribes it). Touched only on the read-loop
+    /// thread; the observer copies synchronously, so nothing outlives the callback.
     final: [8192]u8 = undefined,
     final_len: usize = 0,
 
@@ -190,27 +211,30 @@ pub const Session = struct {
     su_buf: [2048]u8 = undefined,
     su_len: usize = 0,
 
-    /// Local Capture buffer for a press that lands while the link is not ready. Guarded
-    /// by `pending_mu`; drained in order by markReadyAndFlush the moment the session
-    /// becomes ready. `pending_commit` records that the Utterance was already released
-    /// (Talk Key up) while buffering, so the flush also sends the commit.
     handler: Handler = undefined,
     read_thread: ?std.Thread = null,
     maint_thread: ?std.Thread = null,
+    sender_thread: ?std.Thread = null,
 
-    pending: []u8,
-    pending_len: usize = 0,
-    pending_commit: bool = false,
-    pending_overflow: bool = false,
-    /// Ordered before `write_mu` everywhere it is taken (appendAudio, commitUtterance,
-    /// markReadyAndFlush): the only nesting is pending_mu → write_mu, never the reverse.
-    pending_mu: std.Io.Mutex = .init,
+    /// The outbound ring: EVERY data write — Capture appends and the per-Utterance
+    /// commit — is enqueued here and drained in order by the sender thread once the
+    /// session is `.ready`. Enqueue is a memcpy under `out_mu`, never a socket write,
+    /// so the AudioQueue and tap threads never block on TLS; while the link is down,
+    /// records simply accumulate (subsuming #17's press-mid-reconnect buffer) and
+    /// replay in order — deferred commit included — on reconnect. `out_mu` never nests
+    /// with `write_mu`: producers take only `out_mu`; the sender takes the two strictly
+    /// one after the other.
+    out: []OutRecord,
+    out_head: usize = 0, // next slot to drain
+    out_count: usize = 0, // filled slots
+    out_overflow: bool = false, // ring-full already logged for this Utterance
+    out_mu: std.Io.Mutex = .init,
 
     pub fn connect(io: std.Io, alloc: std.mem.Allocator, api_key: []const u8, params: TranscriptionParams, observer: ?TranscriptObserver) !*Session {
         const self = try alloc.create(Session);
         errdefer alloc.destroy(self);
-        const pending = try alloc.alloc(u8, pending_cap);
-        errdefer alloc.free(pending);
+        const out = try alloc.alloc(OutRecord, out_slot_count);
+        errdefer alloc.free(out);
 
         self.* = .{
             .io = io,
@@ -219,21 +243,23 @@ pub const Session = struct {
             .api_key = api_key,
             .params = params,
             .observer = observer, // set before openClient starts the read loop — never mid-stream
-            .pending = pending,
+            .out = out,
         };
         self.su_len = (try formatSessionUpdate(&self.su_buf, params)).len;
         self.handler = .{ .session = self };
 
         try self.openClient(); // first connection: init + handshake + start read loop
 
-        // Keep the link warm and cycle it between Utterances for the rest of the run.
+        // The sender drains the outbound ring for the rest of the run; the maintenance
+        // thread keeps the link warm and cycles it between Utterances.
+        self.sender_thread = try std.Thread.spawn(.{}, senderLoop, .{self});
         self.maint_thread = try std.Thread.spawn(.{}, maintenanceLoop, .{self});
         return self;
     }
 
     /// Free memory. Assumes `shutdown` already ran (link + threads torn down).
     pub fn deinit(self: *Session) void {
-        self.alloc.free(self.pending);
+        self.alloc.free(self.out);
         self.alloc.destroy(self);
     }
 
@@ -302,8 +328,8 @@ pub const Session = struct {
 
     // ---- writes (all funnel through write_mu + the link_open guard) --------------
 
-    /// Encode+send one Capture chunk as an input_audio_buffer.append. Caller decides
-    /// whether the link is ready; this only writes (dropping if the link is down).
+    /// Encode+send one Capture chunk as an input_audio_buffer.append. Sender-thread-only
+    /// (the ring is the sole route for audio); drops silently if the link is down.
     fn rawAppend(self: *Session, pcm: []const u8) void {
         var buf: [8192]u8 = undefined; // 2400B pcm -> 3200 b64 + framing
         const prefix = "{\"type\":\"input_audio_buffer.append\",\"audio\":\"";
@@ -334,18 +360,27 @@ pub const Session = struct {
     /// Reset per-Utterance state. Call on Talk Key press, before capture starts.
     pub fn beginUtterance(self: *Session) void {
         self.bytes_utt.store(0, .release);
-        self.got_final.store(false, .release);
         self.poisoned.store(false, .release); // fresh Utterance — no drop seen yet (#19)
         self.partial_len = 0;
         self.t0_ms = nowMs();
+        // This Utterance owns the outbound ring afresh: purge undelivered records of an
+        // abandoned predecessor (they only linger when a link outage outlived the
+        // worker's insert deadline). If anything was dropped, part of that Utterance may
+        // already sit in the server-side input buffer (its audio sent, its commit now
+        // purged) — queue a clear ahead of the new audio so stale speech can't be
+        // committed into THIS Utterance's transcript (crib sheet: input_audio_buffer.clear).
+        var dropped: usize = 0;
         {
-            // This Utterance owns the local buffer afresh (overlapping presses during a
-            // reconnect are not hardened — same NB as main.zig; deferred to #19).
-            self.pending_mu.lockUncancelable(self.io);
-            defer self.pending_mu.unlock(self.io);
-            self.pending_len = 0;
-            self.pending_commit = false;
-            self.pending_overflow = false;
+            self.out_mu.lockUncancelable(self.io);
+            defer self.out_mu.unlock(self.io);
+            dropped = self.out_count;
+            self.out_head = 0;
+            self.out_count = 0;
+            self.out_overflow = false;
+        }
+        if (dropped > 0) {
+            feedback.log("  (purged {d} undelivered records of the previous Utterance)\n", .{dropped});
+            _ = self.enqueueOut(.control, "{\"type\":\"input_audio_buffer.clear\"}");
         }
         self.active.store(true, .release);
     }
@@ -355,77 +390,113 @@ pub const Session = struct {
         self.active.store(false, .release);
     }
 
-    /// Append one Capture chunk. Called on the AudioQueue thread; base64 + JSON +
-    /// masked write all happen here (crib sheet blesses this on the AQ thread). When the
-    /// link is not ready, the chunk is buffered locally instead of dropped, so a press
-    /// during a reconnect does not lose the Utterance (wayfinder #17).
+    /// Append one Capture chunk. Called on the AudioQueue thread — which is exactly why
+    /// this only memcpys the PCM onto the outbound ring: the base64 + JSON framing and
+    /// the blocking TLS write happen on the sender thread, so a network stall can never
+    /// starve the queue's 3×50 ms of buffers (capture.zig). While the link is not ready
+    /// the records simply accumulate, so a press during a reconnect does not lose the
+    /// Utterance (wayfinder #17).
     pub fn appendAudio(self: *Session, pcm: []const u8) void {
         if (pcm.len == 0) return; // a 0-byte buffer (delivered during stop) => empty append, which errors
         if (!self.active.load(.acquire)) return; // not in an Utterance — drop it
-
-        self.pending_mu.lockUncancelable(self.io);
-        defer self.pending_mu.unlock(self.io);
-        // Live path only when ready AND nothing is queued ahead of us — otherwise this
-        // chunk must go behind the buffered prefix to keep the Utterance in order.
-        if (self.state.load(.acquire) == .ready and self.pending_len == 0) {
-            self.rawAppend(pcm);
-        } else if (self.pending_len + pcm.len <= self.pending.len) {
-            @memcpy(self.pending[self.pending_len..][0..pcm.len], pcm);
-            self.pending_len += pcm.len;
-        } else if (!self.pending_overflow) {
-            self.pending_overflow = true;
-            feedback.log("  (buffered Capture hit {d}B during reconnect — truncating this Utterance)\n", .{self.pending.len});
+        // Capture hands ≤2400 B chunks (capture.zig buffer_bytes == out_payload_cap);
+        // slice defensively so a larger future buffer still fits the slots.
+        var off: usize = 0;
+        while (off < pcm.len) {
+            const end = @min(off + out_payload_cap, pcm.len);
+            if (!self.enqueueOut(.audio, pcm[off..end])) break; // ring full — truncating (logged once)
+            off = end;
         }
-        _ = self.bytes_utt.fetchAdd(pcm.len, .monotonic); // count buffered audio too, so commit isn't suppressed
+        _ = self.bytes_utt.fetchAdd(pcm.len, .monotonic); // count even truncated audio, so commit isn't suppressed
     }
 
     /// Commit the Utterance (Talk Key release). Suppresses empty commits, which error.
-    /// If the link is not ready, the commit is deferred: markReadyAndFlush replays the
-    /// buffered audio and sends the commit once the session reconnects.
+    /// The commit is a ring record like the audio, so it is delivered strictly after
+    /// every queued chunk; if the link is down it waits in the ring and replays on
+    /// reconnect (the deferred commit of wayfinder #17). Called on the tap's run-loop
+    /// thread — enqueue only, no socket write, so the tap callback never blocks on TLS.
     ///
-    /// Returns whether a Final Transcript should now be expected: `true` when a commit
-    /// was sent OR deferred (a transcript is coming), `false` when the Utterance held no
-    /// audio and was dropped — letting the caller sound the "no Insertion" error cue
-    /// immediately instead of waiting out the worker's transcript timeout (#18).
+    /// Returns whether a Final Transcript should now be expected: `true` when the commit
+    /// was queued (a transcript is coming), `false` when the Utterance held no audio and
+    /// was dropped — letting the caller sound the "no Insertion" error cue immediately
+    /// instead of waiting out the worker's transcript timeout (#18).
     pub fn commitUtterance(self: *Session) !bool {
         if (self.bytes_utt.load(.acquire) == 0) {
             feedback.log("  (no audio captured — skipping commit)\n", .{});
             return false;
         }
-        self.pending_mu.lockUncancelable(self.io);
-        defer self.pending_mu.unlock(self.io);
-        if (self.state.load(.acquire) == .ready and self.pending_len == 0) {
-            try self.sendControl("{\"type\":\"input_audio_buffer.commit\"}");
-        } else {
-            self.pending_commit = true; // flushed + committed on reconnect
-        }
+        if (!self.enqueueOut(.control, "{\"type\":\"input_audio_buffer.commit\"}"))
+            return error.OutboundRingFull;
         return true;
     }
 
-    /// Session became READY (session.updated). Replay any buffered Capture in order,
-    /// then commit if the Utterance was already released, then publish `.ready` — all
-    /// under pending_mu so appendAudio can't interleave a live chunk ahead of the
-    /// buffered prefix. Runs on the read-loop thread.
-    fn markReadyAndFlush(self: *Session) void {
-        self.pending_mu.lockUncancelable(self.io);
-        defer self.pending_mu.unlock(self.io);
+    /// Session became READY (session.updated). Publish `.ready` — the sender thread then
+    /// drains whatever the outbound ring accumulated while the link was down, in order,
+    /// deferred commit included (#17's replay, with no special flush path: the single
+    /// queue makes chunk-ahead-of-buffered-prefix interleaving impossible by
+    /// construction). Runs on the read-loop thread.
+    fn markReady(self: *Session) void {
+        self.out_mu.lockUncancelable(self.io);
+        const backlog = self.out_count;
+        self.out_mu.unlock(self.io);
+        if (backlog > 0) feedback.log("  session READY — draining {d} buffered records\n", .{backlog});
+        self.state.store(.ready, .release);
+    }
 
-        if (self.pending_len > 0) {
-            feedback.log("  replaying {d}B buffered Capture\n", .{self.pending_len});
-            var off: usize = 0;
-            while (off < self.pending_len) {
-                const chunk_end = @min(off + 2400, self.pending_len);
-                self.rawAppend(self.pending[off..chunk_end]);
-                off = chunk_end;
+    // ---- the outbound ring + its sender thread -----------------------------------
+
+    /// Queue one outbound record (a memcpy under `out_mu` — no socket IO; safe on the
+    /// AudioQueue and tap threads). False when the ring is full; the once-per-Utterance
+    /// truncation log lives here so every producer degrades the same way.
+    fn enqueueOut(self: *Session, kind: OutKind, payload: []const u8) bool {
+        std.debug.assert(payload.len <= out_payload_cap);
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        if (self.out_count == self.out.len) {
+            if (!self.out_overflow) {
+                self.out_overflow = true;
+                feedback.log("  (outbound ring full — truncating this Utterance)\n", .{});
+            }
+            return false;
+        }
+        const slot = &self.out[(self.out_head + self.out_count) % self.out.len];
+        slot.kind = kind;
+        slot.len = @intCast(payload.len);
+        @memcpy(slot.data[0..payload.len], payload);
+        self.out_count += 1;
+        return true;
+    }
+
+    /// Copy the oldest record out of the ring. False when it is empty.
+    fn dequeueOut(self: *Session, rec: *OutRecord) bool {
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        if (self.out_count == 0) return false;
+        rec.* = self.out[self.out_head];
+        self.out_head = (self.out_head + 1) % self.out.len;
+        self.out_count -= 1;
+        return true;
+    }
+
+    /// The sender thread: the only writer of data frames for the session's lifetime.
+    /// Drains the ring in order while the session is `.ready`; parks (records
+    /// accumulate) while it is connecting/reconnecting; exits on `.closed`. The base64
+    /// framing and the blocking TLS write happen here and nowhere else, so no
+    /// latency-critical thread ever waits on the network. A write onto a link that died
+    /// mid-drain is swallowed exactly like the old live path — the read loop detects the
+    /// drop and the Utterance is poisoned as before.
+    fn senderLoop(self: *Session) void {
+        var rec: OutRecord = undefined;
+        while (self.state.load(.acquire) != .closed) {
+            if (self.state.load(.acquire) != .ready or !self.dequeueOut(&rec)) {
+                sleepMs(sender_tick_ms);
+                continue;
+            }
+            switch (rec.kind) {
+                .audio => self.rawAppend(rec.data[0..rec.len]),
+                .control => self.sendControl(rec.data[0..rec.len]) catch {},
             }
         }
-        if (self.pending_commit) {
-            self.sendControl("{\"type\":\"input_audio_buffer.commit\"}") catch {};
-            self.pending_commit = false;
-        }
-        self.pending_len = 0;
-        self.pending_overflow = false;
-        self.state.store(.ready, .release);
     }
 
     // ---- maintenance: keepalive + drop detection + reconnect --------------------
@@ -563,13 +634,18 @@ pub const Session = struct {
         self.client.deinit();
     }
 
-    /// Graceful shutdown for good: stop the maintenance thread, then close the link.
+    /// Graceful shutdown for good: stop the maintenance + sender threads, then close the
+    /// link (the sender is joined before closeCurrent so no write can race the teardown).
     pub fn shutdown(self: *Session) void {
         self.active.store(false, .release);
         self.state.store(.closed, .release);
         if (self.maint_thread) |t| {
             t.join();
             self.maint_thread = null;
+        }
+        if (self.sender_thread) |t| {
+            t.join();
+            self.sender_thread = null;
         }
         self.closeCurrent();
     }
@@ -640,7 +716,7 @@ pub const Handler = struct {
             try s.sendControl(s.su_buf[0..s.su_len]);
             feedback.log("  session.created -> sent session.update\n", .{});
         } else if (std.mem.eql(u8, typ, "session.updated")) {
-            s.markReadyAndFlush();
+            s.markReady();
             feedback.log("  session.updated -> READY\n", .{});
         } else if (std.mem.eql(u8, typ, "conversation.item.input_audio_transcription.delta")) {
             const d = getStr(root, "delta") orelse "";
@@ -658,16 +734,17 @@ pub const Handler = struct {
             @memcpy(s.final[0..n], t[0..n]);
             s.final_len = n;
             feedback.log("  [{d:>6}ms] FINAL: {s}  ({d:.2}s audio)\n", .{ nowMs() - s.t0_ms, t, usageSeconds(root) });
-            // Flash the Final Transcript on the overlay HUD (wayfinder #22) before releasing
-            // got_final; the daemon's worker then inserts it and hides the pill.
+            // Deliver the Final Transcript to the observer (the Utterance Coordinator, and
+            // through it the overlay HUD). This synchronous push IS the delivery — there is
+            // no polled got_final flag any more (architecture review 2026-07-08, candidate 1).
             if (s.observer) |o| o.on_final(o.ctx, s.final[0..s.final_len]);
-            s.got_final.store(true, .release); // release: publishes final[0..final_len]
         } else if (std.mem.eql(u8, typ, "conversation.item.input_audio_transcription.failed")) {
             // Operational failure: drop this Utterance, keep the session (crib sheet §).
-            // final_len=0 makes the worker sound the "no Insertion" error cue (#18).
+            // Deliver an EMPTY Final Transcript so the Coordinator resolves the Utterance
+            // immediately (error cue, nothing inserted) instead of waiting out the deadline.
             feedback.log("  transcription FAILED: {s}\n", .{errMessage(root)});
             s.final_len = 0; // nothing to insert
-            s.got_final.store(true, .release);
+            if (s.observer) |o| o.on_final(o.ctx, s.final[0..s.final_len]);
         } else if (std.mem.eql(u8, typ, "error")) {
             feedback.log("  ERROR event: {s}\n", .{errMessage(root)});
         } else if (std.mem.eql(u8, typ, "input_audio_buffer.committed")) {
@@ -719,3 +796,30 @@ pub const Handler = struct {
         feedback.log("  [read loop ended]\n", .{});
     }
 };
+
+// ---- tests (backfilled with the coordinator work, 2026-07-08) ----------------
+
+test "formatSessionUpdate defaults reproduce the #8-proven string" {
+    var buf: [2048]u8 = undefined;
+    const out = try formatSessionUpdate(&buf, .{});
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"session.update\",\"session\":{\"type\":\"transcription\",\"audio\":{\"input\":{\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},\"transcription\":{\"model\":\"gpt-realtime-whisper\",\"language\":\"en\",\"delay\":\"low\"},\"turn_detection\":null,\"noise_reduction\":{\"type\":\"near_field\"}}}}}",
+        out,
+    );
+}
+
+test "formatSessionUpdate emits JSON null when noise reduction is disabled" {
+    var buf: [2048]u8 = undefined;
+    const out = try formatSessionUpdate(&buf, .{ .noise_reduction = null });
+    try std.testing.expect(std.mem.endsWith(u8, out, "\"turn_detection\":null,\"noise_reduction\":null}}}}"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"type\":\"near_field\"") == null);
+}
+
+test "backoffMs ramps 0.5s→8s and caps" {
+    try std.testing.expectEqual(@as(i64, 500), Session.backoffMs(0));
+    try std.testing.expectEqual(@as(i64, 1000), Session.backoffMs(1));
+    try std.testing.expectEqual(@as(i64, 2000), Session.backoffMs(2));
+    try std.testing.expectEqual(@as(i64, 4000), Session.backoffMs(3));
+    try std.testing.expectEqual(@as(i64, 8000), Session.backoffMs(4));
+    try std.testing.expectEqual(@as(i64, 8000), Session.backoffMs(9)); // capped
+}

@@ -1,0 +1,48 @@
+# ADR 0001 — Fully serialize the Utterance lifecycle
+
+- Status: accepted (2026-07-08)
+- Supersedes: the press-during-paste overlap grilled for wayfinder #19
+
+## Context
+
+Wayfinder #19 deliberately released the overlap guard (`busy`) the *instant* the
+Final Transcript was copied out of the Transcription Session — **before** the ~400 ms
+paste tail (clipboard settle + restore, `insert.zig`). The intent was that holding the
+Talk Key again during that paste tail would begin the next Utterance rather than being
+dropped. That decision forced two subtleties:
+
+1. A guard released *mid-way* through resolving one Utterance, so the read of the
+   shared Final Transcript state had to be sequenced against the next `beginUtterance`
+   by hand (daemon.zig's `busy` / `hold_active` / `insert_pending` atomics).
+2. `hud.hideIfFinal()` — a take-down that had to check "am I still showing *this*
+   Utterance's Final Transcript, or did a successor's `.recording` pill already
+   repaint?", because a new Utterance could start while the paste was still landing.
+
+When the lifecycle logic was lifted into the **Utterance Coordinator** (candidate 1 of
+the 2026-07-08 architecture review), a single synchronous state machine under one mutex,
+the overlap became the one piece of state that could not be expressed as a plain phase:
+it required releasing the guard partway through the terminal phase.
+
+## Decision
+
+The Coordinator's phase machine is `idle → capturing → awaiting_final → inserting → idle`.
+`.inserting` is a **blocking** phase: the Utterance is not resolved — and no new Talk Key
+hold is accepted — until the Insertion completes and the worker reports `.inserted`. One
+Utterance resolves fully before the next begins.
+
+## Consequences
+
+- **The ~400 ms re-hold window is dropped.** A Talk Key hold landing within the paste
+  tail of the previous Utterance is ignored (logged), perceptible only on very rapid
+  back-to-back dictation.
+- **`hideIfFinal` collapses to a plain `hide()`.** Nothing can repaint the pill during
+  `.inserting`, so the "only if still Final" guard is unnecessary.
+- **`busy` / `hold_active` / `insert_pending` disappear**, replaced by the single `phase`
+  enum under the Coordinator's mutex (`busy` ≡ `phase != .idle`).
+- **`.inserting` carries no deadline.** Insertion is bounded (local `usleep`s, no
+  network), so a wedge is unlikely; unlike `.awaiting_final` there is no timer catching a
+  stuck paste. Revisit if a hang is ever observed.
+
+A future architecture review should not "restore" the #19 overlap without re-reading this
+record: the overlap was reconsidered here and traded away on purpose for a single-source-
+of-truth state machine.

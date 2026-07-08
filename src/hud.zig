@@ -328,6 +328,19 @@ pub const Hud = struct {
         self.dirty = true;
     }
 
+    /// Take the pill down. Called at the end of an Utterance (inserted, abandoned, empty,
+    /// timed out). Since the Utterance lifecycle is fully serialized (ADR-0001) — no new
+    /// `.recording` pill can exist until the current Insertion resolves — this is an
+    /// unconditional hide; it needs no "only if still Final" guard. No-op when inactive.
+    pub fn hide(self: *Hud) void {
+        if (!self.active) return;
+        os_unfair_lock_lock(&self.mu);
+        defer os_unfair_lock_unlock(&self.mu);
+        self.pending_state = .hidden;
+        self.len = 0;
+        self.dirty = true;
+    }
+
     /// Reflect the published state into the panel. Main thread only (the render pump). An
     /// autorelease pool keeps the per-tick NSString/NSColor churn from piling up.
     fn render(self: *Hud) void {
