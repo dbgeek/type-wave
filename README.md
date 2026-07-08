@@ -96,6 +96,10 @@ nix develop --command zig build install-agent
 ~/.local/bin/type-wave --set-key
 ```
 
+Plain builds in this repo default to Zig's `ReleaseFast` optimization mode, so
+`zig build install-agent` installs a speed-optimized binary without needing
+`-Doptimize=ReleaseFast`.
+
 This requires a one-time self-signed `type-wave dev` code-signing certificate and a
 `launchctl bootstrap` to start it. The full procedure — creating the identity, loading /
 unloading, granting permissions, and verifying grant persistence across a rebuild — is in
@@ -111,6 +115,15 @@ daemon prompt-free reads across rebuilds (`src/keychain.zig` has the full story)
 nix develop --command zig build            # build the daemon → zig-out/bin/type-wave
 nix develop --command zig build test       # Coordinator lifecycle matrix + pure-function tests
 nix develop --command zig build capture-check   # live Capture start/stop regression probe (real mic IO)
+```
+
+Build optimization defaults to `ReleaseFast` for the daemon, tests, and local probes.
+Override it explicitly when you need a different tradeoff:
+
+```sh
+nix develop --command zig build -Doptimize=Debug       # development checks + easier debugging
+nix develop --command zig build -Doptimize=ReleaseSafe # optimized, with runtime safety checks
+nix develop --command zig build -Doptimize=ReleaseSmall # optimized for binary size
 ```
 
 ### Architecture

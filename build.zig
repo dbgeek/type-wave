@@ -2,7 +2,17 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // This project installs a long-running local agent; default plain builds to
+    // the production mode we install, while still allowing `-Doptimize=Debug`.
+    const optimize: std.builtin.OptimizeMode = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size",
+    ) orelse switch (b.graph.release_mode) {
+        .off, .any, .fast => .ReleaseFast,
+        .safe => .ReleaseSafe,
+        .small => .ReleaseSmall,
+    };
 
     const ws = b.dependency("websocket", .{ .target = target, .optimize = optimize });
 
