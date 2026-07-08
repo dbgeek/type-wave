@@ -1,0 +1,18 @@
+.{
+    .name = .type_wave,
+    .version = "0.0.0",
+    .fingerprint = 0xd0b68818c78be1d,
+    // Floor guard (docs/toolchain.md): fail loudly if built with a Zig older than
+    // the flake-locked nightly. NOT a ceiling — forward drift is caught by flake.lock.
+    .minimum_zig_version = "0.17.0-dev.1267+300116b02",
+    .dependencies = .{
+        // Vendored at commit 2283d22 with the §3.5 TLS-read fix applied (docs/toolchain.md).
+        .websocket = .{ .path = "vendor/websocket.zig" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "vendor",
+    },
+}

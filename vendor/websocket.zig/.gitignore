@@ -1,0 +1,5 @@
+zig-out/
+.zig-cache/
+support/autobahn/client/reports/
+support/autobahn/server/reports/
+zig-pkg/
