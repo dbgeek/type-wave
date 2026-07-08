@@ -93,15 +93,13 @@ prompts (and the entries in **System Settings → Privacy & Security**) are attr
 - **Microphone** — Capture (prompted on the first Utterance, with the Info.plist
   rationale).
 
-> **`OPENAI_API_KEY` caveat (until [config loading, #16](https://github.com/dbgeek/type-wave/issues/16)).**
-> A launchd process has no shell environment, so the current skeleton — which reads
-> `OPENAI_API_KEY` from the environment — logs a missing-key error and exits before it can
-> reach the Microphone prompt. #16 makes the daemon read the key from
-> `~/.config/type-wave/env` directly, at which point a headless run is fully functional.
-> Input Monitoring and PostEvent are still requested and grantable now; the full
-> three-grant persistence check is cleanest to run **after #16**. (To test today, you may
-> temporarily add an `EnvironmentVariables` dict with the key to the installed plist —
-> remove it once #16 lands; don't commit the secret anywhere.)
+> **`OPENAI_API_KEY`.** A launchd process has no shell environment, so the daemon reads the
+> key from `~/.config/type-wave/env` directly ([config loading, #16](https://github.com/dbgeek/type-wave/issues/16))
+> — the rendered plist sets `HOME` so it can find that path. **No plist `EnvironmentVariables`
+> secret hack is needed** (that workaround was only for the pre-#16 skeleton); keep the key
+> solely in `~/.config/type-wave/env` (`chmod 600`), never in a committed plist. A missing
+> key is the one hard stop — the daemon logs `error.NoApiKey` and exits — so make sure that
+> file exists before you load the agent.
 
 ## Verify grant persistence across a rebuild (the point of #15)
 

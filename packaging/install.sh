@@ -89,7 +89,7 @@ Next steps:
   • Grant the three permissions on first run, then verify persistence across a rebuild
     per docs/packaging.md.
 
-Note: until config loading (#16) lands, a headless run can't read OPENAI_API_KEY (launchd
-has no shell env), so the daemon will log a missing-key error and exit. That is expected —
-#15 delivers the signed identity + packaging; #16 makes the headless run functional.
+Note: the daemon reads OPENAI_API_KEY from ~/.config/type-wave/env (config loading #16; the
+rendered plist sets HOME so it can find it). Create that file (chmod 600) before loading, or
+the daemon logs error.NoApiKey and exits.
 EOF
