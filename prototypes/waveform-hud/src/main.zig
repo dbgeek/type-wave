@@ -349,10 +349,14 @@ fn handle(ch: u8) void {
             }
             s.look_dirty = true;
         },
-        'd' => s.variant = switch (s.variant) {
-            .wave => .dots,
-            .dots => .breathe,
-            .breathe => .wave,
+        // Variants only differ while processing — jump there so the change is visible.
+        'd' => {
+            s.variant = switch (s.variant) {
+                .wave => .dots,
+                .dots => .breathe,
+                .breathe => .wave,
+            };
+            s.mode = .processing;
         },
         'f' => s.pump_hz = if (s.pump_hz == 20) 30 else if (s.pump_hz == 30) 60 else 20,
         'a' => s.implicit = !s.implicit,

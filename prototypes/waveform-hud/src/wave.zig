@@ -113,8 +113,9 @@ pub const Scheme = enum {
 pub const AnimVariant = enum { wave, dots, breathe };
 
 pub const Look = struct {
-    pill_w: f64 = 250,
-    pill_h: f64 = 38,
+    // HITL round 2: 420x60 beat the smaller sizes; transparent + fine bars stay.
+    pill_w: f64 = 420,
+    pill_h: f64 = 60,
     bar_w: f64 = 3,
     bar_gap: f64 = 2,
     scheme: Scheme = .transparent_tinted_bars,
@@ -302,7 +303,7 @@ pub const Pill = struct {
                 .dots => {
                     for (self.dots, 0..) |dot, j| {
                         const fj: f64 = @floatFromInt(j);
-                        const bounce = 8.0 * @sin(t * 5.0 + fj * 0.8);
+                        const bounce = 11.0 * @sin(t * 5.0 + fj * 0.8);
                         const dots_w = 3 * dot_size + 2 * dot_gap;
                         msgRect(dot, "setFrame:", .{
                             .x = (look.pill_w - dots_w) / 2.0 + fj * (dot_size + dot_gap),
@@ -318,7 +319,8 @@ pub const Pill = struct {
                         const lv: f64 = @floatCast(self.levels[max_bars - self.nbars + i]);
                         self.setBarHeight(i, x0, min_bar_h + lv * (max_h - min_bar_h));
                     }
-                    msgFloat(self.layer, "setOpacity:", @floatCast(0.72 + 0.24 * @sin(t * 3.0)));
+                    // Wide swing (0.30..0.95) — the subtle version read as "no animation".
+                    msgFloat(self.layer, "setOpacity:", @floatCast(0.625 + 0.325 * @sin(t * 3.0)));
                 },
             },
         }
