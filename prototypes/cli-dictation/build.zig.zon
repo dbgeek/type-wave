@@ -1,0 +1,16 @@
+.{
+    .name = .cli_dictation,
+    .version = "0.0.0",
+    .fingerprint = 0x593374dab792ba58,
+    .minimum_zig_version = "0.17.0-dev.1267+300116b02",
+    .dependencies = .{
+        // Vendored at commit 2283d22 with the §3.5 TLS-read fix applied.
+        .websocket = .{ .path = "vendor/websocket.zig" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "vendor",
+    },
+}
