@@ -88,12 +88,22 @@ pub const TranscriptObserver = struct {
 
 /// The transcription knobs that vary by config (wayfinder #16), fed to the
 /// session.update built at connect time. Defaults reproduce the exact string proven
-/// live in #8. `noise_reduction` is null when disabled (emits JSON `null`).
+/// live in #8. `noise_reduction` is null when disabled (emits JSON `null`);
+/// `language` empty means auto-detect (the field is omitted from the JSON).
 pub const TranscriptionParams = struct {
     model: []const u8 = "gpt-realtime-whisper",
     language: []const u8 = "en",
     delay: []const u8 = "low",
     noise_reduction: ?[]const u8 = "near_field",
+};
+
+/// Where the Session gets its TranscriptionParams — re-invoked at EVERY connect attempt
+/// (first connect and each reconnect alike), so a live settings change (wayfinder #32)
+/// binds simply by cycling the link. The daemon backs this with the current Settings
+/// snapshot; the returned slices must outlive the Session (snapshots leak by design).
+pub const ParamsProvider = struct {
+    ctx: ?*anyopaque,
+    get: *const fn (ctx: ?*anyopaque) TranscriptionParams,
 };
 
 /// Manual-commit transcription config (crib sheet §2). turn_detection:null is
@@ -106,7 +116,12 @@ pub fn formatSessionUpdate(buf: []u8, params: TranscriptionParams) ![]const u8 {
         try std.fmt.bufPrint(&nr_buf, "{{\"type\":\"{s}\"}}", .{t})
     else
         "null";
-    return std.fmt.bufPrint(buf, "{{\"type\":\"session.update\",\"session\":{{\"type\":\"transcription\",\"audio\":{{\"input\":{{\"format\":{{\"type\":\"audio/pcm\",\"rate\":24000}},\"transcription\":{{\"model\":\"{s}\",\"language\":\"{s}\",\"delay\":\"{s}\"}},\"turn_detection\":null,\"noise_reduction\":{s}}}}}}}}}", .{ params.model, params.language, params.delay, nr });
+    var lang_buf: [160]u8 = undefined;
+    const lang = if (params.language.len == 0)
+        "" // auto-detect: omit the field entirely (wayfinder #34's Language preset)
+    else
+        try std.fmt.bufPrint(&lang_buf, "\"language\":\"{s}\",", .{params.language});
+    return std.fmt.bufPrint(buf, "{{\"type\":\"session.update\",\"session\":{{\"type\":\"transcription\",\"audio\":{{\"input\":{{\"format\":{{\"type\":\"audio/pcm\",\"rate\":24000}},\"transcription\":{{\"model\":\"{s}\",{s}\"delay\":\"{s}\"}},\"turn_detection\":null,\"noise_reduction\":{s}}}}}}}}}", .{ params.model, lang, params.delay, nr });
 }
 
 const timeval = extern struct { sec: i64, usec: i32 };
@@ -136,10 +151,11 @@ pub const Session = struct {
     alloc: std.mem.Allocator,
     client: websocket.Client,
 
-    /// Retained so the maintenance thread can rebuild the connection on reconnect. Both
-    /// borrow the process-lifetime Config (wayfinder #16), so they outlive the session.
+    /// Retained so the maintenance thread can rebuild the connection on reconnect. The
+    /// key borrows a process-lifetime allocation (wayfinder #16); the provider re-reads
+    /// the current Settings snapshot at every connect (wayfinder #32).
     api_key: []const u8,
-    params: TranscriptionParams,
+    params_provider: ParamsProvider,
 
     /// Optional live-transcript subscriber (the overlay HUD, wayfinder #22). Set once at
     /// connect, before the read loop starts, so it is never installed mid-stream. Read
@@ -194,6 +210,13 @@ pub const Session = struct {
     /// close-frame drain). The maintenance/shutdown thread waits on this before joining.
     read_ended: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// A session-shaped setting (model/language/delay/noise_reduction) changed in the
+    /// live snapshot (wayfinder #32). Set by the menu via `markParamsDirty`; the
+    /// maintenance loop — already the sole reconnect owner, already idle-only — cycles
+    /// the session at its next idle tick, and `openClient` re-reads the snapshot. An
+    /// in-flight Utterance always completes on the old params.
+    params_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     /// Utterance start, for relative event timestamps. Set by beginUtterance.
     t0_ms: i64 = 0,
 
@@ -207,7 +230,8 @@ pub const Session = struct {
     final: [8192]u8 = undefined,
     final_len: usize = 0,
 
-    /// The config-built session.update, formatted once at connect (wayfinder #16) and
+    /// The config-built session.update, re-formatted from the live snapshot at every
+    /// connect attempt (openClient, before the read loop starts — wayfinder #32) and
     /// replayed on every `session.created` (the read-loop thread sends it).
     su_buf: [2048]u8 = undefined,
     su_len: usize = 0,
@@ -231,7 +255,7 @@ pub const Session = struct {
     out_overflow: bool = false, // ring-full already logged for this Utterance
     out_mu: std.Io.Mutex = .init,
 
-    pub fn connect(io: std.Io, alloc: std.mem.Allocator, api_key: []const u8, params: TranscriptionParams, observer: ?TranscriptObserver) !*Session {
+    pub fn connect(io: std.Io, alloc: std.mem.Allocator, api_key: []const u8, params_provider: ParamsProvider, observer: ?TranscriptObserver) !*Session {
         const self = try alloc.create(Session);
         errdefer alloc.destroy(self);
         const out = try alloc.alloc(OutRecord, out_slot_count);
@@ -242,11 +266,10 @@ pub const Session = struct {
             .alloc = alloc,
             .client = undefined, // openClient establishes it
             .api_key = api_key,
-            .params = params,
+            .params_provider = params_provider,
             .observer = observer, // set before openClient starts the read loop — never mid-stream
             .out = out,
         };
-        self.su_len = (try formatSessionUpdate(&self.su_buf, params)).len;
         self.handler = .{ .session = self };
 
         try self.openClient(); // first connection: init + handshake + start read loop
@@ -269,6 +292,15 @@ pub const Session = struct {
     /// on any failure `self.client` is deinited and the error propagates for the caller
     /// (connect / the reconnect loop) to handle.
     fn openClient(self: *Session) !void {
+        // Re-read the live Settings snapshot and rebuild the session.update NOW — every
+        // connect (first and reconnect alike) speaks the freshest params (wayfinder #32).
+        // Clear the dirty flag first: a change landing after the clear is still picked up
+        // by this very read (the provider loads the current snapshot), and the stale flag
+        // then costs at most one redundant idle cycle later.
+        self.params_dirty.store(false, .release);
+        const params = self.params_provider.get(self.params_provider.ctx);
+        self.su_len = (try formatSessionUpdate(&self.su_buf, params)).len;
+
         self.client = try websocket.Client.init(self.io, self.alloc, .{
             .host = host,
             .port = 443,
@@ -325,6 +357,13 @@ pub const Session = struct {
     /// on Talk Key release to abandon a would-be-truncated Utterance (wayfinder #19).
     pub fn isPoisoned(self: *Session) bool {
         return self.poisoned.load(.acquire);
+    }
+
+    /// A session-shaped setting changed (wayfinder #32) — request an idle cycle so the
+    /// next connect re-reads the snapshot. Safe from any thread; never disturbs an
+    /// in-flight Utterance (the maintenance loop's existing idle gate).
+    pub fn markParamsDirty(self: *Session) void {
+        self.params_dirty.store(true, .release);
     }
 
     // ---- writes (all funnel through write_mu + the link_open guard) --------------
@@ -516,6 +555,14 @@ pub const Session = struct {
                 .ready => {},
             }
             if (self.active.load(.acquire)) continue; // never disturb an in-flight Utterance
+
+            // Live-apply (wayfinder #32): a session-shaped setting changed — cycle now,
+            // while idle; openClient re-reads the snapshot into the session.update.
+            if (self.params_dirty.load(.acquire)) {
+                feedback.log("  session: transcription settings changed — cycling the session\n", .{});
+                self.reconnect();
+                continue;
+            }
 
             const now = nowMs();
             if (self.read_ended.load(.acquire)) {
@@ -807,6 +854,13 @@ test "formatSessionUpdate defaults reproduce the #8-proven string" {
         "{\"type\":\"session.update\",\"session\":{\"type\":\"transcription\",\"audio\":{\"input\":{\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},\"transcription\":{\"model\":\"gpt-realtime-whisper\",\"language\":\"en\",\"delay\":\"low\"},\"turn_detection\":null,\"noise_reduction\":{\"type\":\"near_field\"}}}}}",
         out,
     );
+}
+
+test "formatSessionUpdate omits language entirely for auto-detect (empty string)" {
+    var buf: [2048]u8 = undefined;
+    const out = try formatSessionUpdate(&buf, .{ .language = "" });
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"language\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"model\":\"gpt-realtime-whisper\",\"delay\":\"low\"") != null);
 }
 
 test "formatSessionUpdate emits JSON null when noise reduction is disabled" {

@@ -17,11 +17,20 @@
 //! daemon from starting. A missing secret never stops startup either: the daemon's
 //! self-heal supervisor polls `loadApiKeyOnly` until a key appears.
 //!
-//! Lifetime: settings are a load-once, process-lifetime singleton. Backing allocations
-//! are intentionally never freed — and `std.zon.parse.free` must NOT be called on the
-//! parsed `Settings`: fields omitted from the file keep their struct-default value,
-//! which points at a static string literal, and `free` would fault trying to release
-//! it (verified against this Zig nightly).
+//! Lifetime: settings are load-and-leak, published as **immutable snapshots** through
+//! `Store` (wayfinder #32/#34): the menu — the sole writer, on the main thread — builds
+//! a complete fresh `Settings` per change and atomically swaps the pointer; every reader
+//! acquire-loads once and reads fields off its coherent snapshot. Old snapshots are
+//! intentionally never freed — and `std.zon.parse.free` must NOT be called on a parsed
+//! `Settings`: fields omitted from the file keep their struct-default value, which
+//! points at a static string literal, and `free` would fault trying to release it
+//! (verified against this Zig nightly). That leak is also what makes a stale snapshot
+//! held across a menu change (e.g. a Session keeping the old `model` pointer) safe.
+//!
+//! This module also owns the `config.zon` **write** path (wayfinder #32): a targeted
+//! single-field textual patch that preserves comments and hand-formatting byte-for-byte,
+//! with a full re-serialize only when the file is absent or malformed; both write
+//! atomically (temp file + rename).
 
 const std = @import("std");
 const tap = @import("tap.zig");
@@ -215,6 +224,222 @@ fn parseEnvKey(text: []const u8) ?[]const u8 {
     return result;
 }
 
+// ============================================================================
+// Live settings (wayfinder #32/#34): the snapshot store, the change diff, and
+// the config.zon write path.
+// ============================================================================
+
+/// The immutable-snapshot pointer swap. One instance lives on the Daemon; the menu is
+/// the only writer (main thread), every other thread reads via `current`. Snapshots
+/// leak by design (see the module doc), so a reader may hold one indefinitely.
+pub const Store = struct {
+    ptr: std.atomic.Value(usize),
+
+    pub fn init(first: *const Settings) Store {
+        return .{ .ptr = std.atomic.Value(usize).init(@intFromPtr(first)) };
+    }
+    pub fn current(self: *Store) *const Settings {
+        return @ptrFromInt(self.ptr.load(.acquire));
+    }
+    pub fn swap(self: *Store, next: *const Settings) void {
+        self.ptr.store(@intFromPtr(next), .release);
+    }
+};
+
+/// What changed between two snapshots — drives what the swap must trigger: a
+/// session-shaped change marks the Transcription Session dirty (idle reconnect), an
+/// overlay change flips the HUD. Simple fields need nothing (read-at-use).
+pub const Diff = struct {
+    any: bool = false,
+    session_shaped: bool = false, // model / language / delay / noise_reduction
+    overlay: bool = false,
+};
+
+pub fn diffSettings(a: *const Settings, b: *const Settings) Diff {
+    var d: Diff = .{};
+    if (a.talk_key != b.talk_key) d.any = true;
+    if (a.insertion != b.insertion) d.any = true;
+    if (!std.mem.eql(u8, a.model, b.model)) d.session_shaped = true;
+    if (!std.mem.eql(u8, a.language, b.language)) d.session_shaped = true;
+    if (!std.mem.eql(u8, a.delay, b.delay)) d.session_shaped = true;
+    if (a.noise_reduction != b.noise_reduction) d.session_shaped = true;
+    if (a.overlay != b.overlay) d.overlay = true;
+    if (d.session_shaped or d.overlay) d.any = true;
+    return d;
+}
+
+/// Write one field into `config.zon` (wayfinder #32): read the file fresh (so a menu
+/// write never clobbers a hand-edit elsewhere in it), patch just that field's value
+/// textually, validate the result parses, and rename it into place. An absent or
+/// malformed file — or a patch that somehow fails to validate — falls back to a full
+/// re-serialize of `current` (which the caller has already updated with the new value).
+/// Best-effort: failures are logged and the in-memory snapshot stays authoritative.
+pub fn writeField(io: std.Io, gpa: std.mem.Allocator, field: []const u8, value: []const u8, current: Settings) bool {
+    const home = homeDir() orelse return false;
+    var path_buf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ home, config_rel }) catch return false;
+
+    var text: ?[:0]const u8 = null;
+    if (std.Io.Dir.cwd().readFileAllocOptions(io, path, gpa, .limited(max_file), .of(u8), 0)) |src| {
+        if (patchZonField(gpa, src, field, value)) |patched| {
+            if (zonValid(gpa, patched)) text = patched;
+        }
+    } else |_| {}
+    if (text == null) {
+        const full = serializeSettings(gpa, current) orelse return false;
+        if (!zonValid(gpa, full)) {
+            std.debug.print("config: refusing to write {s} — serialized settings did not validate\n", .{path});
+            return false;
+        }
+        text = full;
+    }
+    if (!atomicWrite(io, path, text.?)) {
+        std.debug.print("config: could not write {s} — the change applies live but is not persisted\n", .{path});
+        return false;
+    }
+    return true;
+}
+
+/// Make sure `config.zon` exists (serializing the current snapshot if not) and return
+/// its path in `buf` — the menu's "Open config file" needs a file to open on a
+/// defaults-only install.
+pub fn ensureConfigFile(io: std.Io, gpa: std.mem.Allocator, current: Settings, buf: []u8) ?[]const u8 {
+    const home = homeDir() orelse return null;
+    const path = std.fmt.bufPrint(buf, "{s}/{s}", .{ home, config_rel }) catch return null;
+    if (std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_file))) |_| {
+        return path;
+    } else |_| {}
+    const full = serializeSettings(gpa, current) orelse return null;
+    if (!atomicWrite(io, path, full)) return null;
+    return path;
+}
+
+const FieldSpan = struct { start: usize, end: usize };
+
+/// Locate the value span of a top-level `.field = <value>` line. Comment lines are
+/// skipped (the example file's header mentions field names in comments); a quoted value
+/// ends at its closing quote (so a string holding a comma stays intact), anything else
+/// ends before the `,` / a trailing `//` comment / end of line. The schema is a flat
+/// struct of scalars, so line-granularity is the whole grammar this needs.
+fn findZonField(src: []const u8, field: []const u8) ?FieldSpan {
+    var offset: usize = 0;
+    var it = std.mem.splitScalar(u8, src, '\n');
+    while (it.next()) |line| {
+        defer offset += line.len + 1;
+        const t = std.mem.trimStart(u8, line, " \t");
+        if (t.len < 2 or t[0] != '.') continue; // blank, comment, brace, …
+        const rest = t[1..];
+        if (!std.mem.startsWith(u8, rest, field)) continue;
+        const after = std.mem.trimStart(u8, rest[field.len..], " \t");
+        if (after.len == 0 or after[0] != '=') continue; // a longer field name that merely prefixes ours
+
+        const line_end = offset + line.len;
+        // absolute index just past '='
+        var vstart = line_end - after.len + 1;
+        while (vstart < line_end and (src[vstart] == ' ' or src[vstart] == '\t')) vstart += 1;
+        if (vstart >= line_end) return null; // value on the next line — not our flat schema
+        var vend = vstart;
+        if (src[vstart] == '"') {
+            vend += 1;
+            while (vend < line_end) : (vend += 1) {
+                if (src[vend] == '\\') {
+                    vend += 1;
+                    continue;
+                }
+                if (src[vend] == '"') {
+                    vend += 1;
+                    break;
+                }
+            }
+        } else {
+            while (vend < line_end) : (vend += 1) {
+                const c = src[vend];
+                if (c == ',') break;
+                if (c == '/' and vend + 1 < line_end and src[vend + 1] == '/') break;
+            }
+            while (vend > vstart and (src[vend - 1] == ' ' or src[vend - 1] == '\t')) vend -= 1;
+        }
+        if (vend <= vstart) return null;
+        return .{ .start = vstart, .end = vend };
+    }
+    return null;
+}
+
+/// Rewrite `.field`'s value to `value` in `src`, inserting `    .field = value,` before
+/// the closing `}` when the field is absent. Everything else — comments, ordering,
+/// hand-formatting — passes through byte-for-byte. Null when `src` has no top-level
+/// struct to patch (the caller then falls back to a full re-serialize).
+fn patchZonField(gpa: std.mem.Allocator, src: []const u8, field: []const u8, value: []const u8) ?[:0]u8 {
+    if (findZonField(src, field)) |span| {
+        const out = gpa.allocSentinel(u8, src.len - (span.end - span.start) + value.len, 0) catch return null;
+        @memcpy(out[0..span.start], src[0..span.start]);
+        @memcpy(out[span.start..][0..value.len], value);
+        @memcpy(out[span.start + value.len ..], src[span.end..]);
+        return out;
+    }
+    // Field absent: insert a fresh line before the line holding the final '}'.
+    const close = std.mem.lastIndexOfScalar(u8, src, '}') orelse return null;
+    const line_start = if (std.mem.lastIndexOfScalar(u8, src[0..close], '\n')) |nl| nl + 1 else 0;
+    var line_buf: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "    .{s} = {s},\n", .{ field, value }) catch return null;
+    const out = gpa.allocSentinel(u8, src.len + line.len, 0) catch return null;
+    @memcpy(out[0..line_start], src[0..line_start]);
+    @memcpy(out[line_start..][0..line.len], line);
+    @memcpy(out[line_start + line.len ..], src[line_start..]);
+    return out;
+}
+
+/// The full-file fallback: every field from `s`, under a generated header naming the
+/// accepted values (the file may be the user's first sight of the schema).
+fn serializeSettings(gpa: std.mem.Allocator, s: Settings) ?[:0]u8 {
+    var buf: [4096]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf,
+        \\// type-wave settings. Hand-edit freely — the menu bar rewrites single fields in
+        \\// place and picks hand-edits up when the menu opens (or on restart). This full
+        \\// version was generated because the file was absent or malformed.
+        \\//
+        \\//   .talk_key        = .right_option | .left_option | .globe
+        \\//   .model           = "<transcription model>"
+        \\//   .language        = "<ISO code>"  ("" = auto-detect)
+        \\//   .delay           = "low" | "medium" | "high"
+        \\//   .noise_reduction = .near_field | .far_field | .off
+        \\//   .insertion       = .paste | .keystroke
+        \\//   .overlay         = true | false
+        \\.{{
+        \\    .talk_key = .{s},
+        \\    .model = "{s}",
+        \\    .language = "{s}",
+        \\    .delay = "{s}",
+        \\    .noise_reduction = .{s},
+        \\    .insertion = .{s},
+        \\    .overlay = {},
+        \\}}
+        \\
+    , .{
+        @tagName(s.talk_key), s.model, s.language, s.delay,
+        @tagName(s.noise_reduction), @tagName(s.insertion), s.overlay,
+    }) catch return null;
+    return gpa.dupeSentinel(u8, text, 0) catch null;
+}
+
+/// Does this text parse back into `Settings`? The guard that keeps a bad patch (or a
+/// pathological string value) from ever landing in the file.
+fn zonValid(gpa: std.mem.Allocator, text: [:0]const u8) bool {
+    var diag: std.zon.parse.Diagnostics = .{};
+    _ = std.zon.parse.fromSliceAlloc(Settings, gpa, text, &diag, .{}) catch return false;
+    return true;
+}
+
+/// Temp-file-then-rename in the same directory. Single writer (the main thread), so
+/// the fixed temp name cannot race itself.
+fn atomicWrite(io: std.Io, path: []const u8, data: []const u8) bool {
+    var tmp_buf: [4096 + 8]u8 = undefined;
+    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path}) catch return false;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = data }) catch return false;
+    std.Io.Dir.rename(.cwd(), tmp, .cwd(), path, io) catch return false;
+    return true;
+}
+
 // ---- tests (backfilled with the coordinator work, 2026-07-08) ----------------
 
 test "parseEnvKey reads a bare assignment" {
@@ -243,4 +468,105 @@ test "parseEnvKey: last assignment wins, blanks and comments ignored" {
 test "parseEnvKey ignores a near-miss key and an absent key" {
     try std.testing.expect(parseEnvKey("OPENAI_API_KEY_OTHER=nope") == null);
     try std.testing.expect(parseEnvKey("# nothing here\nFOO=bar") == null);
+}
+
+// ---- config.zon patcher tests (wayfinder #34) ---------------------------------
+
+const talloc = std.testing.allocator;
+
+fn expectPatch(src: []const u8, field: []const u8, value: []const u8, want: []const u8) !void {
+    const got = patchZonField(talloc, src, field, value) orelse return error.PatchReturnedNull;
+    defer talloc.free(got);
+    try std.testing.expectEqualStrings(want, got);
+}
+
+test "patchZonField rewrites an enum value in place" {
+    try expectPatch(
+        ".{\n    .talk_key = .right_option,\n    .overlay = true,\n}\n",
+        "talk_key",
+        ".left_option",
+        ".{\n    .talk_key = .left_option,\n    .overlay = true,\n}\n",
+    );
+}
+
+test "patchZonField preserves comments — including ones naming other fields" {
+    const src =
+        \\// header: set .model = "gpt-4o-mini-transcribe" to A/B (comment must survive)
+        \\.{
+        \\    // which held key starts an Utterance
+        \\    .talk_key = .right_option, // trailing note
+        \\    .model = "gpt-realtime-whisper",
+        \\}
+        \\
+    ;
+    const want =
+        \\// header: set .model = "gpt-4o-mini-transcribe" to A/B (comment must survive)
+        \\.{
+        \\    // which held key starts an Utterance
+        \\    .talk_key = .right_option, // trailing note
+        \\    .model = "gpt-4o-mini-transcribe",
+        \\}
+        \\
+    ;
+    try expectPatch(src, "model", "\"gpt-4o-mini-transcribe\"", want);
+}
+
+test "patchZonField handles a quoted value containing a comma" {
+    try expectPatch(
+        ".{\n    .language = \"en,sv\",\n}\n",
+        "language",
+        "\"en\"",
+        ".{\n    .language = \"en\",\n}\n",
+    );
+}
+
+test "patchZonField inserts an absent field before the closing brace" {
+    try expectPatch(
+        ".{\n    .talk_key = .right_option,\n}\n",
+        "overlay",
+        "false",
+        ".{\n    .talk_key = .right_option,\n    .overlay = false,\n}\n",
+    );
+}
+
+test "patchZonField does not confuse a longer field name for a prefix" {
+    // patching "delay" must not touch a hypothetical ".delay_extra"
+    try expectPatch(
+        ".{\n    .delay_extra = \"x\",\n    .delay = \"low\",\n}\n",
+        "delay",
+        "\"high\"",
+        ".{\n    .delay_extra = \"x\",\n    .delay = \"high\",\n}\n",
+    );
+}
+
+test "serializeSettings round-trips through the ZON parser" {
+    const s = Settings{ .talk_key = .left_option, .language = "", .delay = "high", .overlay = false };
+    const text = serializeSettings(talloc, s) orelse return error.SerializeFailed;
+    defer talloc.free(text);
+    var diag: std.zon.parse.Diagnostics = .{};
+    defer diag.deinit(talloc);
+    const parsed = try std.zon.parse.fromSliceAlloc(Settings, talloc, text, &diag, .{});
+    // free the parsed strings (all fields present in the file, so no static defaults)
+    defer std.zon.parse.free(talloc, parsed);
+    try std.testing.expectEqual(Settings.NoiseReduction.near_field, parsed.noise_reduction);
+    try std.testing.expectEqual(tap.TalkKey.left_option, parsed.talk_key);
+    try std.testing.expectEqualStrings("", parsed.language);
+    try std.testing.expect(!parsed.overlay);
+}
+
+test "diffSettings flags session-shaped and overlay changes" {
+    const base = Settings{};
+    var b = base;
+    try std.testing.expect(!diffSettings(&base, &b).any);
+    b.language = "sv";
+    var d = diffSettings(&base, &b);
+    try std.testing.expect(d.any and d.session_shaped and !d.overlay);
+    b = base;
+    b.overlay = false;
+    d = diffSettings(&base, &b);
+    try std.testing.expect(d.any and !d.session_shaped and d.overlay);
+    b = base;
+    b.talk_key = .globe;
+    d = diffSettings(&base, &b);
+    try std.testing.expect(d.any and !d.session_shaped and !d.overlay);
 }

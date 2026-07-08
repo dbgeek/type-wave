@@ -22,29 +22,32 @@ pub const Surface = struct {
     hud: *hud.Hud,
 
     /// Utterance began, Capture is up. The pill (scrolling red waveform, fed levels by
-    /// Capture's on_level) supersedes the start chime when the overlay is on.
+    /// Capture's on_level) supersedes the start chime when the overlay is on — `isOn`
+    /// consults the live Overlay toggle (#34), so a menu-disabled pill falls back to
+    /// the chime like an overlay=false start.
     pub fn listening(self: *Surface) void {
-        if (self.hud.active) self.hud.publish(.recording) else self.cues.start();
+        if (self.hud.isOn()) self.hud.publish(.recording) else self.cues.start();
     }
 
     /// Talk Key released, Capture stopped, transcript pending. The pill flips to the green
     /// processing dots — held over the whole resolution (final, Insertion) — superseding
     /// the stop chime, same rule as `listening`.
     pub fn released(self: *Surface) void {
-        if (self.hud.active) self.hud.publish(.processing) else self.cues.stop();
+        if (self.hud.isOn()) self.hud.publish(.processing) else self.cues.stop();
     }
 
     /// Insertion succeeded. Take the pill down; success is silent (the text landing is the
-    /// signal).
+    /// signal). `hide` (not `isOn`-gated): a pill left up by a mid-Utterance disable
+    /// still comes down.
     pub fn inserted(self: *Surface) void {
-        if (self.hud.active) self.hud.hide();
+        self.hud.hide();
     }
 
     /// This Utterance produced no Insertion (no session, no audio, poison, empty/failed
     /// transcript, deadline, or a failed insert). Take the pill down and sound the error
     /// cue — always audible, even under the pill.
     pub fn abandoned(self: *Surface) void {
-        if (self.hud.active) self.hud.hide();
+        self.hud.hide();
         self.cues.err();
     }
 };

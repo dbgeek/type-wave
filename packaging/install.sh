@@ -89,7 +89,12 @@ Next steps:
   • Grant the three permissions on first run, then verify persistence across a rebuild
     per docs/packaging.md.
 
-Note: the daemon reads OPENAI_API_KEY from ~/.config/type-wave/env (config loading #16; the
-rendered plist sets HOME so it can find it). Create that file (chmod 600) before loading, or
-the daemon logs error.NoApiKey and exits.
+Note: the OpenAI API key lives in the login keychain (#33). Set it either from the
+daemon's menu-bar icon (Set API Key…) once it is running, or right now via:
+      $install_bin --set-key
+Run --set-key through THIS installed signed binary — the keychain item's ACL keys to its
+creator, so only then does the daemon read it prompt-free. A key still in the legacy
+~/.config/type-wave/env file is auto-migrated into the keychain on first run. The daemon
+starts fine without a key: the menu-bar icon dims and the status line reads
+"No API key" until one appears.
 EOF

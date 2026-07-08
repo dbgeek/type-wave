@@ -1,5 +1,6 @@
-//! daemon.zig — the headless type-wave daemon (wayfinder #19; lifecycle lifted into the
-//! Utterance Coordinator by the 2026-07-08 architecture review, candidate 1).
+//! daemon.zig — the type-wave daemon (wayfinder #19; lifecycle lifted into the
+//! Utterance Coordinator by the 2026-07-08 architecture review, candidate 1; menu-bar
+//! Status Item + live settings grown by #34).
 //!
 //! The capstone that turns the proven modules into a real daily-driver background daemon:
 //! hold the Talk Key → CoreAudio Capture streams to the warm OpenAI Transcription Session →
@@ -30,10 +31,12 @@
 //! 2. **Link state** (owned by session.zig): connecting / ready / reconnecting / closed.
 //!
 //! # Threads
-//!   - main / run-loop  : installs the tap + the overlay HUD render pump, then blocks in
-//!                        CFRunLoopRun. The tap callback trampolines press/release into the
-//!                        Coordinator (kept fast — a slow tap callback makes the OS disable
-//!                        the tap). All AppKit happens here.
+//!   - main / run-loop  : installs the tap, the overlay HUD render pump, and the menu-bar
+//!                        status item (#34), then blocks in [NSApp run] (appkit.zig — the
+//!                        #31 swap; plain CFRunLoopRun when headless). The tap callback
+//!                        trampolines press/release into the Coordinator (kept fast — a
+//!                        slow tap callback makes the OS disable the tap). All AppKit
+//!                        happens here, menu actions included.
 //!   - insert worker    : the InsertionAdapter — drains one insert job, performs the slow
 //!                        Insertion off the Coordinator's mutex, then reports `.inserted`.
 //!   - deadline timer   : the DeadlineAdapter — fires `.deadline` if a Final Transcript does
@@ -56,6 +59,9 @@ const feedback = @import("feedback.zig");
 const hud_mod = @import("hud.zig");
 const surface = @import("surface.zig");
 const coord = @import("coordinator.zig");
+const menu_mod = @import("menu.zig");
+const appkit = @import("appkit.zig");
+const keychain = @import("keychain.zig");
 
 const Session = session_mod.Session;
 
@@ -85,11 +91,13 @@ fn onSignal(_: c_int) callconv(.c) void {
     g_quit.store(true, .release);
 }
 
-/// Waits for the quit signal, then stops the main run loop (CFRunLoopStop is documented
-/// thread-safe), unblocking `tap.run()` on the main thread.
+/// Waits for the quit signal, then unwinds the main loop. Under the status item that
+/// loop is [NSApp run], which CFRunLoopStop does NOT unwind — menu.requestStop routes
+/// [NSApp stop:] onto the main thread instead (#34 quit-path audit). Headless (no menu)
+/// falls back to CFRunLoopStop (documented thread-safe), unblocking tap.run().
 fn quitWatcher(loop: CFRunLoopRef) void {
     while (!g_quit.load(.acquire)) _ = usleep(50_000);
-    CFRunLoopStop(loop);
+    if (!menu_mod.requestStop()) CFRunLoopStop(loop);
 }
 
 /// A sleep that returns early once quitting, so the supervisor joins promptly at shutdown.
@@ -163,9 +171,11 @@ const TranscriptionAdapter = struct {
 /// worker thread. The slow paste (~400 ms of pasteboard settling) runs there — never on the
 /// Coordinator's mutex — because the tap callback shares that critical section and a slow
 /// callback makes the OS disable the tap. On completion the worker reports `.inserted`.
+/// The Insertion method is read from the live Settings snapshot per job (wayfinder #32's
+/// read-at-use), so a menu change binds at the next Utterance.
 const InsertionAdapter = struct {
     inserter: *insertmod.Inserter,
-    method: insertmod.Method,
+    store: *config.Store,
 
     /// The single insert job (NUL-terminated for insert.paste's NSString). Written by
     /// `submit` before the `pending` release-store; read by the worker after its acquire.
@@ -193,7 +203,8 @@ const InsertionAdapter = struct {
                 continue;
             }
             const z: [*:0]const u8 = @ptrCast(&self.job);
-            const result: coord.InsertResult = if (self.inserter.insert(self.method, z)) |_|
+            const method = self.store.current().insertion;
+            const result: coord.InsertResult = if (self.inserter.insert(method, z)) |_|
                 .ok
             else |e| blk: {
                 feedback.log("  insertion failed: {s}\n", .{explainInsert(e)});
@@ -261,17 +272,21 @@ const Daemon = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
 
-    // ---- from config (#16); read-only after startup ----
-    settings: config.Settings,
-    talk_key: tapmod.TalkKey,
-    insert_method: insertmod.Method,
-    params: session_mod.TranscriptionParams,
+    // ---- live settings (#16, made mutable by #32/#34): the immutable-snapshot store.
+    //      The menu is the sole writer; every reader acquire-loads a coherent snapshot
+    //      at use (tap → talk_key, insert worker → insertion, session connect → params).
+    store: config.Store,
+
+    /// Menu-bar "Pause dictation" (#34): a paused daemon ignores Talk Key presses (the
+    /// key keeps its normal OS meaning). Runtime-only — not a config.zon field.
+    paused: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     // ---- long-lived modules ----
     capture: cap.Capture = .{},
     inserter: insertmod.Inserter = .{},
     cues: feedback.Cues = .{},
     hud: hud_mod.Hud = .{},
+    menu: menu_mod.Menu = .{},
     tap: tapmod.Tap = undefined, // built in run()
 
     // ---- the Coordinator's real adapters + the Coordinator itself (wired in run()) ----
@@ -314,15 +329,19 @@ const Daemon = struct {
     }
 
     // ---- tap callbacks: run on the run-loop thread, kept fast (filter, then trampoline) ----
+    // talk_key is read from the live snapshot per event (#32 read-at-use): a menu change
+    // binds at the next press. Release is NOT pause-gated so a hold that began before a
+    // pause still resolves (the Coordinator ignores a stray release anyway).
 
     fn tapPress(ctx: ?*anyopaque, key: tapmod.TalkKey, _: i64, _: u64) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
-        if (key != self.talk_key) return; // key filtering stays in the adapter
+        if (key != self.store.current().talk_key) return; // key filtering stays in the adapter
+        if (self.paused.load(.acquire)) return; // menu-paused: ignore the Talk Key (#34)
         self.coordinator.handle(.press);
     }
     fn tapRelease(ctx: ?*anyopaque, key: tapmod.TalkKey) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
-        if (key != self.talk_key) return;
+        if (key != self.store.current().talk_key) return;
         self.coordinator.handle(.release);
     }
 
@@ -352,7 +371,7 @@ const Daemon = struct {
             // 1. Build the Transcription Session the moment the API key is present.
             if (!self.transcription.available()) {
                 if (config.loadApiKeyOnly(self.io, self.alloc)) |key| {
-                    const sess = Session.connect(self.io, self.alloc, key, self.params, self.observer()) catch |e| {
+                    const sess = Session.connect(self.io, self.alloc, key, .{ .ctx = self, .get = getParams }, self.observer()) catch |e| {
                         feedback.log("  supervisor: session connect failed: {s} — will retry\n", .{@errorName(e)});
                         continue;
                     };
@@ -381,7 +400,7 @@ const Daemon = struct {
                 if (!announced) {
                     announced = true;
                     self.last_missing = 0xFF; // so a later drop re-reports what's missing
-                    feedback.log("  READY — hold {s}, speak, release; the transcript lands at the cursor.\n", .{keyName(self.talk_key)});
+                    feedback.log("  READY — hold {s}, speak, release; the transcript lands at the cursor.\n", .{keyName(self.store.current().talk_key)});
                 }
             } else {
                 announced = false;
@@ -401,10 +420,93 @@ const Daemon = struct {
         self.last_missing = missing;
 
         feedback.log("  not-configured — waiting on:\n", .{});
-        if (!key_ok) feedback.log("    - OpenAI API key — run:  ~/.local/bin/type-wave --set-key  (login keychain, #33); export OPENAI_API_KEY instead for a foreground run\n", .{});
+        if (!key_ok) feedback.log("    - OpenAI API key — use the menu bar's Set API Key\xe2\x80\xa6 or run:  ~/.local/bin/type-wave --set-key  (login keychain, #33); export OPENAI_API_KEY instead for a foreground run\n", .{});
         if (!im) feedback.log("    - Input Monitoring for type-wave (System Settings > Privacy & Security > Input Monitoring)\n", .{});
         if (!pe) feedback.log("    - Accessibility for type-wave (System Settings > Privacy & Security > Accessibility)\n", .{});
         self.cues.err();
+    }
+
+    // ---- live-settings + menu-bar seams (wayfinder #32/#34) -----------------------
+
+    /// session.ParamsProvider: invoked at EVERY connect attempt (session.zig), so a
+    /// cycled session always speaks the freshest snapshot. Snapshot strings leak by
+    /// design, so handing them to the Session is lifetime-safe.
+    fn getParams(ctx: ?*anyopaque) session_mod.TranscriptionParams {
+        const self: *Daemon = @ptrCast(@alignCast(ctx.?));
+        const s = self.store.current();
+        return .{
+            .model = s.model,
+            .language = s.language,
+            .delay = s.delay,
+            .noise_reduction = s.noiseReductionType(),
+        };
+    }
+
+    // menu.Host callbacks — all run on the main thread (menu action / chrome pump).
+
+    /// Health for the two-tier icon + status line, in the menu's priority order. The
+    /// same signals the supervisor gates "configured" on, read non-destructively.
+    fn menuHealth(ctx: *anyopaque) menu_mod.Health {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        const paused = self.paused.load(.acquire);
+        if (!self.transcription.available()) return .{ .paused = paused, .status = .no_key };
+        if (!self.tap.isEnabled()) return .{ .paused = paused, .status = .input_monitoring_needed };
+        if (!insertmod.postEventGranted()) return .{ .paused = paused, .status = .accessibility_needed };
+        const ready = if (self.transcription.current()) |s| s.isReady() else false;
+        return .{ .paused = paused, .status = if (ready) .ready else .reconnecting };
+    }
+
+    /// A session-shaped setting changed: nudge the Session to cycle when idle. Before
+    /// the first connect there is nothing to mark — that connect reads the snapshot.
+    fn menuMarkSessionDirty(ctx: *anyopaque) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        if (self.transcription.current()) |s| s.markParamsDirty();
+    }
+
+    /// The Overlay toggle (#32 decision 3): lazy-build on first enable — menu actions
+    /// run exactly where the HUD must be built (main thread, so its render pump joins
+    /// this run loop); init failure degrades to sound-only like startup. Disable keeps
+    /// the built HUD and just stops showing it.
+    fn menuSetOverlay(ctx: *anyopaque, on: bool) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        if (on and !self.hud.active) {
+            if (self.hud.init())
+                self.hud.startRenderPump()
+            else
+                feedback.log("  overlay HUD: enabled but no display detected — sound-only feedback\n", .{});
+        }
+        self.hud.setEnabled(on);
+    }
+
+    fn menuSetPaused(ctx: *anyopaque, paused: bool) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        self.paused.store(paused, .release);
+    }
+
+    /// Set API Key… → the login keychain. Same mechanism as `type-wave --set-key`
+    /// (keychain.zig); the installed signed daemon creates the item itself, so its ACL
+    /// keys to the daemon's Designated Requirement and later reads stay prompt-free.
+    /// The supervisor's ~3 s poll then picks the key up — no restart.
+    fn menuStoreApiKey(ctx: *anyopaque, key: []const u8) bool {
+        _ = ctx;
+        const st = keychain.storeKey(key);
+        if (st == keychain.errSecSuccess) {
+            feedback.log("  menu: API key stored in the login keychain (service \"{s}\")\n", .{keychain.service});
+            return true;
+        }
+        var buf: [256]u8 = undefined;
+        feedback.log("  menu: keychain store failed: {s}\n", .{keychain.describe(st, &buf)});
+        return false;
+    }
+
+    /// Menu Quit: signal every thread, then unwind [NSApp run] — daemon.run's normal
+    /// graceful shutdown (supervisor join, websocket close drain) follows, and the
+    /// process exits 0, which the LaunchAgent's KeepAlive (SuccessfulExit=false)
+    /// treats as deliberate: it stays down until the next login/bootstrap.
+    fn menuQuit(ctx: *anyopaque) void {
+        _ = ctx;
+        g_quit.store(true, .release);
+        appkit.stop();
     }
 };
 
@@ -414,8 +516,11 @@ const Daemon = struct {
 /// crash-loops on them.
 pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     // Settings load always (defaults if absent); the secret is NOT required up front — the
-    // supervisor waits for it (self-heal).
-    const settings = config.loadSettingsOnly(io, alloc);
+    // supervisor waits for it (self-heal). The parsed Settings become the first immutable
+    // snapshot in the Store (#32); every later change swaps in a fresh heap copy.
+    const first_snapshot = try alloc.create(config.Settings);
+    first_snapshot.* = config.loadSettingsOnly(io, alloc);
+    const settings = first_snapshot.*;
     std.debug.print("config: talk_key={s} model=\"{s}\" language=\"{s}\" delay=\"{s}\" noise_reduction={s} insertion={s} overlay={}\n", .{
         @tagName(settings.talk_key), settings.model, settings.language, settings.delay, @tagName(settings.noise_reduction), @tagName(settings.insertion), settings.overlay,
     });
@@ -423,15 +528,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     var daemon = Daemon{
         .io = io,
         .alloc = alloc,
-        .settings = settings,
-        .talk_key = settings.talk_key,
-        .insert_method = settings.insertion,
-        .params = .{
-            .model = settings.model,
-            .language = settings.language,
-            .delay = settings.delay,
-            .noise_reduction = settings.noiseReductionType(),
-        },
+        .store = config.Store.init(first_snapshot),
     };
 
     // ---- modules that need neither a grant nor the key to construct ----
@@ -460,7 +557,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
 
     // ---- wire the real adapters, then the Coordinator that drives them ----
     daemon.feedback_surface = .{ .cues = &daemon.cues, .hud = &daemon.hud };
-    daemon.insertion = .{ .inserter = &daemon.inserter, .method = daemon.insert_method };
+    daemon.insertion = .{ .inserter = &daemon.inserter, .store = &daemon.store };
     daemon.coordinator = Coord.init(.{
         .audio = &daemon.capture,
         .transcription = &daemon.transcription,
@@ -498,6 +595,19 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     };
     feedback.log("  Talk Key tap: {s}\n", .{if (tap_live) "live" else "created, waiting for Input Monitoring"});
 
+    // ---- menu-bar status item (#34): built on the main thread before the run loop.
+    //      Headless (no display) skips it and the daemon behaves exactly as before. ----
+    const menu_up = daemon.menu.init(io, alloc, &daemon.store, .{
+        .ctx = &daemon,
+        .health = Daemon.menuHealth,
+        .markSessionDirty = Daemon.menuMarkSessionDirty,
+        .setOverlay = Daemon.menuSetOverlay,
+        .setPaused = Daemon.menuSetPaused,
+        .storeApiKey = Daemon.menuStoreApiKey,
+        .quit = Daemon.menuQuit,
+    });
+    feedback.log("  menu bar: {s}\n", .{if (menu_up) "status item up" else "no display — running headless (no status item)"});
+
     // ---- threads ----
     const worker = try std.Thread.spawn(.{}, InsertionAdapter.workerLoop, .{&daemon.insertion});
     worker.detach();
@@ -513,7 +623,13 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
 
     feedback.log("type-wave daemon up — self-healing. SIGTERM/Ctrl-C to quit.\n", .{});
 
-    daemon.tap.run(); // CFRunLoopRun — blocks until the quit watcher stops the loop
+    // The main loop. With the status item up this MUST be [NSApp run] — a bare
+    // CFRunLoopRun never runs AppKit's nextEvent→sendEvent: dispatch, so status-item
+    // clicks would never be routed (#31's load-bearing finding). It drives the same
+    // main run loop: the tap's CFMachPort source and the HUD's render-pump timer keep
+    // firing under it. Headless keeps the plain CFRunLoopRun.
+    if (menu_up) appkit.run() else daemon.tap.run();
+    g_quit.store(true, .release); // normally already set (menu Quit / signal) — belt-and-braces
 
     // Quit: g_quit is set (that's why run() returned). Join the supervisor first so it is not
     // mid-connect, then close the session gracefully (websocket close-frame drain, #17). We

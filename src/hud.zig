@@ -34,6 +34,7 @@
 //! returning it (arm64 has no objc_msgSend_stret). type-wave is macOS-only on this Mac.
 
 const std = @import("std");
+const appkit = @import("appkit.zig");
 
 // ---- ObjC runtime primitives (same as insert.zig) ---------------------------
 const id = ?*anyopaque;
@@ -96,13 +97,6 @@ inline fn msgRect(self: id, op: [*:0]const u8, r: NSRect) void {
     const f: *const fn (id, SEL, NSRect) callconv(.c) void = @ptrCast(&objc_msgSend);
     f(self, sel_registerName(op), r);
 }
-
-// ---- NSApplication activation (accessory: no Dock icon, never force-activate) ----
-inline fn setActivationPolicy(app: id, policy: c_long) void {
-    const f: *const fn (id, SEL, c_long) callconv(.c) bool = @ptrCast(&objc_msgSend);
-    _ = f(app, sel_registerName("setActivationPolicy:"), policy);
-}
-const NSApplicationActivationPolicyAccessory: c_long = 2;
 
 // ---- Cocoa geometry ---------------------------------------------------------
 /// NSRect == {origin{x,y}, size{w,h}}; flat here, identical layout. Four f64 = an HFA,
@@ -227,6 +221,11 @@ pub const Hud = struct {
 
     // ---- producer → render handoff (any thread writes, main thread reads) ----
     mu: os_unfair_lock = .{},
+    /// The live Overlay toggle (wayfinder #32/#34): a built HUD that has been switched
+    /// off from the menu keeps all its machinery — no teardown path is ever exercised —
+    /// but ignores lifecycle publishes, so it never shows; re-enable is instant. Guarded
+    /// by `mu` like the state it gates.
+    enabled: bool = true,
     pending_state: State = .hidden,
     q: [level_queue_cap]f32 = @splat(0), // raw linear RMS, one sample per Capture buffer
     qlen: usize = 0,
@@ -253,19 +252,19 @@ pub const Hud = struct {
         const pool = objc_autoreleasePoolPush();
         defer objc_autoreleasePoolPop(pool);
 
-        // Shared, accessory-policy app: present UI, own no Dock icon, never force-activate.
-        // Order matters — set the policy before finishLaunching so no Dock icon ever flashes.
-        const app = msg(cls("NSApplication"), "sharedApplication");
-        setActivationPolicy(app, NSApplicationActivationPolicyAccessory);
+        // Shared, accessory-policy app (appkit.zig — also used by the menu-bar status
+        // item, #34). Order matters — the policy is set before finishLaunching so no
+        // Dock icon ever flashes.
+        _ = appkit.app();
 
         // No display ⇒ no HUD. Bail before finishLaunching / any window work so a headless
         // run degrades to sound-only instead of failing (wayfinder #22).
         const screen = mainScreen();
         if (screen == null) return false;
 
-        // finishLaunching wires up AppKit enough to draw WITHOUT [NSApp run] taking the loop
-        // — the daemon's CFRunLoopRun (tap.zig) drives it (proven by #20).
-        msgv(app, "finishLaunching");
+        // finishLaunching wires up AppKit enough to draw whether the loop is the headless
+        // CFRunLoopRun (proven by #20) or [NSApp run] under the status item (#31/#34).
+        appkit.ensureLaunched();
 
         // Bottom-centre of the main screen — the Wispr-Flow pill position.
         const sf = screenFrame(screen);
@@ -364,8 +363,33 @@ pub const Hud = struct {
         if (!self.active) return;
         os_unfair_lock_lock(&self.mu);
         defer os_unfair_lock_unlock(&self.mu);
+        if (!self.enabled and state != .hidden) return; // switched off from the menu
         if (state != self.pending_state) self.qlen = 0;
         self.pending_state = state;
+    }
+
+    /// The menu's live Overlay toggle. Disable hides the pill immediately (the render
+    /// pump keeps ticking — a hidden tick is just the lock and a state check); enable
+    /// lets the next Utterance show it again. No-op while inactive (headless).
+    pub fn setEnabled(self: *Hud, on: bool) void {
+        if (!self.active) return;
+        os_unfair_lock_lock(&self.mu);
+        defer os_unfair_lock_unlock(&self.mu);
+        self.enabled = on;
+        if (!on) {
+            self.pending_state = .hidden;
+            self.qlen = 0;
+        }
+    }
+
+    /// Whether the pill is carrying feedback right now — built AND enabled. The Feedback
+    /// Surface consults this per verb, so a disabled overlay falls back to sound cues
+    /// exactly like an overlay=false start.
+    pub fn isOn(self: *Hud) bool {
+        if (!self.active) return false;
+        os_unfair_lock_lock(&self.mu);
+        defer os_unfair_lock_unlock(&self.mu);
+        return self.enabled;
     }
 
     /// Take the pill down. Called at the end of an Utterance (inserted, abandoned, empty,
