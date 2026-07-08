@@ -4,13 +4,13 @@ This repo uses **GitHub Issues** on `dbgeek/type-wave`, operated via the `gh` CL
 
 ## Wayfinding operations
 
-- **The map** is the issue labelled `wayfinder:map` (currently [#1](https://github.com/dbgeek/type-wave/issues/1)). Find it with:
+- **Maps** are the issues labelled `wayfinder:map` — there may be several, one per effort (currently [#1](https://github.com/dbgeek/type-wave/issues/1) speak→insert, [#24](https://github.com/dbgeek/type-wave/issues/24) waveform HUD). Find them with:
 
   ```sh
   gh issue list --label "wayfinder:map" --state open
   ```
 
-- **Tickets** are issues carrying one `wayfinder:<type>` label (`research`, `prototype`, `grilling`, `task`) and a `_Part of map #1_` line in the body. The issue title is the ticket's **name** — refer to tickets by name (linking the issue), never by bare number.
+- **Tickets** are issues carrying one `wayfinder:<type>` label (`research`, `prototype`, `grilling`, `task`) and a `_Part of map #<n>_` line in the body naming their map. The issue title is the ticket's **name** — refer to tickets by name (linking the issue), never by bare number.
 - **Claiming**: add the `wayfinder:claimed` label *before* doing any work:
 
   ```sh
