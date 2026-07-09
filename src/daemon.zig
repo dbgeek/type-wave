@@ -63,6 +63,7 @@ const menu_mod = @import("menu.zig");
 const appkit = @import("appkit.zig");
 const keychain = @import("keychain.zig");
 const insertion_adapter = @import("insertion_adapter.zig");
+const readiness = @import("readiness.zig");
 
 const Session = session_mod.Session;
 
@@ -270,9 +271,9 @@ const Daemon = struct {
     feedback_surface: surface.Surface = undefined,
     coordinator: Coord = undefined,
 
-    /// Supervisor-thread-only: the last set of missing prerequisites reported, so
-    /// not-configured isn't re-logged every tick. 0xFF = nothing reported yet.
-    last_missing: u8 = 0xFF,
+    /// Supervisor-thread-only: remembers the last not-configured missing set, so the
+    /// same prerequisites are not re-logged every tick.
+    readiness_reporter: readiness.Reporter = .{},
 
     /// Always-on live-transcript subscriber: Final Transcripts from the read-loop thread
     /// trampoline into the Coordinator. Installed at every Session.connect, before the read
@@ -357,7 +358,6 @@ const Daemon = struct {
             // 2. Grants — silent preflight (no re-prompt).
             const im = tapmod.Tap.listenGranted();
             const pe = insertmod.postEventGranted();
-            const key_ok = self.transcription.available();
 
             // 3. Bring the created-but-disabled tap live once Input Monitoring appears.
             if (im and !self.tap.isEnabled()) {
@@ -369,34 +369,27 @@ const Daemon = struct {
 
             // 4. Configured? (PostEvent is also preflighted per-insert, so a later revoke is
             //    caught there too; here it just gates the "READY" banner + reporting.)
-            const configured = key_ok and im and pe and self.tap.isEnabled();
-            if (configured) {
+            const rs = self.readinessSnapshot(im, pe);
+            if (readiness.configured(rs)) {
+                _ = self.readiness_reporter.next(rs);
                 if (!announced) {
                     announced = true;
-                    self.last_missing = 0xFF; // so a later drop re-reports what's missing
                     feedback.log("  READY — hold {s}, speak, release; the transcript lands at the cursor.\n", .{keyName(self.store.current().talk_key)});
                 }
             } else {
                 announced = false;
-                self.reportMissing(key_ok, im, pe);
+                self.reportMissing(rs);
             }
         }
     }
 
     /// Log the missing prerequisites once per distinct set (not every tick), with one error
     /// cue so a headless user hears that the daemon is waiting on them.
-    fn reportMissing(self: *Daemon, key_ok: bool, im: bool, pe: bool) void {
-        var missing: u8 = 0;
-        if (!key_ok) missing |= 1;
-        if (!im) missing |= 2;
-        if (!pe) missing |= 4;
-        if (missing == self.last_missing) return; // already reported this exact set
-        self.last_missing = missing;
+    fn reportMissing(self: *Daemon, rs: readiness.Snapshot) void {
+        const report = self.readiness_reporter.next(rs) orelse return;
 
         feedback.log("  not-configured — waiting on:\n", .{});
-        if (!key_ok) feedback.log("    - OpenAI API key — use the menu bar's Set API Key\xe2\x80\xa6 or run:  ~/.local/bin/type-wave --set-key  (login keychain, #33); export OPENAI_API_KEY instead for a foreground run\n", .{});
-        if (!im) feedback.log("    - Input Monitoring for type-wave (System Settings > Privacy & Security > Input Monitoring)\n", .{});
-        if (!pe) feedback.log("    - Accessibility for type-wave (System Settings > Privacy & Security > Accessibility)\n", .{});
+        for (report.slice()) |line| feedback.log("{s}\n", .{line});
         self.cues.err();
     }
 
@@ -416,18 +409,36 @@ const Daemon = struct {
         };
     }
 
+    fn readinessSnapshot(self: *Daemon, im: bool, pe: bool) readiness.Snapshot {
+        const session_ready = if (self.transcription.current()) |s| s.isReady() else false;
+        return .{
+            .key_present = self.transcription.available(),
+            .input_monitoring_granted = im,
+            .post_event_granted = pe,
+            .tap_enabled = self.tap.isEnabled(),
+            .session_ready = session_ready,
+            .paused = self.paused.load(.acquire),
+        };
+    }
+
+    fn menuStatus(status: readiness.Status) menu_mod.Status {
+        return switch (status) {
+            .ready => .ready,
+            .reconnecting => .reconnecting,
+            .no_key => .no_key,
+            .input_monitoring_needed => .input_monitoring_needed,
+            .accessibility_needed => .accessibility_needed,
+        };
+    }
+
     // menu.Host callbacks — all run on the main thread (menu action / chrome pump).
 
     /// Health for the two-tier icon + status line, in the menu's priority order. The
     /// same signals the supervisor gates "configured" on, read non-destructively.
     fn menuHealth(ctx: *anyopaque) menu_mod.Health {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
-        const paused = self.paused.load(.acquire);
-        if (!self.transcription.available()) return .{ .paused = paused, .status = .no_key };
-        if (!self.tap.isEnabled()) return .{ .paused = paused, .status = .input_monitoring_needed };
-        if (!insertmod.postEventGranted()) return .{ .paused = paused, .status = .accessibility_needed };
-        const ready = if (self.transcription.current()) |s| s.isReady() else false;
-        return .{ .paused = paused, .status = if (ready) .ready else .reconnecting };
+        const h = readiness.health(self.readinessSnapshot(tapmod.Tap.listenGranted(), insertmod.postEventGranted()));
+        return .{ .paused = h.paused, .status = menuStatus(h.status) };
     }
 
     /// A session-shaped setting changed: nudge the Session to cycle when idle. Before

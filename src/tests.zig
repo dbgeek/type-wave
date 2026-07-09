@@ -11,4 +11,5 @@ test {
     _ = @import("hud.zig");
     _ = @import("insert.zig"); // ensureTrailingSpace (the Insertion separator)
     _ = @import("insertion_adapter.zig");
+    _ = @import("readiness.zig");
 }
