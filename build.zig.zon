@@ -6,7 +6,9 @@
     // the flake-locked nightly. NOT a ceiling — forward drift is caught by flake.lock.
     .minimum_zig_version = "0.17.0-dev.1267+300116b02",
     .dependencies = .{
-        // Vendored at commit 2283d22 with the §3.5 TLS-read fix applied (docs/toolchain.md).
+        // Vendored at dev commit 4b475a8 — the §3.5 TLS-read fix is now upstream
+        // (karlseguin/websocket.zig "Don't poll if tls has buffered client", closes #106),
+        // so the vendored one-line patch is dropped. See docs/toolchain.md.
         .websocket = .{ .path = "vendor/websocket.zig" },
     },
     .paths = .{

@@ -36,7 +36,7 @@ against a nightly we need and can't easily patch.
 | Component | Pin | Where it's pinned |
 |---|---|---|
 | Zig compiler | `0.17.0-dev.1267+300116b02` | `flake.lock` → `zig-overlay` rev `be62cd684cf34f701cd1b91f2aa0c056c29fafa1` (locked 2026-07-07), which resolves `zig-overlay.packages.<system>.master` to this nightly |
-| websocket.zig | `dev` @ commit `2283d22` **+ the §3.5 TLS-read fix** | vendored as plain files under `prototypes/cli-dictation/vendor/websocket.zig` (a `.path` dependency), so the pin *is* the committed tree |
+| websocket.zig | `dev` @ commit `4b475a8` (the §3.5 TLS-read fix is now upstream) | vendored as plain files under `vendor/websocket.zig` (root) and `prototypes/cli-dictation/vendor/websocket.zig` (a `.path` dependency), so the pin *is* the committed tree |
 | Floor guard | `minimum_zig_version = "0.17.0-dev.1267+300116b02"` | every `build.zig.zon` in the repo |
 
 Two things to understand about how the pin actually holds:
@@ -51,19 +51,21 @@ Two things to understand about how the pin actually holds:
   may still break websocket.zig's `dev` branch. The forward-drift guard is the flake.lock pin +
   this procedure, not `minimum_zig_version`.
 
-### The vendored §3.5 patch
+### The §3.5 TLS-read fix (now upstream — patch dropped)
 
-The vendored websocket.zig carries a one-line fix on top of `2283d22`: `Stream.read` in
-`src/client/client.zig` also checks `tls_client.client.input.bufferedLen()` so a TLS handshake
-read doesn't starve against Cloudflare/api.openai.com's bursty delivery (research §3.5). It is
-filed upstream as [karlseguin/websocket.zig#107](https://github.com/karlseguin/websocket.zig/pull/107)
-([File the websocket.zig TLS-read fix upstream, #12](https://github.com/dbgeek/type-wave/issues/12)).
-**Keep carrying the patch until #107 merges**; only then does a bump drop it.
+The §3.5 TLS-read starvation (a TLS handshake read starving against Cloudflare/api.openai.com's
+bursty delivery — `Stream.read` polling the raw socket while a complete record already sits
+decrypted-pending in the TLS `input` buffer; research §3.5) is **fixed upstream** as of `dev`
+commit `4b475a8` ("Don't poll if tls has buffered client", `Closes #106`). The maintainer applied
+his own fix rather than merging our one-liner
+([PR #107](https://github.com/karlseguin/websocket.zig/pull/107) stayed open;
+[#12](https://github.com/dbgeek/type-wave/issues/12) has the trail).
 
-> New root project note: when the root `build.zig` / `build.zig.zon` is scaffolded
-> ([Scaffold the daemon skeleton, #14](https://github.com/dbgeek/type-wave/issues/14)), it must
-> (a) set the same `minimum_zig_version`, and (b) vendor websocket.zig at the same commit with
-> the §3.5 patch still applied.
+His fix is a **strict superset** of the one-line patch we carried: it gates the poll-skip on a
+`hasBufferedTlsRecord` helper that fires only when a *complete* TLS record is buffered, so it also
+handles the *partial*-record case (still polls, to honor the read timeout) that our cruder
+"any buffered bytes" check got subtly wrong. So the vendored one-line patch is **dropped** — the
+tree is now plain upstream `4b475a8`, no local delta.
 
 ## Bump procedure
 
@@ -79,18 +81,19 @@ trusting it.
    ```
 
 2. **Bump websocket.zig to a `dev` commit that matches that nightly.** Find a `dev` commit
-   built against the same/nearby zig-master, then refresh the vendored tree and **re-apply the
-   §3.5 patch** (until #107 merges):
+   built against the same/nearby zig-master, then refresh the vendored tree:
 
    ```sh
    # in a scratch checkout:
    zig fetch --save git+https://github.com/karlseguin/websocket.zig#dev   # resolves & prints the commit
    ```
 
-   Replace the files under `prototypes/cli-dictation/vendor/websocket.zig` (and, once it
-   exists, the root project's vendored copy) with that commit's tree, then re-apply the §3.5
-   `input.bufferedLen()` check to `src/client/client.zig` if upstream still lacks it. Update the
-   `// Vendored at commit …` comment in `build.zig.zon` to the new hash.
+   Replace the files under **both** `vendor/websocket.zig` (root) and
+   `prototypes/cli-dictation/vendor/websocket.zig` with that commit's tree, and update the
+   `// Vendored at … commit` comment in each `build.zig.zon` to the new hash. The §3.5 TLS-read
+   fix is upstream as of `dev` `4b475a8`, so there is no longer a local patch to re-apply — the
+   vendored tree should be plain upstream. (If a future bump ever lands on a commit *before* the
+   fix, re-check `Stream.read`/`hasBufferedTlsRecord` in `src/client/client.zig`.)
 
 3. **Raise the floor.** Set `minimum_zig_version` to the new nightly string in **every**
    `build.zig.zon` (currently the two prototypes; later the root too).

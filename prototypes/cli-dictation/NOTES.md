@@ -39,7 +39,7 @@ start a fresh Utterance. `q` + ENTER quits.
 - `src/audio.zig` — CoreAudio Capture (portable; graduation candidate)
 - `src/session.zig` — OpenAI Transcription Session over websocket (portable; graduation candidate)
 - `src/main.zig` — terminal shell wiring the two (throwaway)
-- `vendor/websocket.zig` — karlseguin/websocket.zig @ 2283d22 + §3.5 fix
+- `vendor/websocket.zig` — karlseguin/websocket.zig `dev` @ 4b475a8 (plain upstream; §3.5 fix now upstream)
 
 ## Verdict (2026-07-08)
 
