@@ -4,7 +4,9 @@
 //! then later report `.inserted`. This module owns the adapter implementation behind that
 //! seam: copy the transcript, enforce the Insertion separator invariant, read the current
 //! Settings Snapshot at job execution time, run the slow macOS Insertion mechanism off the
-//! Coordinator mutex, and report completion back through the reverse edge.
+//! Coordinator mutex, and report completion back through the reverse edge — *before*
+//! draining the mechanism's deferred clipboard restore, so the restore window never pads
+//! the Coordinator's `.inserting` lockout (issue #38).
 //!
 //! `insert.zig` remains the macOS mechanism module. This module is the policy adapter
 //! between the Utterance lifecycle and those mechanisms.
@@ -63,12 +65,16 @@ pub fn InsertionAdapter(comptime Deps: type) type {
                 break :blk .failed;
             };
             if (result == .ok) {
-                // NB: both deltas include the mechanism's post-paste settle + clipboard
-                // restore — the text itself landed at the "[insert] Cmd-V posted" line.
                 const now = feedback.nowMs();
                 feedback.log("  inserted at the cursor (+{d}ms after the Final Transcript; mechanism {d}ms)\n", .{ now - self.submitted_at_ms, now - t_pick });
             }
+            // Report completion *before* the deferred clipboard restore (issue #38): the
+            // Coordinator leaves `.inserting` at the Cmd-V settle, so the ~300 ms restore
+            // pads this worker's time, not the lockout. Serialization is the ordering
+            // guard — the restore finishes before this loop can drain the next job, so a
+            // following paste never interleaves with a pending restore.
             self.deps.complete(result);
+            self.deps.finishInsert();
             return true;
         }
 
@@ -91,6 +97,8 @@ const FakeDeps = struct {
     result: insertmod.InsertError!void = {},
     completions: usize = 0,
     last_completion: coord.InsertResult = .ok,
+    finishes: usize = 0,
+    completions_at_finish: usize = 0,
     quit: bool = false,
     idles: usize = 0,
 
@@ -110,6 +118,11 @@ const FakeDeps = struct {
     fn complete(self: *FakeDeps, result: coord.InsertResult) void {
         self.completions += 1;
         self.last_completion = result;
+    }
+
+    fn finishInsert(self: *FakeDeps) void {
+        self.finishes += 1;
+        self.completions_at_finish = self.completions;
     }
 
     fn shouldQuit(self: *FakeDeps) bool {
@@ -156,6 +169,21 @@ test "insert failure reports a failed completion" {
     try std.testing.expectEqual(@as(usize, 1), adapter.deps.calls);
     try std.testing.expectEqual(@as(usize, 1), adapter.deps.completions);
     try std.testing.expectEqual(coord.InsertResult.failed, adapter.deps.last_completion);
+    // Deferred cleanup still runs on the failure path (a no-op when nothing is pending).
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.finishes);
+}
+
+test "completion is reported before the deferred clipboard restore (issue #38)" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{});
+
+    adapter.submit("hello");
+    try std.testing.expect(adapter.runOnce());
+
+    // The Coordinator must leave `.inserting` before the ~300 ms restore runs, so the
+    // restore pads worker time — not the lockout. Worker serialization is the ordering
+    // guard: runOnce finishes the restore before it can drain the next job.
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.finishes);
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.completions_at_finish);
 }
 
 test "runOnce reports idle without touching dependencies" {

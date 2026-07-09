@@ -184,6 +184,9 @@ const RealInsertionDeps = struct {
     pub fn complete(self: *RealInsertionDeps, result: coord.InsertResult) void {
         self.on_done(self.co_ctx, result);
     }
+    pub fn finishInsert(self: *RealInsertionDeps) void {
+        self.inserter.drainDeferredRestore();
+    }
     pub fn shouldQuit(_: *RealInsertionDeps) bool {
         return g_quit.load(.acquire);
     }

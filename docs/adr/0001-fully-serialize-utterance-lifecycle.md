@@ -1,6 +1,6 @@
 # ADR 0001 — Fully serialize the Utterance lifecycle
 
-- Status: accepted (2026-07-08)
+- Status: accepted (2026-07-08); amended (2026-07-09, issue #38 — see Amendment)
 - Supersedes: the press-during-paste overlap grilled for wayfinder #19
 
 ## Context
@@ -46,3 +46,25 @@ Utterance resolves fully before the next begins.
 A future architecture review should not "restore" the #19 overlap without re-reading this
 record: the overlap was reconsidered here and traded away on purpose for a single-source-
 of-truth state machine.
+
+## Amendment (2026-07-09, issue #38)
+
+`.inserted` is now reported when the Insertion *lands* — the Cmd-V settle — rather than
+after the paste mechanism's ~300 ms clipboard-restore tail. The restore is deferred: the
+insert worker reports completion first, then drains the restore before it can pick up the
+next job (`insertion_adapter.zig`), and `paste` itself drains any pending restore at entry
+as a belt-and-braces interleave guard (`insert.zig`).
+
+This narrows the `.inserting` lockout by ~300 ms but is **not** a return of the #19
+overlap this ADR traded away:
+
+- No guard is released partway through a phase. `.inserting` still ends at exactly one
+  event (`.inserted`), delivered once per Utterance; the phase machine is unchanged.
+- No shared state needs hand-sequencing. The deferred restore lives entirely on the
+  single insert-worker thread; the next Utterance's paste cannot start until the worker
+  has drained it, because the same thread runs both.
+- `hideIfFinal` stays collapsed. The pill for Utterance N is taken down at `.inserted`,
+  which still precedes anything Utterance N+1 can paint.
+
+What moved is only *where the Insertion is considered complete*: at the text landing,
+not at the end of the mechanism's private cleanup.

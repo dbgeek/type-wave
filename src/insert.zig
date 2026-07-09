@@ -186,6 +186,12 @@ pub fn ensureTrailingSpace(dst: []u8, text: []const u8) [:0]const u8 {
 pub const Inserter = struct {
     /// A tagged event source so our observer can recognise our own posts (§4).
     src: CGEventSourceRef = null,
+    /// Clipboard restore deferred by `paste` (issue #38): the saved plain text (retained,
+    /// or null if the clipboard held none) plus when Cmd-V was posted, so
+    /// `drainDeferredRestore` can wait out only the *remainder* of the restore window.
+    pending_restore: ?PendingRestore = null,
+
+    const PendingRestore = struct { saved: id, cmdv_at_ms: i64 };
 
     pub fn init(self: *Inserter) void {
         self.src = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
@@ -210,10 +216,16 @@ pub const Inserter = struct {
         }
     }
 
-    /// Primary mechanism: save clipboard → set transcript → Cmd-V → restore.
-    /// `utf8` must be NUL-terminated (it becomes an NSString). Returns the
-    /// pasteboard changeCount delta so the caller can spot a clobbering manager.
+    /// Primary mechanism: save clipboard → set transcript → Cmd-V. Returns as soon as
+    /// the Cmd-V settles; the clipboard restore is *deferred* to `drainDeferredRestore`
+    /// so the restore window pads the insert worker's time, not the Coordinator's
+    /// `.inserting` lockout (issue #38). `utf8` must be NUL-terminated (→ NSString).
     pub fn paste(self: *Inserter, utf8: [*:0]const u8, pre_paste_ms: u32) InsertError!void {
+        // Ordering guard, first thing on every path: never let this paste's pasteboard
+        // write interleave with a still-pending restore from the previous one. The
+        // worker's serialization makes this a no-op in practice; this keeps the
+        // mechanism correct on its own.
+        self.drainDeferredRestore();
         if (!CGPreflightPostEventAccess()) return error.PostEventDenied;
         const t_paste = feedback.nowMs();
 
@@ -224,8 +236,10 @@ pub const Inserter = struct {
         const type_utf8 = nsString(pb_type_utf8);
 
         // Save the current plain text (best effort — rich/promised types are lost
-        // on restore, crib sheet §8). Copied out, so it survives clearContents.
+        // on restore, crib sheet §8). Retained so it outlives this pool and survives
+        // clearContents, until `drainDeferredRestore` restores and releases it.
         const saved = stringForType(pb, type_utf8);
+        if (saved != null) _ = sendId(saved, "retain");
 
         _ = sendLong(pb, "clearContents");
         setStringForType(pb, nsString(utf8), type_utf8);
@@ -235,14 +249,37 @@ pub const Inserter = struct {
 
         sleepMs(@min(pre_paste_ms, max_pre_paste_ms));
         self.postCmdV();
-        // Text becomes visible at the Cmd-V post — everything after (restore_ms + the
-        // clipboard restore) pads the Coordinator's `.inserting` lockout, not the user's
-        // wait. Logged here so the split is visible in the timing hunt (issues #37/#38).
-        feedback.log("  [insert] Cmd-V posted {d}ms into paste (text lands here; clipboard restore follows)\n", .{feedback.nowMs() - t_paste});
-        sleepMs(restore_ms);
+        self.pending_restore = .{ .saved = saved, .cmdv_at_ms = feedback.nowMs() };
+        // Text becomes visible at the Cmd-V post — the restore window that used to pad
+        // the `.inserting` lockout now runs after completion is reported (issues #37/#38).
+        feedback.log("  [insert] Cmd-V posted {d}ms into paste (text lands here; clipboard restore deferred)\n", .{feedback.nowMs() - t_paste});
+    }
 
+    /// Drain a restore deferred by `paste`: wait out whatever remains of the restore
+    /// window (espanso's §3 rule — let the target's async paste read finish before the
+    /// pasteboard changes again), then put the saved plain text back. No-op when nothing
+    /// is pending (keystroke path, failed paste). Called by the insert worker *after*
+    /// completion is reported, and by `paste` itself as the interleave guard.
+    pub fn drainDeferredRestore(self: *Inserter) void {
+        const p = self.pending_restore orelse return;
+        self.pending_restore = null;
+
+        // nowMs is wall-clock (the repo's deliberate libc choice) — clamp so a backward
+        // clock step can't push the wait past restore_ms (and usleep past its 1 s POSIX
+        // ceiling); a forward step at worst shortens the window to the fixed-sleep risk
+        // every paste tool already accepts.
+        const elapsed: i64 = @max(0, feedback.nowMs() - p.cmdv_at_ms);
+        if (elapsed < restore_ms) sleepMs(@intCast(restore_ms - elapsed));
+
+        const pool = objc_autoreleasePoolPush();
+        defer objc_autoreleasePoolPop(pool);
+
+        const pb = sendId(objc_getClass("NSPasteboard"), "generalPasteboard");
         _ = sendLong(pb, "clearContents");
-        if (saved != null) setStringForType(pb, saved, type_utf8);
+        if (p.saved != null) {
+            setStringForType(pb, p.saved, nsString(pb_type_utf8));
+            _ = sendId(p.saved, "release");
+        }
     }
 
     fn postCmdV(self: *Inserter) void {
@@ -285,7 +322,7 @@ pub const Inserter = struct {
     }
 };
 
-// ---- tests: the trailing-space separator (pure, no OS) -----------------------
+// ---- tests: pure, no OS (the trailing-space separator + the deferred restore) ----
 
 const expectEqualStrings = std.testing.expectEqualStrings;
 
@@ -318,4 +355,12 @@ test "ensureTrailingSpace keeps content within dst so keystroke's UTF-16 dest ca
     try std.testing.expect(out.len <= buf.len - 1);
     try std.testing.expectEqual(@as(u8, ' '), out[out.len - 1]); // still ends with the separator
     try std.testing.expectEqual(@as(u8, 0), buf[out.len]);
+}
+
+test "drainDeferredRestore with nothing pending is a no-op" {
+    // The keystroke path and a failed paste leave no deferred restore; the worker drains
+    // unconditionally, so the early-out must not touch the pasteboard.
+    var inserter = Inserter{};
+    inserter.drainDeferredRestore();
+    try std.testing.expect(inserter.pending_restore == null);
 }
