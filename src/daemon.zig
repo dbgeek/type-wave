@@ -62,6 +62,7 @@ const coord = @import("coordinator.zig");
 const menu_mod = @import("menu.zig");
 const appkit = @import("appkit.zig");
 const keychain = @import("keychain.zig");
+const insertion_adapter = @import("insertion_adapter.zig");
 
 const Session = session_mod.Session;
 
@@ -118,12 +119,6 @@ fn keyName(k: tapmod.TalkKey) []const u8 {
     };
 }
 
-fn explainInsert(e: insertmod.InsertError) []const u8 {
-    return switch (e) {
-        error.PostEventDenied => "no PostEvent grant — enable type-wave under System Settings > Privacy & Security > Accessibility",
-    };
-}
-
 // ============================================================================
 // The real adapters satisfying the Utterance Coordinator's four outbound seams.
 // (Audio is Capture itself — it already fits the seam, so it needs no wrapper.)
@@ -167,54 +162,33 @@ const TranscriptionAdapter = struct {
     }
 };
 
-/// Insertion seam: `submit` copies the Final Transcript and hands it to this adapter's own
-/// worker thread. The slow paste (~400 ms of pasteboard settling) runs there — never on the
-/// Coordinator's mutex — because the tap callback shares that critical section and a slow
-/// callback makes the OS disable the tap. On completion the worker reports `.inserted`.
-/// The Insertion method is read from the live Settings snapshot per job (wayfinder #32's
-/// read-at-use), so a menu change binds at the next Utterance.
-const InsertionAdapter = struct {
+/// Real dependencies for insertion_adapter.zig. The adapter owns the asynchronous
+/// Insertion policy; daemon.zig supplies the concrete macOS mechanism, Settings Snapshot,
+/// process quit flag, and reverse edge into the Coordinator.
+const RealInsertionDeps = struct {
     inserter: *insertmod.Inserter,
     store: *config.Store,
 
-    /// The single insert job (NUL-terminated for insert.paste's NSString). Written by
-    /// `submit` before the `pending` release-store; read by the worker after its acquire.
-    job: [8193]u8 = undefined,
-    pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    /// Trampoline back to the Coordinator (its concrete type is known only at the wiring
-    /// site, so the reverse edge is a type-erased fn-pointer, not a generic dep).
     co_ctx: *anyopaque = undefined,
     on_done: *const fn (*anyopaque, coord.InsertResult) void = undefined,
 
-    /// Coordinator seam (pub: called cross-file). Runs under the Coordinator's mutex; must
-    /// not block — just memcpy.
-    pub fn submit(self: *InsertionAdapter, text: []const u8) void {
-        // Copy in + guarantee a single trailing space so back-to-back Insertions don't
-        // run their words together (insert.ensureTrailingSpace; CONTEXT.md, Insertion).
-        _ = insertmod.ensureTrailingSpace(&self.job, text);
-        self.pending.store(true, .release); // publishes the job bytes to the worker
+    pub fn insertionMethod(self: *RealInsertionDeps) insertmod.Method {
+        return self.store.current().insertion;
     }
-
-    fn workerLoop(self: *InsertionAdapter) void {
-        while (!g_quit.load(.acquire)) {
-            if (!self.pending.swap(false, .acquire)) {
-                _ = usleep(2_000);
-                continue;
-            }
-            const z: [*:0]const u8 = @ptrCast(&self.job);
-            const method = self.store.current().insertion;
-            const result: coord.InsertResult = if (self.inserter.insert(method, z)) |_|
-                .ok
-            else |e| blk: {
-                feedback.log("  insertion failed: {s}\n", .{explainInsert(e)});
-                break :blk .failed;
-            };
-            if (result == .ok) feedback.log("  inserted at the cursor\n", .{});
-            self.on_done(self.co_ctx, result);
-        }
+    pub fn insert(self: *RealInsertionDeps, method: insertmod.Method, text: [*:0]const u8) insertmod.InsertError!void {
+        return self.inserter.insert(method, text);
+    }
+    pub fn complete(self: *RealInsertionDeps, result: coord.InsertResult) void {
+        self.on_done(self.co_ctx, result);
+    }
+    pub fn shouldQuit(_: *RealInsertionDeps) bool {
+        return g_quit.load(.acquire);
+    }
+    pub fn idle(_: *RealInsertionDeps) void {
+        _ = usleep(2_000);
     }
 };
+const InsertionAdapter = insertion_adapter.InsertionAdapter(RealInsertionDeps);
 
 /// Deadline seam: a small timer thread. `arm` (Coordinator entering `awaiting_final`) sets
 /// a fire time; `cancel` (final arrived) clears it. The loop fires `.deadline` once if the
@@ -557,7 +531,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
 
     // ---- wire the real adapters, then the Coordinator that drives them ----
     daemon.feedback_surface = .{ .cues = &daemon.cues, .hud = &daemon.hud };
-    daemon.insertion = .{ .inserter = &daemon.inserter, .store = &daemon.store };
+    daemon.insertion = InsertionAdapter.init(.{ .inserter = &daemon.inserter, .store = &daemon.store });
     daemon.coordinator = Coord.init(.{
         .audio = &daemon.capture,
         .transcription = &daemon.transcription,
@@ -566,8 +540,8 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
         .feedback = &daemon.feedback_surface,
     });
     // Reverse edges: the worker/timer threads re-enter the now-constructed Coordinator.
-    daemon.insertion.co_ctx = &daemon.coordinator;
-    daemon.insertion.on_done = insertDoneTramp;
+    daemon.insertion.deps.co_ctx = &daemon.coordinator;
+    daemon.insertion.deps.on_done = insertDoneTramp;
     daemon.deadline.co_ctx = &daemon.coordinator;
     daemon.deadline.on_fire = deadlineFireTramp;
 

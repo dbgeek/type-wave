@@ -10,4 +10,5 @@ test {
     _ = @import("session.zig");
     _ = @import("hud.zig");
     _ = @import("insert.zig"); // ensureTrailingSpace (the Insertion separator)
+    _ = @import("insertion_adapter.zig");
 }
