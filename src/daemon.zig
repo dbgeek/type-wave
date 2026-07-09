@@ -174,11 +174,12 @@ const RealInsertionDeps = struct {
     co_ctx: *anyopaque = undefined,
     on_done: *const fn (*anyopaque, coord.InsertResult) void = undefined,
 
-    pub fn insertionMethod(self: *RealInsertionDeps) insertmod.Method {
-        return self.store.current().insertion;
+    pub fn insertionPlan(self: *RealInsertionDeps) insertmod.Plan {
+        const s = self.store.current(); // one snapshot: method + settle stay coherent
+        return .{ .method = s.insertion, .pre_paste_ms = s.pre_paste_ms };
     }
-    pub fn insert(self: *RealInsertionDeps, method: insertmod.Method, text: [*:0]const u8) insertmod.InsertError!void {
-        return self.inserter.insert(method, text);
+    pub fn insert(self: *RealInsertionDeps, plan: insertmod.Plan, text: [*:0]const u8) insertmod.InsertError!void {
+        return self.inserter.insert(plan, text);
     }
     pub fn complete(self: *RealInsertionDeps, result: coord.InsertResult) void {
         self.on_done(self.co_ctx, result);
@@ -514,8 +515,8 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     const first_snapshot = try alloc.create(config.Settings);
     first_snapshot.* = config.loadSettingsOnly(io, alloc);
     const settings = first_snapshot.*;
-    std.debug.print("config: talk_key={s} model=\"{s}\" language=\"{s}\" delay=\"{s}\" noise_reduction={s} insertion={s} overlay={}\n", .{
-        @tagName(settings.talk_key), settings.model, settings.language, settings.delay, @tagName(settings.noise_reduction), @tagName(settings.insertion), settings.overlay,
+    std.debug.print("config: talk_key={s} model=\"{s}\" language=\"{s}\" delay=\"{s}\" noise_reduction={s} insertion={s} pre_paste_ms={d} overlay={}\n", .{
+        @tagName(settings.talk_key), settings.model, settings.language, settings.delay, @tagName(settings.noise_reduction), @tagName(settings.insertion), settings.pre_paste_ms, settings.overlay,
     });
 
     var daemon = Daemon{

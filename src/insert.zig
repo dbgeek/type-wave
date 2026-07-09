@@ -19,6 +19,13 @@ pub const InsertError = error{
 /// Which Insertion mechanism to use (wayfinder #16 config). `paste` is the proven
 /// primary (clipboard swap + ⌘V); `keystroke` is the synthetic-typing fallback.
 pub const Method = enum { paste, keystroke };
+
+/// The Insertion knobs for one job, read off a single Settings Snapshot so the
+/// mechanism and its pre-paste settle can never mix two snapshots (issue #37).
+pub const Plan = struct {
+    method: Method = .paste,
+    pre_paste_ms: u32 = default_pre_paste_ms,
+};
 // NB: Secure Event Input (crib sheet §6) is a *policy* concern, not a mechanism
 // one — whether it actually suppresses CGEventPost/Cmd-V is undocumented (§6,
 // spike item 4). So these functions just attempt the post; the caller decides
@@ -104,10 +111,18 @@ fn sleepMs(ms: u32) void {
     _ = usleep(ms * 1000);
 }
 
-/// espanso's constants (§3): settle before, let the async paste read finish after.
-const pre_paste_ms: u32 = 100;
+/// Default pre-paste settle: the gap between writing the pasteboard and posting Cmd-V.
+/// NSPasteboard writes are synchronous to the pasteboard server, so this only guards
+/// slow target apps — espanso's conservative 100 ms (§3) added a flat 100 ms to every
+/// perceived insert, and comparable tools get away with 20–30 ms (issue #37). This is
+/// the `Settings.pre_paste_ms` default; a slow target can dial it back up in config.zon.
+pub const default_pre_paste_ms: u32 = 25;
+/// espanso's constants (§3): let the async paste read finish after Cmd-V.
 const restore_ms: u32 = 300;
 const cmd_v_gap_ms: u32 = 10;
+/// Ceiling on a hand-edited `pre_paste_ms`: keeps `sleepMs`'s µs conversion inside u32
+/// and `usleep` under its POSIX-specified 1 s — a settle beyond this is nonsense anyway.
+const max_pre_paste_ms: u32 = 999;
 
 /// Preflight (silent) and prompt for PostEvent access if absent.
 pub fn requestPostEventAccess() bool {
@@ -177,18 +192,19 @@ pub const Inserter = struct {
         if (self.src != null) CGEventSourceSetUserData(self.src, tap.self_event_tag);
     }
 
-    /// Insert `utf8` (NUL-terminated) via the configured mechanism (wayfinder #16).
-    /// The keystroke path converts to the UTF-16 that `keystroke` wants; malformed
-    /// UTF-8 (not expected from the transcription service) degrades to paste.
-    pub fn insert(self: *Inserter, method: Method, utf8: [*:0]const u8) InsertError!void {
-        switch (method) {
-            .paste => return self.paste(utf8),
+    /// Insert `utf8` (NUL-terminated) per `plan` (wayfinder #16; knobs read off one
+    /// Settings Snapshot at job execution time). The keystroke path converts to the
+    /// UTF-16 that `keystroke` wants; malformed UTF-8 (not expected from the
+    /// transcription service) degrades to paste.
+    pub fn insert(self: *Inserter, plan: Plan, utf8: [*:0]const u8) InsertError!void {
+        switch (plan.method) {
+            .paste => return self.paste(utf8, plan.pre_paste_ms),
             .keystroke => {
                 const s = std.mem.span(utf8);
                 // The Final Transcript buffer is 8192 bytes and UTF-16 units never
                 // outnumber source bytes, so this dest can't overflow.
                 var u16buf: [8192]u16 = undefined;
-                const n = std.unicode.utf8ToUtf16Le(&u16buf, s) catch return self.paste(utf8);
+                const n = std.unicode.utf8ToUtf16Le(&u16buf, s) catch return self.paste(utf8, plan.pre_paste_ms);
                 return self.keystroke(u16buf[0..n]);
             },
         }
@@ -197,7 +213,7 @@ pub const Inserter = struct {
     /// Primary mechanism: save clipboard → set transcript → Cmd-V → restore.
     /// `utf8` must be NUL-terminated (it becomes an NSString). Returns the
     /// pasteboard changeCount delta so the caller can spot a clobbering manager.
-    pub fn paste(self: *Inserter, utf8: [*:0]const u8) InsertError!void {
+    pub fn paste(self: *Inserter, utf8: [*:0]const u8, pre_paste_ms: u32) InsertError!void {
         if (!CGPreflightPostEventAccess()) return error.PostEventDenied;
         const t_paste = feedback.nowMs();
 
@@ -217,7 +233,7 @@ pub const Inserter = struct {
         setStringForType(pb, nsString(""), nsString("org.nspasteboard.TransientType"));
         setStringForType(pb, nsString(""), nsString("org.nspasteboard.ConcealedType"));
 
-        sleepMs(pre_paste_ms);
+        sleepMs(@min(pre_paste_ms, max_pre_paste_ms));
         self.postCmdV();
         // Text becomes visible at the Cmd-V post — everything after (restore_ms + the
         // clipboard restore) pads the Coordinator's `.inserting` lockout, not the user's

@@ -36,6 +36,11 @@
     //   .keystroke — synthetic Unicode typing (fallback)
     .insertion = .paste,
 
+    // Milliseconds between writing the pasteboard and posting ⌘V (paste insertion
+    // only). The pasteboard write is synchronous, so this only guards slow target
+    // apps — raise it (espanso used 100) if a target pastes the OLD clipboard.
+    .pre_paste_ms = 25,
+
     // Show the floating overlay HUD (wayfinder #22/#27): a silent bottom-centre pill —
     // a scrolling red waveform of your live mic level while you hold the Talk Key,
     // three bouncing green dots until the Insertion resolves, no text ever. When on, it

@@ -52,6 +52,11 @@ pub const Settings = struct {
     delay: []const u8 = "low",
     noise_reduction: NoiseReduction = .near_field,
     insertion: insert.Method = .paste,
+    /// Pre-paste settle in milliseconds — the pause between writing the pasteboard and
+    /// posting Cmd-V (paste insertion only; issue #37). The default suits native views,
+    /// terminals and Electron; raise it (espanso used 100) if a slow target pastes the
+    /// old clipboard. Hand-edit-only, like `delay = "xhigh"` — no menu group.
+    pre_paste_ms: u32 = insert.default_pre_paste_ms,
     /// Show the live-partials overlay pill at the cursor (wayfinder #22). On by default;
     /// set `.overlay = false` for sound-only feedback. A headless run (no display) also
     /// degrades to sound-only on its own, so this never blocks startup.
@@ -259,6 +264,7 @@ pub fn diffSettings(a: *const Settings, b: *const Settings) Diff {
     var d: Diff = .{};
     if (a.talk_key != b.talk_key) d.any = true;
     if (a.insertion != b.insertion) d.any = true;
+    if (a.pre_paste_ms != b.pre_paste_ms) d.any = true;
     if (!std.mem.eql(u8, a.model, b.model)) d.session_shaped = true;
     if (!std.mem.eql(u8, a.language, b.language)) d.session_shaped = true;
     if (!std.mem.eql(u8, a.delay, b.delay)) d.session_shaped = true;
@@ -404,6 +410,7 @@ fn serializeSettings(gpa: std.mem.Allocator, s: Settings) ?[:0]u8 {
         \\//   .delay           = "minimal" | "low" | "medium" | "high" | "xhigh"
         \\//   .noise_reduction = .near_field | .far_field | .off
         \\//   .insertion       = .paste | .keystroke
+        \\//   .pre_paste_ms    = <ms between the pasteboard write and Cmd-V; raise for a slow target>
         \\//   .overlay         = true | false
         \\.{{
         \\    .talk_key = .{s},
@@ -412,12 +419,13 @@ fn serializeSettings(gpa: std.mem.Allocator, s: Settings) ?[:0]u8 {
         \\    .delay = "{s}",
         \\    .noise_reduction = .{s},
         \\    .insertion = .{s},
+        \\    .pre_paste_ms = {d},
         \\    .overlay = {},
         \\}}
         \\
     , .{
         @tagName(s.talk_key), s.model, s.language, s.delay,
-        @tagName(s.noise_reduction), @tagName(s.insertion), s.overlay,
+        @tagName(s.noise_reduction), @tagName(s.insertion), s.pre_paste_ms, s.overlay,
     }) catch return null;
     return gpa.dupeSentinel(u8, text, 0) catch null;
 }
@@ -540,7 +548,7 @@ test "patchZonField does not confuse a longer field name for a prefix" {
 }
 
 test "serializeSettings round-trips through the ZON parser" {
-    const s = Settings{ .talk_key = .left_option, .language = "", .delay = "high", .overlay = false };
+    const s = Settings{ .talk_key = .left_option, .language = "", .delay = "high", .overlay = false, .pre_paste_ms = 42 };
     const text = serializeSettings(talloc, s) orelse return error.SerializeFailed;
     defer talloc.free(text);
     var diag: std.zon.parse.Diagnostics = .{};
@@ -552,6 +560,23 @@ test "serializeSettings round-trips through the ZON parser" {
     try std.testing.expectEqual(tap.TalkKey.left_option, parsed.talk_key);
     try std.testing.expectEqualStrings("", parsed.language);
     try std.testing.expect(!parsed.overlay);
+    try std.testing.expectEqual(@as(u32, 42), parsed.pre_paste_ms);
+}
+
+test "pre_paste_ms parses from config.zon and defaults when absent" {
+    var diag: std.zon.parse.Diagnostics = .{};
+    defer diag.deinit(talloc);
+    const parsed = try std.zon.parse.fromSliceAlloc(Settings, talloc, ".{ .pre_paste_ms = 100 }", &diag, .{});
+    try std.testing.expectEqual(@as(u32, 100), parsed.pre_paste_ms);
+    try std.testing.expectEqual(insert.default_pre_paste_ms, (Settings{}).pre_paste_ms);
+}
+
+test "diffSettings flags a pre_paste_ms change as plain (read-at-use)" {
+    const base = Settings{};
+    var b = base;
+    b.pre_paste_ms = base.pre_paste_ms + 10;
+    const d = diffSettings(&base, &b);
+    try std.testing.expect(d.any and !d.session_shaped and !d.overlay);
 }
 
 test "diffSettings flags session-shaped and overlay changes" {

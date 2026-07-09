@@ -55,8 +55,8 @@ pub fn InsertionAdapter(comptime Deps: type) type {
             const t_pick = feedback.nowMs();
 
             const z: [*:0]const u8 = @ptrCast(&self.job);
-            const method = self.deps.insertionMethod();
-            const result: coord.InsertResult = if (self.deps.insert(method, z)) |_|
+            const plan = self.deps.insertionPlan();
+            const result: coord.InsertResult = if (self.deps.insert(plan, z)) |_|
                 .ok
             else |e| blk: {
                 feedback.log("  insertion failed: {s}\n", .{explainInsert(e)});
@@ -83,9 +83,9 @@ pub fn InsertionAdapter(comptime Deps: type) type {
 }
 
 const FakeDeps = struct {
-    method: insertmod.Method = .paste,
+    plan: insertmod.Plan = .{},
     calls: usize = 0,
-    last_method: insertmod.Method = .paste,
+    last_plan: insertmod.Plan = .{},
     last: [256]u8 = undefined,
     last_len: usize = 0,
     result: insertmod.InsertError!void = {},
@@ -94,13 +94,13 @@ const FakeDeps = struct {
     quit: bool = false,
     idles: usize = 0,
 
-    fn insertionMethod(self: *FakeDeps) insertmod.Method {
-        return self.method;
+    fn insertionPlan(self: *FakeDeps) insertmod.Plan {
+        return self.plan;
     }
 
-    fn insert(self: *FakeDeps, method: insertmod.Method, text: [*:0]const u8) insertmod.InsertError!void {
+    fn insert(self: *FakeDeps, plan: insertmod.Plan, text: [*:0]const u8) insertmod.InsertError!void {
         self.calls += 1;
-        self.last_method = method;
+        self.last_plan = plan;
         const s = std.mem.span(text);
         @memcpy(self.last[0..s.len], s);
         self.last_len = s.len;
@@ -137,13 +137,14 @@ test "submit copies a Final Transcript and applies the Insertion separator" {
 }
 
 test "worker reads the Settings Snapshot at job execution time" {
-    var adapter = InsertionAdapter(FakeDeps).init(.{ .method = .paste });
+    var adapter = InsertionAdapter(FakeDeps).init(.{ .plan = .{ .method = .paste } });
 
     adapter.submit("hello");
-    adapter.deps.method = .keystroke;
+    adapter.deps.plan = .{ .method = .keystroke, .pre_paste_ms = 40 };
 
     try std.testing.expect(adapter.runOnce());
-    try std.testing.expectEqual(insertmod.Method.keystroke, adapter.deps.last_method);
+    try std.testing.expectEqual(insertmod.Method.keystroke, adapter.deps.last_plan.method);
+    try std.testing.expectEqual(@as(u32, 40), adapter.deps.last_plan.pre_paste_ms);
 }
 
 test "insert failure reports a failed completion" {

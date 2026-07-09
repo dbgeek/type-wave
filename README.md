@@ -75,6 +75,7 @@ cp packaging/config.example.zon ~/.config/type-wave/config.zon
 | `delay` | `"low"` | |
 | `noise_reduction` | `.near_field` | `.near_field` / `.far_field` / `.off` |
 | `insertion` | `.paste` | `.paste` (clipboard + ⌘V) or `.keystroke` (synthetic typing) |
+| `pre_paste_ms` | `25` | Settle between the pasteboard write and ⌘V; raise (espanso used `100`) if a slow target pastes the old clipboard |
 | `overlay` | `true` | The floating live-partials pill; `false` = sound-only |
 
 An absent or malformed `config.zon` falls back to all defaults, so a typo never keeps
