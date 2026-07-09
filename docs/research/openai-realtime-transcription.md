@@ -148,7 +148,8 @@ Field notes (all from the transcription guide + SDK types):
   trade-off, "Only supported with `gpt-realtime-whisper` in GA Realtime sessions". Docs: `minimal`
   for most latency-sensitive, `low` for live captions, higher levels improve word error rate. "The
   exact delay in milliseconds can vary by model configuration, so benchmark with representative
-  audio."
+  audio." Benchmarked 2026-07-09 (issue #36): `minimal` saves only ~30–50ms over `low` and costs
+  WER on quiet speech — see `delay-tier-benchmark.md`; `low` stays the default.
 - `audio.input.turn_detection`: `null` (or omitted) for manual commit; see §4.
 - `audio.input.noise_reduction`: optional; `near_field` (headsets/close mics) or `far_field`
   (laptop/conference mics); `null` to disable. "Filtering the audio can improve VAD and turn

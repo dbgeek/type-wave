@@ -24,6 +24,20 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // Delay-tier benchmark (issue #36): file playback instead of the mic, so no
+    // AudioToolbox. `zig build` installs it; run zig-out/bin/bench by hand.
+    const bench = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench.root_module.addImport("websocket", ws.module("websocket"));
+    b.installArtifact(bench);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Build and run the CLI dictation prototype");

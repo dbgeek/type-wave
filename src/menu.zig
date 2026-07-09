@@ -220,6 +220,7 @@ const groups = [_]GroupDef{
         .{ .label = "auto-detect", .zon = "\"\"" },
     } },
     .{ .title = "Delay", .field = "delay", .session_shaped = true, .opts = &.{
+        .{ .label = "minimal", .zon = "\"minimal\"" },
         .{ .label = "low", .zon = "\"low\"" },
         .{ .label = "medium", .zon = "\"medium\"" },
         .{ .label = "high", .zon = "\"high\"" },
@@ -237,7 +238,11 @@ const groups = [_]GroupDef{
 
 const talk_keys = [_]tapmod.TalkKey{ .right_option, .left_option, .globe };
 const languages = [_][]const u8{ "en", "sv", "" }; // "" = auto-detect (session omits the field)
-const delays = [_][]const u8{ "low", "medium", "high" };
+// "minimal" earned its slot via the issue #36 benchmark: ~30-50ms faster to Final
+// Transcript than "low" but measurably worse WER on quiet speech, so "low" stays the
+// default and "minimal" is the one-click latency escape hatch ("xhigh" stays
+// hand-edit-only). See docs/research/delay-tier-benchmark.md.
+const delays = [_][]const u8{ "minimal", "low", "medium", "high" };
 const noises = [_]config.Settings.NoiseReduction{ .near_field, .far_field, .off };
 const insertions = [_]insertmod.Method{ .paste, .keystroke };
 

@@ -401,7 +401,7 @@ fn serializeSettings(gpa: std.mem.Allocator, s: Settings) ?[:0]u8 {
         \\//   .talk_key        = .right_option | .left_option | .globe
         \\//   .model           = "<transcription model>"
         \\//   .language        = "<ISO code>"  ("" = auto-detect)
-        \\//   .delay           = "low" | "medium" | "high"
+        \\//   .delay           = "minimal" | "low" | "medium" | "high" | "xhigh"
         \\//   .noise_reduction = .near_field | .far_field | .off
         \\//   .insertion       = .paste | .keystroke
         \\//   .overlay         = true | false
