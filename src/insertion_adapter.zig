@@ -29,6 +29,10 @@ pub fn InsertionAdapter(comptime Deps: type) type {
         /// The single insert job (NUL-terminated for insert.paste's NSString). Written by
         /// `submit` before the `pending` release-store; read by the worker after acquire.
         job: [8193]u8 = undefined,
+        /// When `submit` handed the job over (≈ the Final Transcript's arrival) — anchors
+        /// the final→inserted split in the timing logs (issues #36–#38). Ordered across
+        /// threads by the `pending` release-store / acquire-swap, like `job`.
+        submitted_at_ms: i64 = 0,
         pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
         pub fn init(deps: Deps) Self {
@@ -40,6 +44,7 @@ pub fn InsertionAdapter(comptime Deps: type) type {
         /// lands with exactly one trailing separator.
         pub fn submit(self: *Self, text: []const u8) void {
             _ = insertmod.ensureTrailingSpace(&self.job, text);
+            self.submitted_at_ms = feedback.nowMs();
             self.pending.store(true, .release);
         }
 
@@ -47,6 +52,7 @@ pub fn InsertionAdapter(comptime Deps: type) type {
         /// thread or sleeping. Returns whether a job was drained.
         pub fn runOnce(self: *Self) bool {
             if (!self.pending.swap(false, .acquire)) return false;
+            const t_pick = feedback.nowMs();
 
             const z: [*:0]const u8 = @ptrCast(&self.job);
             const method = self.deps.insertionMethod();
@@ -56,7 +62,12 @@ pub fn InsertionAdapter(comptime Deps: type) type {
                 feedback.log("  insertion failed: {s}\n", .{explainInsert(e)});
                 break :blk .failed;
             };
-            if (result == .ok) feedback.log("  inserted at the cursor\n", .{});
+            if (result == .ok) {
+                // NB: both deltas include the mechanism's post-paste settle + clipboard
+                // restore — the text itself landed at the "[insert] Cmd-V posted" line.
+                const now = feedback.nowMs();
+                feedback.log("  inserted at the cursor (+{d}ms after the Final Transcript; mechanism {d}ms)\n", .{ now - self.submitted_at_ms, now - t_pick });
+            }
             self.deps.complete(result);
             return true;
         }

@@ -46,6 +46,15 @@ const Tm = extern struct {
 extern "c" fn gettimeofday(tv: *timeval, tz: ?*anyopaque) c_int;
 extern "c" fn localtime_r(clock: *const c_long, result: *Tm) ?*Tm;
 
+/// Wall-clock milliseconds. libc, to sidestep std time-API churn on this nightly.
+/// Lives here (not session.zig) so the insert-side modules can stamp timing deltas
+/// without a dependency on the OpenAI half.
+pub fn nowMs() i64 {
+    var tv: timeval = undefined;
+    _ = gettimeofday(&tv, null);
+    return tv.sec * 1000 + @divTrunc(@as(i64, tv.usec), 1000);
+}
+
 /// Format the current local time as `YYYY-MM-DD HH:MM:SS.mmm` into `buf`.
 ///
 /// The components are cast to **unsigned** before formatting: on this Zig nightly a

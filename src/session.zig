@@ -124,16 +124,10 @@ pub fn formatSessionUpdate(buf: []u8, params: TranscriptionParams) ![]const u8 {
     return std.fmt.bufPrint(buf, "{{\"type\":\"session.update\",\"session\":{{\"type\":\"transcription\",\"audio\":{{\"input\":{{\"format\":{{\"type\":\"audio/pcm\",\"rate\":24000}},\"transcription\":{{\"model\":\"{s}\",{s}\"delay\":\"{s}\"}},\"turn_detection\":null,\"noise_reduction\":{s}}}}}}}}}", .{ params.model, lang, params.delay, nr });
 }
 
-const timeval = extern struct { sec: i64, usec: i32 };
-extern "c" fn gettimeofday(tv: *timeval, tz: ?*anyopaque) c_int;
 extern "c" fn usleep(usec: c_uint) c_int;
 
-/// Wall-clock milliseconds. libc, to sidestep std time-API churn on this nightly.
-pub fn nowMs() i64 {
-    var tv: timeval = undefined;
-    _ = gettimeofday(&tv, null);
-    return tv.sec * 1000 + @divTrunc(@as(i64, tv.usec), 1000);
-}
+/// Wall-clock milliseconds (feedback.zig owns the libc mechanism).
+pub const nowMs = feedback.nowMs;
 
 fn sleepMs(ms: i64) void {
     if (ms <= 0) return;
@@ -219,6 +213,11 @@ pub const Session = struct {
 
     /// Utterance start, for relative event timestamps. Set by beginUtterance.
     t0_ms: i64 = 0,
+
+    /// Talk Key release, anchoring the post-release timing splits (release→committed→
+    /// FINAL — the speak→insert latency hunt, issues #36–#38). Set by endUtterance;
+    /// read on the read-loop thread — the same benign cross-thread pattern as t0_ms.
+    t_release_ms: i64 = 0,
 
     /// Live Partial Transcript accumulator. Touched only on the read-loop thread.
     partial: [8192]u8 = undefined,
@@ -427,7 +426,11 @@ pub const Session = struct {
 
     /// Stop forwarding Capture audio. Call after the queue is stopped, before commit.
     pub fn endUtterance(self: *Session) void {
+        self.t_release_ms = nowMs();
         self.active.store(false, .release);
+        // The bracketed offset is ms since press, i.e. the hold itself — the anchor the
+        // committed/FINAL "+Nms after release" deltas subtract away.
+        feedback.log("  [{d:>6}ms] released\n", .{self.t_release_ms - self.t0_ms});
     }
 
     /// Append one Capture chunk. Called on the AudioQueue thread — which is exactly why
@@ -781,7 +784,8 @@ pub const Handler = struct {
             const n = @min(t.len, s.final.len);
             @memcpy(s.final[0..n], t[0..n]);
             s.final_len = n;
-            feedback.log("  [{d:>6}ms] FINAL: {s}  ({d:.2}s audio)\n", .{ nowMs() - s.t0_ms, t, usageSeconds(root) });
+            const now = nowMs();
+            feedback.log("  [{d:>6}ms] FINAL (+{d}ms after release): {s}  ({d:.2}s audio)\n", .{ now - s.t0_ms, now - s.t_release_ms, t, usageSeconds(root) });
             // Deliver the Final Transcript to the observer (the Utterance Coordinator, and
             // through it the overlay HUD). This synchronous push IS the delivery — there is
             // no polled got_final flag any more (architecture review 2026-07-08, candidate 1).
@@ -796,7 +800,8 @@ pub const Handler = struct {
         } else if (std.mem.eql(u8, typ, "error")) {
             feedback.log("  ERROR event: {s}\n", .{errMessage(root)});
         } else if (std.mem.eql(u8, typ, "input_audio_buffer.committed")) {
-            feedback.log("  [{d:>6}ms] committed (awaiting transcript)\n", .{nowMs() - s.t0_ms});
+            const now = nowMs();
+            feedback.log("  [{d:>6}ms] committed (+{d}ms after release — awaiting transcript)\n", .{ now - s.t0_ms, now - s.t_release_ms });
         }
         // else: item.created / item.added / etc. — ignored.
     }

@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const tap = @import("tap.zig");
+const feedback = @import("feedback.zig");
 
 pub const InsertError = error{
     /// No kTCCServicePostEvent grant — CGEventPost is silently dropped. §7.
@@ -198,6 +199,7 @@ pub const Inserter = struct {
     /// pasteboard changeCount delta so the caller can spot a clobbering manager.
     pub fn paste(self: *Inserter, utf8: [*:0]const u8) InsertError!void {
         if (!CGPreflightPostEventAccess()) return error.PostEventDenied;
+        const t_paste = feedback.nowMs();
 
         const pool = objc_autoreleasePoolPush();
         defer objc_autoreleasePoolPop(pool);
@@ -217,6 +219,10 @@ pub const Inserter = struct {
 
         sleepMs(pre_paste_ms);
         self.postCmdV();
+        // Text becomes visible at the Cmd-V post — everything after (restore_ms + the
+        // clipboard restore) pads the Coordinator's `.inserting` lockout, not the user's
+        // wait. Logged here so the split is visible in the timing hunt (issues #37/#38).
+        feedback.log("  [insert] Cmd-V posted {d}ms into paste (text lands here; clipboard restore follows)\n", .{feedback.nowMs() - t_paste});
         sleepMs(restore_ms);
 
         _ = sendLong(pb, "clearContents");
