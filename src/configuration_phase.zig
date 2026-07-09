@@ -43,19 +43,17 @@ pub const ConfigurationPhase = struct {
         };
         const is_configured = readiness.configured(snap);
 
-        // Session construction is an adapter effect that can fail. Do not advance
-        // reporting or READY memory until daemon.zig has executed it and re-ticked.
-        if (!actions.connect_session) {
-            if (is_configured) {
-                _ = self.reporter.next(snap);
-                if (!self.announced) {
-                    actions.announce_ready = true;
-                    self.announced = true;
-                }
-            } else {
-                self.announced = false;
-                actions.report_missing = self.reporter.next(snap);
+        if (is_configured) {
+            _ = self.reporter.next(snap);
+            // Session construction is an adapter effect that can fail. Do not advance
+            // READY memory until daemon.zig has executed it and re-ticked.
+            if (!actions.connect_session and !self.announced) {
+                actions.announce_ready = true;
+                self.announced = true;
             }
+        } else {
+            self.announced = false;
+            actions.report_missing = self.reporter.next(snap);
         }
 
         return .{
@@ -160,5 +158,19 @@ test "commands tap enable and reports the current missing set" {
     const out = phase.tick(makeFacts(.{ .tap_enabled = false }));
     try std.testing.expect(!out.configured);
     try std.testing.expect(out.actions.enable_tap);
+    try std.testing.expect(out.actions.report_missing != null);
+}
+
+test "session construction and missing prerequisite reporting are independent" {
+    var phase = ConfigurationPhase{};
+
+    const out = phase.tick(makeFacts(.{
+        .session_present = false,
+        .session_ready = false,
+        .input_monitoring_granted = false,
+        .tap_enabled = false,
+    }));
+    try std.testing.expect(!out.configured);
+    try std.testing.expect(out.actions.connect_session);
     try std.testing.expect(out.actions.report_missing != null);
 }

@@ -20,14 +20,14 @@
 //! Coordinator's four seams, trampolines real-world events into `coordinator.handle`, and
 //! runs the two supervisory state machines below.
 //!
-//! # Two orthogonal state machines still owned here
+//! # Two orthogonal state machines still assembled here
 //!
-//! 1. **Configuration phase** (this file, the self-heal supervisor): `not-configured` ⇄
-//!    `configured`. The gate is (API key present) AND (Input Monitoring granted) AND
-//!    (PostEvent granted). Missing prerequisites do NOT crash the daemon (the LaunchAgent's
-//!    KeepAlive would crash-loop); the supervisor polls (~3 s), builds the Transcription
-//!    Session the moment a key appears, and brings the created-but-disabled tap live the
-//!    moment Input Monitoring appears. `exit(0)` is reserved for a clean SIGTERM/bootout.
+//! 1. **Configuration Phase** (configuration_phase.zig, driven by the self-heal
+//!    supervisor): `not-configured` ⇄ `configured`. The gate is (API key present) AND
+//!    (Input Monitoring granted) AND (PostEvent granted) AND (tap enabled). Missing
+//!    prerequisites do NOT crash the daemon (the LaunchAgent's KeepAlive would crash-loop);
+//!    the supervisor polls (~3 s), executes the phase module's actions, and reserves
+//!    `exit(0)` for a clean SIGTERM/bootout.
 //! 2. **Link state** (owned by session.zig): connecting / ready / reconnecting / closed.
 //!
 //! # Threads
@@ -356,15 +356,15 @@ const Daemon = struct {
             var changed_facts = false;
             if (outcome.actions.connect_session) {
                 if (key) |k| {
-                    const sess = Session.connect(self.io, self.alloc, k, .{ .ctx = self, .get = getParams }, self.observer()) catch |e| {
+                    if (Session.connect(self.io, self.alloc, k, .{ .ctx = self, .get = getParams }, self.observer())) |sess| {
+                        self.transcription.set(sess);
+                        facts.session_present = true;
+                        facts.session_ready = sess.isReady();
+                        changed_facts = true;
+                        feedback.log("  supervisor: API key found — Transcription Session connecting…\n", .{});
+                    } else |e| {
                         feedback.log("  supervisor: session connect failed: {s} — will retry\n", .{@errorName(e)});
-                        continue;
-                    };
-                    self.transcription.set(sess);
-                    facts.session_present = true;
-                    facts.session_ready = sess.isReady();
-                    changed_facts = true;
-                    feedback.log("  supervisor: API key found — Transcription Session connecting…\n", .{});
+                    }
                 }
             }
 
