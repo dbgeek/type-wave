@@ -53,6 +53,12 @@ acquire-load once and see a coherent whole. Old snapshots leak by design, so a h
 canonical hand-editable form of the same settings.
 _Avoid_: mutable config, live config object
 
+**Configuration Phase**:
+The daemon's setup-readiness state: `not-configured` until the API key, required macOS
+grants, and live Talk Key tap are all present, then `configured`. Transcription Session
+readiness and pause state affect status, but do not define this phase.
+_Avoid_: setup state, readiness state, configured flag
+
 **Status Item**:
 The daemon's menu-bar presence (icon near the clock): a two-tier icon — normal when
 dictation can fire, dimmed when it can't (paused / no key / permission missing) — whose

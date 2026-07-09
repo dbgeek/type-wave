@@ -12,4 +12,5 @@ test {
     _ = @import("insert.zig"); // ensureTrailingSpace (the Insertion separator)
     _ = @import("insertion_adapter.zig");
     _ = @import("readiness.zig");
+    _ = @import("configuration_phase.zig");
 }

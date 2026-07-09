@@ -64,6 +64,7 @@ const appkit = @import("appkit.zig");
 const keychain = @import("keychain.zig");
 const insertion_adapter = @import("insertion_adapter.zig");
 const readiness = @import("readiness.zig");
+const configuration_phase = @import("configuration_phase.zig");
 
 const Session = session_mod.Session;
 
@@ -271,9 +272,9 @@ const Daemon = struct {
     feedback_surface: surface.Surface = undefined,
     coordinator: Coord = undefined,
 
-    /// Supervisor-thread-only: remembers the last not-configured missing set, so the
-    /// same prerequisites are not re-logged every tick.
-    readiness_reporter: readiness.Reporter = .{},
+    /// Supervisor-thread-only: owns Configuration Phase memory, including READY
+    /// announcements and distinct not-configured reports.
+    configuration: configuration_phase.ConfigurationPhase = .{},
 
     /// Always-on live-transcript subscriber: Final Transcripts from the read-loop thread
     /// trampoline into the Coordinator. Installed at every Session.connect, before the read
@@ -336,58 +337,60 @@ const Daemon = struct {
     // ---- supervisor thread: the self-heal / not-configured → configured engine ----
 
     fn supervisorLoop(self: *Daemon) void {
-        var announced = false;
         var first = true;
         while (!g_quit.load(.acquire)) {
             if (!first) sleepInterruptible(supervisor_tick_ms);
             first = false;
             if (g_quit.load(.acquire)) return;
 
-            // 1. Build the Transcription Session the moment the API key is present.
-            if (!self.transcription.available()) {
-                if (config.loadApiKeyOnly(self.io, self.alloc)) |key| {
-                    const sess = Session.connect(self.io, self.alloc, key, .{ .ctx = self, .get = getParams }, self.observer()) catch |e| {
+            // 1. Observe current facts. Key lookup is skipped once a Session exists: the
+            // Session itself is proof the key prerequisite was satisfied for this run.
+            const session_present = self.transcription.available();
+            const key = if (!session_present) config.loadApiKeyOnly(self.io, self.alloc) else null;
+            const im = tapmod.Tap.listenGranted();
+            const pe = insertmod.postEventGranted();
+            var facts = self.configurationFacts(im, pe, session_present or key != null);
+            var outcome = self.configuration.tick(facts);
+
+            // 2. Execute adapter effects in the old supervisor order.
+            var changed_facts = false;
+            if (outcome.actions.connect_session) {
+                if (key) |k| {
+                    const sess = Session.connect(self.io, self.alloc, k, .{ .ctx = self, .get = getParams }, self.observer()) catch |e| {
                         feedback.log("  supervisor: session connect failed: {s} — will retry\n", .{@errorName(e)});
                         continue;
                     };
                     self.transcription.set(sess);
+                    facts.session_present = true;
+                    facts.session_ready = sess.isReady();
+                    changed_facts = true;
                     feedback.log("  supervisor: API key found — Transcription Session connecting…\n", .{});
                 }
             }
 
-            // 2. Grants — silent preflight (no re-prompt).
-            const im = tapmod.Tap.listenGranted();
-            const pe = insertmod.postEventGranted();
-
-            // 3. Bring the created-but-disabled tap live once Input Monitoring appears.
-            if (im and !self.tap.isEnabled()) {
-                if (self.tap.enable())
-                    feedback.log("  supervisor: Input Monitoring granted — Talk Key tap is live\n", .{})
-                else
+            if (outcome.actions.enable_tap) {
+                if (self.tap.enable()) {
+                    facts.tap_enabled = true;
+                    changed_facts = true;
+                    feedback.log("  supervisor: Input Monitoring granted — Talk Key tap is live\n", .{});
+                } else {
                     feedback.log("  supervisor: Input Monitoring looks granted but the tap won't enable — a daemon restart may be needed\n", .{});
+                }
             }
 
-            // 4. Configured? (PostEvent is also preflighted per-insert, so a later revoke is
-            //    caught there too; here it just gates the "READY" banner + reporting.)
-            const rs = self.readinessSnapshot(im, pe);
-            if (readiness.configured(rs)) {
-                _ = self.readiness_reporter.next(rs);
-                if (!announced) {
-                    announced = true;
-                    feedback.log("  READY — hold {s}, speak, release; the transcript lands at the cursor.\n", .{keyName(self.store.current().talk_key)});
-                }
-            } else {
-                announced = false;
-                self.reportMissing(rs);
-            }
+            // 3. Re-evaluate after successful self-heal effects so READY/reporting reflects
+            // the state users see at the end of this poll tick.
+            if (changed_facts) outcome = self.configuration.tick(facts);
+
+            if (outcome.actions.announce_ready)
+                feedback.log("  READY — hold {s}, speak, release; the transcript lands at the cursor.\n", .{keyName(self.store.current().talk_key)});
+            if (outcome.actions.report_missing) |report| self.reportMissing(report);
         }
     }
 
     /// Log the missing prerequisites once per distinct set (not every tick), with one error
     /// cue so a headless user hears that the daemon is waiting on them.
-    fn reportMissing(self: *Daemon, rs: readiness.Snapshot) void {
-        const report = self.readiness_reporter.next(rs) orelse return;
-
+    fn reportMissing(self: *Daemon, report: readiness.Report) void {
         feedback.log("  not-configured — waiting on:\n", .{});
         for (report.slice()) |line| feedback.log("{s}\n", .{line});
         self.cues.err();
@@ -409,14 +412,15 @@ const Daemon = struct {
         };
     }
 
-    fn readinessSnapshot(self: *Daemon, im: bool, pe: bool) readiness.Snapshot {
-        const session_ready = if (self.transcription.current()) |s| s.isReady() else false;
+    fn configurationFacts(self: *Daemon, im: bool, pe: bool, key_present: bool) configuration_phase.Facts {
+        const sess = self.transcription.current();
         return .{
-            .key_present = self.transcription.available(),
+            .key_present = key_present,
+            .session_present = sess != null,
             .input_monitoring_granted = im,
             .post_event_granted = pe,
             .tap_enabled = self.tap.isEnabled(),
-            .session_ready = session_ready,
+            .session_ready = if (sess) |s| s.isReady() else false,
             .paused = self.paused.load(.acquire),
         };
     }
@@ -437,7 +441,11 @@ const Daemon = struct {
     /// same signals the supervisor gates "configured" on, read non-destructively.
     fn menuHealth(ctx: *anyopaque) menu_mod.Health {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
-        const h = readiness.health(self.readinessSnapshot(tapmod.Tap.listenGranted(), insertmod.postEventGranted()));
+        const h = configuration_phase.health(self.configurationFacts(
+            tapmod.Tap.listenGranted(),
+            insertmod.postEventGranted(),
+            self.transcription.available(),
+        ));
         return .{ .paused = h.paused, .status = menuStatus(h.status) };
     }
 
