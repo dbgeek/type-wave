@@ -144,19 +144,18 @@ const TranscriptionAdapter = struct {
     pub fn available(self: *TranscriptionAdapter) bool {
         return self.ptr.load(.acquire) != 0;
     }
-    pub fn beginUtterance(self: *TranscriptionAdapter) void {
-        if (self.current()) |s| s.beginUtterance();
+    pub fn prepareUtterance(self: *TranscriptionAdapter) void {
+        if (self.current()) |s| s.prepareUtterance();
     }
-    pub fn endUtterance(self: *TranscriptionAdapter) void {
-        if (self.current()) |s| s.endUtterance();
+    pub fn finishAudio(self: *TranscriptionAdapter) void {
+        if (self.current()) |s| s.finishAudio();
     }
-    pub fn commitUtterance(self: *TranscriptionAdapter) !bool {
+    pub fn commitUtterance(self: *TranscriptionAdapter) !void {
         if (self.current()) |s| return s.commitUtterance();
-        return false;
+        return error.NoTranscriptionSession;
     }
-    pub fn isPoisoned(self: *TranscriptionAdapter) bool {
-        if (self.current()) |s| return s.isPoisoned();
-        return false;
+    pub fn discardAudio(self: *TranscriptionAdapter) void {
+        if (self.current()) |s| s.discardAudio();
     }
     // ---- used by the audio sink (Capture → current Session), not the Coordinator ----
     fn appendAudio(self: *TranscriptionAdapter, pcm: []const u8) void {
@@ -285,11 +284,15 @@ const Daemon = struct {
     /// loop starts — never mid-stream. Partials are not subscribed — the HUD shows no text
     /// (wayfinder #27); their log lives upstream in session.zig (#18).
     fn observer(self: *Daemon) session_mod.TranscriptObserver {
-        return .{ .ctx = self, .on_final = obsFinal };
+        return .{ .ctx = self, .on_final = obsFinal, .on_drop = obsDropped };
     }
     fn obsFinal(ctx: ?*anyopaque, text: []const u8) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
         self.coordinator.handle(.{ .final = text });
+    }
+    fn obsDropped(ctx: ?*anyopaque) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx.?));
+        self.coordinator.handle(.transcription_dropped);
     }
 
     /// Capture chunk sink: forward PCM to the current Session (created lazily by the

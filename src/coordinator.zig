@@ -45,6 +45,7 @@ pub const Event = union(enum) {
     press,
     release,
     final: []const u8,
+    transcription_dropped,
     deadline,
     inserted: InsertResult,
 };
@@ -74,6 +75,7 @@ pub fn Coordinator(comptime Deps: type) type {
         deps: Deps,
         mu: Mutex = .{},
         phase: Phase = .idle,
+        invalidated: bool = false,
 
         pub fn init(deps: Deps) Self {
             return .{ .deps = deps };
@@ -87,6 +89,7 @@ pub fn Coordinator(comptime Deps: type) type {
                 .press => self.onPress(),
                 .release => self.onRelease(),
                 .final => |t| self.onFinal(t),
+                .transcription_dropped => self.onTranscriptionDropped(),
                 .deadline => self.onDeadline(),
                 .inserted => |r| self.onInserted(r),
             }
@@ -108,10 +111,11 @@ pub fn Coordinator(comptime Deps: type) type {
                 self.deps.feedback.abandoned();
                 return;
             }
-            self.deps.transcription.beginUtterance();
+            self.invalidated = false;
+            self.deps.transcription.prepareUtterance();
             self.deps.audio.start() catch |e| {
                 feedback.log("  capture.start failed: {s} — Utterance aborted\n", .{@errorName(e)});
-                self.deps.transcription.endUtterance();
+                self.deps.transcription.finishAudio();
                 self.deps.feedback.abandoned();
                 return; // stays .idle
             };
@@ -124,14 +128,21 @@ pub fn Coordinator(comptime Deps: type) type {
             if (self.phase != .capturing) return; // press was rejected / no live hold
 
             self.deps.audio.stop(); // synchronous; final buffers flush + forward during this
-            self.deps.transcription.endUtterance(); // stop forwarding before committing
+            self.deps.transcription.finishAudio(); // stop forwarding before committing
             self.deps.feedback.released();
 
             // Link dropped mid-Utterance: the head audio already streamed live is gone
             // server-side, so committing the buffered tail would insert a truncated Final
             // Transcript. Abandon cleanly rather than commit a fragment.
-            if (self.deps.transcription.isPoisoned()) {
+            if (self.invalidated) {
                 feedback.log("  Transcription Session dropped mid-Utterance — discarded; hold the Talk Key and say it again\n", .{});
+                self.deps.transcription.discardAudio();
+                self.deps.feedback.abandoned();
+                self.phase = .idle;
+                return;
+            }
+            if (!self.deps.audio.capturedAudio()) {
+                feedback.log("  Utterance produced no audio — nothing to insert\n", .{});
                 self.deps.feedback.abandoned();
                 self.phase = .idle;
                 return;
@@ -140,19 +151,14 @@ pub fn Coordinator(comptime Deps: type) type {
             if (!self.deps.audio.heardSound())
                 feedback.log("  microphone captured only silence — is Microphone permission granted to this process?\n", .{});
 
-            const expecting = self.deps.transcription.commitUtterance() catch |e| blk: {
+            self.deps.transcription.commitUtterance() catch |e| {
                 feedback.log("  commit error: {s}\n", .{@errorName(e)});
-                break :blk false;
-            };
-            if (expecting) {
-                self.phase = .awaiting_final;
-                self.deps.deadline.arm(); // release-anchored deadline; final cancels it
-            } else {
-                // Nothing committed (no audio) — no Final Transcript is coming.
-                feedback.log("  Utterance produced no audio — nothing to insert\n", .{});
                 self.deps.feedback.abandoned();
                 self.phase = .idle;
-            }
+                return;
+            };
+            self.phase = .awaiting_final;
+            self.deps.deadline.arm(); // release-anchored deadline; final cancels it
         }
 
         fn onFinal(self: *Self, text: []const u8) void {
@@ -178,6 +184,23 @@ pub fn Coordinator(comptime Deps: type) type {
             self.phase = .idle;
         }
 
+        fn onTranscriptionDropped(self: *Self) void {
+            switch (self.phase) {
+                .capturing => {
+                    self.invalidated = true;
+                    feedback.log("  Transcription Session dropped mid-Utterance — will discard this Utterance on release\n", .{});
+                },
+                .awaiting_final => {
+                    self.deps.deadline.cancel();
+                    feedback.log("  Transcription Session dropped before a Final Transcript arrived — nothing inserted\n", .{});
+                    self.deps.transcription.discardAudio();
+                    self.deps.feedback.abandoned();
+                    self.phase = .idle;
+                },
+                .idle, .inserting => {},
+            }
+        }
+
         fn onInserted(self: *Self, r: InsertResult) void {
             if (self.phase != .inserting) return; // defensive: only the active insert resolves
             switch (r) {
@@ -200,6 +223,7 @@ const FakeAudio = struct {
     start_result: anyerror!void = {},
     started: usize = 0,
     stopped: usize = 0,
+    captured: bool = true,
     heard: bool = true,
     fn start(self: *FakeAudio) anyerror!void {
         self.started += 1;
@@ -208,6 +232,9 @@ const FakeAudio = struct {
     fn stop(self: *FakeAudio) void {
         self.stopped += 1;
     }
+    fn capturedAudio(self: *FakeAudio) bool {
+        return self.captured;
+    }
     fn heardSound(self: *FakeAudio) bool {
         return self.heard;
     }
@@ -215,26 +242,26 @@ const FakeAudio = struct {
 
 const FakeTranscription = struct {
     avail: bool = true,
-    poisoned: bool = false,
-    commit_result: anyerror!bool = true,
+    commit_result: anyerror!void = {},
     began: usize = 0,
     ended: usize = 0,
     committed: usize = 0,
+    discarded: usize = 0,
     fn available(self: *FakeTranscription) bool {
         return self.avail;
     }
-    fn beginUtterance(self: *FakeTranscription) void {
+    fn prepareUtterance(self: *FakeTranscription) void {
         self.began += 1;
     }
-    fn endUtterance(self: *FakeTranscription) void {
+    fn finishAudio(self: *FakeTranscription) void {
         self.ended += 1;
     }
-    fn commitUtterance(self: *FakeTranscription) anyerror!bool {
+    fn commitUtterance(self: *FakeTranscription) anyerror!void {
         self.committed += 1;
         return self.commit_result;
     }
-    fn isPoisoned(self: *FakeTranscription) bool {
-        return self.poisoned;
+    fn discardAudio(self: *FakeTranscription) void {
+        self.discarded += 1;
     }
 };
 
@@ -383,13 +410,14 @@ test "5 capture.start failure aborts the Utterance" {
     try expect(h.transcription.began == 2);
 }
 
-test "6 poison on release abandons without committing" {
+test "6 link drop while capturing abandons on release without committing" {
     var h = Harness{};
-    h.transcription.poisoned = true;
     const co = h.wire();
     co.handle(.press);
+    co.handle(.transcription_dropped);
     co.handle(.release);
     try expect(h.transcription.committed == 0);
+    try expect(h.transcription.discarded == 1);
     try expect(h.deadline.arms == 0);
     try expect(h.feedback.abandoneds == 1);
 }
@@ -407,15 +435,15 @@ test "7 silence still commits, just warns" {
 
 test "8 no audio committed → abandon at release" {
     var h = Harness{};
-    h.transcription.commit_result = false;
+    h.audio.captured = false;
     const co = h.wire();
     co.handle(.press);
     co.handle(.release);
-    try expect(h.transcription.committed == 1);
+    try expect(h.transcription.committed == 0);
     try expect(h.deadline.arms == 0);
     try expect(h.feedback.abandoneds == 1);
     // resolved to idle
-    h.transcription.commit_result = true;
+    h.audio.captured = true;
     co.handle(.press);
     try expect(h.transcription.began == 2);
 }
@@ -426,6 +454,21 @@ test "9 deadline before final abandons" {
     co.handle(.press);
     co.handle(.release); // → awaiting_final
     co.handle(.deadline);
+    try expect(h.feedback.abandoneds == 1);
+    try expect(h.insertion.submits == 0);
+    // a stale final afterwards is ignored
+    co.handle(.{ .final = "too late" });
+    try expect(h.insertion.submits == 0);
+}
+
+test "9b link drop while awaiting final abandons immediately" {
+    var h = Harness{};
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release); // -> awaiting_final
+    co.handle(.transcription_dropped);
+    try expect(h.deadline.cancels == 1);
+    try expect(h.transcription.discarded == 1);
     try expect(h.feedback.abandoneds == 1);
     try expect(h.insertion.submits == 0);
     // a stale final afterwards is ignored

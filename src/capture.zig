@@ -98,6 +98,11 @@ pub const Capture = struct {
     /// Set once a nonzero sample is seen — the denial/silence detector, since
     /// mic-TCC denial yields zeros with noErr rather than an error (crib sheet §5.3).
     nonzero_seen: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set once the queue delivers any non-empty buffer during this Capture. The
+    /// Coordinator uses this as Utterance evidence: no chunks means no commit should be
+    /// sent; chunks with all-zero samples still commit so the transcription service can
+    /// produce the empty/failed Final Transcript path.
+    audio_seen: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Runs on the audio queue's internal thread (run-loop arg = null).
     fn onBuffer(
@@ -113,6 +118,7 @@ pub const Capture = struct {
         const bytes: [*]const u8 = @ptrCast(b.mAudioData);
         const slice = bytes[0..b.mAudioDataByteSize];
 
+        if (slice.len > 0) self.audio_seen.store(true, .monotonic);
         if (!self.nonzero_seen.load(.monotonic)) {
             for (slice) |x| {
                 if (x != 0) {
@@ -169,6 +175,7 @@ pub const Capture = struct {
     /// and start it. First call performs input IO for real => microphone prompt
     /// (attributed to the terminal for a CLI, crib sheet §5.1).
     pub fn start(self: *Capture) !void {
+        self.audio_seen.store(false, .monotonic);
         self.nonzero_seen.store(false, .monotonic);
         for (self.buffers) |buf| {
             if (AudioQueueEnqueueBuffer(self.queue, buf, 0, null) != 0)
@@ -187,6 +194,10 @@ pub const Capture = struct {
 
     pub fn heardSound(self: *Capture) bool {
         return self.nonzero_seen.load(.monotonic);
+    }
+
+    pub fn capturedAudio(self: *Capture) bool {
+        return self.audio_seen.load(.monotonic);
     }
 
     pub fn deinit(self: *Capture) void {

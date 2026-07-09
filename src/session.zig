@@ -10,7 +10,8 @@
 //!     immediately).
 //!   - A **maintenance thread** keeps the link healthy between Utterances: a keepalive
 //!     ping doubles as a drop probe, and the session is reconnected *only when idle* —
-//!     proactively before the 60-min `expires_at` cap, and on a detected drop.
+//!     proactively before the 60-min `expires_at` cap, and on a detected drop. Utterance
+//!     invalidation stays with the Coordinator; the Session reports link drops as events.
 //!   - A dedicated **sender thread** owns every data write: Capture appends and commits
 //!     are enqueued onto an outbound ring (a memcpy, never a socket write) and drained
 //!     in order once the session is ready. The AudioQueue and Talk Key tap threads thus
@@ -84,6 +85,10 @@ pub const TranscriptObserver = struct {
     on_partial: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     /// The completed Final Transcript for the Utterance.
     on_final: *const fn (ctx: ?*anyopaque, text: []const u8) void,
+    /// The live link dropped before the current Utterance could resolve. The Utterance
+    /// Coordinator decides whether this invalidates a Capture in progress, abandons an
+    /// awaiting Final Transcript, or is irrelevant to the current phase.
+    on_drop: ?*const fn (ctx: ?*anyopaque) void = null,
 };
 
 /// The transcription knobs that vary by config (wayfinder #16), fed to the
@@ -173,23 +178,10 @@ pub const Session = struct {
     /// ring or let records accumulate.
     state: std.atomic.Value(State) = std.atomic.Value(State).init(.connecting),
 
-    bytes_utt: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-
-    /// True only between beginUtterance and endUtterance. The audio thread forwards
-    /// Capture chunks only while this is set, so buffers delivered outside an Utterance
-    /// (the queue can deliver before an explicit start) are dropped. Also the guard that
-    /// keeps reconnects strictly *between* Utterances (maintenance skips while active).
-    active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    /// Set when the link drops (a genuine `.ready`→`.reconnecting` transition) *while an
-    /// Utterance is active*: the head audio already streamed live is gone server-side, so
-    /// committing the buffered tail would insert a truncated Final Transcript. The daemon
-    /// (wayfinder #19) reads this on Talk Key release to abandon the Utterance cleanly
-    /// (error cue, no Insertion) rather than commit a fragment. Reset by beginUtterance,
-    /// set in Handler.close. This is what distinguishes a real mid-hold drop (abandon)
-    /// from a press that merely *landed* during a reconnect (that path buffers-and-flushes
-    /// — wayfinder #17 — and never sets this, because no `.ready`→ transition occurs).
-    poisoned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// True while the Capture stream is open. This is transport-internal gating: it keeps
+    /// reconnects between streams and drops stray AudioQueue buffers outside a captured
+    /// span. Utterance invalidation lives in the Coordinator, fed by `observer.on_drop`.
+    streaming: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// Session deadline in wall-clock ms (from `session.created`'s `expires_at`, or the
     /// conservative fallback). The maintenance thread cycles the session before it.
@@ -208,14 +200,14 @@ pub const Session = struct {
     /// live snapshot (wayfinder #32). Set by the menu via `markParamsDirty`; the
     /// maintenance loop — already the sole reconnect owner, already idle-only — cycles
     /// the session at its next idle tick, and `openClient` re-reads the snapshot. An
-    /// in-flight Utterance always completes on the old params.
+    /// in-flight Capture stream always completes on the old params.
     params_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    /// Utterance start, for relative event timestamps. Set by beginUtterance.
+    /// Utterance start, for relative event timestamps. Set by prepareUtterance.
     t0_ms: i64 = 0,
 
     /// Talk Key release, anchoring the post-release timing splits (release→committed→
-    /// FINAL — the speak→insert latency hunt, issues #36–#38). Set by endUtterance;
+    /// FINAL — the speak→insert latency hunt, issues #36–#38). Set by finishAudio;
     /// read on the read-loop thread — the same benign cross-thread pattern as t0_ms.
     t_release_ms: i64 = 0,
 
@@ -352,17 +344,15 @@ pub const Session = struct {
         return self.state.load(.acquire) == .ready;
     }
 
-    /// True when the link dropped mid-Utterance (see `poisoned`). The daemon checks this
-    /// on Talk Key release to abandon a would-be-truncated Utterance (wayfinder #19).
-    pub fn isPoisoned(self: *Session) bool {
-        return self.poisoned.load(.acquire);
-    }
-
     /// A session-shaped setting changed (wayfinder #32) — request an idle cycle so the
     /// next connect re-reads the snapshot. Safe from any thread; never disturbs an
     /// in-flight Utterance (the maintenance loop's existing idle gate).
     pub fn markParamsDirty(self: *Session) void {
         self.params_dirty.store(true, .release);
+    }
+
+    fn notifyLinkDropped(self: *Session) void {
+        if (self.observer) |o| if (o.on_drop) |f| f(o.ctx);
     }
 
     // ---- writes (all funnel through write_mu + the link_open guard) --------------
@@ -396,10 +386,10 @@ pub const Session = struct {
         try self.client.write(buf[0..text.len]);
     }
 
-    /// Reset per-Utterance state. Call on Talk Key press, before capture starts.
-    pub fn beginUtterance(self: *Session) void {
-        self.bytes_utt.store(0, .release);
-        self.poisoned.store(false, .release); // fresh Utterance — no drop seen yet (#19)
+    /// Prepare the transport for an accepted Utterance. Call on Talk Key press, before
+    /// Capture starts. Lifecycle policy stays in the Coordinator; this method only resets
+    /// transcript accumulators and transport queues.
+    pub fn prepareUtterance(self: *Session) void {
         self.partial_len = 0;
         self.t0_ms = nowMs();
         // This Utterance owns the outbound ring afresh: purge undelivered records of an
@@ -421,13 +411,13 @@ pub const Session = struct {
             feedback.log("  (purged {d} undelivered records of the previous Utterance)\n", .{dropped});
             _ = self.enqueueOut(.control, "{\"type\":\"input_audio_buffer.clear\"}");
         }
-        self.active.store(true, .release);
+        self.streaming.store(true, .release);
     }
 
-    /// Stop forwarding Capture audio. Call after the queue is stopped, before commit.
-    pub fn endUtterance(self: *Session) void {
+    /// Stop accepting Capture audio. Call after the queue is stopped, before commit.
+    pub fn finishAudio(self: *Session) void {
         self.t_release_ms = nowMs();
-        self.active.store(false, .release);
+        self.streaming.store(false, .release);
         // The bracketed offset is ms since press, i.e. the hold itself — the anchor the
         // committed/FINAL "+Nms after release" deltas subtract away.
         feedback.log("  [{d:>6}ms] released\n", .{self.t_release_ms - self.t0_ms});
@@ -441,7 +431,7 @@ pub const Session = struct {
     /// Utterance (wayfinder #17).
     pub fn appendAudio(self: *Session, pcm: []const u8) void {
         if (pcm.len == 0) return; // a 0-byte buffer (delivered during stop) => empty append, which errors
-        if (!self.active.load(.acquire)) return; // not in an Utterance — drop it
+        if (!self.streaming.load(.acquire)) return; // not in a Capture stream — drop it
         // Capture hands ≤2400 B chunks (capture.zig buffer_bytes == out_payload_cap);
         // slice defensively so a larger future buffer still fits the slots.
         var off: usize = 0;
@@ -450,27 +440,36 @@ pub const Session = struct {
             if (!self.enqueueOut(.audio, pcm[off..end])) break; // ring full — truncating (logged once)
             off = end;
         }
-        _ = self.bytes_utt.fetchAdd(pcm.len, .monotonic); // count even truncated audio, so commit isn't suppressed
     }
 
-    /// Commit the Utterance (Talk Key release). Suppresses empty commits, which error.
-    /// The commit is a ring record like the audio, so it is delivered strictly after
+    /// Commit the current audio buffer (Talk Key release). The Coordinator suppresses
+    /// commits for captures with no audio; this method only enqueues the transport
+    /// control record. The commit is a ring record like the audio, so it is delivered strictly after
     /// every queued chunk; if the link is down it waits in the ring and replays on
     /// reconnect (the deferred commit of wayfinder #17). Called on the tap's run-loop
     /// thread — enqueue only, no socket write, so the tap callback never blocks on TLS.
-    ///
-    /// Returns whether a Final Transcript should now be expected: `true` when the commit
-    /// was queued (a transcript is coming), `false` when the Utterance held no audio and
-    /// was dropped — letting the caller sound the "no Insertion" error cue immediately
-    /// instead of waiting out the worker's transcript timeout (#18).
-    pub fn commitUtterance(self: *Session) !bool {
-        if (self.bytes_utt.load(.acquire) == 0) {
-            feedback.log("  (no audio captured — skipping commit)\n", .{});
-            return false;
-        }
+    pub fn commitUtterance(self: *Session) !void {
         if (!self.enqueueOut(.control, "{\"type\":\"input_audio_buffer.commit\"}"))
             return error.OutboundRingFull;
-        return true;
+    }
+
+    /// Discard queued audio/control records for an Utterance the Coordinator has already
+    /// abandoned. If records were waiting for reconnect, enqueue a clear so the next
+    /// ready session cannot inherit stale audio before a later Utterance starts.
+    pub fn discardAudio(self: *Session) void {
+        var dropped: usize = 0;
+        {
+            self.out_mu.lockUncancelable(self.io);
+            defer self.out_mu.unlock(self.io);
+            dropped = self.out_count;
+            self.out_head = 0;
+            self.out_count = 0;
+            self.out_overflow = false;
+        }
+        if (dropped > 0) {
+            feedback.log("  (discarded {d} queued transcription records for the abandoned Utterance)\n", .{dropped});
+            _ = self.enqueueOut(.control, "{\"type\":\"input_audio_buffer.clear\"}");
+        }
     }
 
     /// Session became READY (session.updated). Publish `.ready` — the sender thread then
@@ -526,8 +525,8 @@ pub const Session = struct {
     /// accumulate) while it is connecting/reconnecting; exits on `.closed`. The base64
     /// framing and the blocking TLS write happen here and nowhere else, so no
     /// latency-critical thread ever waits on the network. A write onto a link that died
-    /// mid-drain is swallowed exactly like the old live path — the read loop detects the
-    /// drop and the Utterance is poisoned as before.
+    /// mid-drain is swallowed exactly like the old live path; link-drop events tell the
+    /// Coordinator whether the current Utterance is still valid.
     fn senderLoop(self: *Session) void {
         var rec: OutRecord = undefined;
         while (self.state.load(.acquire) != .closed) {
@@ -552,12 +551,12 @@ pub const Session = struct {
                 .connecting => continue, // connect() drives the first handshake
                 .reconnecting => {
                     // A drop was flagged (possibly mid-Utterance); cycle once idle.
-                    if (!self.active.load(.acquire)) self.reconnect();
+                    if (!self.streaming.load(.acquire)) self.reconnect();
                     continue;
                 },
                 .ready => {},
             }
-            if (self.active.load(.acquire)) continue; // never disturb an in-flight Utterance
+            if (self.streaming.load(.acquire)) continue; // never disturb an in-flight Capture stream
 
             // Live-apply (wayfinder #32): a session-shaped setting changed — cycle now,
             // while idle; openClient re-reads the snapshot into the session.update.
@@ -600,7 +599,8 @@ pub const Session = struct {
             var empty: [0]u8 = .{};
             self.client.writePing(&empty) catch {
                 feedback.log("  session: ping write failed — link down\n", .{});
-                _ = self.state.cmpxchgStrong(.ready, .reconnecting, .monotonic, .monotonic);
+                if (self.state.cmpxchgStrong(.ready, .reconnecting, .monotonic, .monotonic) == null)
+                    self.notifyLinkDropped();
                 return;
             };
         }
@@ -688,7 +688,7 @@ pub const Session = struct {
     /// Graceful shutdown for good: stop the maintenance + sender threads, then close the
     /// link (the sender is joined before closeCurrent so no write can race the teardown).
     pub fn shutdown(self: *Session) void {
-        self.active.store(false, .release);
+        self.streaming.store(false, .release);
         self.state.store(.closed, .release);
         if (self.maint_thread) |t| {
             t.join();
@@ -838,14 +838,12 @@ pub const Handler = struct {
     pub fn close(self: *Handler) void {
         const s = self.session;
         s.read_ended.store(true, .release);
-        // cmpxchg returns null on success (state WAS .ready and we flipped it). If that
-        // real ready→reconnecting transition happens with an Utterance in flight, its
-        // already-streamed head audio is lost server-side — poison the Utterance so the
-        // daemon abandons it cleanly instead of committing a truncated tail (#19). A
-        // press that merely landed during a reconnect finds state already non-ready here,
-        // so the cmpxchg no-ops and poisoned stays clear (its buffer-and-flush path — #17).
-        if (s.state.cmpxchgStrong(.ready, .reconnecting, .monotonic, .monotonic) == null and s.active.load(.acquire))
-            s.poisoned.store(true, .release);
+        // cmpxchg returns null on success (state WAS .ready and we flipped it). Only
+        // that real ready→reconnecting transition can invalidate an Utterance; a press
+        // that merely landed during a reconnect finds state already non-ready here, so
+        // the cmpxchg no-ops and its buffer-and-flush path remains intact (#17).
+        if (s.state.cmpxchgStrong(.ready, .reconnecting, .monotonic, .monotonic) == null)
+            s.notifyLinkDropped();
         feedback.log("  [read loop ended]\n", .{});
     }
 };
