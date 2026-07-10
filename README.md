@@ -1,181 +1,187 @@
 # type-wave
 
-**Hold-to-talk dictation for macOS.** Hold a key, speak, release — the transcribed
-text lands at the cursor of whatever app is focused. Built for whisper-quiet speech,
-running headless in the background.
+**Hold-to-talk dictation for macOS.** Hold a key, speak, release, and the
+transcribed text is inserted at the cursor of the app you are already using.
 
-> Status: research repo, `v0.0.0`, macOS-only. Built [Zig](https://ziglang.org)
-> against the OpenAI Realtime transcription API. The full mic → transcribe → insert
-> pipeline runs end-to-end; distribution (notarization, hardened runtime) is still fog.
+type-wave is a Zig daemon for Apple Silicon macOS. It uses CoreAudio for capture,
+OpenAI's Realtime transcription API over WebSocket/TLS, and macOS event/pasteboard
+APIs for insertion. It can run in the foreground while developing, or as a signed
+per-user LaunchAgent for daily use.
 
-## How it works
+> Status: research repo, `v0.0.0`, macOS-only. The mic -> transcribe -> insert
+> pipeline is implemented end-to-end. Distribution work such as hardened runtime,
+> entitlements, and notarization is still out of scope.
 
+## How It Works
+
+```text
+hold Talk Key
+    -> CoreAudio Capture (24 kHz mono PCM)
+    -> warm OpenAI Realtime Transcription Session
+release Talk Key
+    -> manual commit
+    -> Final Transcript
+    -> insertion at the Focused Target cursor
 ```
-hold Talk Key ─► CoreAudio Capture (24 kHz mono s16le)
-                     │
-                     ▼
-              OpenAI Realtime Transcription Session  (warm, reconnecting websocket)
-                     │  Partial Transcripts stream back while you speak
-                     ▼
-release Talk Key ─► commit ─► Final Transcript ─► Insertion at the Focused Target's cursor
-```
 
-You hold the **Talk Key** (Right-Option by default), speak one **Utterance**, and
-release. Audio streams to a warm OpenAI Transcription Session that keeps itself
-connected between Utterances; **Partial Transcripts** stream back as live feedback
-while you hold; on release the **Final Transcript** is committed and inserted at the
-cursor via a clipboard-swap paste (or synthetic keystrokes). A floating overlay pill
-shows the live partials, plus sound cues for start / stop / error.
+The default **Talk Key** is Right Option. While it is held, type-wave streams mic
+audio to a warm transcription session. On release, it commits the utterance, waits
+for the **Final Transcript**, then inserts that text through either a clipboard-swap
+paste or synthetic keystrokes.
 
-The vocabulary above (Utterance, Talk Key, Partial/Final Transcript, Insertion,
-Focused Target, Capture, Transcription Session) is the project's ubiquitous language —
-see [`CONTEXT.md`](./CONTEXT.md) for the precise definitions the code and docs use.
+The floating HUD is visual feedback only: a red waveform while recording, then green
+processing dots until the utterance resolves. It never shows transcript text. Partial
+transcripts are logged and may be revised; only Final Transcripts are inserted.
+
+A menu-bar status item shows whether dictation is ready, paused, reconnecting, or
+waiting on a prerequisite. Its menu edits the same `config.zon` settings used for
+hand configuration, stores the API key in the login keychain, pauses dictation, opens
+the config file, and quits cleanly.
+
+The project vocabulary is kept in [CONTEXT.md](./CONTEXT.md).
 
 ## Requirements
 
-- **macOS** (Apple Silicon; uses CoreAudio, CoreGraphics, AppKit, Carbon).
-- **[Nix](https://nixos.org)** with flakes — pins the exact Zig nightly the WebSocket/TLS
-  stack needs. (Bare Zig works too if you match the pinned nightly; see
-  [`docs/toolchain.md`](./docs/toolchain.md).)
-- An **OpenAI API key** with access to the Realtime transcription API.
+- Apple Silicon macOS.
+- Nix with flakes, or a matching bare Zig nightly. See [docs/toolchain.md](./docs/toolchain.md).
+- An OpenAI API key with access to Realtime transcription.
+- macOS grants for Input Monitoring, Accessibility, and Microphone.
 
-## Quick start (foreground)
+## Quick Start
+
+For a foreground development run:
 
 ```sh
-# 1. Provide the OpenAI secret (the dev override for foreground runs)
 export OPENAI_API_KEY=sk-...
-
-# 2. Build and run the daemon in the foreground
 nix develop --command zig build run
 ```
 
-On first run macOS prompts for **Input Monitoring** (the Talk Key tap),
-**Accessibility** (Insertion), and **Microphone** (Capture). Grant all three, then
-hold Right-Option and speak. The daemon **self-heals**: a missing key or ungranted
-permission never crashes it — it logs what it's waiting on and goes live the moment the
-prerequisite appears.
+On first run, macOS may prompt for:
 
-`nix develop` alone drops you into a dev shell with the pinned Zig on `PATH`; if a
-legacy `~/.config/type-wave/env` file exists, the shell sources it so the override is
-exported automatically.
+- **Input Monitoring**: observing the Talk Key.
+- **Accessibility**: posting insertion events.
+- **Microphone**: capturing audio.
+
+Missing prerequisites do not crash the daemon. It reports what it is waiting for and
+self-heals when the key or permission appears.
+
+## Daily Install
+
+Install type-wave as a signed per-user LaunchAgent:
+
+```sh
+nix develop --command zig build install-agent
+~/.local/bin/type-wave --set-key
+```
+
+The install step signs the binary with the local `type-wave dev` identity, installs it
+to `~/.local/bin/type-wave`, and writes the LaunchAgent plist. Running `--set-key`
+through the installed signed binary stores the OpenAI key in the login keychain so the
+daemon can read it without prompts across rebuilds.
+
+The one-time signing identity setup, LaunchAgent load/unload commands, and TCC grant
+persistence checks are documented in [docs/packaging.md](./docs/packaging.md). Logs go
+to `~/Library/Logs/type-wave.log`.
 
 ## Configuration
 
-Every setting is optional. Copy the annotated example and edit:
+Every field is optional. Copy the annotated example when you want a hand-editable file:
 
 ```sh
+mkdir -p ~/.config/type-wave
 cp packaging/config.example.zon ~/.config/type-wave/config.zon
 ```
 
 | Field | Default | Notes |
-|---|---|---|
-| `talk_key` | `.right_option` | `.right_option` / `.left_option` (proven), `.globe` (Fn key, opt-in) |
-| `model` | `"gpt-realtime-whisper"` | A/B a different model with no rebuild |
-| `language` | `"en"` | |
-| `delay` | `"low"` | |
-| `noise_reduction` | `.near_field` | `.near_field` / `.far_field` / `.off` |
-| `insertion` | `.paste` | `.paste` (clipboard + ⌘V) or `.keystroke` (synthetic typing) |
-| `pre_paste_ms` | `25` | Settle between the pasteboard write and ⌘V; raise (espanso used `100`) if a slow target pastes the old clipboard |
-| `overlay` | `true` | The floating live-partials pill; `false` = sound-only |
+| --- | --- | --- |
+| `talk_key` | `.right_option` | `.right_option`, `.left_option`, or `.globe` |
+| `model` | `"gpt-realtime-whisper"` | String, so model experiments do not require a rebuild |
+| `language` | `"en"` | `"en"`, `"sv"`, or `""` for auto-detect |
+| `delay` | `"low"` | `"minimal"`, `"low"`, `"medium"`, `"high"`; other strings stay hand-editable |
+| `noise_reduction` | `.near_field` | `.near_field`, `.far_field`, or `.off` |
+| `insertion` | `.paste` | `.paste` or `.keystroke` |
+| `pre_paste_ms` | `25` | Pasteboard settle delay before Cmd-V |
+| `overlay` | `true` | Show the silent waveform/processing HUD |
 
-An absent or malformed `config.zon` falls back to all defaults, so a typo never keeps
-the daemon from starting. The OpenAI secret lives in the **login keychain** (set it with
-`~/.local/bin/type-wave --set-key`), never in `config.zon` or a committed plist; an
-exported `OPENAI_API_KEY` overrides it for foreground dev runs. A key from the retired
-`~/.config/type-wave/env` file is migrated into the keychain automatically on first
-sight — the daemon logs when the file can be deleted.
+The menu bar is the live settings writer. It swaps in complete immutable settings
+snapshots and patches single fields in `config.zon` while preserving comments. Hand
+edits are picked up on restart or the next time the menu opens.
 
-## Install as a background daemon
+Secrets do not live in `config.zon`. Key precedence is:
 
-For daily-driver use, install type-wave as a headless per-user **LaunchAgent** with a
-stable code-signing identity — so its three permission grants **survive rebuilds**:
-
-```sh
-nix develop --command zig build install-agent
-
-# then store the API key in the login keychain, via the *installed signed* binary:
-~/.local/bin/type-wave --set-key
-```
-
-Plain builds in this repo default to Zig's `ReleaseFast` optimization mode, so
-`zig build install-agent` installs a speed-optimized binary without needing
-`-Doptimize=ReleaseFast`.
-
-This requires a one-time self-signed `type-wave dev` code-signing certificate and a
-`launchctl bootstrap` to start it. The full procedure — creating the identity, loading /
-unloading, granting permissions, and verifying grant persistence across a rebuild — is in
-[`docs/packaging.md`](./docs/packaging.md). Logs land in `~/Library/Logs/type-wave.log`.
-
-`--set-key` must run via `~/.local/bin/type-wave` (not `zig-out/`): the keychain item's
-ACL keys to its creator's code signature, so only the stable-signed binary gives the
-daemon prompt-free reads across rebuilds (`src/keychain.zig` has the full story).
+1. `OPENAI_API_KEY` from the process environment, for foreground dev runs.
+2. The login keychain item created by the menu or `~/.local/bin/type-wave --set-key`.
+3. One-time migration from the retired `~/.config/type-wave/env` file, if present.
 
 ## Development
 
 ```sh
-nix develop --command zig build            # build the daemon → zig-out/bin/type-wave
-nix develop --command zig build test       # Coordinator lifecycle matrix + pure-function tests
-nix develop --command zig build capture-check   # live Capture start/stop regression probe (real mic IO)
+nix develop --command zig build
+nix develop --command zig build test
+nix develop --command zig build capture-check
 ```
 
-Build optimization defaults to `ReleaseFast` for the daemon, tests, and local probes.
-Override it explicitly when you need a different tradeoff:
+Useful build modes:
 
 ```sh
-nix develop --command zig build -Doptimize=Debug       # development checks + easier debugging
-nix develop --command zig build -Doptimize=ReleaseSafe # optimized, with runtime safety checks
-nix develop --command zig build -Doptimize=ReleaseSmall # optimized for binary size
+nix develop --command zig build -Doptimize=Debug
+nix develop --command zig build -Doptimize=ReleaseSafe
+nix develop --command zig build -Doptimize=ReleaseSmall
 ```
 
-### Architecture
+Plain builds default to `ReleaseFast`, matching the installed daemon. `capture-check`
+is a live CoreAudio start/stop probe and uses real microphone IO.
 
-The daemon is thin wiring around a testable core. The **Utterance Coordinator**
-(`src/coordinator.zig`) is a single synchronous state machine —
-`idle → capturing → awaiting_final → inserting → idle` — that owns the whole lifecycle
-policy (overlap guard, poison-on-drop abandonment, the release-anchored deadline,
-empty/failed handling). It reaches the outside world only through four seams, so it's
-exercised by feeding it events, not hardware. `daemon.zig` builds the real adapters
-behind those seams and runs the supervisory state machines (self-heal + link state).
+## Architecture
+
+The daemon is thin wiring around testable state machines and OS adapters.
+
+The **Utterance Coordinator** in `src/coordinator.zig` owns the utterance lifecycle:
+`idle -> capturing -> awaiting_final -> inserting -> idle`. It handles the overlap
+guard, release-anchored deadline, empty or failed transcripts, dropped sessions, and
+failed insertions. Hardware and OS effects reach it through seams.
+
+`src/daemon.zig` builds the real adapters, starts the threads, runs the menu/HUD/tap
+main loop, and supervises readiness. Two state machines remain outside the Coordinator:
+configuration readiness in `src/configuration_phase.zig`, and transcription link state
+in `src/session.zig`.
 
 | Module | Role |
-|---|---|
-| `coordinator.zig` | The Utterance Coordinator — the tested lifecycle state machine |
-| `daemon.zig` | Wiring: real adapters, threads, self-heal supervisor |
-| `capture.zig` | CoreAudio Capture via AudioQueue (24 kHz mono s16le) |
-| `session.zig` | OpenAI Realtime Transcription Session (warm, reconnecting websocket) |
-| `tap.zig` | Global Talk Key observation (listen-only `CGEventTap`) |
-| `insert.zig` | Insertion — pasteboard swap + ⌘V, or synthetic keystrokes |
-| `surface.zig` | Feedback Surface — HUD-vs-cue arbitration |
-| `hud.zig` | Overlay pill, driven purely through the ObjC runtime C API |
-| `feedback.zig` | Sound cues + timestamped logging |
-| `config.zig` | ZON settings + env-file secret loading |
-| `info_plist.zig` | Embeds `Info.plist` into the `__TEXT,__info_plist` section |
+| --- | --- |
+| `src/main.zig` | CLI entry point and `--set-key` subcommand |
+| `src/daemon.zig` | Long-running daemon wiring, threads, supervisor, menu seams |
+| `src/coordinator.zig` | Utterance lifecycle state machine |
+| `src/config.zig` | ZON settings, key loading, immutable settings snapshots, config writes |
+| `src/configuration_phase.zig` | Setup readiness transitions and reporting |
+| `src/readiness.zig` | Pure readiness/status policy |
+| `src/session.zig` | Warm OpenAI Realtime transcription session and reconnect logic |
+| `src/capture.zig` | CoreAudio capture |
+| `src/tap.zig` | Global Talk Key observation |
+| `src/insert.zig` | Clipboard paste and synthetic keystroke insertion |
+| `src/insertion_adapter.zig` | Async insertion worker around the Coordinator |
+| `src/menu.zig` | Menu-bar status item and live settings UI |
+| `src/hud.zig` | Silent waveform/processing overlay |
+| `src/surface.zig` | HUD-vs-sound feedback arbitration |
+| `src/feedback.zig` | Sound cues and timestamped logging |
+| `src/keychain.zig` | OpenAI API key storage in the login keychain |
+| `src/info_plist.zig` | Embedded `Info.plist` Mach-O section |
 
-Key design records live in [`docs/adr/`](./docs/adr) (e.g. why the Utterance lifecycle is
-fully serialized) and the research crib sheets that seeded each piece are in
-[`docs/research/`](./docs/research).
+## Repository Layout
 
-## Repository layout
-
-```
-src/                 the daemon and its modules
-docs/
-  toolchain.md       the pinned Zig ↔ websocket.zig pair and bump procedure
-  packaging.md       signing identity + LaunchAgent install
-  adr/               architecture decision records
-  research/          research crib sheets (CoreAudio, TLS, insertion, hotkeys, OpenAI)
-  agents/            issue-tracker (wayfinder) conventions
-packaging/           Info.plist, LaunchAgent plist, install.sh, config.example.zon
-prototypes/          throwaway spikes that proved the pipeline before it was graduated
-vendor/              vendored karlseguin/websocket.zig (with the §3.5 TLS-read fix)
-flake.nix            dev shell pinning the Zig nightly
+```text
+src/                 daemon source
+docs/                toolchain, packaging, ADRs, research notes, agent docs
+packaging/           Info.plist, LaunchAgent plist, install script, config example
+prototypes/          spikes that proved capture, insertion, menu, and HUD behavior
+vendor/              vendored karlseguin/websocket.zig
+flake.nix            development shell pinning the Zig nightly
 ```
 
 ## Notes
 
-- The websocket/TLS stack rides a **pinned Zig nightly + `websocket.zig` `dev`** pair
-  that must move in lockstep. Don't `nix flake update` casually — read
-  [`docs/toolchain.md`](./docs/toolchain.md) first.
-- Work is tracked as [GitHub Issues](https://github.com/dbgeek/type-wave/issues) using the
-  *wayfinder* map/ticket convention (see [`docs/agents/issue-tracker.md`](./docs/agents/issue-tracker.md)).
-- `vendor/websocket.zig` is MIT-licensed (see its `LICENSE`).
+- The Zig nightly and vendored `websocket.zig` commit move together. Read
+  [docs/toolchain.md](./docs/toolchain.md) before bumping either.
+- Architecture decisions live in [docs/adr](./docs/adr).
+- Research crib sheets live in [docs/research](./docs/research).
+- Work tracking conventions are in [docs/agents/issue-tracker.md](./docs/agents/issue-tracker.md).
+- `vendor/websocket.zig` is MIT-licensed; see its `LICENSE`.
