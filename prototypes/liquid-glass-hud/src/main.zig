@@ -373,6 +373,9 @@ fn handle(ch: u8) void {
             } else if (s.look.pill_w == 340) {
                 s.look.pill_w = 300;
                 s.look.pill_h = 44;
+            } else if (s.look.pill_h == 44) {
+                s.look.pill_w = 300;
+                s.look.pill_h = 22; // ultra-slim: a sliver of glass under the text
             } else {
                 s.look.pill_w = 420;
                 s.look.pill_h = 60;
@@ -497,7 +500,7 @@ pub fn main() void {
         \\     soft / accent strong)               k  cycle corner radius (capsule / 16 / 8)
         \\  d  cycle processing animation          x  toggle window shadow
         \\     (accent dots / neutral dots /       1/2/3  bars: fine / thin / medium
-        \\     glass pulse)                        z  cycle size 420x60 / 340x52 / 300x44
+        \\     glass pulse)                        z  cycle size 420x60 / 340x52 / 300x44 / 300x22
         \\
         \\Motion (#44):
         \\  a  cycle show/hide (pop / fade /       f  cycle recording->processing (cut /

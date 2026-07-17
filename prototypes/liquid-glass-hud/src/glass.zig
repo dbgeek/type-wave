@@ -247,8 +247,18 @@ pub const Look = struct {
 
 const pad_x: f64 = 20; // inner margin before the first / after the last bar
 const min_bar_h: f64 = 3; // silence reads as a flat dotted line, not an empty pill
-const dot_size: f64 = 12;
-const dot_gap: f64 = 10;
+
+// Dots scale down with the pill so a slim pill (300x22) doesn't clip them:
+// full 12 pt dots with the 11 pt bounce need ~34 pt of height.
+fn dotSize(look: Look) f64 {
+    return @min(12.0, look.pill_h * 0.4);
+}
+fn dotGap(look: Look) f64 {
+    return dotSize(look) * (10.0 / 12.0);
+}
+fn dotBounce(look: Look) f64 {
+    return @min(11.0, (look.pill_h - dotSize(look)) / 2.0 - 1.0);
+}
 
 pub fn barCount(look: Look) usize {
     const usable = look.pill_w - 2 * pad_x;
@@ -369,7 +379,6 @@ pub const Pill = struct {
         for (&self.dots) |*dot| {
             dot.* = msg(cls("CALayer"), "layer");
             msgBool(dot.*, "setHidden:", true);
-            msgDouble(dot.*, "setCornerRadius:", dot_size / 2);
             msg1v(layer, "addSublayer:", dot.*);
         }
 
@@ -421,14 +430,17 @@ pub const Pill = struct {
                 .h = min_bar_h,
             });
         }
-        const dots_w = 3 * dot_size + 2 * dot_gap;
+        const ds = dotSize(look);
+        const dg = dotGap(look);
+        const dots_w = 3 * ds + 2 * dg;
         for (self.dots, 0..) |dot, j| {
             const fj: f64 = @floatFromInt(j);
+            msgDouble(dot, "setCornerRadius:", ds / 2);
             msgRect(dot, "setFrame:", .{
-                .x = (look.pill_w - dots_w) / 2.0 + fj * (dot_size + dot_gap),
-                .y = (look.pill_h - dot_size) / 2.0,
-                .w = dot_size,
-                .h = dot_size,
+                .x = (look.pill_w - dots_w) / 2.0 + fj * (ds + dg),
+                .y = (look.pill_h - ds) / 2.0,
+                .w = ds,
+                .h = ds,
             });
         }
         self.last_mode = null; // force a recolor + visibility pass next render
@@ -488,15 +500,17 @@ pub const Pill = struct {
             .processing => switch (anim) {
                 // Three bouncing dots (bars handed over by applyModeVisibility).
                 .dots_accent, .dots_neutral => {
+                    const ds = dotSize(look);
+                    const dg = dotGap(look);
+                    const dots_w = 3 * ds + 2 * dg;
                     for (self.dots, 0..) |dot, j| {
                         const fj: f64 = @floatFromInt(j);
-                        const bounce = 11.0 * @sin(t * 5.0 + fj * 0.8);
-                        const dots_w = 3 * dot_size + 2 * dot_gap;
+                        const bounce = dotBounce(look) * @sin(t * 5.0 + fj * 0.8);
                         msgRect(dot, "setFrame:", .{
-                            .x = (look.pill_w - dots_w) / 2.0 + fj * (dot_size + dot_gap),
-                            .y = (look.pill_h - dot_size) / 2.0 + bounce,
-                            .w = dot_size,
-                            .h = dot_size,
+                            .x = (look.pill_w - dots_w) / 2.0 + fj * (ds + dg),
+                            .y = (look.pill_h - ds) / 2.0 + bounce,
+                            .w = ds,
+                            .h = ds,
                         });
                     }
                     self.swellTick(t, motion);
@@ -639,10 +653,12 @@ pub const Pill = struct {
                         // setBarHeight rewrites the full frame.
                         const j = (i * 3) / self.nbars;
                         const fj: f64 = @floatFromInt(j);
-                        const dots_w = 3 * dot_size + 2 * dot_gap;
-                        const dot_x = (self.look.pill_w - dots_w) / 2.0 + fj * (dot_size + dot_gap);
+                        const ds = dotSize(self.look);
+                        const dg = dotGap(self.look);
+                        const dots_w = 3 * ds + 2 * dg;
+                        const dot_x = (self.look.pill_w - dots_w) / 2.0 + fj * (ds + dg);
                         msgRect(bar, "setFrame:", .{
-                            .x = dot_x + (dot_size - self.look.bar_w) / 2.0,
+                            .x = dot_x + (ds - self.look.bar_w) / 2.0,
                             .y = (self.look.pill_h - min_bar_h) / 2.0,
                             .w = self.look.bar_w,
                             .h = min_bar_h,

@@ -58,7 +58,7 @@ Commands (letter + Enter in the terminal):
        soft / accent strong)               k  cycle corner radius (capsule / 16 / 8)
     d  cycle processing animation          x  toggle window shadow
        (accent dots / neutral dots /       1/2/3  bars: fine / thin / medium
-       glass pulse)                        z  cycle size 420x60 / 340x52 / 300x44
+       glass pulse)                        z  cycle size 420x60 / 340x52 / 300x44 / 300x22
     q  quit
 
 React to: whisper visibility on glass (`w`, then `m` for the real thing) over
