@@ -33,10 +33,11 @@ The floating HUD is visual feedback only: a red waveform while recording, then g
 processing dots until the utterance resolves. It never shows transcript text. Partial
 transcripts are logged and may be revised; only Final Transcripts are inserted.
 
-A menu-bar status item shows whether dictation is ready, paused, reconnecting, or
-waiting on a prerequisite. Its menu edits the same `config.zon` settings used for
-hand configuration, stores the API key in the login keychain, pauses dictation, opens
-the config file, and quits cleanly.
+A menu-bar Status Item derives readiness for the selected Transcription Backend and exposes
+the persisted OpenAI/local chooser. Its compact menu shows one relevant primary action,
+keeps OpenAI controls in OpenAI context, and leaves full Local Model management reachable
+under either selection. Ready local mode says that audio stays on this Mac; an explicit
+network-using Model Operation gets its own separate cue.
 
 The project vocabulary is kept in [CONTEXT.md](./CONTEXT.md).
 

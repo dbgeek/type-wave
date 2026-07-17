@@ -54,11 +54,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
             return;
         }
         if (argv.len == 2 and std.mem.eql(u8, arg, "--discard-model")) return discardModel(init.environ);
-        if (argv.len == 2 and std.mem.eql(u8, arg, "--remove-model")) return removeModel(init.environ);
+        if (argv.len == 2 and (std.mem.eql(u8, arg, "--remove-model") or std.mem.eql(u8, arg, "--remove-model-confirmed")))
+            return removeModel(init.environ, std.mem.eql(u8, arg, "--remove-model-confirmed"));
         if (argv.len == 2 and std.mem.eql(u8, arg, "--forget-hf-token")) return forgetHuggingFaceToken(init.environ);
         if (argv.len == 2 and std.mem.eql(u8, arg, "--model-status")) return modelStatus(init.environ);
         if (argv.len == 2 and std.mem.eql(u8, arg, "--verify-model")) return verifyModel(init.environ);
-        if (argv.len == 2 and std.mem.eql(u8, arg, "--repair-model")) return repairModel(init.environ);
+        if (argv.len == 2 and (std.mem.eql(u8, arg, "--repair-model") or std.mem.eql(u8, arg, "--repair-model-confirmed")))
+            return repairModel(init.environ, std.mem.eql(u8, arg, "--repair-model-confirmed"));
         std.debug.print(
             \\usage: type-wave [--set-key | --set-hf-token | --install-model | --update-model | --resume-model | --discard-model | --remove-model | --forget-hf-token | --model-status | --verify-model | --repair-model]
             \\
@@ -288,8 +290,8 @@ fn discardModel(environ: std.process.Environ) !void {
 const UnusedTransport = struct {};
 const UnusedSmoke = struct {};
 
-fn removeModel(environ: std.process.Environ) !void {
-    if (!confirmModelRemoval()) return error.ModelRemovalNotConfirmed;
+fn removeModel(environ: std.process.Environ, confirmed: bool) !void {
+    if (!confirmed and !confirmModelRemoval()) return error.ModelRemovalNotConfirmed;
     const allocator = std.heap.c_allocator;
     const home = environ.getPosix("HOME") orelse return error.HomeDirectoryUnavailable;
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -356,7 +358,7 @@ fn verifyModel(environ: std.process.Environ) !void {
     try printIntegrity(try operation.verify());
 }
 
-fn repairModel(environ: std.process.Environ) !void {
+fn repairModel(environ: std.process.Environ, confirmed: bool) !void {
     const allocator = std.heap.c_allocator;
     const home = environ.getPosix("HOME") orelse return error.HomeDirectoryUnavailable;
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -395,7 +397,7 @@ fn repairModel(environ: std.process.Environ) !void {
         return;
     }
 
-    if (!confirmRepairNetworkUse()) return error.ModelRepairNotConfirmed;
+    if (!confirmed and !confirmRepairNetworkUse()) return error.ModelRepairNotConfirmed;
     var owned_token: ?[:0]const u8 = null;
     defer if (owned_token) |token| {
         std.crypto.secureZero(u8, @constCast(token));

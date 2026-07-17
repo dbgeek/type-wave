@@ -69,11 +69,14 @@ const backend = @import("transcription_backend.zig");
 const local_backend = @import("local_backend.zig");
 const model_store = @import("model_store.zig");
 const local_model_recovery = @import("local_model_recovery.zig");
+const status_item = @import("status_item.zig");
 
 const Session = session_mod.Session;
 const LocalAdapter = local_backend.Adapter(local_backend.ProcessHelper);
 
 extern "c" fn usleep(usec: c_uint) c_int;
+extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
+extern "c" fn kill(pid: c_int, sig: c_int) c_int;
 
 const CFRunLoopRef = ?*anyopaque;
 extern "c" fn CFRunLoopGetMain() CFRunLoopRef;
@@ -82,6 +85,8 @@ extern "c" fn signal(sig: c_int, handler: *const fn (c_int) callconv(.c) void) c
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
 const SIGHUP: c_int = 1;
+var g_model_operation_pid = std.atomic.Value(c_int).init(0);
+var g_model_operation_action = std.atomic.Value(u8).init(@intFromEnum(menu_mod.ModelAction.install));
 
 // ---- tuning ----------------------------------------------------------------
 /// Self-heal poll cadence. Fast enough that granting a permission / dropping in the key
@@ -777,7 +782,7 @@ const Daemon = struct {
 
     /// Health for the two-tier icon + status line, in the menu's priority order. The
     /// same signals the supervisor gates "configured" on, read non-destructively.
-    fn menuHealth(ctx: *anyopaque) menu_mod.Health {
+    fn menuStatus(ctx: *anyopaque) status_item.Snapshot {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
         const h = configuration_phase.health(self.configurationFacts(
             tapmod.Tap.listenGranted(),
@@ -785,7 +790,44 @@ const Daemon = struct {
             false,
             self.localInstallationPresent(),
         ));
-        return h;
+        var installation: status_item.Installation = .absent;
+        var operation: status_item.Operation = .idle;
+        if (std.c.getenv("HOME")) |raw_home| {
+            var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            if (model_store.rootPath(std.mem.span(raw_home), &root_buffer)) |root| {
+                if (model_store.activeArtifact(self.io, root) catch null != null) {
+                    installation = if (model_store.updateAvailable(self.io, root, model_store.pinned_manifest) catch false)
+                        .update_available
+                    else
+                        .ready;
+                }
+                const recovery = model_store.recoveryState(self.io, root, model_store.pinned_manifest) catch null;
+                if (recovery) |state| operation = switch (state.phase) {
+                    .idle => .idle,
+                    .downloading => switch (std.enums.fromInt(menu_mod.ModelAction, g_model_operation_action.load(.acquire)) orelse .install) {
+                        .update => .updating,
+                        .verify => .verifying,
+                        .remove => .removing,
+                        else => .installing,
+                    },
+                    .paused => .paused,
+                    .verifying => .verifying,
+                    .smoke_testing => .smoke_testing,
+                    .activating => .activating,
+                    .removing => .removing,
+                    .failed => .failed,
+                };
+            } else |_| {}
+        }
+        const recovery_state = self.local_model_recovery.current();
+        if (recovery_state == .corrupt) installation = .corrupt;
+        return .{
+            .selected_backend = self.store.current().transcription_backend,
+            .health = h,
+            .terminal_backend_failure = recovery_state == .runtime_failure,
+            .installation = installation,
+            .operation = operation,
+        };
     }
 
     /// A session-shaped setting changed: nudge the Session to cycle when idle. Before
@@ -829,6 +871,78 @@ const Daemon = struct {
         var buf: [256]u8 = undefined;
         feedback.log("  menu: keychain store failed: {s}\n", .{keychain.describe(st, &buf)});
         return false;
+    }
+
+    fn menuStoreHuggingFaceToken(ctx: *anyopaque, token: []const u8) bool {
+        _ = ctx;
+        const st = keychain.storeHuggingFaceToken(token);
+        if (st == keychain.errSecSuccess) {
+            feedback.log("  menu: Hugging Face token stored separately in the login Keychain\n", .{});
+            return true;
+        }
+        var buf: [256]u8 = undefined;
+        feedback.log("  menu: Hugging Face token Keychain write failed: {s}\n", .{keychain.describe(st, &buf)});
+        return false;
+    }
+
+    fn menuModelAction(ctx: *anyopaque, action: menu_mod.ModelAction) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        switch (action) {
+            .retry_runtime => {
+                g_retry_local.store(true, .release);
+                return;
+            },
+            .cancel_operation => {
+                const pid = g_model_operation_pid.load(.acquire);
+                if (pid != 0) _ = kill(pid, SIGTERM);
+                return;
+            },
+            else => {},
+        }
+        if (g_model_operation_pid.load(.acquire) != 0) return;
+        const argument: []const u8 = switch (action) {
+            .install => "--install-model",
+            .update => "--update-model",
+            .resume_operation => "--resume-model",
+            .discard => "--discard-model",
+            .verify => "--verify-model",
+            .repair => "--repair-model-confirmed",
+            .remove => "--remove-model-confirmed",
+            .forget_hugging_face_token => "--forget-hf-token",
+            .retry_runtime, .cancel_operation => unreachable,
+        };
+        var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        var executable_size: u32 = executable_buffer.len;
+        if (_NSGetExecutablePath(&executable_buffer, &executable_size) != 0) return;
+        const executable = std.mem.sliceTo(executable_buffer[0..executable_size], 0);
+        var child = std.process.spawn(self.io, .{
+            .argv = &.{ executable, argument },
+            .stdin = .ignore,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        }) catch |failure| {
+            feedback.log("  menu: could not start Model Operation: {s}\n", .{@errorName(failure)});
+            return;
+        };
+        const pid: c_int = @intCast(child.id.?);
+        g_model_operation_action.store(@intFromEnum(action), .release);
+        g_model_operation_pid.store(pid, .release);
+        const waiter = std.Thread.spawn(.{}, waitForModelAction, .{ self.io, child, action }) catch {
+            child.kill(self.io);
+            g_model_operation_pid.store(0, .release);
+            return;
+        };
+        waiter.detach();
+    }
+
+    fn waitForModelAction(io: std.Io, child_value: std.process.Child, action: menu_mod.ModelAction) void {
+        var child = child_value;
+        const term = child.wait(io) catch {
+            g_model_operation_pid.store(0, .release);
+            return;
+        };
+        g_model_operation_pid.store(0, .release);
+        feedback.log("  menu: Model Operation {s} {s}\n", .{ @tagName(action), if (term.success()) "finished" else "failed" });
     }
 
     /// Menu Quit: signal every thread, then unwind [NSApp run] — daemon.run's normal
@@ -937,12 +1051,14 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     //      Headless (no display) skips it and the daemon behaves exactly as before. ----
     const menu_up = daemon.menu.init(io, alloc, &daemon.store, .{
         .ctx = &daemon,
-        .health = Daemon.menuHealth,
+        .status = Daemon.menuStatus,
         .selectBackend = Daemon.menuSelectBackend,
         .markSessionDirty = Daemon.menuMarkSessionDirty,
         .setOverlay = Daemon.menuSetOverlay,
         .setPaused = Daemon.menuSetPaused,
         .storeApiKey = Daemon.menuStoreApiKey,
+        .storeHuggingFaceToken = Daemon.menuStoreHuggingFaceToken,
+        .modelAction = Daemon.menuModelAction,
         .quit = Daemon.menuQuit,
     });
     feedback.log("  menu bar: {s}\n", .{if (menu_up)
