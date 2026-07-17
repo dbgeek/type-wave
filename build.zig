@@ -62,6 +62,59 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // The private local-inference helper is built only from a manually provisioned,
+    // byte-verified whisper.cpp v1.9.1 source archive. The build owns no downloader or
+    // credential path. Pass `-Dwhisper-archive=/path/to/v1.9.1.tar.gz`.
+    const helper_step = b.step("whisper-helper", "Build the pinned private KB Whisper helper");
+    const whisper_archive = b.option([]const u8, "whisper-archive", "Verified whisper.cpp v1.9.1 source archive");
+    if (whisper_archive) |archive_path| {
+        const runtime_build = b.addSystemCommand(&.{"bash"});
+        runtime_build.addFileArg(b.path("tools/build-whisper-runtime.sh"));
+        runtime_build.addFileArg(.{ .cwd_relative = archive_path });
+        const runtime_output = runtime_build.addOutputDirectoryArg("whisper-cpp-v1.9.1");
+
+        const artifact = b.addExecutable(.{
+            .name = "type-wave-whisper",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/whisper_helper.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .link_libcpp = true,
+            }),
+        });
+        artifact.root_module.addIncludePath(b.path("src"));
+        artifact.root_module.addIncludePath(runtime_output.path(b, "source/include"));
+        artifact.root_module.addIncludePath(runtime_output.path(b, "source/ggml/include"));
+        artifact.root_module.addCSourceFile(.{
+            .file = b.path("src/whisper_bridge.cpp"),
+            .flags = &.{ "-std=c++17", "-fno-exceptions" },
+        });
+        inline for (.{
+            "build/src/libwhisper.a",
+            "build/ggml/src/libggml.a",
+            "build/ggml/src/libggml-base.a",
+            "build/ggml/src/libggml-cpu.a",
+            "build/ggml/src/ggml-blas/libggml-blas.a",
+            "build/ggml/src/ggml-metal/libggml-metal.a",
+        }) |library| artifact.root_module.addObjectFile(runtime_output.path(b, library));
+        artifact.root_module.linkFramework("Accelerate", .{});
+        artifact.root_module.linkFramework("Foundation", .{});
+        artifact.root_module.linkFramework("Metal", .{});
+        artifact.root_module.linkFramework("MetalKit", .{});
+        artifact.root_module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk}) });
+        artifact.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
+        artifact.step.dependOn(&runtime_build.step);
+        b.installArtifact(artifact);
+        helper_step.dependOn(&artifact.step);
+    } else {
+        const missing = b.addSystemCommand(&.{
+            "sh",                                                                                            "-c",
+            "echo 'error: -Dwhisper-archive must name the verified whisper.cpp v1.9.1 archive' >&2; exit 1",
+        });
+        helper_step.dependOn(&missing.step);
+    }
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Build and run type-wave (foreground skeleton)");

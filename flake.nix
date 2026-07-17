@@ -13,7 +13,13 @@
         pkgs = nixpkgs.legacyPackages.${system};
       in {
         devShells.default = pkgs.mkShell {
-          packages = [ zig-overlay.packages.${system}.master pkgs.python3 pkgs.mypy ];
+          packages = [
+            zig-overlay.packages.${system}.master
+            pkgs.cmake
+            pkgs.ninja
+            pkgs.python3
+            pkgs.mypy
+          ];
 
           # Dev-shell convenience: make sure OPENAI_API_KEY is exported — the dev
           # override for foreground runs (#33; the installed daemon reads the login

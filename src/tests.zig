@@ -7,6 +7,9 @@
 test {
     _ = @import("coordinator.zig");
     _ = @import("transcription_backend.zig");
+    _ = @import("whisper_ipc.zig");
+    _ = @import("whisper_helper_core.zig");
+    _ = @import("whisper_supervisor.zig");
     _ = @import("config.zig");
     _ = @import("session.zig");
     _ = @import("hud.zig");
