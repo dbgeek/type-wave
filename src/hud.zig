@@ -5,7 +5,11 @@
 //! of plain CALayers whose frames the render pump pokes each tick — graduated from
 //! prototypes/waveform-hud (wayfinder #25, into the daemon by #27); the bare-marks
 //! v3 look — labelColor bars / secondaryLabelColor dots in a 300×22 sliver, no
-//! glass, no accent — from prototypes/liquid-glass-hud (ADR 0002, #41/#44). The HUD
+//! glass, no accent — from prototypes/liquid-glass-hud (ADR 0002, #41/#44); and the
+//! native motion — fade show/hide, bars→dots crossfade, all at the locked 0.7×
+//! timings — from the same prototype (#44/#47, landed by #51): a pure `Sequencer`
+//! decides each tick's transition, `render` executes it via explicit
+//! NSAnimationContext / actions-enabled CATransaction groupings. The HUD
 //! shows **no text, ever**: while recording it scrolls live mic volume as bars; after
 //! the Talk Key release three neutral dots bounce until the Insertion resolves.
 //!
@@ -99,6 +103,11 @@ inline fn msgDouble(self: id, op: [*:0]const u8, x: f64) void {
     const f: *const fn (id, SEL, f64) callconv(.c) void = @ptrCast(&objc_msgSend);
     f(self, sel_registerName(op), x);
 }
+// [self op:x]  (C float) -> void — CALayer.opacity is a plain float, not CGFloat.
+inline fn msgFloat(self: id, op: [*:0]const u8, x: f32) void {
+    const f: *const fn (id, SEL, f32) callconv(.c) void = @ptrCast(&objc_msgSend);
+    f(self, sel_registerName(op), x);
+}
 // [self op:rect]  (NSRect/CGRect) -> void
 inline fn msgRect(self: id, op: [*:0]const u8, r: NSRect) void {
     const f: *const fn (id, SEL, NSRect) callconv(.c) void = @ptrCast(&objc_msgSend);
@@ -132,6 +141,43 @@ inline fn makePanel(rect: NSRect, style: c_ulong, backing: c_ulong) id {
 /// [NSScreen mainScreen] — nil when there is no display (the headless signal).
 inline fn mainScreen() id {
     return msg(cls("NSScreen"), "mainScreen");
+}
+
+// ---- animation helpers (#44/#47, graduated as-is): explicit groupings, immune
+// to the pump's per-tick setDisableActions — window animator changes are
+// explicit animations, and the nested transaction re-enables implicit actions
+// for the raw bar/dot layers we own. CA interpolates in the render server.
+fn easeOut() id {
+    const f: *const fn (id, SEL, f32, f32, f32, f32) callconv(.c) id = @ptrCast(&objc_msgSend);
+    return f(cls("CAMediaTimingFunction"), sel_registerName("functionWithControlPoints::::"), 0.17, 0.7, 0.3, 1.0);
+}
+
+/// NSAnimationContext grouping for window animator properties (panel
+/// alphaValue). Pair with animEnd().
+fn animBegin(dur: f64) void {
+    msgv(cls("CATransaction"), "begin");
+    msgBool(cls("CATransaction"), "setDisableActions:", false);
+    msgv(cls("NSAnimationContext"), "beginGrouping");
+    const ctx = msg(cls("NSAnimationContext"), "currentContext");
+    msgDouble(ctx, "setDuration:", dur);
+    msgBool(ctx, "setAllowsImplicitAnimation:", true);
+    msg1v(ctx, "setTimingFunction:", easeOut());
+}
+fn animEnd() void {
+    msgv(cls("NSAnimationContext"), "endGrouping");
+    msgv(cls("CATransaction"), "commit");
+}
+
+/// Nested CATransaction with implicit actions ON — property pokes on our raw
+/// CALayers (opacity) animate over `dur`. Pair with layerAnimEnd().
+fn layerAnimBegin(dur: f64) void {
+    msgv(cls("CATransaction"), "begin");
+    msgBool(cls("CATransaction"), "setDisableActions:", false);
+    msgDouble(cls("CATransaction"), "setAnimationDuration:", dur);
+    msg1v(cls("CATransaction"), "setAnimationTimingFunction:", easeOut());
+}
+fn layerAnimEnd() void {
+    msgv(cls("CATransaction"), "commit");
 }
 /// [screen frame] — NSRect returned by value (HFA, v0–v3).
 inline fn screenFrame(screen: id) NSRect {
@@ -205,6 +251,86 @@ const n_bars: usize = @intFromFloat(@floor((pill_w - 2 * pad_x + bar_gap) / (bar
 /// once the Utterance resolves (inserted, abandoned, empty, or timed out).
 pub const State = enum { hidden, recording, processing };
 
+// ---- native motion (#44/#47, graduated): the locked 0.7× timings ------------
+// Show ≈0.14 s fade-in on press, bars→dots crossfade ≈0.15 s on release,
+// hide ≈0.11 s fade-out on every resolution.
+const motion_speed: f64 = 0.7; // the HITL-locked speed dial (#44), baked in
+const show_dur: f64 = 0.20 * motion_speed;
+const hide_dur: f64 = 0.16 * motion_speed;
+const cross_dur: f64 = 0.22 * motion_speed;
+
+/// The PURE decision half of the pill's motion (the #47 prototype shape,
+/// graduated): fed (published state, now) once per pump tick, it decides which
+/// transition starts this tick; the AppKit executor in `render` performs it.
+/// It owns the window lifecycle (shown / hide-fade deadline), so the executor
+/// carries no motion state of its own. Unit-tested below by feeding
+/// (state, clock) sequences and asserting decisions.
+pub const Sequencer = struct {
+    /// Edge detection: published state != prev_mode starts a transition.
+    prev_mode: State = .hidden,
+    /// Panel ordered in — true from the show-fade start until the deferred order-out.
+    shown: bool = false,
+    /// Hide-fade deadline; the pump orders out once now >= deadline.
+    hide_at: ?f64 = null,
+
+    /// What happens to the panel window this tick.
+    pub const WindowFx = enum {
+        none,
+        show_fade, // alpha 0 → order front → fade to 1 (≈0.14 s)
+        hide_fade, // fade to 0 (≈0.11 s); the order-out waits for the deadline
+        order_out, // the hide fade has played — take the panel out, exactly once
+        cancel_hide, // re-shown mid-hide-fade: snap alpha back to 1, panel never left
+    };
+    /// Which layer-family flip this tick performs.
+    pub const MarksFx = enum {
+        keep, // steady state — no visibility pokes
+        bars, // cut to the waveform (a fresh Utterance)
+        dots, // cut to the dots (no recording bars to fade from)
+        crossfade, // release handover: bars fade out while dots fade in (≈0.15 s)
+    };
+    pub const Decision = struct {
+        window: WindowFx = .none,
+        marks: MarksFx = .keep,
+    };
+
+    pub fn step(self: *Sequencer, published: State, now: f64) Decision {
+        const from = self.prev_mode;
+        self.prev_mode = published;
+
+        if (published == .hidden) {
+            if (self.shown and self.hide_at == null) {
+                self.hide_at = now + hide_dur;
+                return .{ .window = .hide_fade };
+            }
+            if (self.hide_at) |deadline| {
+                if (now >= deadline) {
+                    self.hide_at = null;
+                    self.shown = false;
+                    return .{ .window = .order_out };
+                }
+            }
+            return .{};
+        }
+
+        var window: WindowFx = .none;
+        if (self.hide_at != null) {
+            // A press landed while the hide fade was playing: cancel it — the
+            // panel never left, so a snap-back, not a new show fade.
+            self.hide_at = null;
+            window = .cancel_hide;
+        } else if (!self.shown) {
+            self.shown = true;
+            window = .show_fade;
+        }
+        const marks: MarksFx = if (published == from) .keep else switch (published) {
+            .hidden => unreachable,
+            .recording => .bars,
+            .processing => if (from == .recording) .crossfade else .dots,
+        };
+        return .{ .window = window, .marks = marks };
+    }
+};
+
 // ---- level → bar mapping (the seam carries raw linear RMS; mapping is render-side) ----
 // dBFS with a floor: −60 dB → flat, −10 dB → full bar, linear in dB. Linear amplitude
 // would make whispers invisible; in dB a whisper (~−48..−34 dBFS) lands at 0.25–0.5 of
@@ -249,13 +375,12 @@ pub const Hud = struct {
     qlen: usize = 0,
 
     // ---- render-thread-only ----
-    shown: bool = false,
+    /// The motion's decision half (#51): edge detection, window lifecycle, hide-fade
+    /// deadline. `render` executes whatever it decides each tick.
+    seq: Sequencer = .{},
     /// Scroll buffer of NORMALIZED heights: levels[n_bars-1] is the newest (rightmost)
     /// bar. Bars themselves never move — heights march left, one slot per sample.
     levels: [n_bars]f32 = @splat(0),
-    /// Which layer family the last tick left visible — visibility flips only on state
-    /// transitions, so a steady-state tick is just height pokes.
-    last_visible: ?State = null,
 
     /// Backs the CFRunLoopTimer's context (it borrows `&self.timer_ctx`); lives as long
     /// as the Hud, i.e. the process. Set in `startRenderPump`.
@@ -442,11 +567,30 @@ pub const Hud = struct {
         self.qlen = 0;
         os_unfair_lock_unlock(&self.mu);
 
+        // What moves this tick — the sequencer decides, the code below executes.
+        const decision = self.seq.step(st, CFAbsoluteTimeGetCurrent());
+
         if (st == .hidden) {
-            if (self.shown) {
-                msgv(self.panel, "orderOut:");
-                self.shown = false;
-                self.levels = @splat(0); // next Utterance starts from a flat line
+            // Only window motion happens while hidden; the marks are never touched,
+            // so a hide from processing freezes the dots and fades out around them.
+            switch (decision.window) {
+                .hide_fade => {
+                    const pool = objc_autoreleasePoolPush();
+                    defer objc_autoreleasePoolPop(pool);
+                    animBegin(hide_dur);
+                    defer animEnd();
+                    msgDouble(msg(self.panel, "animator"), "setAlphaValue:", 0.0);
+                },
+                .order_out => {
+                    const pool = objc_autoreleasePoolPush();
+                    defer objc_autoreleasePoolPop(pool);
+                    msgv(self.panel, "orderOut:");
+                    // Reset the animated alpha so the next show starts clean.
+                    msgDouble(self.panel, "setAlphaValue:", 1.0);
+                },
+                // The sequencer never decides these for a hidden state; .none is
+                // the idle tick (nothing on screen, or mid-fade — CA is playing it).
+                .none, .show_fade, .cancel_hide => {},
             }
             return;
         }
@@ -455,13 +599,21 @@ pub const Hud = struct {
         defer objc_autoreleasePoolPop(pool);
 
         // Batch every layer poke into one transaction with implicit animations off —
-        // at 20 Hz, CA's 0.25 s implicit fades would smear the scroll (#25).
+        // at 20 Hz, CA's 0.25 s implicit fades would smear the scroll (#25). The
+        // transition paths nest their own actions-enabled groupings inside it.
         msgv(cls("CATransaction"), "begin");
         msgBool(cls("CATransaction"), "setDisableActions:", true);
         defer msgv(cls("CATransaction"), "commit");
 
+        if (decision.window == .cancel_hide) {
+            // A press mid-hide-fade: snap the pill back before anything repaints.
+            // The direct set (not an animator group) is the prototype-proven cancel
+            // — it retargets the in-flight 0.11 s fade rather than racing it (#47).
+            msgDouble(self.panel, "setAlphaValue:", 1.0);
+        }
+
         self.applyMarkColors();
-        self.setVisibleFamily(st);
+        self.applyMarks(decision.marks);
 
         const row_w = @as(f64, @floatFromInt(n_bars)) * (bar_w + bar_gap) - bar_gap;
         const x0 = (pill_w - row_w) / 2.0;
@@ -495,9 +647,13 @@ pub const Hud = struct {
             },
         }
 
-        if (!self.shown) {
+        if (decision.window == .show_fade) {
+            // This tick's content is already rendered, so nothing stale flashes.
+            msgDouble(self.panel, "setAlphaValue:", 0.0);
             msgv(self.panel, "orderFrontRegardless"); // never makeKey — #20's recipe
-            self.shown = true;
+            animBegin(show_dur);
+            defer animEnd();
+            msgDouble(msg(self.panel, "animator"), "setAlphaValue:", 1.0);
         }
     }
 
@@ -514,14 +670,41 @@ pub const Hud = struct {
         for (self.dots) |dot| msg1v(dot, "setBackgroundColor:", dot_color);
     }
 
-    /// Flip which layer family is visible (bars while recording, dots while processing).
-    /// Only on transitions — a steady-state tick skips all 29 setHidden: calls.
-    fn setVisibleFamily(self: *Hud, st: State) void {
-        if (self.last_visible == st) return;
-        self.last_visible = st;
-        const dots_mode = st == .processing;
-        for (self.bars) |bar| msgBool(bar, "setHidden:", dots_mode);
-        for (self.dots) |dot| msgBool(dot, "setHidden:", !dots_mode);
+    /// Perform the sequencer's layer-family decision. Cuts run inside the pump's
+    /// disabled-actions transaction (instant); the crossfade nests an actions-enabled
+    /// transaction so CA interpolates the opacities in the render server. Steady-state
+    /// ticks (`keep`) skip every visibility poke.
+    fn applyMarks(self: *Hud, fx: Sequencer.MarksFx) void {
+        switch (fx) {
+            .keep => {},
+            .bars => {
+                self.levels = @splat(0); // a fresh Utterance starts from a flat line
+                for (self.bars) |bar| {
+                    msgFloat(bar, "setOpacity:", 1.0); // undo a played crossfade
+                    msgBool(bar, "setHidden:", false);
+                }
+                for (self.dots) |dot| msgBool(dot, "setHidden:", true);
+            },
+            .dots => {
+                for (self.bars) |bar| msgBool(bar, "setHidden:", true);
+                for (self.dots) |dot| {
+                    msgFloat(dot, "setOpacity:", 1.0);
+                    msgBool(dot, "setHidden:", false);
+                }
+            },
+            .crossfade => {
+                // Dots start transparent, in place — instant, actions are off in
+                // the enclosing pump transaction — then both families animate.
+                for (self.dots) |dot| {
+                    msgFloat(dot, "setOpacity:", 0.0);
+                    msgBool(dot, "setHidden:", false);
+                }
+                layerAnimBegin(cross_dur);
+                defer layerAnimEnd();
+                for (self.bars) |bar| msgFloat(bar, "setOpacity:", 0.0);
+                for (self.dots) |dot| msgFloat(dot, "setOpacity:", 1.0);
+            },
+        }
     }
 };
 
@@ -577,4 +760,91 @@ test "levelToNorm: linear in dB between floor and ceiling" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), levelToNorm(0.017783), 0.001);
     // A whisper around −44 dBFS lands visibly off the floor (~0.32) — the product goal.
     try std.testing.expectApproxEqAbs(@as(f32, 0.32), levelToNorm(0.00631), 0.01);
+}
+
+// ---- the transition sequencer's decision matrix (issue #51) -----------------
+// Prior art: the Coordinator's numbered lifecycle matrix. Each test feeds a
+// (published state, clock) sequence into a fresh Sequencer and asserts the
+// decisions — the AppKit executor is not involved.
+
+test "motion 1: press from idle starts the show fade with bars" {
+    var seq = Sequencer{};
+    // Idle hidden ticks decide nothing — the panel was never shown.
+    try std.testing.expectEqual(Sequencer.Decision{}, seq.step(.hidden, 100.0));
+    // Talk Key press → the pill fades in around a fresh waveform.
+    try std.testing.expectEqual(
+        Sequencer.Decision{ .window = .show_fade, .marks = .bars },
+        seq.step(.recording, 100.05),
+    );
+}
+
+test "motion 2: release crossfades the bars into the dots" {
+    var seq = Sequencer{};
+    _ = seq.step(.recording, 100.0);
+    // Steady recording ticks decide nothing — the scroll is just height pokes.
+    try std.testing.expectEqual(Sequencer.Decision{}, seq.step(.recording, 100.05));
+    // Talk Key release → the handover animates; the window is untouched.
+    try std.testing.expectEqual(
+        Sequencer.Decision{ .window = .none, .marks = .crossfade },
+        seq.step(.processing, 100.10),
+    );
+    // Held over the Insertion: nothing more to decide.
+    try std.testing.expectEqual(Sequencer.Decision{}, seq.step(.processing, 100.15));
+}
+
+test "motion 3: resolution starts the hide fade, order-out deferred to its deadline" {
+    var seq = Sequencer{};
+    _ = seq.step(.recording, 100.0);
+    _ = seq.step(.processing, 100.05);
+    // The Utterance resolves → the fade starts; the marks stay untouched, so a
+    // hide from processing freezes the dots and fades out around them.
+    try std.testing.expectEqual(
+        Sequencer.Decision{ .window = .hide_fade, .marks = .keep },
+        seq.step(.hidden, 100.10),
+    );
+    try std.testing.expectEqual(@as(?f64, 100.10 + hide_dur), seq.hide_at);
+}
+
+test "motion 4: order-out fires exactly once, only past the deadline" {
+    var seq = Sequencer{};
+    _ = seq.step(.recording, 100.0);
+    _ = seq.step(.processing, 100.05);
+    _ = seq.step(.hidden, 100.10); // hide fade starts; deadline 100.10 + hide_dur
+    // Mid-fade ticks decide nothing — the pill never disappears before the
+    // fade completes.
+    try std.testing.expectEqual(Sequencer.Decision{}, seq.step(.hidden, 100.15));
+    // First tick at/past the deadline orders out…
+    try std.testing.expectEqual(
+        Sequencer.Decision{ .window = .order_out, .marks = .keep },
+        seq.step(.hidden, 100.10 + hide_dur),
+    );
+    // …and only that tick: hidden is idle again from here on.
+    try std.testing.expectEqual(Sequencer.Decision{}, seq.step(.hidden, 100.30));
+    try std.testing.expectEqual(Sequencer.Decision{}, seq.step(.hidden, 200.0));
+}
+
+test "motion 5: a press during the hide fade cancels it and records normally" {
+    var seq = Sequencer{};
+    _ = seq.step(.recording, 100.0);
+    _ = seq.step(.processing, 100.05);
+    _ = seq.step(.hidden, 100.10); // hide fade starts
+    // A quick re-press mid-fade: the panel never left, so no show fade — the
+    // pill snaps back and the new Utterance's waveform cuts in.
+    try std.testing.expectEqual(
+        Sequencer.Decision{ .window = .cancel_hide, .marks = .bars },
+        seq.step(.recording, 100.14),
+    );
+    try std.testing.expectEqual(@as(?f64, null), seq.hide_at);
+    // The stale deadline must not fire into the new Utterance.
+    try std.testing.expectEqual(Sequencer.Decision{}, seq.step(.recording, 100.30));
+    // And the cancelled hide leaves a full cycle intact: the next resolution
+    // fades out and orders out as usual.
+    try std.testing.expectEqual(
+        Sequencer.Decision{ .window = .hide_fade, .marks = .keep },
+        seq.step(.hidden, 100.40),
+    );
+    try std.testing.expectEqual(
+        Sequencer.Decision{ .window = .order_out, .marks = .keep },
+        seq.step(.hidden, 100.40 + hide_dur),
+    );
 }
