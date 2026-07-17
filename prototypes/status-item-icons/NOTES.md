@@ -77,6 +77,25 @@ system's own items use). Toggle down to one finalist and live with it a bit.
 - Visual reaction — glyph choice, weight match against the system icons, and
   the winning dim style — is the HITL round.
 
-## Verdict
+## Verdict (2026-07-17, HITL)
 
-_Pending the HITL round._
+**Winner:** `waveform.badge.mic`. In harness terms:
+
+    [dim_style=slash_alpha weight=regular size=17pt scale=medium]
+    visible: 4:waveform.badge.mic
+
+- **Glyph:** `waveform.badge.mic` — says *dictation* (waveform + mic badge),
+  beating the incumbent plain `waveform` and the whole mic family.
+- **Rendering:** explicit `NSImageSymbolConfiguration` at **17 pt, regular
+  weight, medium scale**, template image (the incumbent's no-config default
+  rendering lost — too small next to Tahoe's system icons).
+- **Dimmed tier:** the slash+alpha style — which for this glyph (no slash
+  variant exists in SF Symbols) degrades to **the same glyph at
+  `alphaValue 0.35`**. That alpha-dimmed rendering is what was judged and
+  picked, so the daemon's slash-swap logic becomes moot: dimming is alpha
+  alone.
+
+What graduates (in the later graduation effort, not this map):
+`src/menu.zig` swaps `waveform`/`waveform.slash` for `waveform.badge.mic`
+with a 17pt/regular/medium symbol configuration, keeps `setTemplate:` and the
+`alphaValue 0.35` dim, and drops the slash-symbol swap.
