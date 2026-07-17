@@ -35,7 +35,7 @@ transcripts are logged and may be revised; only Final Transcripts are inserted.
 
 A menu-bar Status Item derives readiness for the selected Transcription Backend and exposes
 the persisted OpenAI/local chooser. Its compact menu shows one relevant primary action,
-keeps OpenAI controls in OpenAI context, and leaves full Local Model management reachable
+keeps OpenAI controls in OpenAI context, and leaves full Model Installation management reachable
 under either selection. Ready local mode says that audio stays on this Mac; an explicit
 network-using Model Operation gets its own separate cue.
 

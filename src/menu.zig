@@ -354,6 +354,8 @@ fn primaryText(action: status_item.PrimaryAction, operation: status_item.Operati
             .waiting_for_inference => "Waiting for local inference to drain\xe2\x80\xa6",
             .activating => "Activating Model Installation\xe2\x80\xa6",
             .removing => "Removing Model Installation\xe2\x80\xa6",
+            .discarding => "Discarding staged model data\xe2\x80\xa6",
+            .forgetting_credential => "Forgetting Hugging Face token\xe2\x80\xa6",
             else => "Model Operation in progress\xe2\x80\xa6",
         },
     };
@@ -366,7 +368,7 @@ fn modelActionVisible(action: ModelAction, snapshot: status_item.Snapshot, opera
         .resume_operation, .discard => snapshot.operation == .paused,
         .verify, .remove => snapshot.installation != .absent and !operation_active,
         .repair => snapshot.installation == .corrupt and !operation_active,
-        .retry_runtime => snapshot.terminal_backend_failure and !operation_active,
+        .retry_runtime => snapshot.local_runtime_failure and !operation_active,
         .cancel_operation => operation_active,
         .diagnostics, .forget_hugging_face_token => true,
     };
@@ -614,7 +616,7 @@ pub const Menu = struct {
         };
         msg1v(self.local_operation_status, "setTitle:", nsstr(operation_title));
         const operation_active = switch (snapshot.operation) {
-            .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference, .activating, .removing => true,
+            .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference, .activating, .removing, .discarding, .forgetting_credential => true,
             else => false,
         };
         for (model_action_definitions) |definition| {

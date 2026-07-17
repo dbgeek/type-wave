@@ -85,10 +85,44 @@ extern "c" fn signal(sig: c_int, handler: *const fn (c_int) callconv(.c) void) c
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
 const SIGHUP: c_int = 1;
-var g_model_operation_pid = std.atomic.Value(c_int).init(0);
-var g_model_operation_phase = std.atomic.Value(u8).init(@intFromEnum(status_item.Operation.idle));
-var g_model_operation_completed = std.atomic.Value(u64).init(0);
-var g_model_operation_total = std.atomic.Value(u64).init(0);
+const ModelOperationObservation = struct {
+    pid: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(0),
+    phase: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(status_item.Operation.idle)),
+    completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    const Current = struct { phase: status_item.Operation, bytes: ?status_item.ByteProgress };
+
+    fn current(self: *const ModelOperationObservation) ?Current {
+        if (self.pid.load(.acquire) == 0) return null;
+        const total = self.total.load(.acquire);
+        return .{
+            .phase = std.enums.fromInt(status_item.Operation, self.phase.load(.acquire)) orelse .installing,
+            .bytes = if (total == 0) null else .{ .completed = self.completed.load(.acquire), .total = total },
+        };
+    }
+
+    fn begin(self: *ModelOperationObservation, pid: c_int, phase: status_item.Operation) void {
+        self.phase.store(@intFromEnum(phase), .release);
+        self.completed.store(0, .release);
+        self.total.store(0, .release);
+        self.pid.store(pid, .release);
+    }
+
+    fn finish(self: *ModelOperationObservation) void {
+        self.pid.store(0, .release);
+    }
+
+    fn setPhase(self: *ModelOperationObservation, phase: status_item.Operation) void {
+        self.phase.store(@intFromEnum(phase), .release);
+    }
+
+    fn setProgress(self: *ModelOperationObservation, completed: u64, total: u64) void {
+        self.completed.store(completed, .release);
+        self.total.store(total, .release);
+    }
+};
+var g_model_operation: ModelOperationObservation = .{};
 
 // ---- tuning ----------------------------------------------------------------
 /// Self-heal poll cadence. Fast enough that granting a permission / dropping in the key
@@ -813,7 +847,7 @@ const Daemon = struct {
                         operation_bytes = .{ .completed = state.bytes.completed, .total = state.bytes.total };
                     operation = switch (state.phase) {
                         .idle => .idle,
-                        .downloading => std.enums.fromInt(status_item.Operation, g_model_operation_phase.load(.acquire)) orelse .installing,
+                        .downloading => .installing,
                         .paused => .paused,
                         .verifying => .verifying,
                         .smoke_testing => .smoke_testing,
@@ -821,19 +855,20 @@ const Daemon = struct {
                         .removing => .removing,
                         .failed => .failed,
                     };
-                    if (state.phase == .downloading) {
-                        const total = g_model_operation_total.load(.acquire);
-                        if (total != 0) operation_bytes = .{ .completed = g_model_operation_completed.load(.acquire), .total = total };
-                    }
                 }
             } else |_| {}
         }
         const recovery_state = self.local_model_recovery.current();
         if (recovery_state == .corrupt) installation = .corrupt;
+        if (g_model_operation.current()) |observed| {
+            operation = observed.phase;
+            operation_bytes = observed.bytes;
+        }
         return .{
             .selected_backend = self.store.current().transcription_backend,
             .health = h,
             .terminal_backend_failure = self.store.current().transcription_backend == .local_kb_whisper and recovery_state == .runtime_failure,
+            .local_runtime_failure = recovery_state == .runtime_failure,
             .installation = installation,
             .operation = operation,
             .operation_bytes = operation_bytes,
@@ -904,7 +939,7 @@ const Daemon = struct {
                 return;
             },
             .cancel_operation => {
-                const pid = g_model_operation_pid.load(.acquire);
+                const pid = g_model_operation.pid.load(.acquire);
                 if (pid != 0) _ = kill(pid, SIGTERM);
                 return;
             },
@@ -922,7 +957,7 @@ const Daemon = struct {
             },
             else => {},
         }
-        if (g_model_operation_pid.load(.acquire) != 0) return;
+        if (g_model_operation.pid.load(.acquire) != 0) return;
         const argument: []const u8 = switch (action) {
             .install => "--install-model",
             .update => "--update-model",
@@ -961,18 +996,17 @@ const Daemon = struct {
             child.stdin = null;
         }
         const pid: c_int = @intCast(child.id.?);
-        g_model_operation_phase.store(@intFromEnum(switch (action) {
+        g_model_operation.begin(pid, switch (action) {
             .update => status_item.Operation.updating,
             .verify => .verifying,
             .remove => .removing,
+            .discard => .discarding,
+            .forget_hugging_face_token => .forgetting_credential,
             else => .installing,
-        }), .release);
-        g_model_operation_completed.store(0, .release);
-        g_model_operation_total.store(model_store.pinned_manifest.size, .release);
-        g_model_operation_pid.store(pid, .release);
+        });
         const waiter = std.Thread.spawn(.{}, waitForModelAction, .{ self.io, child, action }) catch {
             child.kill(self.io);
-            g_model_operation_pid.store(0, .release);
+            g_model_operation.finish();
             return;
         };
         waiter.detach();
@@ -987,21 +1021,21 @@ const Daemon = struct {
             feedback.log("  model: {s}\n", .{line});
         }
         const term = child.wait(io) catch {
-            g_model_operation_pid.store(0, .release);
+            g_model_operation.finish();
             return;
         };
-        g_model_operation_pid.store(0, .release);
+        g_model_operation.finish();
         feedback.log("  menu: Model Operation {s} {s}\n", .{ @tagName(action), if (term.success()) "finished" else "failed" });
     }
 
     fn observeModelProgress(line: []const u8) void {
         const prefix = "Model Operation: ";
         const detail = if (std.mem.indexOf(u8, line, prefix)) |at| line[at + prefix.len ..] else return;
-        if (std.mem.startsWith(u8, detail, "verifying ")) g_model_operation_phase.store(@intFromEnum(status_item.Operation.verifying), .release);
-        if (std.mem.startsWith(u8, detail, "smoke testing")) g_model_operation_phase.store(@intFromEnum(status_item.Operation.smoke_testing), .release);
-        if (std.mem.startsWith(u8, detail, "waiting for active local inference")) g_model_operation_phase.store(@intFromEnum(status_item.Operation.waiting_for_inference), .release);
-        if (std.mem.startsWith(u8, detail, "activating")) g_model_operation_phase.store(@intFromEnum(status_item.Operation.activating), .release);
-        if (std.mem.startsWith(u8, detail, "removing")) g_model_operation_phase.store(@intFromEnum(status_item.Operation.removing), .release);
+        if (std.mem.startsWith(u8, detail, "verifying ")) g_model_operation.setPhase(.verifying);
+        if (std.mem.startsWith(u8, detail, "smoke testing")) g_model_operation.setPhase(.smoke_testing);
+        if (std.mem.startsWith(u8, detail, "waiting for active local inference")) g_model_operation.setPhase(.waiting_for_inference);
+        if (std.mem.startsWith(u8, detail, "activating")) g_model_operation.setPhase(.activating);
+        if (std.mem.startsWith(u8, detail, "removing")) g_model_operation.setPhase(.removing);
         const slash = std.mem.indexOfScalar(u8, detail, '/') orelse return;
         var begin = slash;
         while (begin > 0 and std.ascii.isDigit(detail[begin - 1])) begin -= 1;
@@ -1009,8 +1043,7 @@ const Daemon = struct {
         while (end < detail.len and std.ascii.isDigit(detail[end])) end += 1;
         const completed = std.fmt.parseInt(u64, detail[begin..slash], 10) catch return;
         const total = std.fmt.parseInt(u64, detail[slash + 1 .. end], 10) catch return;
-        g_model_operation_completed.store(completed, .release);
-        g_model_operation_total.store(total, .release);
+        g_model_operation.setProgress(completed, total);
     }
 
     fn waitForDetached(io: std.Io, child_value: std.process.Child) void {

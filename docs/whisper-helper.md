@@ -86,5 +86,5 @@ network, buffers the full 24 kHz mono Capture, and sends exactly one inference r
 Talk Key release. Omit the field to retain the default OpenAI backend. Selection persists
 across restarts; opening the Status Item picks up a hand-edited selection immediately and
 drains any active Utterance before preparing the latest choice. The Status Item exposes the
-backend chooser, selected-backend readiness and primary action, local privacy cue, and Local
-Model management without making an unselected backend compete in the main hierarchy.
+backend chooser, selected-backend readiness and primary action, local privacy cue, and Model
+Installation management without making an unselected backend compete in the main hierarchy.
