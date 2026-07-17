@@ -85,6 +85,17 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run the unit tests (Coordinator lifecycle + pure functions)");
     test_step.dependOn(&run_tests.step);
 
+    // The local-backend release gate is a stdlib-only Python program so it can score
+    // checked-in evidence without building or loading the native inference runtime.
+    // Python is pinned in flake.nix alongside Zig.
+    const acceptance_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s", "acceptance/local_backend", "-p", "test_*.py", "-v" });
+    const acceptance_types = b.addSystemCommand(&.{ "mypy", "--strict", "acceptance/local_backend/gate.py" });
+    const acceptance_test_step = b.step("acceptance-test", "Run the deterministic local-backend release-gate tests");
+    acceptance_test_step.dependOn(&acceptance_tests.step);
+    acceptance_test_step.dependOn(&acceptance_types.step);
+    test_step.dependOn(&acceptance_tests.step);
+    test_step.dependOn(&acceptance_types.step);
+
     // `zig build install-agent` — package the daemon as a signed headless LaunchAgent
     // (wayfinder #15): codesign the freshly-built binary with the stable "type-wave dev"
     // identity, install it to ~/.local/bin/type-wave, and render+install the LaunchAgent

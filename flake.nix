@@ -1,5 +1,5 @@
 {
-  description = "Development shell with Zig";
+  description = "Development shell with Zig and the local-backend release-gate runtime";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -13,7 +13,7 @@
         pkgs = nixpkgs.legacyPackages.${system};
       in {
         devShells.default = pkgs.mkShell {
-          packages = [ zig-overlay.packages.${system}.master ];
+          packages = [ zig-overlay.packages.${system}.master pkgs.python3 pkgs.mypy ];
 
           # Dev-shell convenience: make sure OPENAI_API_KEY is exported — the dev
           # override for foreground runs (#33; the installed daemon reads the login
