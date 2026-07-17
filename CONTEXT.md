@@ -33,6 +33,10 @@ _Avoid_: active window
 The live connection to the transcription service over which an Utterance's audio streams out and transcripts stream back.
 _Avoid_: websocket (mechanism)
 
+**Transcription Backend**:
+The selected source of Partial and Final Transcripts for an Utterance. OpenAI is the default backend; a local KB Whisper backend is an offline alternative.
+_Avoid_: transcription provider, engine
+
 **Capture**:
 The microphone audio stream feeding a Transcription Session.
 _Avoid_: recording
