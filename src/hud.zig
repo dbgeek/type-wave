@@ -3,9 +3,11 @@
 //! ObjC shim .m files. The panel + focus-avoidance recipe graduated from
 //! prototypes/overlay-hud (wayfinder #20/#22); the waveform mechanism — a fixed row
 //! of plain CALayers whose frames the render pump pokes each tick — graduated from
-//! prototypes/waveform-hud (wayfinder #25, into the daemon by #27). The HUD shows
-//! **no text, ever**: while recording it scrolls live mic volume as bars; after the
-//! Talk Key release three green dots bounce until the Insertion resolves.
+//! prototypes/waveform-hud (wayfinder #25, into the daemon by #27); the bare-marks
+//! v3 look — labelColor bars / secondaryLabelColor dots in a 300×22 sliver, no
+//! glass, no accent — from prototypes/liquid-glass-hud (ADR 0002, #41/#44). The HUD
+//! shows **no text, ever**: while recording it scrolls live mic volume as bars; after
+//! the Talk Key release three neutral dots bounce until the Insertion resolves.
 //!
 //! The msgSend pattern (cast &objc_msgSend to a typed fn-pointer per call site) is
 //! the exact one proven for NSPasteboard in src/insert.zig, extended to NSPanel /
@@ -72,6 +74,11 @@ inline fn msg1v(self: id, op: [*:0]const u8, a: id) void {
     const f: *const fn (id, SEL, id) callconv(.c) void = @ptrCast(&objc_msgSend);
     f(self, sel_registerName(op), a);
 }
+// [self op:a]  (id arg) -> id
+inline fn msg1(self: id, op: [*:0]const u8, a: id) id {
+    const f: *const fn (id, SEL, id) callconv(.c) id = @ptrCast(&objc_msgSend);
+    return f(self, sel_registerName(op), a);
+}
 // [self op:flag]  (BOOL) -> void
 inline fn msgBool(self: id, op: [*:0]const u8, b: bool) void {
     const f: *const fn (id, SEL, bool) callconv(.c) void = @ptrCast(&objc_msgSend);
@@ -103,10 +110,14 @@ inline fn msgRect(self: id, op: [*:0]const u8, r: NSRect) void {
 /// so it is passed/returned in SIMD regs by the arm64 C ABI (Zig lowers this for us).
 const NSRect = extern struct { x: f64, y: f64, w: f64, h: f64 };
 
-/// [NSColor colorWithSRGBRed:green:blue:alpha:]
-inline fn rgba(r: f64, g: f64, b: f64, a: f64) id {
-    const f: *const fn (id, SEL, f64, f64, f64, f64) callconv(.c) id = @ptrCast(&objc_msgSend);
-    return f(cls("NSColor"), sel_registerName("colorWithSRGBRed:green:blue:alpha:"), r, g, b, a);
+/// A semantic NSColor (`labelColor`, `secondaryLabelColor`, …) pinned to sRGB.
+/// Dynamic system colors must be converted to a component color space before
+/// CGColor use, and the conversion resolves against the *current* appearance —
+/// so re-resolving per recolor pass is what makes the marks track light/dark
+/// with no notification wiring (ADR 0002).
+inline fn systemColor(name: [*:0]const u8) id {
+    const dynamic = msg(cls("NSColor"), name);
+    return msg1(dynamic, "colorUsingColorSpace:", msg(cls("NSColorSpace"), "sRGBColorSpace"));
 }
 /// CGColorRef from an NSColor — CALayer.backgroundColor wants the CG flavour.
 inline fn cgColor(nscolor: id) id {
@@ -166,25 +177,32 @@ extern var kCFRunLoopCommonModes: ?*anyopaque;
 /// with implicit animations off (#25), cheap on an idle (hidden) tick.
 const render_interval_s: f64 = 0.05;
 
-// ---- the look (HITL-decided in #25; fixed, no config knob) --------------------
-const pill_w: f64 = 420;
-const pill_h: f64 = 60;
-const bar_w: f64 = 3;
-const bar_gap: f64 = 2;
+// ---- the look (HUD v3 bare marks — ADR 0002, HITL-locked in #41/#44; fixed, no
+// config knob). Constants proven in prototypes/liquid-glass-hud. ------------------
+const pill_w: f64 = 300;
+const pill_h: f64 = 22;
+const bar_w: f64 = 6;
+const bar_gap: f64 = 4;
 const pad_x: f64 = 20; // inner margin before the first / after the last bar
 const min_bar_h: f64 = 3; // silence reads as a flat dotted line, not nothing
 const max_bar_h: f64 = pill_h * 0.72; // headroom so a full bar never kisses the edge
-const dot_size: f64 = 12;
-const dot_gap: f64 = 10;
+
+// Dots scale with the pill so the 22 pt sliver doesn't clip them: full 12 pt dots
+// with the 11 pt bounce would need ~34 pt of height. Same formulas the prototype
+// proved; the −1 keeps a 1 pt margin under the bounce peak.
+const dot_size: f64 = @min(12.0, pill_h * 0.4);
+const dot_gap: f64 = dot_size * (10.0 / 12.0);
+const dot_bounce: f64 = @min(11.0, (pill_h - dot_size) / 2.0 - 1.0);
+const dots_row_w: f64 = 3 * dot_size + 2 * dot_gap; // the three-dot row, centred in the pill
 
 /// How many bars fit the pill. Also how much history it shows: at one level per
-/// 50 ms Capture buffer, n_bars/20 seconds scroll across it (76 bars ≈ 3.8 s).
+/// 50 ms Capture buffer, n_bars/20 seconds scroll across it (26 bars ≈ 1.3 s).
 const n_bars: usize = @intFromFloat(@floor((pill_w - 2 * pad_x + bar_gap) / (bar_w + bar_gap)));
 
 /// What the pill is doing — drives which layer family is visible. The daemon maps its
 /// Utterance lifecycle onto these: `recording` on Talk Key press (scrolling waveform),
-/// `processing` on release (green dots, held over the whole Insertion), `hidden` once
-/// the Utterance resolves (inserted, abandoned, empty, or timed out).
+/// `processing` on release (bouncing dots, held over the whole Insertion), `hidden`
+/// once the Utterance resolves (inserted, abandoned, empty, or timed out).
 pub const State = enum { hidden, recording, processing };
 
 // ---- level → bar mapping (the seam carries raw linear RMS; mapping is render-side) ----
@@ -302,29 +320,25 @@ pub const Hud = struct {
 
         // The whole mechanism (#25): a fixed row of plain CALayers. [CALayer layer]
         // returns autoreleased; addSublayer: retains, so the hierarchy owns them after
-        // this. Colours never change — recording red bars, green dots — so they are set
-        // once here; state changes only flip visibility.
-        const bar_color = cgColor(rgba(1.0, 0.38, 0.38, 1.0)); // recording tint-red
-        const dot_color = cgColor(rgba(0.30, 0.85, 0.45, 1.0)); // processing green
+        // this. Geometry is fixed here; colors are semantic (labelColor bars,
+        // secondaryLabelColor dots — ADR 0002) and land in applyMarkColors, which
+        // re-resolves them on every visible tick so they track light/dark appearance.
         const row_w = @as(f64, @floatFromInt(n_bars)) * (bar_w + bar_gap) - bar_gap;
         const x0 = (pill_w - row_w) / 2.0;
         for (&self.bars, 0..) |*bar, i| {
             bar.* = msg(cls("CALayer"), "layer");
             msgBool(bar.*, "setHidden:", true);
-            msg1v(bar.*, "setBackgroundColor:", bar_color);
             msgDouble(bar.*, "setCornerRadius:", bar_w / 2.0);
             msgRect(bar.*, "setFrame:", barFrame(i, min_bar_h, x0));
             msg1v(layer, "addSublayer:", bar.*);
         }
-        const dots_w = 3 * dot_size + 2 * dot_gap;
         for (&self.dots, 0..) |*dot, j| {
             dot.* = msg(cls("CALayer"), "layer");
             msgBool(dot.*, "setHidden:", true);
-            msg1v(dot.*, "setBackgroundColor:", dot_color);
             msgDouble(dot.*, "setCornerRadius:", dot_size / 2.0);
             const fj: f64 = @floatFromInt(j);
             msgRect(dot.*, "setFrame:", .{
-                .x = (pill_w - dots_w) / 2.0 + fj * (dot_size + dot_gap),
+                .x = (pill_w - dots_row_w) / 2.0 + fj * (dot_size + dot_gap),
                 .y = (pill_h - dot_size) / 2.0,
                 .w = dot_size,
                 .h = dot_size,
@@ -446,6 +460,7 @@ pub const Hud = struct {
         msgBool(cls("CATransaction"), "setDisableActions:", true);
         defer msgv(cls("CATransaction"), "commit");
 
+        self.applyMarkColors();
         self.setVisibleFamily(st);
 
         const row_w = @as(f64, @floatFromInt(n_bars)) * (bar_w + bar_gap) - bar_gap;
@@ -465,15 +480,14 @@ pub const Hud = struct {
                 }
             },
             .processing => {
-                // Three bouncing green dots, phase-offset — held until the Insertion
+                // Three bouncing neutral dots, phase-offset — held until the Insertion
                 // resolves and the daemon publishes .hidden.
                 const t = CFAbsoluteTimeGetCurrent();
-                const dots_w = 3 * dot_size + 2 * dot_gap;
                 for (self.dots, 0..) |dot, j| {
                     const fj: f64 = @floatFromInt(j);
                     msgRect(dot, "setFrame:", .{
-                        .x = (pill_w - dots_w) / 2.0 + fj * (dot_size + dot_gap),
-                        .y = (pill_h - dot_size) / 2.0 + 11.0 * @sin(t * 5.0 + fj * 0.8),
+                        .x = (pill_w - dots_row_w) / 2.0 + fj * (dot_size + dot_gap),
+                        .y = (pill_h - dot_size) / 2.0 + dot_bounce * @sin(t * 5.0 + fj * 0.8),
                         .w = dot_size,
                         .h = dot_size,
                     });
@@ -487,8 +501,21 @@ pub const Hud = struct {
         }
     }
 
+    /// Re-resolve the semantic mark colors and repaint every layer: labelColor bars,
+    /// secondaryLabelColor dots (ADR 0002). Runs every visible tick — recoloring ON
+    /// REPAINT is the whole appearance-tracking mechanism, so a light/dark switch
+    /// lands within one tick even mid-recording or during a long processing hold,
+    /// with no notification wiring. Cheap: two color resolutions and 29 autoreleased
+    /// setBackgroundColor: pokes inside the tick's already-batched transaction.
+    fn applyMarkColors(self: *Hud) void {
+        const bar_color = cgColor(systemColor("labelColor"));
+        const dot_color = cgColor(systemColor("secondaryLabelColor"));
+        for (self.bars) |bar| msg1v(bar, "setBackgroundColor:", bar_color);
+        for (self.dots) |dot| msg1v(dot, "setBackgroundColor:", dot_color);
+    }
+
     /// Flip which layer family is visible (bars while recording, dots while processing).
-    /// Only on transitions — a steady-state tick skips all 79 setHidden: calls.
+    /// Only on transitions — a steady-state tick skips all 29 setHidden: calls.
     fn setVisibleFamily(self: *Hud, st: State) void {
         if (self.last_visible == st) return;
         self.last_visible = st;
@@ -514,6 +541,22 @@ fn barFrame(i: usize, h: f64, x0: f64) NSRect {
 fn renderTick(_: CFRunLoopTimerRef, info: ?*anyopaque) callconv(.c) void {
     const self: *Hud = @ptrCast(@alignCast(info.?));
     self.render();
+}
+
+test "bare-marks geometry: 26 bars derive from the 300 pt pill" {
+    // 6 pt bars / 4 pt gaps in 300−2×20 usable points → exactly 26 bars (ADR 0002).
+    try std.testing.expectEqual(@as(usize, 26), n_bars);
+}
+
+test "bare-marks geometry: dots never clip the 22 pt pill" {
+    // A dot's lowest bottom edge and highest top edge over a full bounce cycle
+    // both stay inside the pill.
+    const bottom = (pill_h - dot_size) / 2.0 - dot_bounce;
+    const top = (pill_h - dot_size) / 2.0 + dot_bounce + dot_size;
+    try std.testing.expect(bottom >= 0.0);
+    try std.testing.expect(top <= pill_h);
+    // The three-dot row fits the pill width.
+    try std.testing.expect(dots_row_w <= pill_w);
 }
 
 test "levelToNorm: floor and below read flat" {
