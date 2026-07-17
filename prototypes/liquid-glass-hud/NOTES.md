@@ -158,7 +158,25 @@ processing freezes the dots and fades the capsule out around them.
   no visible target, so `swell` degrades to a plain crossfade and
   `glass_pulse` reads as frozen bars.
 
-## Verdict (#44 — motion)
+## Verdict (#44 — motion, 2026-07-17 HITL)
 
-_Pending HITL — pick `a`/`f` candidates, `u` for slow-mo, then `j` to watch
-the whole lifecycle; record the winner here._
+**Motion locked — and the look revised with it.** The winner, in harness
+terms (now the boot default):
+
+    [glass=none tint=accent_strong bars=label radius=capsule shadow=true
+     pill=300x22 bar=6w/4g(26) processing=dots_neutral show=fade
+     switch=crossfade speed=0.7]
+
+- **Motion**: show/hide **fade** (window alpha), recording→processing
+  **crossfade**, both at **0.7×** — show ≈0.14 s, hide ≈0.11 s,
+  crossfade ≈0.15 s.
+- **The winner is bare**: glass style `none` — no capsule at all. The final
+  design is just the marks: label-color bars (6 pt wide / 4 pt gap → 26
+  bars) in a 300×22 sliver, `secondaryLabelColor` dots for processing.
+  This **supersedes #41's** Regular-glass capsule + accent verdict; with the
+  material gone, tint/radius/shadow are moot (they remain in the string but
+  have no visible target while bare).
+- Caveat carried to the graduation spec (#45): whisper contrast for the
+  22 pt label-color bars deserves one deliberate `w`/`m` pass over light and
+  dark backdrops — bar excursion is a third of the 60 pt pill's, and there
+  is no material behind the bars to guarantee contrast.

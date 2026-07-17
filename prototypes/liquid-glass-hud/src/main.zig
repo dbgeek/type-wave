@@ -91,7 +91,7 @@ const Shared = struct {
     source: Source = .talk,
     look: glass.Look = .{},
     look_dirty: bool = false,
-    anim: glass.ProcessingAnim = .dots_accent,
+    anim: glass.ProcessingAnim = .dots_neutral, // #44 verdict
     motion: glass.Motion = .{},
     demo_running: bool = false,
 

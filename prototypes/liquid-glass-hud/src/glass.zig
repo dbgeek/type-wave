@@ -220,9 +220,10 @@ pub const SwitchAnim = enum {
 };
 
 pub const Motion = struct {
-    show: ShowAnim = .pop,
-    switch_anim: SwitchAnim = .cut,
-    speed: f64 = 1.0, // multiplies every duration — slow-mo for HITL eyeballing
+    // Defaults are #44's locked HITL verdict: fade + crossfade at 0.7x.
+    show: ShowAnim = .fade,
+    switch_anim: SwitchAnim = .crossfade,
+    speed: f64 = 0.7, // multiplies every duration — `u` cycles for eyeballing
 };
 
 const show_dur: f64 = 0.20;
@@ -234,14 +235,16 @@ const swell_extra: f64 = 0.30; // tint alpha bump at the moment of release
 const materialize_inset: f64 = 0.05; // frame inset fraction per axis (~90% scale)
 
 pub const Look = struct {
-    // Defaults are #41's locked HITL verdict: Regular glass, strong accent
-    // tint, accent bars, capsule radius, shadow on, 420x60 fine bars.
-    pill_w: f64 = 420,
-    pill_h: f64 = 60,
-    bar_w: f64 = 3,
-    bar_gap: f64 = 2,
-    style: GlassStyle = .regular,
-    bars: BarScheme = .accent,
+    // Defaults are #44's locked HITL verdict (supersedes #41's capsule):
+    // BARE — no glass at all — label bars 6w/4g in a 300x22 sliver.
+    // tint/radius/shadow are moot while bare but keep the #44 string's
+    // values so cycling `g` back to glass shows something sensible.
+    pill_w: f64 = 300,
+    pill_h: f64 = 22,
+    bar_w: f64 = 6,
+    bar_gap: f64 = 4,
+    style: GlassStyle = .none,
+    bars: BarScheme = .label,
     tint: Tint = .accent_strong,
     radius: Radius = .capsule,
     shadow: bool = true,
