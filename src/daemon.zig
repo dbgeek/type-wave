@@ -66,8 +66,10 @@ const insertion_adapter = @import("insertion_adapter.zig");
 const readiness = @import("readiness.zig");
 const configuration_phase = @import("configuration_phase.zig");
 const backend = @import("transcription_backend.zig");
+const local_backend = @import("local_backend.zig");
 
 const Session = session_mod.Session;
+const LocalAdapter = local_backend.Adapter(local_backend.ProcessHelper);
 
 extern "c" fn usleep(usec: c_uint) c_int;
 
@@ -120,6 +122,13 @@ fn keyName(k: tapmod.TalkKey) []const u8 {
     };
 }
 
+/// Temporary thin-path selection for a manually provisioned Model Installation.
+/// Persisted selection and live drain-then-switch are owned by follow-up #74.
+fn manuallySelectedBackend() backend.Backend {
+    const value = std.c.getenv("TYPE_WAVE_BACKEND") orelse return .openai;
+    return if (std.mem.eql(u8, std.mem.span(value), "local")) .local_kb_whisper else .openai;
+}
+
 // ============================================================================
 // The real adapters satisfying the Utterance Coordinator's four outbound seams.
 // (Audio is Capture itself — it already fits the seam, so it needs no wrapper.)
@@ -132,6 +141,9 @@ fn keyName(k: tapmod.TalkKey) []const u8 {
 const TranscriptionAdapter = struct {
     ptr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     active_id: std.atomic.Value(backend.UtteranceId) = std.atomic.Value(backend.UtteranceId).init(0),
+    selected: backend.Backend = .openai,
+    local: ?*LocalAdapter = null,
+    store: *config.Store = undefined,
 
     const commands = backend.Commands{
         .begin = begin,
@@ -149,9 +161,17 @@ const TranscriptionAdapter = struct {
     }
     // ---- the Coordinator's backend-neutral lease seam -----------------------------
     pub fn available(self: *TranscriptionAdapter) bool {
-        return self.ptr.load(.acquire) != 0;
+        return switch (self.selected) {
+            .openai => self.ptr.load(.acquire) != 0,
+            .local_kb_whisper => if (self.local) |local| local.isReady() else false,
+        };
     }
     pub fn acquire(self: *TranscriptionAdapter, id: backend.UtteranceId) ?backend.Lease {
+        self.active_id.store(id, .release);
+        if (self.selected == .local_kb_whisper) {
+            const local = self.local orelse return null;
+            return local.acquire(id, self.store.current().language);
+        }
         const session = self.current() orelse return null;
         return .{
             .id = id,
@@ -188,7 +208,10 @@ const TranscriptionAdapter = struct {
     fn appendCurrent(self: *TranscriptionAdapter, pcm: []const u8) !backend.UtteranceId {
         const id = self.active_id.load(.acquire);
         if (id == 0) return error.NoActiveUtterance;
-        try commands.append_audio(self, id, pcm);
+        switch (self.selected) {
+            .openai => try commands.append_audio(self, id, pcm),
+            .local_kb_whisper => try (self.local orelse return error.NoLocalBackend).appendAudio(id, pcm),
+        }
         return id;
     }
     fn activeId(self: *TranscriptionAdapter) backend.UtteranceId {
@@ -332,6 +355,12 @@ const Daemon = struct {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
         self.coordinator.handle(.{ .backend_failed = id });
     }
+    fn localFinal(ctx: *anyopaque, id: backend.UtteranceId, text: []const u8) void {
+        obsFinal(ctx, id, text);
+    }
+    fn localFailed(ctx: *anyopaque, id: backend.UtteranceId) void {
+        obsDropped(ctx, id);
+    }
 
     /// Capture chunk sink: forward PCM to the current Session (created lazily by the
     /// supervisor). A press only starts Capture once a session exists, so the null case is
@@ -392,27 +421,44 @@ const Daemon = struct {
             first = false;
             if (g_quit.load(.acquire)) return;
 
+            if (self.transcription.selected == .local_kb_whisper) {
+                // #72 keeps only the existing common Talk Key self-heal. Backend-aware
+                // Configuration Phase, readiness reporting, and Status Item policy are #74/#80.
+                if (tapmod.Tap.listenGranted() and !self.tap.isEnabled()) {
+                    if (self.tap.enable())
+                        feedback.log("  supervisor: Input Monitoring granted — Talk Key tap is live\n", .{})
+                    else
+                        feedback.log("  supervisor: Input Monitoring looks granted but the tap won't enable — a daemon restart may be needed\n", .{});
+                }
+                continue;
+            }
+
             // 1. Observe current facts. Key lookup is skipped once a Session exists: the
             // Session itself is proof the key prerequisite was satisfied for this run.
-            const session_present = self.transcription.available();
-            const key = if (!session_present) config.loadApiKeyOnly(self.io, self.alloc) else null;
+            const backend_present = self.transcription.available();
+            const key = if (self.transcription.selected == .openai and !backend_present)
+                config.loadApiKeyOnly(self.io, self.alloc)
+            else
+                null;
             const im = tapmod.Tap.listenGranted();
             const pe = insertmod.postEventGranted();
-            var facts = self.configurationFacts(im, pe, session_present or key != null);
+            var facts = self.configurationFacts(im, pe, backend_present or key != null);
             var outcome = self.configuration.tick(facts);
 
             // 2. Execute adapter effects in the old supervisor order.
             var changed_facts = false;
             if (outcome.actions.connect_session) {
-                if (key) |k| {
-                    if (Session.connect(self.io, self.alloc, k, .{ .ctx = self, .get = getParams }, self.observer())) |sess| {
-                        self.transcription.set(sess);
-                        facts.session_present = true;
-                        facts.session_ready = sess.isReady();
-                        changed_facts = true;
-                        feedback.log("  supervisor: API key found — Transcription Session connecting…\n", .{});
-                    } else |e| {
-                        feedback.log("  supervisor: session connect failed: {s} — will retry\n", .{@errorName(e)});
+                if (self.transcription.selected == .openai) {
+                    if (key) |k| {
+                        if (Session.connect(self.io, self.alloc, k, .{ .ctx = self, .get = getParams }, self.observer())) |sess| {
+                            self.transcription.set(sess);
+                            facts.session_present = true;
+                            facts.session_ready = sess.isReady();
+                            changed_facts = true;
+                            feedback.log("  supervisor: API key found — Transcription Session connecting…\n", .{});
+                        } else |e| {
+                            feedback.log("  supervisor: session connect failed: {s} — will retry\n", .{@errorName(e)});
+                        }
                     }
                 }
             }
@@ -563,8 +609,9 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     const first_snapshot = try alloc.create(config.Settings);
     first_snapshot.* = config.loadSettingsOnly(io, alloc);
     const settings = first_snapshot.*;
-    std.debug.print("config: talk_key={s} model=\"{s}\" language=\"{s}\" delay=\"{s}\" noise_reduction={s} insertion={s} pre_paste_ms={d} overlay={}\n", .{
-        @tagName(settings.talk_key), settings.model, settings.language, settings.delay, @tagName(settings.noise_reduction), @tagName(settings.insertion), settings.pre_paste_ms, settings.overlay,
+    const selected_backend = manuallySelectedBackend();
+    std.debug.print("config: backend={s} talk_key={s} model=\"{s}\" language=\"{s}\" delay=\"{s}\" noise_reduction={s} insertion={s} pre_paste_ms={d} overlay={}\n", .{
+        @tagName(selected_backend), @tagName(settings.talk_key), settings.model, settings.language, settings.delay, @tagName(settings.noise_reduction), @tagName(settings.insertion), settings.pre_paste_ms, settings.overlay,
     });
 
     var daemon = Daemon{
@@ -572,6 +619,8 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
         .alloc = alloc,
         .store = config.Store.init(first_snapshot),
     };
+    daemon.transcription.store = &daemon.store;
+    daemon.transcription.selected = selected_backend;
 
     // ---- modules that need neither a grant nor the key to construct ----
     try daemon.capture.init();
@@ -614,6 +663,35 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     daemon.deadline.co_ctx = &daemon.coordinator;
     daemon.deadline.on_fire = deadlineFireTramp;
 
+    // The #72 thin path deliberately uses fixed, manually provisioned locations. The
+    // helper verifies the exact pinned artifact before declaring ready; no credential or
+    // network-capable component is touched with the local Transcription Backend selected.
+    if (selected_backend == .local_kb_whisper) {
+        const home_ptr = std.c.getenv("HOME");
+        if (home_ptr) |raw_home| {
+            const home = std.mem.span(raw_home);
+            var helper_buf: [4096]u8 = undefined;
+            var model_buf: [4096]u8 = undefined;
+            const helper_path = std.fmt.bufPrint(&helper_buf, "{s}/.local/libexec/type-wave/type-wave-whisper", .{home}) catch "";
+            const model_path = std.fmt.bufPrint(&model_buf, "{s}/Library/Application Support/type-wave/models/active/ggml-model.bin", .{home}) catch "";
+            if (local_backend.ProcessHelper.start(alloc, io, helper_path, model_path)) |helper| {
+                const local = try alloc.create(LocalAdapter);
+                local.* = LocalAdapter.init(alloc, io, helper, .{
+                    .ctx = &daemon,
+                    .final = Daemon.localFinal,
+                    .failed = Daemon.localFailed,
+                });
+                local.bindHelperEvents();
+                daemon.transcription.local = local;
+                feedback.log("  local KB Whisper helper warm — Capture stays on this Mac\n", .{});
+            } else |failure| {
+                feedback.log("  local KB Whisper unavailable: {s}\n", .{@errorName(failure)});
+            }
+        } else {
+            feedback.log("  local KB Whisper unavailable: HOME is not set\n", .{});
+        }
+    }
+
     // ---- Talk Key tap: prompt for the two event grants once, then create the tap on THIS
     //      (main) run loop. A created-but-disabled tap is fine — the supervisor enables it
     //      once Input Monitoring appears. Only a null port is a genuine hard failure. ----
@@ -640,16 +718,24 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
 
     // ---- menu-bar status item (#34): built on the main thread before the run loop.
     //      Headless (no display) skips it and the daemon behaves exactly as before. ----
-    const menu_up = daemon.menu.init(io, alloc, &daemon.store, .{
-        .ctx = &daemon,
-        .health = Daemon.menuHealth,
-        .markSessionDirty = Daemon.menuMarkSessionDirty,
-        .setOverlay = Daemon.menuSetOverlay,
-        .setPaused = Daemon.menuSetPaused,
-        .storeApiKey = Daemon.menuStoreApiKey,
-        .quit = Daemon.menuQuit,
-    });
-    feedback.log("  menu bar: {s}\n", .{if (menu_up) "status item up" else "no display — running headless (no status item)"});
+    const menu_up = if (selected_backend == .openai)
+        daemon.menu.init(io, alloc, &daemon.store, .{
+            .ctx = &daemon,
+            .health = Daemon.menuHealth,
+            .markSessionDirty = Daemon.menuMarkSessionDirty,
+            .setOverlay = Daemon.menuSetOverlay,
+            .setPaused = Daemon.menuSetPaused,
+            .storeApiKey = Daemon.menuStoreApiKey,
+            .quit = Daemon.menuQuit,
+        })
+    else
+        false;
+    feedback.log("  menu bar: {s}\n", .{if (menu_up)
+        "status item up"
+    else if (selected_backend == .local_kb_whisper)
+        "backend-aware status deferred — running local thin path headless"
+    else
+        "no display — running headless (no status item)"});
 
     // ---- threads ----
     const worker = try std.Thread.spawn(.{}, InsertionAdapter.workerLoop, .{&daemon.insertion});
@@ -681,6 +767,9 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     // still hold the pointer (same process-lifetime-singleton stance as config).
     feedback.log("shutting down…\n", .{});
     supervisor.join();
-    if (daemon.transcription.current()) |sess| sess.shutdown();
+    if (daemon.transcription.local) |local|
+        local.shutdown()
+    else if (daemon.transcription.current()) |sess|
+        sess.shutdown();
     feedback.log("bye.\n", .{});
 }

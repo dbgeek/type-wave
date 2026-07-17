@@ -38,3 +38,33 @@ python3 tools/probe-whisper-helper.py \
 The probe validates protocol version, lengths, model digest, request identity, UTF-8,
 and the structured terminal response. The helper supports one inference at a time;
 a matching `cancel` frame trips whisper.cpp's abort callback.
+
+## Dictate through the manually provisioned local backend
+
+Until model installation and persisted backend switching land, the thin local path uses
+fixed private locations and an explicit startup selection. Provision the already-built
+helper and the exact pinned artifact there:
+
+```sh
+mkdir -p "$HOME/.local/libexec/type-wave"
+install -m 755 zig-out/bin/type-wave-whisper \
+  "$HOME/.local/libexec/type-wave/type-wave-whisper"
+
+mkdir -p "$HOME/Library/Application Support/type-wave/models/active"
+install -m 600 /path/to/ggml-model.bin \
+  "$HOME/Library/Application Support/type-wave/models/active/ggml-model.bin"
+```
+
+Start type-wave with local selected:
+
+```sh
+TYPE_WAVE_BACKEND=local zig build run
+```
+
+The helper verifies the pinned size and digest and warms the model before local Capture is
+accepted. The local Transcription Backend reads neither the OpenAI credential nor the
+network, buffers the full 24 kHz mono Capture, and sends exactly one inference request after
+Talk Key release. Omit
+`TYPE_WAVE_BACKEND=local` to retain the default OpenAI backend. Live and persisted switching
+is intentionally deferred to the backend-reconciliation increment; the backend-aware Status
+Item is likewise deferred, so this manually selected thin path runs headless.

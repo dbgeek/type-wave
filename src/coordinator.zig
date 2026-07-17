@@ -177,6 +177,7 @@ pub fn Coordinator(comptime Deps: type) type {
             if (text.len == 0) {
                 // Empty/failed transcript (mic silence, transcription.failed, …).
                 feedback.log("  empty Final Transcript — nothing to insert\n", .{});
+                self.active.?.cancel();
                 self.abandon();
                 return;
             }
@@ -546,6 +547,7 @@ test "10 empty/failed final inserts nothing" {
     co.handle(.release);
     co.handle(.{ .final = .{ .id = 1, .text = "" } });
     try expect(h.deadline.cancels == 1);
+    try expect(h.backends.cancelled == 1);
     try expect(h.insertion.submits == 0);
     try expect(h.feedback.abandoneds == 1);
 }
