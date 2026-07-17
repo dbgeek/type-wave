@@ -454,6 +454,10 @@ const Daemon = struct {
     }
 
     fn localInstallationPresent(self: *Daemon) bool {
+        const raw_home = std.c.getenv("HOME") orelse return false;
+        var root_buf: [4096]u8 = undefined;
+        const root = model_store.rootPath(std.mem.span(raw_home), &root_buf) catch return false;
+        if (model_store.modelRemovalPending(self.io, root)) return false;
         var model_buf: [4096]u8 = undefined;
         return self.local_model_recovery.installationUsable() and localModelPath(self.io, &model_buf) != null;
     }
@@ -478,6 +482,8 @@ const Daemon = struct {
         var root_buf: [4096]u8 = undefined;
         const helper_path = std.fmt.bufPrint(&helper_buf, "{s}/.local/libexec/type-wave/type-wave-whisper", .{home}) catch return null;
         const root = model_store.rootPath(home, &root_buf) catch return null;
+        var runtime_lease = model_store.RuntimeLease.acquire(self.io, root) catch return null;
+        defer runtime_lease.release();
         const model_path = localModelPath(self.io, &model_buf) orelse return null;
         const active_artifact = (model_store.activeArtifact(self.io, root) catch return null) orelse return null;
         if (self.local_model_recovery.current() == .verifying) {
@@ -517,7 +523,7 @@ const Daemon = struct {
             .final = Daemon.localFinal,
             .failed = Daemon.localFailed,
         });
-        local.setInferenceRoot(root) catch {
+        local.setInferenceRoot(root, &runtime_lease) catch {
             helper.shutdown();
             self.alloc.destroy(local);
             return null;

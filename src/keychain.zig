@@ -78,6 +78,7 @@ extern "c" fn CFDictionaryCreate(
 extern "c" fn SecItemAdd(attributes: CFDictionaryRef, result: ?*CFTypeRef) OSStatus;
 extern "c" fn SecItemCopyMatching(query: CFDictionaryRef, result: ?*CFTypeRef) OSStatus;
 extern "c" fn SecItemUpdate(query: CFDictionaryRef, attributes_to_update: CFDictionaryRef) OSStatus;
+extern "c" fn SecItemDelete(query: CFDictionaryRef) OSStatus;
 extern "c" fn SecCopyErrorMessageString(status: OSStatus, reserved: ?*anyopaque) CFStringRef;
 
 // The kSec* keys are exported CFStringRef DATA symbols, not literals — `extern var`,
@@ -167,6 +168,20 @@ pub fn storeKey(key: []const u8) OSStatus {
 
 pub fn storeHuggingFaceToken(token: []const u8) OSStatus {
     return storeSecret(hugging_face_account, hugging_face_label, token);
+}
+
+/// Forget only the Hugging Face credential. Model data and the independent OpenAI item
+/// are outside this exact (service, account) query.
+pub fn deleteHuggingFaceToken() OSStatus {
+    const svc = cfStr(service);
+    defer CFRelease(svc);
+    const acct = cfStr(hugging_face_account);
+    defer CFRelease(acct);
+    const keys = [_]CFTypeRef{ kSecClass, kSecAttrService, kSecAttrAccount };
+    const vals = [_]CFTypeRef{ kSecClassGenericPassword, svc, acct };
+    const query = dict(&keys, &vals);
+    defer CFRelease(query);
+    return SecItemDelete(query);
 }
 
 fn storeSecret(item_account: [*:0]const u8, item_label: [*:0]const u8, secret: []const u8) OSStatus {

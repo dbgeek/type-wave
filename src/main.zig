@@ -54,11 +54,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
             return;
         }
         if (argv.len == 2 and std.mem.eql(u8, arg, "--discard-model")) return discardModel(init.environ);
+        if (argv.len == 2 and std.mem.eql(u8, arg, "--remove-model")) return removeModel(init.environ);
+        if (argv.len == 2 and std.mem.eql(u8, arg, "--forget-hf-token")) return forgetHuggingFaceToken(init.environ);
         if (argv.len == 2 and std.mem.eql(u8, arg, "--model-status")) return modelStatus(init.environ);
         if (argv.len == 2 and std.mem.eql(u8, arg, "--verify-model")) return verifyModel(init.environ);
         if (argv.len == 2 and std.mem.eql(u8, arg, "--repair-model")) return repairModel(init.environ);
         std.debug.print(
-            \\usage: type-wave [--set-key | --set-hf-token | --install-model | --update-model | --resume-model | --discard-model | --model-status | --verify-model | --repair-model]
+            \\usage: type-wave [--set-key | --set-hf-token | --install-model | --update-model | --resume-model | --discard-model | --remove-model | --forget-hf-token | --model-status | --verify-model | --repair-model]
             \\
             \\  (no args)   run the dictation daemon
             \\  --set-key   read the OpenAI API key from stdin and store it in the login
@@ -78,6 +80,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
             \\              explicitly resume validator-matched paused model work.
             \\  --discard-model
             \\              discard paused model work without changing the active installation.
+            \\  --remove-model
+            \\              after confirmation, drain local dictation, unload the helper, and
+            \\              remove the Model Installation and staged Model Operation data
+            \\              without changing selection
+            \\              or the Hugging Face token.
+            \\  --forget-hf-token
+            \\              cooperatively stop authenticated transfer, preserve resumable data,
+            \\              and delete only the Hugging Face login-Keychain item.
             \\  --model-status
             \\              inspect paused model work without making a network request.
             \\  --verify-model
@@ -260,6 +270,7 @@ fn printModelEvent(_: *anyopaque, event: model_store.OperationEvent) void {
         .smoke_testing => std.debug.print("Model Operation: smoke testing\n", .{}),
         .waiting_for_inference => std.debug.print("Model Operation: waiting for active local inference to drain\n", .{}),
         .activating => std.debug.print("Model Operation: activating (cancellation deferred)\n", .{}),
+        .removing => std.debug.print("Model Operation: removing the Model Installation and staged data\n", .{}),
     }
 }
 
@@ -272,6 +283,51 @@ fn discardModel(environ: std.process.Environ) !void {
     const root = try model_store.rootPath(home, &root_buffer);
     try model_store.discardIncomplete(io, root, model_store.pinned_manifest);
     std.debug.print("Model Operation: discarded paused work; active Model Installation unchanged.\n", .{});
+}
+
+const UnusedTransport = struct {};
+const UnusedSmoke = struct {};
+
+fn removeModel(environ: std.process.Environ) !void {
+    if (!confirmModelRemoval()) return error.ModelRemovalNotConfirmed;
+    const allocator = std.heap.c_allocator;
+    const home = environ.getPosix("HOME") orelse return error.HomeDirectoryUnavailable;
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try model_store.rootPath(home, &root_buffer);
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var transport = UnusedTransport{};
+    var smoke = UnusedSmoke{};
+    var operation = model_store.Operation(UnusedTransport, UnusedSmoke).init(allocator, io, root, model_store.pinned_manifest, &transport, &smoke);
+    operation.observer = .{ .ctx = &operation, .on_event = printModelEvent };
+    g_model_cancel.store(@intFromPtr(operation.cancellationSignal()), .release);
+    defer g_model_cancel.store(0, .release);
+    _ = signal(SIGINT, onModelCancel);
+    _ = signal(SIGTERM, onModelCancel);
+    try operation.remove();
+    std.debug.print("Model Installation: removed. Local remains selected when configured and is unavailable until Install. Hugging Face token preserved.\n", .{});
+}
+
+fn forgetHuggingFaceToken(environ: std.process.Environ) !void {
+    const home = environ.getPosix("HOME") orelse return error.HomeDirectoryUnavailable;
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try model_store.rootPath(home, &root_buffer);
+    var threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try model_store.requestCredentialRevocation(io, root);
+    std.debug.print("Hugging Face token: stopping any active authenticated Model Operation before forgetting it…\n", .{});
+    var revocation = try model_store.finishCredentialRevocation(io, root);
+    defer revocation.deinit();
+    const status = keychain.deleteHuggingFaceToken();
+    if (status != keychain.errSecSuccess and status != keychain.errSecItemNotFound) {
+        var message: [256]u8 = undefined;
+        std.debug.print("Hugging Face token: keychain delete failed: {s}\n", .{keychain.describe(status, &message)});
+        return error.HuggingFaceKeychainUnavailable;
+    }
+    std.debug.print("Hugging Face token: forgotten. Installed and safely resumable model data retained.\n", .{});
 }
 
 fn modelStatus(environ: std.process.Environ) !void {
@@ -374,6 +430,14 @@ fn confirmRepairNetworkUse() bool {
     const count = std.posix.read(0, &buffer) catch return false;
     const answer = std.mem.trim(u8, buffer[0..count], " \t\r\n");
     return std.mem.eql(u8, answer, "yes");
+}
+
+fn confirmModelRemoval() bool {
+    std.debug.print("Remove the local Model Installation and all staged Model Operation data? Local backend selection and Hugging Face token will be preserved. Type remove: ", .{});
+    var buffer: [16]u8 = undefined;
+    const count = std.posix.read(0, &buffer) catch return false;
+    const answer = std.mem.trim(u8, buffer[0..count], " \t\r\n");
+    return std.mem.eql(u8, answer, "remove");
 }
 
 fn reportPausedModel(io: std.Io, environ: std.process.Environ, show_idle: bool) !void {

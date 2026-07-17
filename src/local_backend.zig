@@ -37,6 +37,7 @@ pub fn Adapter(comptime Helper: type) type {
         inference_root: [std.fs.max_path_bytes]u8 = undefined,
         inference_root_len: usize = 0,
         inference_lease: ?model_store.InferenceLease = null,
+        runtime_lease: ?model_store.RuntimeLease = null,
 
         const commands = backend.Commands{
             .begin = beginCommand,
@@ -66,8 +67,10 @@ pub fn Adapter(comptime Helper: type) type {
             self.helper.setEvents(.{ .ctx = self, .final = helperFinal, .failed = helperFailed });
         }
 
-        pub fn setInferenceRoot(self: *Self, root: []const u8) !void {
+        pub fn setInferenceRoot(self: *Self, root: []const u8, runtime: *model_store.RuntimeLease) !void {
             if (root.len > self.inference_root.len) return error.NameTooLong;
+            if (self.runtime_lease != null) return error.InferenceRootAlreadySet;
+            self.runtime_lease = runtime.take();
             @memcpy(self.inference_root[0..root.len], root);
             self.inference_root_len = root.len;
         }
@@ -78,6 +81,7 @@ pub fn Adapter(comptime Helper: type) type {
 
         pub fn usesActiveInstallation(self: *Self) bool {
             if (self.inference_root_len == 0) return true;
+            if (model_store.modelRemovalPending(self.io, self.inference_root[0..self.inference_root_len])) return false;
             if (comptime !@hasDecl(Helper, "usesModel")) return true;
             var active_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
             const active_path = (model_store.activeModelPath(
@@ -90,6 +94,8 @@ pub fn Adapter(comptime Helper: type) type {
 
         pub fn shutdown(self: *Self) void {
             self.helper.shutdown();
+            if (self.runtime_lease) |*lease| lease.release();
+            self.runtime_lease = null;
         }
 
         /// Recovery action exposed for the readiness/Status Item layer.

@@ -65,6 +65,13 @@ as paused without network activity. Inspect with `--model-status`, continue expl
 cancels transfer, verification, and helper smoke testing; atomic receipt activation completes
 without interruption once begun.
 
+Remove all local model data explicitly with `--remove-model`. After confirmation, the
+running daemon rejects new local Utterances, lets an accepted Utterance finish, unloads the
+helper, and removes the Model Installation plus staged Model Operation data. The configured local backend remains selected
+and reports unavailable; the Hugging Face token is not touched. `--forget-hf-token` is the
+separate credential action: it first cooperatively stops any authenticated transfer, keeps
+validator-bound resumable data, and then deletes only the Hugging Face login-Keychain item.
+
 Select local in `~/.config/type-wave/config.zon`:
 
 ```zig

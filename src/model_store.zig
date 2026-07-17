@@ -25,6 +25,11 @@ const StatFs = extern struct {
 
 extern "c" fn statfs(path: [*:0]const u8, stats: *StatFs) c_int;
 const staging_overhead_bytes: u64 = 16 * 1024 * 1024;
+const removal_intent_name = ".removal.pending";
+const runtime_lock_name = ".runtime.lock";
+const inference_lock_name = ".inference.lock";
+const credential_lock_name = ".credential.lock";
+const credential_revocation_name = ".credential-revocation.pending";
 
 pub const pinned_manifest = Manifest{
     .repository = "KBLab/kb-whisper-small",
@@ -82,6 +87,7 @@ pub const OperationPhase = enum {
     verifying,
     smoke_testing,
     activating,
+    removing,
     failed,
 };
 
@@ -142,13 +148,31 @@ pub const Validator = struct {
 
 pub const CancelToken = struct {
     requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    observe_credential_revocation: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    io: ?std.Io = null,
+    root: ?[]const u8 = null,
+
+    fn forOperation(io: std.Io, root: []const u8) CancelToken {
+        return .{ .io = io, .root = root };
+    }
 
     pub fn request(self: *CancelToken) void {
         self.requested.store(true, .release);
     }
 
     pub fn isRequested(self: *const CancelToken) bool {
-        return self.requested.load(.acquire);
+        if (self.requested.load(.acquire)) return true;
+        if (self.observe_credential_revocation.load(.acquire))
+            if (self.io) |io| if (self.root) |root| return credentialRevocationPending(io, root);
+        return false;
+    }
+
+    fn beginCredentialUse(self: *CancelToken) void {
+        self.observe_credential_revocation.store(true, .release);
+    }
+
+    fn endCredentialUse(self: *CancelToken) void {
+        self.observe_credential_revocation.store(false, .release);
     }
 
     pub fn signalFlag(self: *const CancelToken) *const std.atomic.Value(bool) {
@@ -186,6 +210,7 @@ pub const OperationEvent = union(enum) {
     smoke_testing,
     waiting_for_inference,
     activating,
+    removing,
 };
 
 pub const Observer = struct {
@@ -195,23 +220,106 @@ pub const Observer = struct {
 
 /// A cross-process shared lease held only while one local Utterance is using the active
 /// Model Installation. Replacement activation takes the exclusive side of the same lock.
-pub const InferenceLease = struct {
+const SharedFileLease = struct {
     io: std.Io,
     file: ?std.Io.File,
 
-    pub fn acquire(io: std.Io, root: []const u8) !InferenceLease {
+    fn acquire(io: std.Io, root: []const u8, lock_name: []const u8, intent_name: []const u8, blocked: anyerror) !SharedFileLease {
         try std.Io.Dir.cwd().createDirPath(io, root);
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buffer, "{s}/.inference.lock", .{root});
+        const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ root, lock_name });
         const file = try std.Io.Dir.cwd().createFile(io, path, .{ .lock = .shared });
-        return .{ .io = io, .file = file };
+        var lease = SharedFileLease{ .io = io, .file = file };
+        errdefer lease.release();
+        if (intentFilePresent(io, root, intent_name)) return blocked;
+        return lease;
     }
 
-    pub fn release(self: *InferenceLease) void {
+    fn release(self: *SharedFileLease) void {
         if (self.file) |file| file.close(self.io);
         self.file = null;
     }
 };
+
+pub const InferenceLease = struct {
+    shared: SharedFileLease,
+
+    pub fn acquire(io: std.Io, root: []const u8) !InferenceLease {
+        return .{ .shared = try SharedFileLease.acquire(io, root, inference_lock_name, removal_intent_name, error.ModelRemovalInProgress) };
+    }
+
+    pub fn release(self: *InferenceLease) void {
+        self.shared.release();
+    }
+};
+
+/// Held for the complete lifetime of a warmed local helper. Removal takes the exclusive
+/// side only after publishing its intent, so the daemon rejects new Utterances, drains the
+/// active one, shuts the helper down, and only then lets model files disappear.
+pub const RuntimeLease = struct {
+    shared: SharedFileLease,
+
+    pub fn acquire(io: std.Io, root: []const u8) !RuntimeLease {
+        return .{ .shared = try SharedFileLease.acquire(io, root, runtime_lock_name, removal_intent_name, error.ModelRemovalInProgress) };
+    }
+
+    pub fn release(self: *RuntimeLease) void {
+        self.shared.release();
+    }
+
+    pub fn take(self: *RuntimeLease) RuntimeLease {
+        const moved = self.*;
+        self.shared.file = null;
+        return moved;
+    }
+};
+
+const CredentialUseLease = struct {
+    shared: SharedFileLease,
+
+    fn acquire(io: std.Io, root: []const u8) !CredentialUseLease {
+        return .{ .shared = try SharedFileLease.acquire(io, root, credential_lock_name, credential_revocation_name, error.ModelOperationCancelled) };
+    }
+
+    fn release(self: *CredentialUseLease) void {
+        self.shared.release();
+    }
+};
+
+pub const CredentialRevocation = struct {
+    io: std.Io,
+    root: []const u8,
+    file: ?std.Io.File,
+
+    pub fn deinit(self: *CredentialRevocation) void {
+        removeIntentFile(self.io, self.root, credential_revocation_name);
+        if (self.file) |file| file.close(self.io);
+        self.file = null;
+    }
+};
+
+/// Phase one of Forget Token: publish a cancellation request without waiting for the
+/// transfer process. Its CancelToken observes this marker between network reads.
+pub fn requestCredentialRevocation(io: std.Io, root: []const u8) !void {
+    try writeIntentFile(io, root, credential_revocation_name);
+}
+
+/// Phase two waits until every authenticated transfer has cooperatively stopped. The
+/// caller deletes only the Hugging Face keychain item while this exclusive gate is held.
+pub fn finishCredentialRevocation(io: std.Io, root: []const u8) !CredentialRevocation {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ root, credential_lock_name });
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .lock = .exclusive });
+    return .{ .io = io, .root = root, .file = file };
+}
+
+pub fn credentialRevocationPending(io: std.Io, root: []const u8) bool {
+    return intentFilePresent(io, root, credential_revocation_name);
+}
+
+pub fn modelRemovalPending(io: std.Io, root: []const u8) bool {
+    return intentFilePresent(io, root, removal_intent_name);
+}
 
 pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
     return struct {
@@ -238,8 +346,13 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
             io: std.Io,
             path: []u8,
             file: std.Io.File,
+            credential: ?CredentialUseLease = null,
+            cancel: ?*CancelToken = null,
 
-            fn deinit(locked: LockedOperation) void {
+            fn deinit(locked_value: LockedOperation) void {
+                var locked = locked_value;
+                if (locked.cancel) |cancel| cancel.endCredentialUse();
+                if (locked.credential) |*credential| credential.release();
                 locked.file.close(locked.io);
                 locked.allocator.free(locked.path);
             }
@@ -263,7 +376,7 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
             transport: *Transport,
             smoke: *Smoke,
         ) Self {
-            return .{ .allocator = allocator, .io = io, .root = root, .manifest = manifest, .transport = transport, .smoke = smoke };
+            return .{ .allocator = allocator, .io = io, .root = root, .manifest = manifest, .transport = transport, .smoke = smoke, .cancel = CancelToken.forOperation(io, root) };
         }
 
         /// Inspect durable incomplete work after restart. This is deliberately filesystem-only:
@@ -295,7 +408,12 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
         fn beginAuthenticated(self: *Self, token: []const u8) !LockedOperation {
             if (token.len == 0) return error.MissingHuggingFaceToken;
             if (!isHuggingFaceOrigin(self.manifest.url)) return error.UntrustedArtifactOrigin;
-            return self.beginLocked();
+            var locked = try self.beginLocked();
+            errdefer locked.deinit();
+            locked.credential = try CredentialUseLease.acquire(self.io, self.root);
+            self.cancel.beginCredentialUse();
+            locked.cancel = &self.cancel;
+            return locked;
         }
 
         fn stagePaths(self: *Self) !StagePaths {
@@ -399,6 +517,10 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
             const credential = token orelse return error.MissingHuggingFaceToken;
             if (credential.len == 0) return error.MissingHuggingFaceToken;
             if (!isHuggingFaceOrigin(self.manifest.url)) return error.UntrustedArtifactOrigin;
+            var credential_lease = try CredentialUseLease.acquire(self.io, self.root);
+            defer credential_lease.release();
+            self.cancel.beginCredentialUse();
+            defer self.cancel.endCredentialUse();
             if (corruption != .invalid_receipt) {
                 var receipt_buffer: [1024]u8 = undefined;
                 const active = (try activeReceipt(self.io, self.root, &receipt_buffer)) orelse return error.NoModelInstallation;
@@ -424,6 +546,25 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
                 try self.acquire(credential, paths.directory, file, 0, null);
             }
             try self.activate(paths.model, paths.directory, .replace_invalid);
+        }
+
+        /// Confirmed removal is credential-free and serialized with every other Model
+        /// Operation. The intent marker makes selected-local readiness unavailable before
+        /// the exclusive runtime/inference gates allow any model bytes to be removed.
+        pub fn remove(self: *Self) !void {
+            const locked = try self.beginLocked();
+            defer locked.deinit();
+            try writeIntentFile(self.io, self.root, removal_intent_name);
+            defer removeIntentFile(self.io, self.root, removal_intent_name);
+
+            self.notify(.waiting_for_inference);
+            var runtime = try waitForExclusiveLease(self.io, self.root, runtime_lock_name, &self.cancel);
+            defer runtime.close(self.io);
+            var inference = try waitForExclusiveLease(self.io, self.root, inference_lock_name, &self.cancel);
+            defer inference.close(self.io);
+
+            self.notify(.removing);
+            try removeModelData(self.io, self.root);
         }
 
         fn rebuildKnownInstallationMetadata(self: *Self) !void {
@@ -585,8 +726,12 @@ fn capacitySufficient(block_size: u32, available_blocks: u64, remaining_artifact
 }
 
 fn waitForInferenceDrain(io: std.Io, root: []const u8, cancel: *const CancelToken) !std.Io.File {
+    return waitForExclusiveLease(io, root, inference_lock_name, cancel);
+}
+
+fn waitForExclusiveLease(io: std.Io, root: []const u8, lock_name: []const u8, cancel: *const CancelToken) !std.Io.File {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "{s}/.inference.lock", .{root});
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ root, lock_name });
     while (true) {
         if (cancel.isRequested()) return error.ModelOperationCancelled;
         return std.Io.Dir.cwd().createFile(io, path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |failure| switch (failure) {
@@ -596,6 +741,47 @@ fn waitForInferenceDrain(io: std.Io, root: []const u8, cancel: *const CancelToke
             },
             else => return failure,
         };
+    }
+}
+
+fn intentFilePresent(io: std.Io, root: []const u8, name: []const u8) bool {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ root, name }) catch return false;
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+fn writeIntentFile(io: std.Io, root: []const u8, name: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ root, name });
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .permissions = .fromMode(0o600) });
+    file.close(io);
+}
+
+fn removeIntentFile(io: std.Io, root: []const u8, name: []const u8) void {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ root, name }) catch return;
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+}
+
+fn removeModelData(io: std.Io, root: []const u8) !void {
+    var receipt_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const receipt_path = try std.fmt.bufPrint(&receipt_path_buffer, "{s}/active.receipt", .{root});
+    std.Io.Dir.cwd().deleteFile(io, receipt_path) catch |failure| if (failure != error.FileNotFound) return failure;
+    var receipt_tmp_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const receipt_tmp = try std.fmt.bufPrint(&receipt_tmp_path_buffer, "{s}/active.receipt.tmp", .{root});
+    std.Io.Dir.cwd().deleteFile(io, receipt_tmp) catch |failure| if (failure != error.FileNotFound) return failure;
+    var installations_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const installations = try std.fmt.bufPrint(&installations_path_buffer, "{s}/installations", .{root});
+    std.Io.Dir.cwd().deleteTree(io, installations) catch |failure| if (failure != error.FileNotFound) return failure;
+
+    var root_dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer root_dir.close(io);
+    var entries = root_dir.iterate();
+    while (try entries.next(io)) |entry| {
+        if (entry.kind == .directory and std.mem.startsWith(u8, entry.name, "staging-"))
+            try root_dir.deleteTree(io, entry.name);
     }
 }
 
@@ -1635,6 +1821,58 @@ test "replacement activation waits for the active inference lease to drain" {
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, previous_path, .{}));
 }
 
+test "confirmed removal rejects new local Utterances, drains the helper, and removes the Model Installation and staged Model Operation data" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try installTestModel(root);
+    try writeTestPartial(root, "pinned", "\"immutable-test\"");
+    var runtime = try RuntimeLease.acquire(std.testing.io, root);
+    var drain = RemovalDrainLog{ .root = root, .runtime = &runtime };
+    var transport = FakeTransport{};
+    var smoke = FakeSmoke{};
+    var operation = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
+    operation.observer = .{ .ctx = &drain, .on_event = RemovalDrainLog.record };
+
+    try operation.remove();
+
+    try std.testing.expect(drain.rejected_new_inference);
+    try std.testing.expect(drain.released_runtime);
+    try std.testing.expectEqual(@as(usize, 1), drain.removing_events);
+    var model_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expect((try activeModelPath(std.testing.io, root, &model_path_buf)) == null);
+    var installations_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const installations = try std.fmt.bufPrint(&installations_path_buf, "{s}/installations", .{root});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, installations, .{}));
+    var stage_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const stage = try std.fmt.bufPrint(&stage_path_buf, "{s}/staging-{s}", .{ root, test_manifest.installation_id });
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stage, .{}));
+}
+
+test "forgetting the Hugging Face token cancels transfer and retains resumable data" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    var transport = CredentialRevokingTransport{ .io = std.testing.io, .root = root };
+    var smoke = FakeSmoke{};
+    var operation = Operation(CredentialRevokingTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
+    operation.chunk_size = 6;
+
+    try std.testing.expectError(error.ModelOperationCancelled, operation.install("hf_secret"));
+    const recovery = try operation.recover();
+    try std.testing.expectEqual(OperationPhase.paused, recovery.phase);
+    try std.testing.expectEqual(@as(u64, 6), recovery.bytes.completed);
+    var revocation = try finishCredentialRevocation(std.testing.io, root);
+    revocation.deinit();
+    try std.testing.expect(!credentialRevocationPending(std.testing.io, root));
+}
+
 test "Hugging Face authorization is never constructed for a cross-origin request" {
     var buffer: [128]u8 = undefined;
     try std.testing.expectEqualStrings("Bearer hf_secret", authorizationFor(test_manifest.url, "hf_secret", &buffer).?);
@@ -2039,6 +2277,48 @@ const ActivationDrainLog = struct {
         self.waits += 1;
         self.lease.release();
         self.released = true;
+    }
+};
+
+const RemovalDrainLog = struct {
+    root: []const u8,
+    runtime: *RuntimeLease,
+    rejected_new_inference: bool = false,
+    released_runtime: bool = false,
+    removing_events: usize = 0,
+
+    fn record(ctx: *anyopaque, event: OperationEvent) void {
+        const self: *RemovalDrainLog = @ptrCast(@alignCast(ctx));
+        switch (event) {
+            .waiting_for_inference => {
+                if (InferenceLease.acquire(std.testing.io, self.root)) |lease_value| {
+                    var lease = lease_value;
+                    lease.release();
+                } else |failure| {
+                    self.rejected_new_inference = failure == error.ModelRemovalInProgress;
+                }
+                self.runtime.release();
+                self.released_runtime = true;
+            },
+            .removing => self.removing_events += 1,
+            else => {},
+        }
+    }
+};
+
+const CredentialRevokingTransport = struct {
+    io: std.Io,
+    root: []const u8,
+    calls: usize = 0,
+
+    pub fn download(self: *CredentialRevokingTransport, _: []const u8, _: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+        self.calls += 1;
+        if (self.calls == 2) {
+            try requestCredentialRevocation(self.io, self.root);
+            if (request.cancel.isRequested()) return error.ModelOperationCancelled;
+        }
+        try writer.writeAll(test_bytes[@intCast(request.offset)..@intCast(request.end + 1)]);
+        return DownloadResult.fromValidator(.etag, "\"immutable-test\"");
     }
 };
 
