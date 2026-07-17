@@ -1,8 +1,15 @@
 //! glass.zig — the Liquid Glass capsule HUD, PURELY through the ObjC runtime
-//! C API from Zig (wayfinder #41, map #39). Throwaway prototype: wraps the
-//! proven CALayer-per-bar waveform (#25) in an `NSGlassEffectView` capsule
+//! C API from Zig (wayfinder #41 + #44, map #39). Throwaway prototype: wraps
+//! the proven CALayer-per-bar waveform (#25) in an `NSGlassEffectView` capsule
 //! (macOS 26), drops the custom red/green for system accent + semantic
 //! colors, and makes every look axis live-switchable so the human can react.
+//!
+//! #44 adds the MOTION axes: how the capsule appears/disappears around the
+//! Utterance lifecycle (pop / fade / materialize) and how recording flips to
+//! processing (cut / crossfade / morph / swell). Transitions ride explicit
+//! NSAnimationContext groupings and nested actions-enabled CATransactions, so
+//! Core Animation interpolates in the render server — the 20 Hz pump only
+//! *starts* them (and finishes deferred hides), it never steps frames.
 //!
 //! Wiring follows the #40 research crib sheet (docs/research/liquid-glass-api.md):
 //! - one NSGlassEffectView as the capsule; bar/dot layers live on a plain
@@ -120,6 +127,43 @@ inline fn cgColor(nscolor: id) id {
     return msg(nscolor, "CGColor");
 }
 
+// ---- animation helpers (#44): explicit groupings, immune to the pump's
+// per-tick setDisableActions — window/view animator changes are explicit
+// animations, and the nested transaction re-enables implicit actions for the
+// raw bar/dot layers we own.
+fn easeOut() id {
+    const f: *const fn (id, SEL, f32, f32, f32, f32) callconv(.c) id = @ptrCast(&objc_msgSend);
+    return f(cls("CAMediaTimingFunction"), sel_registerName("functionWithControlPoints::::"), 0.17, 0.7, 0.3, 1.0);
+}
+
+/// NSAnimationContext grouping for window/view animator properties
+/// (panel alphaValue, glass/content frames). Pair with animEnd().
+fn animBegin(dur: f64) void {
+    msgv(cls("CATransaction"), "begin");
+    msgBool(cls("CATransaction"), "setDisableActions:", false);
+    msgv(cls("NSAnimationContext"), "beginGrouping");
+    const ctx = msg(cls("NSAnimationContext"), "currentContext");
+    msgDouble(ctx, "setDuration:", dur);
+    msgBool(ctx, "setAllowsImplicitAnimation:", true);
+    msg1v(ctx, "setTimingFunction:", easeOut());
+}
+fn animEnd() void {
+    msgv(cls("NSAnimationContext"), "endGrouping");
+    msgv(cls("CATransaction"), "commit");
+}
+
+/// Nested CATransaction with implicit actions ON — property pokes on our raw
+/// CALayers (opacity, frame) animate over `dur`. Pair with layerAnimEnd().
+fn layerAnimBegin(dur: f64) void {
+    msgv(cls("CATransaction"), "begin");
+    msgBool(cls("CATransaction"), "setDisableActions:", false);
+    msgDouble(cls("CATransaction"), "setAnimationDuration:", dur);
+    msg1v(cls("CATransaction"), "setAnimationTimingFunction:", easeOut());
+}
+fn layerAnimEnd() void {
+    msgv(cls("CATransaction"), "commit");
+}
+
 // ---- window/style constants (same recipe as src/hud.zig, proven by #20) ------
 const NSWindowStyleMaskBorderless: c_ulong = 0;
 const NSWindowStyleMaskNonactivatingPanel: c_ulong = 1 << 7;
@@ -155,17 +199,50 @@ pub const ProcessingAnim = enum {
 
 pub const Radius = enum { capsule, soft, sdk_default }; // pill_h/2 / 16 / 8
 
+// ---- the motion axes (#44) -----------------------------------------------------
+
+/// How the capsule appears/disappears around the Utterance lifecycle.
+pub const ShowAnim = enum {
+    pop, // today's hard cut: orderFront / orderOut, no motion
+    fade, // window alpha 0<->1
+    materialize, // glass-native: alpha fade + the capsule condenses from ~90% scale
+};
+
+/// How recording (bars) hands over to processing (dots). glass_pulse keeps
+/// its bars, so these only apply to the dots processing anims.
+pub const SwitchAnim = enum {
+    cut, // today's hard swap
+    crossfade, // bars fade out while dots fade in
+    morph, // bars gather onto the three dot positions while fading
+    swell, // crossfade + a one-shot accent tint swell that decays
+};
+
+pub const Motion = struct {
+    show: ShowAnim = .pop,
+    switch_anim: SwitchAnim = .cut,
+    speed: f64 = 1.0, // multiplies every duration — slow-mo for HITL eyeballing
+};
+
+const show_dur: f64 = 0.20;
+const hide_dur: f64 = 0.16;
+const cross_dur: f64 = 0.22;
+const morph_dur: f64 = 0.30;
+const swell_dur: f64 = 0.45;
+const swell_extra: f64 = 0.30; // tint alpha bump at the moment of release
+const materialize_inset: f64 = 0.05; // frame inset fraction per axis (~90% scale)
+
 pub const Look = struct {
-    // 420x60 fine bars: the HITL winner from #25, the ticket's fixed footprint.
+    // Defaults are #41's locked HITL verdict: Regular glass, strong accent
+    // tint, accent bars, capsule radius, shadow on, 420x60 fine bars.
     pill_w: f64 = 420,
     pill_h: f64 = 60,
     bar_w: f64 = 3,
     bar_gap: f64 = 2,
     style: GlassStyle = .regular,
     bars: BarScheme = .accent,
-    tint: Tint = .none,
+    tint: Tint = .accent_strong,
     radius: Radius = .capsule,
-    shadow: bool = true, // glass shape probably wants the window shadow back (#40 §3)
+    shadow: bool = true,
 };
 
 const pad_x: f64 = 20; // inner margin before the first / after the last bar
@@ -185,6 +262,25 @@ fn cornerRadius(look: Look) f64 {
         .capsule => look.pill_h / 2.0,
         .soft => 16.0,
         .sdk_default => 8.0,
+    };
+}
+
+fn fullBounds(look: Look) Rect {
+    return .{ .x = 0, .y = 0, .w = look.pill_w, .h = look.pill_h };
+}
+
+/// The materialize start/end frame: centered, inset a fraction per axis.
+fn insetBounds(look: Look) Rect {
+    const dx = look.pill_w * materialize_inset;
+    const dy = look.pill_h * materialize_inset;
+    return .{ .x = dx, .y = dy, .w = look.pill_w - 2 * dx, .h = look.pill_h - 2 * dy };
+}
+
+fn baseTintAlpha(tint: Tint) f64 {
+    return switch (tint) {
+        .none => 0.0,
+        .accent_soft => 0.25,
+        .accent_strong => 0.45,
     };
 }
 
@@ -209,6 +305,13 @@ pub const Pill = struct {
     // cache, so look-axis changes recolor too.
     last_mode: ?Mode = null,
     last_anim: ?ProcessingAnim = null,
+
+    // Transition state (#44). prev_mode detects mode edges; hide_at defers
+    // the orderOut until the hide animation has played (the pump finishes
+    // it); swell_until drives the one-shot tint swell decay.
+    prev_mode: Mode = .hidden,
+    hide_at: ?f64 = null,
+    swell_until: f64 = 0,
 
     /// Build the panel + glass capsule + all layers, hidden. Main thread,
     /// before the run loop. Returns false when headless or glass is missing.
@@ -338,22 +441,36 @@ pub const Pill = struct {
     }
 
     /// Reflect a mode into the layers. Called every pump tick from the main
-    /// thread; `t` (seconds) drives the processing animation.
-    pub fn render(self: *Pill, mode: Mode, anim: ProcessingAnim, t: f64) void {
+    /// thread; `t` (seconds) drives the processing animation and finishes
+    /// deferred hides; `motion` picks the #44 transition candidates.
+    pub fn render(self: *Pill, mode: Mode, anim: ProcessingAnim, motion: Motion, t: f64) void {
         msgv(cls("CATransaction"), "begin");
         msgBool(cls("CATransaction"), "setDisableActions:", true); // #25: implicit anims stay OFF
         defer msgv(cls("CATransaction"), "commit");
 
+        const from = self.prev_mode;
+        const entered = (mode != from);
+        self.prev_mode = mode;
+
         if (mode == .hidden) {
-            if (self.shown) {
-                msgv(self.panel, "orderOut:");
-                self.shown = false;
-                self.levels = @splat(0); // next Utterance starts from a flat line
+            if (self.shown and self.hide_at == null) {
+                self.beginHide(motion, t);
+            } else if (self.hide_at) |deadline| {
+                if (t >= deadline) self.finishHide();
             }
             return;
         }
 
-        self.recolorIfNeeded(mode, anim);
+        // Re-shown mid-hide (a quick re-press): cancel the fade, snap back.
+        if (self.hide_at != null) {
+            self.hide_at = null;
+            msgDouble(self.panel, "setAlphaValue:", 1.0);
+            msgRect(self.glass, "setFrame:", fullBounds(self.look));
+            msgRect(self.content, "setFrame:", fullBounds(self.look));
+        }
+
+        const recolored = self.recolorIfNeeded(mode, anim);
+        if (recolored or entered) self.applyModeVisibility(mode, anim, from, entered, motion, t);
 
         const look = self.look;
         const max_h = look.pill_h * 0.72;
@@ -369,7 +486,7 @@ pub const Pill = struct {
                 }
             },
             .processing => switch (anim) {
-                // Three bouncing dots (bars hidden by recolorIfNeeded).
+                // Three bouncing dots (bars handed over by applyModeVisibility).
                 .dots_accent, .dots_neutral => {
                     for (self.dots, 0..) |dot, j| {
                         const fj: f64 = @floatFromInt(j);
@@ -382,6 +499,7 @@ pub const Pill = struct {
                             .h = dot_size,
                         });
                     }
+                    self.swellTick(t, motion);
                 },
                 // Glass-native: the waveform freezes where the release caught
                 // it and the MATERIAL breathes — tintColor swings toward accent.
@@ -396,9 +514,145 @@ pub const Pill = struct {
             },
         }
 
-        if (!self.shown) {
-            msgv(self.panel, "orderFrontRegardless"); // never makeKey — #20's recipe
-            self.shown = true;
+        if (!self.shown) self.beginShow(motion);
+    }
+
+    /// Order the panel front with the chosen show transition. Content for
+    /// this tick is already rendered, so nothing stale flashes.
+    fn beginShow(self: *Pill, motion: Motion) void {
+        switch (motion.show) {
+            .pop => {},
+            .fade => msgDouble(self.panel, "setAlphaValue:", 0.0),
+            .materialize => {
+                msgDouble(self.panel, "setAlphaValue:", 0.0);
+                msgRect(self.glass, "setFrame:", insetBounds(self.look));
+                msgRect(self.content, "setFrame:", insetBounds(self.look));
+            },
+        }
+        msgv(self.panel, "orderFrontRegardless"); // never makeKey — #20's recipe
+        if (motion.show != .pop) {
+            animBegin(show_dur * motion.speed);
+            defer animEnd();
+            msgDouble(msg(self.panel, "animator"), "setAlphaValue:", 1.0);
+            if (motion.show == .materialize) {
+                msgRect(msg(self.glass, "animator"), "setFrame:", fullBounds(self.look));
+                msgRect(msg(self.content, "animator"), "setFrame:", fullBounds(self.look));
+            }
+        }
+        self.shown = true;
+    }
+
+    /// Start the hide transition; the pump calls finishHide once the
+    /// animation has played (hide_at). Pop hides immediately, like today.
+    fn beginHide(self: *Pill, motion: Motion, t: f64) void {
+        if (motion.show == .pop) {
+            self.finishHide();
+            return;
+        }
+        const dur = hide_dur * motion.speed;
+        animBegin(dur);
+        msgDouble(msg(self.panel, "animator"), "setAlphaValue:", 0.0);
+        if (motion.show == .materialize) {
+            msgRect(msg(self.glass, "animator"), "setFrame:", insetBounds(self.look));
+            msgRect(msg(self.content, "animator"), "setFrame:", insetBounds(self.look));
+        }
+        animEnd();
+        self.hide_at = t + dur;
+    }
+
+    /// The instant part of hiding: order out and reset every animated
+    /// property so the next show starts from a clean slate.
+    fn finishHide(self: *Pill) void {
+        msgv(self.panel, "orderOut:");
+        msgDouble(self.panel, "setAlphaValue:", 1.0);
+        msgRect(self.glass, "setFrame:", fullBounds(self.look));
+        msgRect(self.content, "setFrame:", fullBounds(self.look));
+        self.shown = false;
+        self.hide_at = null;
+        self.swell_until = 0;
+        self.levels = @splat(0); // next Utterance starts from a flat line
+    }
+
+    /// The swell handover: at release the tint jumps toward accent and
+    /// decays back to the Look's static tint. Stepped per tick — tintColor
+    /// is a view property, not a layer one, so CA can't interpolate it.
+    fn swellTick(self: *Pill, t: f64, motion: Motion) void {
+        if (self.swell_until == 0) return;
+        if (t < self.swell_until) {
+            const remain = (self.swell_until - t) / (swell_dur * motion.speed);
+            const a = @min(baseTintAlpha(self.look.tint) + swell_extra * remain, 0.85);
+            msg1v(self.glass, "setTintColor:", withAlpha(systemColor("controlAccentColor"), a));
+        } else {
+            self.swell_until = 0;
+            self.applyStaticTint();
+        }
+    }
+
+    /// Which layer family shows, and how the recording→processing handover
+    /// animates (#44). Runs on mode/anim/look edges only, inside the pump's
+    /// disabled-actions transaction — animated paths nest their own.
+    fn applyModeVisibility(self: *Pill, mode: Mode, anim: ProcessingAnim, from: Mode, entered: bool, motion: Motion, t: f64) void {
+        switch (mode) {
+            .hidden => unreachable,
+            .recording => {
+                for (self.bars, 0..) |bar, i| {
+                    msgFloat(bar, "setOpacity:", 1.0);
+                    msgBool(bar, "setHidden:", i >= self.nbars);
+                }
+                for (self.dots) |dot| msgBool(dot, "setHidden:", true);
+                self.swell_until = 0;
+                self.applyStaticTint();
+            },
+            .processing => {
+                if (anim == .glass_pulse) {
+                    // The material does the talking — bars stay, frozen.
+                    for (self.bars, 0..) |bar, i| {
+                        msgFloat(bar, "setOpacity:", 1.0);
+                        msgBool(bar, "setHidden:", i >= self.nbars);
+                    }
+                    for (self.dots) |dot| msgBool(dot, "setHidden:", true);
+                    return;
+                }
+                const animated = entered and from == .recording and motion.switch_anim != .cut;
+                if (!animated) {
+                    for (self.bars) |bar| msgBool(bar, "setHidden:", true);
+                    for (self.dots) |dot| {
+                        msgFloat(dot, "setOpacity:", 1.0);
+                        msgBool(dot, "setHidden:", false);
+                    }
+                    return;
+                }
+                // Dots start transparent, in place (instant — actions are off
+                // in the enclosing pump transaction).
+                for (self.dots) |dot| {
+                    msgFloat(dot, "setOpacity:", 0.0);
+                    msgBool(dot, "setHidden:", false);
+                }
+                const dur = (if (motion.switch_anim == .morph) morph_dur else cross_dur) * motion.speed;
+                layerAnimBegin(dur);
+                for (self.bars, 0..) |bar, i| {
+                    if (i >= self.nbars) continue;
+                    msgFloat(bar, "setOpacity:", 0.0);
+                    if (motion.switch_anim == .morph) {
+                        // Gather: the bar collapses onto the dot it's nearest
+                        // to. Frames self-heal on the next recording tick —
+                        // setBarHeight rewrites the full frame.
+                        const j = (i * 3) / self.nbars;
+                        const fj: f64 = @floatFromInt(j);
+                        const dots_w = 3 * dot_size + 2 * dot_gap;
+                        const dot_x = (self.look.pill_w - dots_w) / 2.0 + fj * (dot_size + dot_gap);
+                        msgRect(bar, "setFrame:", .{
+                            .x = dot_x + (dot_size - self.look.bar_w) / 2.0,
+                            .y = (self.look.pill_h - min_bar_h) / 2.0,
+                            .w = self.look.bar_w,
+                            .h = min_bar_h,
+                        });
+                    }
+                }
+                for (self.dots) |dot| msgFloat(dot, "setOpacity:", 1.0);
+                layerAnimEnd();
+                if (motion.switch_anim == .swell) self.swell_until = t + swell_dur * motion.speed;
+            },
         }
     }
 
@@ -412,11 +666,13 @@ pub const Pill = struct {
         });
     }
 
-    /// Colors + which layer family is visible change per (mode, anim) and per
-    /// look switch, not per tick. System colors are re-resolved fresh on every
-    /// pass — accent changes land at the next transition/show (#40 §5).
-    fn recolorIfNeeded(self: *Pill, mode: Mode, anim: ProcessingAnim) void {
-        if (self.last_mode == mode and self.last_anim == anim) return;
+    /// Colors change per (mode, anim) and per look switch, not per tick.
+    /// System colors are re-resolved fresh on every pass — accent changes
+    /// land at the next transition/show (#40 §5). Returns true when it ran,
+    /// so the caller reapplies visibility too (visibility itself moved to
+    /// applyModeVisibility for the #44 transitions).
+    fn recolorIfNeeded(self: *Pill, mode: Mode, anim: ProcessingAnim) bool {
+        if (self.last_mode == mode and self.last_anim == anim) return false;
         self.last_mode = mode;
         self.last_anim = anim;
 
@@ -430,24 +686,20 @@ pub const Pill = struct {
             .dots_neutral => systemColor("secondaryLabelColor"),
             .glass_pulse => systemColor("controlAccentColor"), // unused — dots hidden
         };
+        for (self.bars) |bar| msg1v(bar, "setBackgroundColor:", cgColor(bar_color));
+        for (self.dots) |dot| msg1v(dot, "setBackgroundColor:", cgColor(dot_color));
 
         // Static tint per the Look axis; glass_pulse re-modulates it per tick
-        // while processing and this pass restores it on the way back.
-        const tint: id = switch (self.look.tint) {
-            .none => null,
-            .accent_soft => withAlpha(systemColor("controlAccentColor"), 0.25),
-            .accent_strong => withAlpha(systemColor("controlAccentColor"), 0.45),
-        };
-        msg1v(self.glass, "setTintColor:", tint);
+        // while processing and the swell decays over it — both restore here.
+        self.applyStaticTint();
+        return true;
+    }
 
-        const dots_mode = (mode == .processing and anim != .glass_pulse);
-        for (self.bars, 0..) |bar, i| {
-            msg1v(bar, "setBackgroundColor:", cgColor(bar_color));
-            msgBool(bar, "setHidden:", dots_mode or i >= self.nbars);
-        }
-        for (self.dots) |dot| {
-            msg1v(dot, "setBackgroundColor:", cgColor(dot_color));
-            msgBool(dot, "setHidden:", !dots_mode);
-        }
+    fn applyStaticTint(self: *Pill) void {
+        const tint: id = if (self.look.tint == .none)
+            null
+        else
+            withAlpha(systemColor("controlAccentColor"), baseTintAlpha(self.look.tint));
+        msg1v(self.glass, "setTintColor:", tint);
     }
 };
