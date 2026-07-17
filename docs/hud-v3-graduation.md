@@ -1,18 +1,24 @@
-# HUD v3 graduation — handoff spec
+# HUD v3 graduation — landed 2026-07-17
+
+Graduation landed through
+[HUD v3 graduation 1/4: bare-marks pill look](https://github.com/dbgeek/type-wave/issues/50),
+[HUD v3 graduation 2/4: native motion](https://github.com/dbgeek/type-wave/issues/51),
+[HUD v3 graduation 3/4: Tahoe Status Item icon](https://github.com/dbgeek/type-wave/issues/52),
+and [HUD v3 graduation 4/4: acceptance pass and prototype cleanup](https://github.com/dbgeek/type-wave/issues/53).
+The deployed daemon is now the sole runnable reference; this document and ADR 0002
+retain the historical design and acceptance record.
 
 The exit artifact of wayfinder map
 [#39](https://github.com/dbgeek/type-wave/issues/39) (HUD v3: Liquid Glass).
-The look and motion are **locked and proven by runnable prototypes**; this doc
-is what a later graduation effort executes to land them in the deployed
-daemon. The design decision itself — bare marks, no glass — is recorded in
+The look and motion were **locked and proven by runnable prototypes**; this doc
+was the handoff used to land them in the deployed daemon. The design decision
+itself — bare marks, no glass — is recorded in
 [ADR 0002](adr/0002-hud-v3-is-bare-marks-no-glass.md).
 
-The living reference is the prototypes, kept until graduation lands:
+The deleted throwaway prototypes were the living reference during graduation:
 
-- `prototypes/liquid-glass-hud` — boots into the winning look + motion;
-  exact constants and transition mechanics in code and `NOTES.md`.
-- `prototypes/status-item-icons` — the winning Status Item icon; graduation
-  crib in its `NOTES.md`.
+- `liquid-glass-hud` proved the winning look, constants, and transition mechanics.
+- `status-item-icons` proved the winning Status Item icon.
 
 ## 1. Look (`src/hud.zig`)
 
@@ -67,12 +73,11 @@ window shadow is **off**.)
 
 - **No SDK switch.** The bare design never touches the glass API, so the
   daemon keeps building against the nix 14.4 SDK unchanged.
-- For posterity: building against the 26.5 CLT SDK requires the CLI-only
+- For posterity: building against the 26.5 CLT SDK required the CLI-only
   sysroot lever (`zig build --sysroot
-  /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`; see
-  `prototypes/liquid-glass-hud/build.zig` for the `-L`/`-F` split) — only
-  relevant if glass ever returns, and #41 showed even that likely isn't
-  gated on the SDK stamp.
+  /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`) plus separate
+  framework/library search paths — only relevant if glass ever returns, and
+  #41 showed even that likely isn't gated on the SDK stamp.
 
 ## 5. Acceptance
 
@@ -89,6 +94,8 @@ window shadow is **off**.)
 
 ## 6. Cleanup (final step of graduation)
 
-Delete `prototypes/liquid-glass-hud` and `prototypes/status-item-icons` once
-the daemon embodies everything they prove — they are throwaway by charter,
-kept only as the runnable reference until then.
+Completed by
+[HUD v3 graduation 4/4: acceptance pass and prototype cleanup](https://github.com/dbgeek/type-wave/issues/53)
+on 2026-07-17: both throwaway prototype directories were deleted during the
+deployed-daemon closeout. The daemon is the sole runnable reference for the
+graduated HUD.

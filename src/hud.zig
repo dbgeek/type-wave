@@ -5,9 +5,9 @@
 //! of plain CALayers whose frames the render pump pokes each tick — graduated from
 //! prototypes/waveform-hud (wayfinder #25, into the daemon by #27); the bare-marks
 //! v3 look — labelColor bars / secondaryLabelColor dots in a 300×22 sliver, no
-//! glass, no accent — from prototypes/liquid-glass-hud (ADR 0002, #41/#44); and the
+//! glass, no accent design (ADR 0002, #41/#44); and the
 //! native motion — fade show/hide, bars→dots crossfade, all at the locked 0.7×
-//! timings — from the same prototype (#44/#47, landed by #51): a pure `Sequencer`
+//! timings (#44/#47, landed by #51): a pure `Sequencer`
 //! decides each tick's transition, `render` executes it via explicit
 //! NSAnimationContext / actions-enabled CATransaction groupings. The HUD
 //! shows **no text, ever**: while recording it scrolls live mic volume as bars; after
@@ -224,7 +224,7 @@ extern var kCFRunLoopCommonModes: ?*anyopaque;
 const render_interval_s: f64 = 0.05;
 
 // ---- the look (HUD v3 bare marks — ADR 0002, HITL-locked in #41/#44; fixed, no
-// config knob). Constants proven in prototypes/liquid-glass-hud. ------------------
+// config knob). Constants recorded in docs/hud-v3-graduation.md. ------------------
 const pill_w: f64 = 300;
 const pill_h: f64 = 22;
 const bar_w: f64 = 6;
