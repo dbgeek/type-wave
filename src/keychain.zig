@@ -104,7 +104,9 @@ pub const errSecInteractionNotAllowed: OSStatus = -25308;
 /// LaunchAgent Label, the codesign identifier) — the keychain item joins them.
 pub const service = "me.ba78.type-wave";
 pub const account = "openai-api-key";
-const label = "type-wave OpenAI API key";
+pub const hugging_face_account = "huggingface-token";
+const openai_label = "type-wave OpenAI API key";
+const hugging_face_label = "type-wave Hugging Face token";
 
 fn cfStr(s: [*:0]const u8) CFStringRef {
     return CFStringCreateWithCString(null, s, kCFStringEncodingUTF8);
@@ -126,9 +128,17 @@ pub const ReadResult = union(enum) {
 
 /// Read the key: (class, service, account, return-data, match-limit-one).
 pub fn readKey(gpa: std.mem.Allocator) ReadResult {
+    return readSecret(gpa, account);
+}
+
+pub fn readHuggingFaceToken(gpa: std.mem.Allocator) ReadResult {
+    return readSecret(gpa, hugging_face_account);
+}
+
+fn readSecret(gpa: std.mem.Allocator, item_account: [*:0]const u8) ReadResult {
     const svc = cfStr(service);
     defer CFRelease(svc);
-    const acct = cfStr(account);
+    const acct = cfStr(item_account);
     defer CFRelease(acct);
     const keys = [_]CFTypeRef{ kSecClass, kSecAttrService, kSecAttrAccount, kSecReturnData, kSecMatchLimit };
     const vals = [_]CFTypeRef{ kSecClassGenericPassword, svc, acct, kCFBooleanTrue, kSecMatchLimitOne };
@@ -152,13 +162,21 @@ pub fn readKey(gpa: std.mem.Allocator) ReadResult {
 /// Store (add-or-update) the key. Run this from the *installed signed* binary so the
 /// item's ACL keys to the daemon's stable Designated Requirement — see the module doc.
 pub fn storeKey(key: []const u8) OSStatus {
+    return storeSecret(account, openai_label, key);
+}
+
+pub fn storeHuggingFaceToken(token: []const u8) OSStatus {
+    return storeSecret(hugging_face_account, hugging_face_label, token);
+}
+
+fn storeSecret(item_account: [*:0]const u8, item_label: [*:0]const u8, secret: []const u8) OSStatus {
     const svc = cfStr(service);
     defer CFRelease(svc);
-    const acct = cfStr(account);
+    const acct = cfStr(item_account);
     defer CFRelease(acct);
-    const lbl = cfStr(label);
+    const lbl = cfStr(item_label);
     defer CFRelease(lbl);
-    const data = CFDataCreate(null, key.ptr, @intCast(key.len));
+    const data = CFDataCreate(null, secret.ptr, @intCast(secret.len));
     defer CFRelease(data);
 
     const add_keys = [_]CFTypeRef{ kSecClass, kSecAttrService, kSecAttrAccount, kSecAttrLabel, kSecValueData };

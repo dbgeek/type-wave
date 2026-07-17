@@ -114,6 +114,21 @@ Secrets do not live in `config.zon`. Key precedence is:
 2. The login keychain item created by the menu or `~/.local/bin/type-wave --set-key`.
 3. One-time migration from the retired `~/.config/type-wave/env` file, if present.
 
+The pinned local KB Whisper Model Installation uses a separate Hugging Face credential.
+Store it through the installed signed binary, then explicitly start the Model Operation:
+
+```sh
+~/.local/bin/type-wave --set-hf-token
+~/.local/bin/type-wave --install-model
+```
+
+For a foreground development operation, `HF_TOKEN` overrides the Hugging Face login-
+Keychain item for that invocation and is never persisted. The operation authenticates only
+the initial `huggingface.co` request, strips authorization from cross-origin redirects,
+verifies the pinned byte count and SHA-256, smoke-tests the private helper, and only then
+atomically publishes the active receipt. Receipts and provenance contain identities and
+digests, never credentials, signed URLs, audio, or transcript content.
+
 ## Development
 
 ```sh
@@ -164,7 +179,8 @@ in `src/session.zig`.
 | `src/hud.zig` | Silent waveform/processing overlay |
 | `src/surface.zig` | HUD-vs-sound feedback arbitration |
 | `src/feedback.zig` | Sound cues and timestamped logging |
-| `src/keychain.zig` | OpenAI API key storage in the login keychain |
+| `src/keychain.zig` | Separate OpenAI and Hugging Face login-Keychain items |
+| `src/model_store.zig` | Explicit authenticated Model Operation and atomic Model Installation activation |
 | `src/info_plist.zig` | Embedded `Info.plist` Mach-O section |
 
 ## Repository Layout

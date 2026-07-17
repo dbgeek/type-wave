@@ -39,20 +39,25 @@ The probe validates protocol version, lengths, model digest, request identity, U
 and the structured terminal response. The helper supports one inference at a time;
 a matching `cancel` frame trips whisper.cpp's abort callback.
 
-## Dictate through the manually provisioned local backend
+## Install the model explicitly
 
-Until managed Model Installation lands, the local path uses fixed private locations.
-Provision the already-built helper and the exact pinned artifact there:
+Provision the already-built helper at its private path, then let type-wave acquire and
+activate the exact pinned artifact:
 
 ```sh
 mkdir -p "$HOME/.local/libexec/type-wave"
 install -m 755 zig-out/bin/type-wave-whisper \
   "$HOME/.local/libexec/type-wave/type-wave-whisper"
 
-mkdir -p "$HOME/Library/Application Support/type-wave/models/active"
-install -m 600 /path/to/ggml-model.bin \
-  "$HOME/Library/Application Support/type-wave/models/active/ggml-model.bin"
+~/.local/bin/type-wave --set-hf-token
+~/.local/bin/type-wave --install-model
 ```
+
+For foreground development, `HF_TOKEN=hf_... zig-out/bin/type-wave --install-model` is a
+non-persisted override. Installation data lives under
+`~/Library/Application Support/type-wave/models/`; immutable installation directories are
+selected by an atomically replaced `active.receipt` only after exact size/digest verification
+and a successful helper load/warm smoke test.
 
 Select local in `~/.config/type-wave/config.zon`:
 

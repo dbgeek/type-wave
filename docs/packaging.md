@@ -103,6 +103,12 @@ prompts (and the entries in **System Settings → Privacy & Security**) are attr
 > into the keychain the first time the daemon looks for it (the log says when the file can
 > be deleted). A missing key is not fatal: the self-heal supervisor polls until one appears.
 
+The Hugging Face token for an explicit local-model operation is a second generic-password
+item under the same service, account `huggingface-token`, label
+`type-wave Hugging Face token`. Store it separately with
+`~/.local/bin/type-wave --set-hf-token`; `HF_TOKEN` is a foreground-only override for
+`--install-model` and is never written to Keychain or the LaunchAgent plist.
+
 ## Verify grant persistence across a rebuild (the point of #15)
 
 After granting the permissions once:
@@ -140,3 +146,7 @@ rm -f ~/.local/bin/type-wave
 # optionally: remove the three entries under System Settings → Privacy & Security,
 # and delete the "type-wave dev" cert from Keychain Access.
 ```
+
+This leaves Model Installations and both login-Keychain items intact. Remove model data
+under `~/Library/Application Support/type-wave/models/`, the `openai-api-key` item, and the
+`huggingface-token` item only as separate, explicit actions.

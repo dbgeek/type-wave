@@ -18,4 +18,5 @@ test {
     _ = @import("insertion_adapter.zig");
     _ = @import("readiness.zig");
     _ = @import("configuration_phase.zig");
+    _ = @import("model_store.zig");
 }

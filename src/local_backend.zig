@@ -262,6 +262,18 @@ fn spawnWarm(
     };
 }
 
+/// Model Operation smoke test: require the isolated helper to hash, load, warm, and emit
+/// its matching ready frame, then terminate it before activation publishes the receipt.
+pub fn smokeTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    executable: []const u8,
+    model: []const u8,
+) !void {
+    var process = try spawnWarm(allocator, io, executable, model);
+    process.child.kill(io);
+}
+
 fn spawnWarmWithRecovery(
     allocator: std.mem.Allocator,
     io: std.Io,

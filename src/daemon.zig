@@ -67,7 +67,7 @@ const readiness = @import("readiness.zig");
 const configuration_phase = @import("configuration_phase.zig");
 const backend = @import("transcription_backend.zig");
 const local_backend = @import("local_backend.zig");
-const whisper_helper_core = @import("whisper_helper_core.zig");
+const model_store = @import("model_store.zig");
 
 const Session = session_mod.Session;
 const LocalAdapter = local_backend.Adapter(local_backend.ProcessHelper);
@@ -436,21 +436,19 @@ const Daemon = struct {
         obsDropped(ctx, id);
     }
 
-    fn localModelPath(buf: []u8) ?[]const u8 {
+    fn localModelPath(io: std.Io, buf: []u8) ?[]const u8 {
         const raw_home = std.c.getenv("HOME") orelse {
             return null;
         };
         const home = std.mem.span(raw_home);
-        return std.fmt.bufPrint(buf, "{s}/Library/Application Support/type-wave/models/active/ggml-model.bin", .{home}) catch null;
+        var root_buf: [4096]u8 = undefined;
+        const root = model_store.rootPath(home, &root_buf) catch return null;
+        return model_store.activeModelPath(io, root, model_store.pinned_manifest, buf) catch null;
     }
 
     fn localInstallationPresent(self: *Daemon) bool {
         var model_buf: [4096]u8 = undefined;
-        const model_path = localModelPath(&model_buf) orelse return false;
-        var file = std.Io.Dir.cwd().openFile(self.io, model_path, .{}) catch return false;
-        defer file.close(self.io);
-        const stat = file.stat(self.io) catch return false;
-        return stat.size == whisper_helper_core.pinned_model_bytes;
+        return localModelPath(self.io, &model_buf) != null;
     }
 
     fn prepareLocalHelper(self: *Daemon) ?*LocalAdapter {
@@ -459,7 +457,7 @@ const Daemon = struct {
         var helper_buf: [4096]u8 = undefined;
         var model_buf: [4096]u8 = undefined;
         const helper_path = std.fmt.bufPrint(&helper_buf, "{s}/.local/libexec/type-wave/type-wave-whisper", .{home}) catch return null;
-        const model_path = localModelPath(&model_buf) orelse return null;
+        const model_path = localModelPath(self.io, &model_buf) orelse return null;
         const helper = local_backend.ProcessHelper.start(self.alloc, self.io, helper_path, model_path) catch |failure| {
             feedback.log("  local KB Whisper unavailable after bounded recovery: {s}; send SIGHUP to Retry\n", .{@errorName(failure)});
             return null;
