@@ -1,5 +1,6 @@
 const std = @import("std");
 const ipc = @import("whisper_ipc.zig");
+const artifact_identity = @import("artifact_identity.zig");
 
 pub const pinned_model_bytes: u64 = 487_601_984;
 pub const pinned_model_sha256: [32]u8 = .{
@@ -10,10 +11,7 @@ pub const pinned_model_sha256: [32]u8 = .{
 };
 pub const max_pcm_len: usize = 24_000 * 2 * 15;
 
-pub const Artifact = struct {
-    size: u64,
-    sha256: [32]u8,
-};
+pub const Artifact = artifact_identity.Identity;
 
 pub fn pinnedArtifact() Artifact {
     return .{ .size = pinned_model_bytes, .sha256 = pinned_model_sha256 };
@@ -24,22 +22,23 @@ pub fn Preparation(comptime Runtime: type) type {
         const Self = @This();
 
         runtime: *Runtime,
+        expected: Artifact,
         ready: bool = false,
 
-        pub fn init(runtime: *Runtime) Self {
-            return .{ .runtime = runtime };
+        pub fn init(runtime: *Runtime, expected: Artifact) Self {
+            return .{ .runtime = runtime, .expected = expected };
         }
 
         pub fn prepare(self: *Self, artifact: Artifact) ![32]u8 {
             self.ready = false;
-            if (artifact.size != pinned_model_bytes or !std.mem.eql(u8, &artifact.sha256, &pinned_model_sha256)) {
+            if (artifact.size != self.expected.size or !std.mem.eql(u8, &artifact.sha256, &self.expected.sha256)) {
                 return error.InvalidModelArtifact;
             }
             try self.runtime.load();
             errdefer self.ready = false;
             try self.runtime.warm();
             self.ready = true;
-            return pinned_model_sha256;
+            return self.expected.sha256;
         }
 
         pub fn isReady(self: *const Self) bool {
@@ -122,7 +121,7 @@ fn pcmSample(pcm: []const u8, index: usize) f32 {
 
 test "helper declares readiness only after exact artifact load and warm-up" {
     var fake = FakeRuntime{};
-    var helper = Preparation(FakeRuntime).init(&fake);
+    var helper = Preparation(FakeRuntime).init(&fake, pinnedArtifact());
 
     try std.testing.expectError(error.InvalidModelArtifact, helper.prepare(.{ .size = pinned_model_bytes - 1, .sha256 = pinned_model_sha256 }));
     try std.testing.expect(!helper.isReady());
@@ -138,6 +137,17 @@ test "helper declares readiness only after exact artifact load and warm-up" {
     const ready = try helper.prepare(pinnedArtifact());
     try std.testing.expect(helper.isReady());
     try std.testing.expectEqualSlices(u8, &pinned_model_sha256, &ready);
+}
+
+test "helper preparation accepts the verified active receipt identity during an update handoff" {
+    var fake = FakeRuntime{};
+    const expected = Artifact{ .size = 17, .sha256 = @splat(0xab) };
+    var helper = Preparation(FakeRuntime).init(&fake, expected);
+
+    const ready = try helper.prepare(expected);
+
+    try std.testing.expectEqualSlices(u8, &expected.sha256, &ready);
+    try std.testing.expect(helper.isReady());
 }
 
 test "helper keeps one identity-tagged inference active and cancels only its identity" {

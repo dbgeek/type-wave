@@ -44,9 +44,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const arg = std.mem.span(argv[1]);
         if (argv.len == 2 and std.mem.eql(u8, arg, "--set-key")) return setKey();
         if (argv.len == 2 and std.mem.eql(u8, arg, "--set-hf-token")) return setHuggingFaceToken();
-        if (argv.len == 2 and (std.mem.eql(u8, arg, "--install-model") or std.mem.eql(u8, arg, "--resume-model"))) {
+        if (argv.len == 2 and (std.mem.eql(u8, arg, "--install-model") or std.mem.eql(u8, arg, "--update-model") or std.mem.eql(u8, arg, "--resume-model"))) {
             const resume_partial = std.mem.eql(u8, arg, "--resume-model");
-            installModel(init.environ, resume_partial) catch |failure| {
+            const update_only = std.mem.eql(u8, arg, "--update-model");
+            installModel(init.environ, resume_partial, update_only) catch |failure| {
                 std.debug.print("{s}: {s}\n", .{ arg, @errorName(failure) });
                 std.process.exit(1);
             };
@@ -55,7 +56,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (argv.len == 2 and std.mem.eql(u8, arg, "--discard-model")) return discardModel(init.environ);
         if (argv.len == 2 and std.mem.eql(u8, arg, "--model-status")) return modelStatus(init.environ);
         std.debug.print(
-            \\usage: type-wave [--set-key | --set-hf-token | --install-model | --resume-model | --discard-model | --model-status]
+            \\usage: type-wave [--set-key | --set-hf-token | --install-model | --update-model | --resume-model | --discard-model | --model-status]
             \\
             \\  (no args)   run the dictation daemon
             \\  --set-key   read the OpenAI API key from stdin and store it in the login
@@ -68,6 +69,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
             \\              explicitly acquire, verify, smoke-test, and atomically activate
             \\              the pinned KB Whisper Model Installation. HF_TOKEN overrides
             \\              Keychain for this foreground operation and is never persisted.
+            \\  --update-model
+            \\              explicitly stage and validate the embedded replacement while
+            \\              the working Model Installation remains available, then activate.
             \\  --resume-model
             \\              explicitly resume validator-matched paused model work.
             \\  --discard-model
@@ -164,13 +168,22 @@ const HelperSmoke = struct {
     }
 };
 
-fn installModel(environ: std.process.Environ, resume_partial: bool) !void {
+fn installModel(environ: std.process.Environ, resume_partial: bool, update_only: bool) !void {
     const allocator = std.heap.c_allocator;
     const home = environ.getPosix("HOME") orelse return error.HomeDirectoryUnavailable;
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try model_store.rootPath(home, &root_buffer);
     var helper_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const helper = try std.fmt.bufPrint(&helper_buffer, "{s}/.local/libexec/type-wave/type-wave-whisper", .{home});
+
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const update_available = try model_store.updateAvailable(io, root, model_store.pinned_manifest);
+    if (update_only and !update_available) {
+        std.debug.print("Model Installation: already matches the embedded identity; no update available.\n", .{});
+        return;
+    }
 
     var owned_token: ?[:0]const u8 = null;
     defer if (owned_token) |token| {
@@ -188,9 +201,6 @@ fn installModel(environ: std.process.Environ, resume_partial: bool) !void {
         }
     };
 
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
     try std.Io.Dir.cwd().access(io, helper, .{});
 
     var client = std.http.Client{ .allocator = allocator, .io = io };
@@ -223,7 +233,10 @@ fn installModel(environ: std.process.Environ, resume_partial: bool) !void {
         std.debug.print("Model Operation: explicitly resuming pinned KB Whisper artifact at {d}/{d} bytes\n", .{ recovery.bytes.completed, recovery.bytes.total });
         try operation.resumePartial(token);
     } else {
-        std.debug.print("Model Operation: downloading pinned KB Whisper artifact ({d} bytes)\n", .{model_store.pinned_manifest.size});
+        if (update_available)
+            std.debug.print("Model Operation: staging replacement beside the working Model Installation ({d} bytes)\n", .{model_store.pinned_manifest.size})
+        else
+            std.debug.print("Model Operation: downloading pinned KB Whisper artifact ({d} bytes)\n", .{model_store.pinned_manifest.size});
         try operation.install(token);
     }
     std.debug.print("Model Operation: verified, smoke-tested, and activated {s}@{s}\n", .{ model_store.pinned_manifest.repository, model_store.pinned_manifest.revision });
@@ -238,6 +251,7 @@ fn printModelEvent(_: *anyopaque, event: model_store.OperationEvent) void {
         ),
         .verifying => |bytes| std.debug.print("Model Operation: verifying {d}/{d} bytes\n", .{ bytes.completed, bytes.total }),
         .smoke_testing => std.debug.print("Model Operation: smoke testing\n", .{}),
+        .waiting_for_inference => std.debug.print("Model Operation: waiting for active local inference to drain\n", .{}),
         .activating => std.debug.print("Model Operation: activating (cancellation deferred)\n", .{}),
     }
 }
@@ -269,6 +283,8 @@ fn reportPausedModel(io: std.Io, environ: std.process.Environ, show_idle: bool) 
             "Model Operation: paused at {d}/{d} bytes (no network activity); Resume: --resume-model; Discard: --discard-model.\n",
             .{ recovery.bytes.completed, recovery.bytes.total },
         );
+    } else if (try model_store.updateAvailable(io, root, model_store.pinned_manifest)) {
+        std.debug.print("Model Installation: update available; the working installation remains ready. Run --update-model to stage it explicitly.\n", .{});
     } else if (show_idle) {
         std.debug.print("Model Operation: no paused work.\n", .{});
     }

@@ -49,6 +49,16 @@ pub const Selection = struct {
         return ready;
     }
 
+    /// An authoritative resource changed underneath the selected backend (for example,
+    /// atomic activation published a new Model Installation). New leases stay rejected
+    /// until the owner prepares the replacement generation.
+    pub fn invalidate(self: *Selection, expected: Backend) bool {
+        if (self.selected != expected or self.active != null or self.readiness != .ready) return false;
+        self.generation +%= 1;
+        self.readiness = .unavailable;
+        return true;
+    }
+
     pub fn acquire(self: *Selection, id: UtteranceId) ?Backend {
         if (self.active != null or self.readiness != .ready) return null;
         self.active = .{ .id = id, .backend = self.selected };
@@ -291,4 +301,16 @@ test "obsolete preparation never becomes ready" {
     try std.testing.expect(state.acquire(1) == null);
     try std.testing.expect(state.beginPreparation(.openai) == null);
     try std.testing.expectEqual(Backend.local_kb_whisper, state.beginPreparation(.local_kb_whisper).?.backend);
+}
+
+test "invalidating a ready resource rejects leases until its replacement is prepared" {
+    var state = Selection.init(.local_kb_whisper);
+    const first = state.beginPreparation(.local_kb_whisper).?;
+    try std.testing.expect(state.finishPreparation(first, true));
+
+    try std.testing.expect(state.invalidate(.local_kb_whisper));
+    try std.testing.expect(state.acquire(1) == null);
+    const replacement = state.beginPreparation(.local_kb_whisper).?;
+    try std.testing.expect(state.finishPreparation(replacement, true));
+    try std.testing.expectEqual(Backend.local_kb_whisper, state.acquire(2).?);
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("whisper_helper_core.zig");
 const ipc = @import("whisper_ipc.zig");
+const artifact_identity = @import("artifact_identity.zig");
 const WhisperRuntime = @import("whisper_runtime.zig").Runtime;
 
 const Server = struct {
@@ -99,15 +100,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
+    const expected = readArtifactIdentity(io, model_path) catch |failure| {
+        try writeStartupFailure(allocator, 9, @errorName(failure));
+        std.process.exit(1);
+    };
 
-    var inspected = inspectArtifact(io, model_path) catch |failure| {
+    var inspected = inspectArtifact(io, model_path, expected) catch |failure| {
         try writeStartupFailure(allocator, 10, @errorName(failure));
         std.process.exit(1);
     };
     defer inspected.file.close(io);
     var runtime = WhisperRuntime.init(inspected.file.handle);
     defer runtime.deinit();
-    var preparation = core.Preparation(WhisperRuntime).init(&runtime);
+    var preparation = core.Preparation(WhisperRuntime).init(&runtime, expected);
     const digest = preparation.prepare(inspected.artifact) catch |failure| {
         try writeStartupFailure(allocator, 11, @errorName(failure));
         std.process.exit(1);
@@ -161,11 +166,25 @@ const InspectedArtifact = struct {
     artifact: core.Artifact,
 };
 
-fn inspectArtifact(io: std.Io, path: []const u8) !InspectedArtifact {
+fn readArtifactIdentity(io: std.Io, model_path: []const u8) !core.Artifact {
+    const directory = std.fs.path.dirname(model_path) orelse return error.InvalidModelPath;
+    var manifest_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const manifest_path = try std.fmt.bufPrint(&manifest_path_buffer, "{s}/MODEL_MANIFEST", .{directory});
+    var provenance_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const provenance_path = try std.fmt.bufPrint(&provenance_path_buffer, "{s}/PROVENANCE", .{directory});
+    var identity_buffer: [1024]u8 = undefined;
+    const identity = std.Io.Dir.cwd().readFile(io, manifest_path, &identity_buffer) catch |failure| switch (failure) {
+        error.FileNotFound => try std.Io.Dir.cwd().readFile(io, provenance_path, &identity_buffer),
+        else => return failure,
+    };
+    return artifact_identity.parse(identity) catch return error.InvalidModelIdentity;
+}
+
+fn inspectArtifact(io: std.Io, path: []const u8, expected: core.Artifact) !InspectedArtifact {
     var file = try std.Io.Dir.cwd().openFile(io, path, .{});
     errdefer file.close(io);
     const stat = try file.stat(io);
-    if (stat.size != core.pinned_model_bytes) return error.InvalidModelSize;
+    if (stat.size != expected.size) return error.InvalidModelSize;
 
     var digest = std.crypto.hash.sha2.Sha256.init(.{});
     var read_buffer: [1024 * 1024]u8 = undefined;
@@ -180,6 +199,6 @@ fn inspectArtifact(io: std.Io, path: []const u8) !InspectedArtifact {
     }
     var sha256: [32]u8 = undefined;
     digest.final(&sha256);
-    if (!std.mem.eql(u8, &sha256, &core.pinned_model_sha256)) return error.InvalidModelDigest;
+    if (!std.mem.eql(u8, &sha256, &expected.sha256)) return error.InvalidModelDigest;
     return .{ .file = file, .artifact = .{ .size = stat.size, .sha256 = sha256 } };
 }

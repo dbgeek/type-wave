@@ -6,10 +6,12 @@ const ipc = @import("whisper_ipc.zig");
 const helper_core = @import("whisper_helper_core.zig");
 const helper_supervisor = @import("whisper_supervisor.zig");
 const coordinator = @import("coordinator.zig");
+const model_store = @import("model_store.zig");
 
 extern "c" fn usleep(usec: c_uint) c_int;
 
 pub const local_deadline = backend.DeadlinePolicy{ .cooperative_cancel_ms = 9_500, .final_ms = 10_000 };
+pub const ModelArtifact = helper_core.Artifact;
 
 pub const Events = struct {
     ctx: *anyopaque,
@@ -32,6 +34,9 @@ pub fn Adapter(comptime Helper: type) type {
         active_id: ?backend.UtteranceId = null,
         language: ipc.Language = .english,
         released: bool = false,
+        inference_root: [std.fs.max_path_bytes]u8 = undefined,
+        inference_root_len: usize = 0,
+        inference_lease: ?model_store.InferenceLease = null,
 
         const commands = backend.Commands{
             .begin = beginCommand,
@@ -61,8 +66,26 @@ pub fn Adapter(comptime Helper: type) type {
             self.helper.setEvents(.{ .ctx = self, .final = helperFinal, .failed = helperFailed });
         }
 
+        pub fn setInferenceRoot(self: *Self, root: []const u8) !void {
+            if (root.len > self.inference_root.len) return error.NameTooLong;
+            @memcpy(self.inference_root[0..root.len], root);
+            self.inference_root_len = root.len;
+        }
+
         pub fn isReady(self: *Self) bool {
-            return self.helper.isReady();
+            return self.helper.isReady() and self.usesActiveInstallation();
+        }
+
+        pub fn usesActiveInstallation(self: *Self) bool {
+            if (self.inference_root_len == 0) return true;
+            if (comptime !@hasDecl(Helper, "usesModel")) return true;
+            var active_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const active_path = (model_store.activeModelPath(
+                self.io,
+                self.inference_root[0..self.inference_root_len],
+                &active_path_buffer,
+            ) catch return false) orelse return false;
+            return self.helper.usesModel(active_path);
         }
 
         pub fn shutdown(self: *Self) void {
@@ -78,7 +101,13 @@ pub fn Adapter(comptime Helper: type) type {
             self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
             if (self.active_id != null) return error.Busy;
-            if (!self.helper.isReady()) return error.NotReady;
+            if (!self.isReady()) return error.NotReady;
+            var inference_lease: ?model_store.InferenceLease = if (self.inference_root_len > 0)
+                try model_store.InferenceLease.acquire(self.io, self.inference_root[0..self.inference_root_len])
+            else
+                null;
+            errdefer if (inference_lease) |*lease| lease.release();
+            if (!self.usesActiveInstallation()) return error.NotReady;
             self.language = if (std.mem.eql(u8, language, "en"))
                 .english
             else if (std.mem.eql(u8, language, "sv"))
@@ -89,6 +118,7 @@ pub fn Adapter(comptime Helper: type) type {
                 return error.UnsupportedLanguage;
             try self.helper.reserveUtterance(id);
             self.pcm.clearRetainingCapacity();
+            self.inference_lease = inference_lease;
             self.active_id = id;
             self.released = false;
         }
@@ -118,6 +148,7 @@ pub fn Adapter(comptime Helper: type) type {
             if (self.active_id != id) return;
             if (self.released) self.helper.cancel(id);
             self.pcm.clearRetainingCapacity();
+            self.releaseInferenceLease();
             self.active_id = null;
             self.released = false;
         }
@@ -155,8 +186,14 @@ pub fn Adapter(comptime Helper: type) type {
             defer self.mu.unlock(self.io);
             if (self.active_id != id) return; // Coordinator cancellation already cleared it.
             self.pcm.clearRetainingCapacity();
+            self.releaseInferenceLease();
             self.active_id = null;
             self.released = false;
+        }
+
+        fn releaseInferenceLease(self: *Self) void {
+            if (self.inference_lease) |*lease| lease.release();
+            self.inference_lease = null;
         }
 
         fn from(ctx: *anyopaque) *Self {
@@ -222,6 +259,7 @@ fn spawnWarm(
     io: std.Io,
     executable: []const u8,
     model: []const u8,
+    artifact: helper_core.Artifact,
     cancel: ?*const std.atomic.Value(bool),
 ) !ProcessInstance {
     var helper_environment = std.process.Environ.Map.init(allocator);
@@ -259,7 +297,7 @@ fn spawnWarm(
     var frame = startup.frame orelse return error.HelperExitedBeforeReady;
     defer frame.deinit(allocator);
 
-    var supervisor = helper_supervisor.Supervisor.init(helper_core.pinned_model_sha256);
+    var supervisor = helper_supervisor.Supervisor.init(artifact.sha256);
     const event = try supervisor.receive(frame);
     if (event != .ready) return error.HelperDidNotBecomeReady;
     return .{
@@ -279,7 +317,7 @@ pub fn smokeTest(
     model: []const u8,
     cancel: *const std.atomic.Value(bool),
 ) !void {
-    var process = try spawnWarm(allocator, io, executable, model, cancel);
+    var process = try spawnWarm(allocator, io, executable, model, helper_core.pinnedArtifact(), cancel);
     process.child.kill(io);
 }
 
@@ -288,10 +326,11 @@ fn spawnWarmWithRecovery(
     io: std.Io,
     executable: []const u8,
     model: []const u8,
+    artifact: helper_core.Artifact,
 ) !RecoveredInstance {
     var recovery = helper_supervisor.RecoveryBudget{};
     while (true) {
-        const process = spawnWarm(allocator, io, executable, model, null) catch |failure| {
+        const process = spawnWarm(allocator, io, executable, model, artifact, null) catch |failure| {
             const delay = recovery.failed() orelse return failure;
             var waited_ms: u32 = 0;
             while (waited_ms < delay) : (waited_ms += 50) _ = usleep(50_000);
@@ -313,6 +352,7 @@ pub const ProcessHelper = struct {
     lease_id: ?backend.UtteranceId = null,
     executable: []u8,
     model: []u8,
+    artifact: helper_core.Artifact,
     mu: std.Io.Mutex = .init,
     write_mu: std.Io.Mutex = .init,
     events: ?HelperEvents = null,
@@ -333,8 +373,9 @@ pub const ProcessHelper = struct {
         io: std.Io,
         executable: []const u8,
         model: []const u8,
+        artifact: helper_core.Artifact,
     ) !*ProcessHelper {
-        const recovered = try spawnWarmWithRecovery(allocator, io, executable, model);
+        const recovered = try spawnWarmWithRecovery(allocator, io, executable, model, artifact);
         var instance = recovered.process;
         errdefer instance.child.kill(io);
 
@@ -353,6 +394,7 @@ pub const ProcessHelper = struct {
             .supervisor = instance.supervisor,
             .executable = executable_copy,
             .model = model_copy,
+            .artifact = artifact,
             .recovery = recovered.recovery,
         };
 
@@ -371,6 +413,10 @@ pub const ProcessHelper = struct {
 
     pub fn isReady(self: *ProcessHelper) bool {
         return self.ready.load(.acquire);
+    }
+
+    pub fn usesModel(self: *const ProcessHelper, model: []const u8) bool {
+        return std.mem.eql(u8, self.model, model);
     }
 
     pub fn reserveUtterance(self: *ProcessHelper, id: backend.UtteranceId) !void {
@@ -608,7 +654,7 @@ pub const ProcessHelper = struct {
     }
 
     fn launch(self: *ProcessHelper) !void {
-        var instance = try spawnWarm(self.allocator, self.io, self.executable, self.model, null);
+        var instance = try spawnWarm(self.allocator, self.io, self.executable, self.model, self.artifact, null);
         errdefer instance.child.kill(self.io);
 
         self.write_mu.lockUncancelable(self.io);

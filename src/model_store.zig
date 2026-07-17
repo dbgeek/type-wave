@@ -1,6 +1,30 @@
 //! Explicit, authenticated Model Operations for the pinned KB Whisper installation.
 
 const std = @import("std");
+const artifact_identity = @import("artifact_identity.zig");
+
+const StatFs = extern struct {
+    block_size: u32,
+    io_size: i32,
+    blocks: u64,
+    free_blocks: u64,
+    available_blocks: u64,
+    files: u64,
+    free_files: u64,
+    fsid: [2]i32,
+    owner: u32,
+    fs_type: u32,
+    flags: u32,
+    subtype: u32,
+    type_name: [16]u8,
+    mounted_on: [std.fs.max_path_bytes]u8,
+    mounted_from: [std.fs.max_path_bytes]u8,
+    extended_flags: u32,
+    reserved: [7]u32,
+};
+
+extern "c" fn statfs(path: [*:0]const u8, stats: *StatFs) c_int;
+const staging_overhead_bytes: u64 = 16 * 1024 * 1024;
 
 pub const pinned_manifest = Manifest{
     .repository = "KBLab/kb-whisper-small",
@@ -65,6 +89,8 @@ pub const Recovery = struct {
     phase: OperationPhase,
     bytes: ByteProgress,
 };
+
+pub const ArtifactIdentity = artifact_identity.Identity;
 
 pub const ValidatorKind = enum { etag, last_modified };
 
@@ -135,12 +161,33 @@ pub const OperationEvent = union(enum) {
     retrying: RetryProgress,
     verifying: ByteProgress,
     smoke_testing,
+    waiting_for_inference,
     activating,
 };
 
 pub const Observer = struct {
     ctx: *anyopaque,
     on_event: *const fn (*anyopaque, OperationEvent) void,
+};
+
+/// A cross-process shared lease held only while one local Utterance is using the active
+/// Model Installation. Replacement activation takes the exclusive side of the same lock.
+pub const InferenceLease = struct {
+    io: std.Io,
+    file: ?std.Io.File,
+
+    pub fn acquire(io: std.Io, root: []const u8) !InferenceLease {
+        try std.Io.Dir.cwd().createDirPath(io, root);
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, "{s}/.inference.lock", .{root});
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .lock = .shared });
+        return .{ .io = io, .file = file };
+    }
+
+    pub fn release(self: *InferenceLease) void {
+        if (self.file) |file| file.close(self.io);
+        self.file = null;
+    }
 };
 
 pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
@@ -239,6 +286,7 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
 
             if ((try loadPartial(self.io, self.root, self.manifest)) != null)
                 return error.PartialRequiresExplicitResume;
+            try self.preflightCapacity(self.manifest.size);
 
             const paths = try self.stagePaths();
             defer paths.deinit();
@@ -254,6 +302,7 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
             const locked = try self.beginLocked(token);
             defer locked.deinit();
             const partial = (try loadPartial(self.io, self.root, self.manifest)) orelse return error.NoResumablePartial;
+            try self.preflightCapacity(self.manifest.size - partial.offset);
             const paths = try self.stagePaths();
             defer paths.deinit();
             var file = try std.Io.Dir.cwd().openFile(self.io, paths.model, .{ .mode = .read_write });
@@ -263,6 +312,17 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
                 return failure;
             };
             try self.activate(paths.model, paths.directory);
+        }
+
+        fn preflightCapacity(self: *Self, remaining_artifact_bytes: u64) !void {
+            const path = try self.allocator.alloc(u8, self.root.len + 1);
+            defer self.allocator.free(path);
+            @memcpy(path[0..self.root.len], self.root);
+            path[self.root.len] = 0;
+            var stats: StatFs = undefined;
+            if (statfs(@ptrCast(path.ptr), &stats) != 0) return error.ModelCapacityCheckFailed;
+            if (!capacitySufficient(stats.block_size, stats.available_blocks, remaining_artifact_bytes))
+                return error.InsufficientModelStorage;
         }
 
         fn acquire(self: *Self, token: []const u8, stage_dir: []const u8, file: std.Io.File, starting_offset: u64, starting_validator: ?Validator) !void {
@@ -327,6 +387,11 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
                     try discardStage(self.io, stage_dir);
                 return failure;
             };
+            if (self.cancel.isRequested()) return error.ModelOperationCancelled;
+            self.notify(.waiting_for_inference);
+            var activation_lock = try waitForInferenceDrain(self.io, self.root, &self.cancel);
+            defer activation_lock.close(self.io);
+
             const installations = try std.fmt.allocPrint(self.allocator, "{s}/installations", .{self.root});
             defer self.allocator.free(installations);
             try std.Io.Dir.cwd().createDirPath(self.io, installations);
@@ -345,7 +410,6 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
                 prepared = try self.prepareInstallation(final_model, final_dir);
             }
 
-            if (self.cancel.isRequested()) return error.ModelOperationCancelled;
             self.notify(.activating);
             if (final_exists) {
                 try std.Io.Dir.cwd().deleteTree(self.io, stage_dir);
@@ -362,6 +426,7 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
         fn prepareInstallation(self: *Self, model_path: []const u8, directory: []const u8) !PreparedInstallation {
             const stat = try verifyArtifactCancelable(self.io, model_path, self.manifest, &self.cancel, self.observer);
             if (self.cancel.isRequested()) return error.ModelOperationCancelled;
+            try writeArtifactManifest(self.io, directory, self.manifest);
             self.notify(.smoke_testing);
             const runtime_sha256 = try self.smoke.run(model_path, &self.cancel);
             if (self.cancel.isRequested()) return error.ModelOperationCancelled;
@@ -369,6 +434,27 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
             return .{ .stat = stat, .runtime_sha256 = runtime_sha256 };
         }
     };
+}
+
+fn capacitySufficient(block_size: u32, available_blocks: u64, remaining_artifact_bytes: u64) bool {
+    const available = std.math.mul(u64, block_size, available_blocks) catch std.math.maxInt(u64);
+    const required = std.math.add(u64, remaining_artifact_bytes, staging_overhead_bytes) catch return false;
+    return available >= required;
+}
+
+fn waitForInferenceDrain(io: std.Io, root: []const u8, cancel: *const CancelToken) !std.Io.File {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/.inference.lock", .{root});
+    while (true) {
+        if (cancel.isRequested()) return error.ModelOperationCancelled;
+        return std.Io.Dir.cwd().createFile(io, path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |failure| switch (failure) {
+            error.WouldBlock => {
+                try std.Io.sleep(io, .fromMilliseconds(50), .awake);
+                continue;
+            },
+            else => return failure,
+        };
+    }
 }
 
 fn isTransientDownloadFailure(failure: anyerror) bool {
@@ -514,8 +600,8 @@ fn receipt(manifest: Manifest, runtime_sha256: [32]u8, model_stat: std.Io.File.S
     const runtime_hex = std.fmt.bytesToHex(runtime_sha256, .lower);
     return std.fmt.bufPrint(
         buffer,
-        "schema=1\nrepository={s}\nrevision={s}\nruntime={s}\nruntime_sha256={s}\nartifact={s}\nsize={d}\nmodel_mtime_ns={d}\nsha256={s}\ninstalled_by=type-wave-v{s}\n",
-        .{ manifest.repository, manifest.revision, manifest.runtime, &runtime_hex, manifest.artifact, manifest.size, model_stat.mtime.nanoseconds, &hex, manifest.installer_version },
+        "schema=2\nrepository={s}\nrevision={s}\nruntime={s}\nruntime_sha256={s}\nartifact={s}\ninstallation_id={s}\nsize={d}\nmodel_mtime_ns={d}\nsha256={s}\ninstalled_by=type-wave-v{s}\n",
+        .{ manifest.repository, manifest.revision, manifest.runtime, &runtime_hex, manifest.artifact, manifest.installation_id, manifest.size, model_stat.mtime.nanoseconds, &hex, manifest.installer_version },
     );
 }
 
@@ -524,6 +610,15 @@ fn writeProvenance(io: std.Io, directory: []const u8, manifest: Manifest, runtim
     const text = try receipt(manifest, runtime_sha256, model_stat, &text_buffer);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, "{s}/PROVENANCE", .{directory});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text, .flags = .{ .permissions = .fromMode(0o600) } });
+}
+
+fn writeArtifactManifest(io: std.Io, directory: []const u8, manifest: Manifest) !void {
+    const digest = std.fmt.bytesToHex(manifest.sha256, .lower);
+    var text_buffer: [256]u8 = undefined;
+    const text = try std.fmt.bufPrint(&text_buffer, "size={d}\nsha256={s}\n", .{ manifest.size, &digest });
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/MODEL_MANIFEST", .{directory});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text, .flags = .{ .permissions = .fromMode(0o600) } });
 }
 
@@ -542,6 +637,9 @@ fn publishReceipt(io: std.Io, root: []const u8, manifest: Manifest, runtime_sha2
 }
 
 pub fn activeInstallationPresent(io: std.Io, root: []const u8, manifest: Manifest) !bool {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    if ((try activeModelPath(io, root, &path_buffer)) == null) return false;
+
     var receipt_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const receipt_path = try std.fmt.bufPrint(&receipt_path_buffer, "{s}/active.receipt", .{root});
     var actual_buffer: [1024]u8 = undefined;
@@ -549,20 +647,47 @@ pub fn activeInstallationPresent(io: std.Io, root: []const u8, manifest: Manifes
         error.FileNotFound => return false,
         else => return failure,
     };
-    var model_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const model_path = try std.fmt.bufPrint(&model_path_buffer, "{s}/installations/{s}/{s}", .{ root, manifest.installation_id, manifest.artifact });
-    var model = std.Io.Dir.cwd().openFile(io, model_path, .{}) catch |failure| switch (failure) {
-        error.FileNotFound => return false,
+    return receiptMatchesManifest(actual, manifest);
+}
+
+fn safePathComponent(value: []const u8) bool {
+    return value.len > 0 and
+        !std.mem.eql(u8, value, ".") and
+        !std.mem.eql(u8, value, "..") and
+        std.mem.indexOfAny(u8, value, "/\\") == null;
+}
+
+fn receiptMatchesManifest(actual: []const u8, manifest: Manifest) bool {
+    var size_buffer: [32]u8 = undefined;
+    const expected_size = std.fmt.bufPrint(&size_buffer, "{d}", .{manifest.size}) catch return false;
+    const expected_digest = std.fmt.bytesToHex(manifest.sha256, .lower);
+    const schema = receiptValue(actual, "schema=") orelse return false;
+    const installation_matches = if (std.mem.eql(u8, schema, "2"))
+        std.mem.eql(u8, receiptValue(actual, "installation_id=") orelse return false, manifest.installation_id)
+    else if (std.mem.eql(u8, schema, "1"))
+        true
+    else
+        false;
+    return installation_matches and
+        std.mem.eql(u8, receiptValue(actual, "repository=") orelse return false, manifest.repository) and
+        std.mem.eql(u8, receiptValue(actual, "revision=") orelse return false, manifest.revision) and
+        std.mem.eql(u8, receiptValue(actual, "runtime=") orelse return false, manifest.runtime) and
+        std.mem.eql(u8, receiptValue(actual, "artifact=") orelse return false, manifest.artifact) and
+        std.mem.eql(u8, receiptValue(actual, "size=") orelse return false, expected_size) and
+        std.mem.eql(u8, receiptValue(actual, "sha256=") orelse return false, &expected_digest);
+}
+
+fn activeReceipt(io: std.Io, root: []const u8, buffer: []u8) !?[]const u8 {
+    var receipt_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const receipt_path = try std.fmt.bufPrint(&receipt_path_buffer, "{s}/active.receipt", .{root});
+    return std.Io.Dir.cwd().readFile(io, receipt_path, buffer) catch |failure| switch (failure) {
+        error.FileNotFound => null,
         else => return failure,
     };
-    defer model.close(io);
-    const stat = try model.stat(io);
-    if (stat.size != manifest.size) return false;
-    var installed_manifest = manifest;
-    installed_manifest.installer_version = receiptValue(actual, "installed_by=type-wave-v") orelse return false;
-    var expected_buffer: [1024]u8 = undefined;
-    const expected = try receipt(installed_manifest, receiptRuntimeDigest(actual) orelse return false, stat, &expected_buffer);
-    return std.mem.eql(u8, actual, expected);
+}
+
+fn receiptArtifact(actual: []const u8) ?ArtifactIdentity {
+    return artifact_identity.parse(actual) catch null;
 }
 
 fn receiptRuntimeDigest(receipt_text: []const u8) ?[32]u8 {
@@ -574,10 +699,13 @@ fn receiptRuntimeDigest(receipt_text: []const u8) ?[32]u8 {
 }
 
 fn receiptValue(receipt_text: []const u8, prefix: []const u8) ?[]const u8 {
-    const start = (std.mem.indexOf(u8, receipt_text, prefix) orelse return null) + prefix.len;
-    const end_offset = std.mem.indexOfScalar(u8, receipt_text[start..], '\n') orelse return null;
-    if (end_offset == 0) return null;
-    return receipt_text[start .. start + end_offset];
+    var lines = std.mem.splitScalar(u8, receipt_text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, prefix)) continue;
+        const value = line[prefix.len..];
+        return if (value.len == 0) null else value;
+    }
+    return null;
 }
 
 pub fn sha256File(io: std.Io, path: []const u8) ![32]u8 {
@@ -616,9 +744,120 @@ pub fn rootPath(home: []const u8, buffer: []u8) ![]const u8 {
     return std.fmt.bufPrint(buffer, "{s}/Library/Application Support/type-wave/models", .{home});
 }
 
-pub fn activeModelPath(io: std.Io, root: []const u8, manifest: Manifest, buffer: []u8) !?[]const u8 {
-    if (!try activeInstallationPresent(io, root, manifest)) return null;
-    return try std.fmt.bufPrint(buffer, "{s}/installations/{s}/{s}", .{ root, manifest.installation_id, manifest.artifact });
+pub fn activeModelPath(io: std.Io, root: []const u8, buffer: []u8) !?[]const u8 {
+    var receipt_buffer: [1024]u8 = undefined;
+    const actual = (try activeReceipt(io, root, &receipt_buffer)) orelse return null;
+    const schema = receiptValue(actual, "schema=") orelse return null;
+    const artifact = receiptValue(actual, "artifact=") orelse return null;
+    if (!safePathComponent(artifact)) return null;
+    const parsed_artifact = receiptArtifact(actual) orelse return null;
+    const mtime_ns = std.fmt.parseInt(i96, receiptValue(actual, "model_mtime_ns=") orelse return null, 10) catch return null;
+    if (receiptRuntimeDigest(actual) == null) return null;
+
+    if (std.mem.eql(u8, schema, "2")) {
+        const installation_id = receiptValue(actual, "installation_id=") orelse return null;
+        if (!safePathComponent(installation_id)) return null;
+        return validateReceiptPath(io, root, actual, installation_id, artifact, parsed_artifact.size, mtime_ns, buffer);
+    }
+    if (!std.mem.eql(u8, schema, "1")) return null;
+
+    var installations_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const installations_path = try std.fmt.bufPrint(&installations_path_buffer, "{s}/installations", .{root});
+    var installations = std.Io.Dir.cwd().openDir(io, installations_path, .{ .iterate = true }) catch |failure| switch (failure) {
+        error.FileNotFound => return null,
+        else => return failure,
+    };
+    defer installations.close(io);
+    var entries = installations.iterate();
+    while (try entries.next(io)) |entry| {
+        if (entry.kind != .directory or !safePathComponent(entry.name)) continue;
+        if (try validateReceiptPath(io, root, actual, entry.name, artifact, parsed_artifact.size, mtime_ns, buffer)) |path| return path;
+    }
+    return null;
+}
+
+fn validateReceiptPath(
+    io: std.Io,
+    root: []const u8,
+    actual: []const u8,
+    installation_id: []const u8,
+    artifact: []const u8,
+    size: u64,
+    mtime_ns: i96,
+    buffer: []u8,
+) !?[]const u8 {
+    const path = try std.fmt.bufPrint(buffer, "{s}/installations/{s}/{s}", .{ root, installation_id, artifact });
+    var model = std.Io.Dir.cwd().openFile(io, path, .{}) catch |failure| switch (failure) {
+        error.FileNotFound => return null,
+        else => return failure,
+    };
+    defer model.close(io);
+    const stat = try model.stat(io);
+    if (stat.size != size or stat.mtime.nanoseconds != mtime_ns) return null;
+    var provenance_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const provenance_path = try std.fmt.bufPrint(&provenance_path_buffer, "{s}/installations/{s}/PROVENANCE", .{ root, installation_id });
+    var provenance_buffer: [1024]u8 = undefined;
+    const provenance = std.Io.Dir.cwd().readFile(io, provenance_path, &provenance_buffer) catch |failure| switch (failure) {
+        error.FileNotFound => return null,
+        else => return failure,
+    };
+    if (!std.mem.eql(u8, actual, provenance)) return null;
+    return path;
+}
+
+/// Update availability is a comparison between the independently usable active receipt
+/// and the complete identity embedded in this type-wave release.
+pub fn updateAvailable(io: std.Io, root: []const u8, desired: Manifest) !bool {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    if ((try activeModelPath(io, root, &path_buffer)) == null) return false;
+    var receipt_buffer: [1024]u8 = undefined;
+    const actual = (try activeReceipt(io, root, &receipt_buffer)) orelse return false;
+    return !receiptMatchesManifest(actual, desired);
+}
+
+pub fn activeArtifact(io: std.Io, root: []const u8) !?ArtifactIdentity {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    if ((try activeModelPath(io, root, &path_buffer)) == null) return null;
+    var receipt_buffer: [1024]u8 = undefined;
+    const actual = (try activeReceipt(io, root, &receipt_buffer)) orelse return null;
+    return receiptArtifact(actual);
+}
+
+/// Retire superseded immutable installations after the old helper has drained and shut
+/// down. The operation and inference locks make this safe against another process starting
+/// maintenance or a late local Utterance.
+pub fn removeInactiveInstallations(io: std.Io, root: []const u8) !usize {
+    var operation_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const operation_path = try std.fmt.bufPrint(&operation_path_buffer, "{s}/.operation.lock", .{root});
+    var operation_lock = std.Io.Dir.cwd().createFile(io, operation_path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |failure| switch (failure) {
+        error.WouldBlock => return error.ModelOperationInProgress,
+        else => return failure,
+    };
+    defer operation_lock.close(io);
+    var inference_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const inference_path = try std.fmt.bufPrint(&inference_path_buffer, "{s}/.inference.lock", .{root});
+    var inference_lock = std.Io.Dir.cwd().createFile(io, inference_path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |failure| switch (failure) {
+        error.WouldBlock => return error.ModelInferenceActive,
+        else => return failure,
+    };
+    defer inference_lock.close(io);
+
+    var active_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const active_path = (try activeModelPath(io, root, &active_path_buffer)) orelse return 0;
+    const active_directory = std.fs.path.dirname(active_path) orelse return error.InvalidModelPath;
+    const active_id = std.fs.path.basename(active_directory);
+    var installations_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const installations_path = try std.fmt.bufPrint(&installations_path_buffer, "{s}/installations", .{root});
+    var installations = try std.Io.Dir.cwd().openDir(io, installations_path, .{ .iterate = true });
+    defer installations.close(io);
+    var removed: usize = 0;
+    var entries = installations.iterate();
+    while (try entries.next(io)) |entry| {
+        if (entry.kind != .directory or std.mem.eql(u8, entry.name, active_id)) continue;
+        try installations.deleteTree(io, entry.name);
+        removed += 1;
+    }
+    return removed;
 }
 
 pub fn isHuggingFaceOrigin(url: []const u8) bool {
@@ -762,6 +1001,12 @@ fn headerValue(head: std.http.Client.Response.Head, name: []const u8) ?[]const u
     return null;
 }
 
+test "capacity preflight retains the working installation plus staging overhead" {
+    const replacement = 500 * 1024 * 1024;
+    try std.testing.expect(capacitySufficient(4096, (replacement + staging_overhead_bytes) / 4096, replacement));
+    try std.testing.expect(!capacitySufficient(4096, replacement / 4096, replacement));
+}
+
 test "Model Operation verifies and smoke-tests before publishing the active receipt" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -846,6 +1091,101 @@ test "failed verification or smoke test cannot replace the active receipt" {
     try std.testing.expectError(error.HelperSmokeTestFailed, bad_smoke.install("hf_secret"));
     const after_smoke_failure = try std.Io.Dir.cwd().readFile(std.testing.io, receipt_path, &actual_buf);
     try std.testing.expectEqualStrings("previous installation\n", after_smoke_failure);
+}
+
+test "a working older Model Installation remains active when the embedded identity changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try installTestModel(root);
+    const desired = replacementManifest();
+
+    try std.testing.expect(try updateAvailable(std.testing.io, root, desired));
+    var active_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const active_path = (try activeModelPath(std.testing.io, root, &active_path_buf)).?;
+    try std.testing.expect(std.mem.endsWith(u8, active_path, "/installations/test-installation/ggml-model.bin"));
+}
+
+test "a schema-one receipt remains usable and reports an embedded replacement" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    var transport = FakeTransport{};
+    var smoke = FakeSmoke{};
+    var operation = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
+    try operation.install("hf_secret");
+
+    var receipt_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const receipt_path = try std.fmt.bufPrint(&receipt_path_buf, "{s}/active.receipt", .{root});
+    var provenance_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const provenance_path = try std.fmt.bufPrint(&provenance_path_buf, "{s}/installations/{s}/PROVENANCE", .{ root, test_manifest.installation_id });
+    var receipt_buf: [1024]u8 = undefined;
+    const current = try std.Io.Dir.cwd().readFile(std.testing.io, receipt_path, &receipt_buf);
+    const old_schema = try std.mem.replaceOwned(u8, std.testing.allocator, current, "schema=2", "schema=1");
+    defer std.testing.allocator.free(old_schema);
+    const old_receipt = try std.mem.replaceOwned(u8, std.testing.allocator, old_schema, "installation_id=test-installation\n", "");
+    defer std.testing.allocator.free(old_receipt);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = receipt_path, .data = old_receipt });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = provenance_path, .data = old_receipt });
+
+    const desired = replacementManifest();
+    try std.testing.expect(try updateAvailable(std.testing.io, root, desired));
+    var active_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expect((try activeModelPath(std.testing.io, root, &active_path_buf)) != null);
+}
+
+test "a failed replacement leaves the working Model Installation unchanged and usable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try installTestModel(root);
+    const desired = replacementManifest();
+    var replacement_transport = FakeTransport{};
+    var failing_smoke = FailingSmoke{};
+    var replacement = Operation(FakeTransport, FailingSmoke).init(std.testing.allocator, std.testing.io, root, desired, &replacement_transport, &failing_smoke);
+
+    try std.testing.expectError(error.HelperSmokeTestFailed, replacement.install("hf_secret"));
+    try std.testing.expect(try updateAvailable(std.testing.io, root, desired));
+    var active_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const active_path = (try activeModelPath(std.testing.io, root, &active_path_buf)).?;
+    try std.testing.expect(std.mem.endsWith(u8, active_path, "/installations/test-installation/ggml-model.bin"));
+}
+
+test "replacement activation waits for the active inference lease to drain" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try installTestModel(root);
+    const desired = replacementManifest();
+    var lease = try InferenceLease.acquire(std.testing.io, root);
+    var drain = ActivationDrainLog{ .lease = &lease };
+    var replacement_transport = FakeTransport{};
+    var replacement_smoke = FakeSmoke{};
+    var replacement = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, desired, &replacement_transport, &replacement_smoke);
+    replacement.observer = .{ .ctx = &drain, .on_event = ActivationDrainLog.record };
+
+    try replacement.install("hf_secret");
+
+    try std.testing.expect(drain.released);
+    try std.testing.expectEqual(@as(usize, 1), drain.waits);
+    try std.testing.expect(!try updateAvailable(std.testing.io, root, desired));
+    try std.testing.expect(try activeInstallationPresent(std.testing.io, root, desired));
+    var previous_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const previous_path = try std.fmt.bufPrint(&previous_path_buf, "{s}/installations/{s}", .{ root, test_manifest.installation_id });
+    try std.Io.Dir.cwd().access(std.testing.io, previous_path, .{});
+    try std.testing.expectEqual(@as(usize, 1), try removeInactiveInstallations(std.testing.io, root));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, previous_path, .{}));
 }
 
 test "Hugging Face authorization is never constructed for a cross-origin request" {
@@ -1165,6 +1505,21 @@ test "cancellation during smoke testing pauses the verified download before acti
 const test_bytes = "pinned test model";
 const test_manifest = Manifest.forTest();
 
+fn installTestModel(root: []const u8) !void {
+    var transport = FakeTransport{};
+    var smoke = FakeSmoke{};
+    var operation = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
+    try operation.install("hf_secret");
+}
+
+fn replacementManifest() Manifest {
+    var desired = test_manifest;
+    desired.revision = "replacement-revision";
+    desired.installation_id = "replacement-installation";
+    desired.url = "https://huggingface.co/example/test-model/resolve/replacement-revision/ggml-model.bin";
+    return desired;
+}
+
 const FakeTransport = struct {
     pub fn download(_: *FakeTransport, _: []const u8, _: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
         try writer.writeAll(test_bytes[@intCast(request.offset)..@intCast(request.end + 1)]);
@@ -1220,6 +1575,20 @@ const EventLog = struct {
     fn record(ctx: *anyopaque, event: OperationEvent) void {
         const self: *EventLog = @ptrCast(@alignCast(ctx));
         if (event == .retrying) self.retries += 1;
+    }
+};
+
+const ActivationDrainLog = struct {
+    lease: *InferenceLease,
+    waits: usize = 0,
+    released: bool = false,
+
+    fn record(ctx: *anyopaque, event: OperationEvent) void {
+        const self: *ActivationDrainLog = @ptrCast(@alignCast(ctx));
+        if (event != .waiting_for_inference) return;
+        self.waits += 1;
+        self.lease.release();
+        self.released = true;
     }
 };
 

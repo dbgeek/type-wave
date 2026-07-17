@@ -195,6 +195,11 @@ const TranscriptionAdapter = struct {
         defer self.selection_mu.unlock(self.io);
         return self.selection.finishPreparation(ticket, ready);
     }
+    fn invalidate(self: *TranscriptionAdapter, expected: backend.Backend) bool {
+        self.selection_mu.lockUncancelable(self.io);
+        defer self.selection_mu.unlock(self.io);
+        return self.selection.invalidate(expected);
+    }
     fn activeRoute(self: *TranscriptionAdapter) ?backend.Selection.Route {
         self.selection_mu.lockUncancelable(self.io);
         defer self.selection_mu.unlock(self.io);
@@ -443,7 +448,7 @@ const Daemon = struct {
         const home = std.mem.span(raw_home);
         var root_buf: [4096]u8 = undefined;
         const root = model_store.rootPath(home, &root_buf) catch return null;
-        return model_store.activeModelPath(io, root, model_store.pinned_manifest, buf) catch null;
+        return model_store.activeModelPath(io, root, buf) catch null;
     }
 
     fn localInstallationPresent(self: *Daemon) bool {
@@ -451,14 +456,32 @@ const Daemon = struct {
         return localModelPath(self.io, &model_buf) != null;
     }
 
+    fn removeInactiveModelInstallations(self: *Daemon) void {
+        const raw_home = std.c.getenv("HOME") orelse return;
+        var root_buf: [4096]u8 = undefined;
+        const root = model_store.rootPath(std.mem.span(raw_home), &root_buf) catch return;
+        const removed = model_store.removeInactiveInstallations(self.io, root) catch |failure| {
+            if (failure == error.ModelOperationInProgress or failure == error.ModelInferenceActive) return;
+            feedback.log("  superseded Model Installation cleanup failed: {s}; retrying while idle\n", .{@errorName(failure)});
+            return;
+        };
+        if (removed > 0) feedback.log("  removed {d} superseded Model Installation(s) after helper drain\n", .{removed});
+    }
+
     fn prepareLocalHelper(self: *Daemon) ?*LocalAdapter {
         const raw_home = std.c.getenv("HOME") orelse return null;
         const home = std.mem.span(raw_home);
         var helper_buf: [4096]u8 = undefined;
         var model_buf: [4096]u8 = undefined;
+        var root_buf: [4096]u8 = undefined;
         const helper_path = std.fmt.bufPrint(&helper_buf, "{s}/.local/libexec/type-wave/type-wave-whisper", .{home}) catch return null;
+        const root = model_store.rootPath(home, &root_buf) catch return null;
         const model_path = localModelPath(self.io, &model_buf) orelse return null;
-        const helper = local_backend.ProcessHelper.start(self.alloc, self.io, helper_path, model_path) catch |failure| {
+        const active_artifact = (model_store.activeArtifact(self.io, root) catch return null) orelse return null;
+        const helper = local_backend.ProcessHelper.start(self.alloc, self.io, helper_path, model_path, .{
+            .size = active_artifact.size,
+            .sha256 = active_artifact.sha256,
+        }) catch |failure| {
             feedback.log("  local KB Whisper unavailable after bounded recovery: {s}; send SIGHUP to Retry\n", .{@errorName(failure)});
             return null;
         };
@@ -472,6 +495,11 @@ const Daemon = struct {
             .final = Daemon.localFinal,
             .failed = Daemon.localFailed,
         });
+        local.setInferenceRoot(root) catch {
+            helper.shutdown();
+            self.alloc.destroy(local);
+            return null;
+        };
         local.bindHelperEvents();
         return local;
     }
@@ -550,10 +578,21 @@ const Daemon = struct {
 
             const selected = self.store.current().transcription_backend;
             self.transcription.select(selected);
+            if (selected == .local_kb_whisper and self.transcription.activeRoute() == null) {
+                if (self.transcription.currentLocal()) |local| {
+                    if (!local.usesActiveInstallation()) {
+                        _ = self.transcription.invalidate(.local_kb_whisper);
+                        feedback.log("  local Model Installation changed — draining old helper and warming the activated replacement\n", .{});
+                    }
+                }
+            }
             if (self.transcription.activeRoute() == null and !self.transcription.selectionReady()) {
                 switch (selected) {
                     .openai => if (self.transcription.takeSession()) |session| session.shutdown(),
-                    .local_kb_whisper => if (self.transcription.takeLocal()) |local| local.shutdown(),
+                    .local_kb_whisper => if (self.transcription.takeLocal()) |local| {
+                        local.shutdown();
+                        self.removeInactiveModelInstallations();
+                    },
                 }
             }
             const local_installation = self.localInstallationPresent();
@@ -626,6 +665,11 @@ const Daemon = struct {
             if (outcome.actions.announce_ready)
                 feedback.log("  READY — hold {s}, speak, release; the transcript lands at the cursor.\n", .{keyName(self.store.current().talk_key)});
             if (outcome.actions.report_missing) |report| self.reportMissing(report);
+            // Cheap nonblocking reconciliation also catches updates activated while OpenAI
+            // is selected and no local helper exists. Busy operation/inference locks defer
+            // cleanup to the next supervisor tick without disturbing dictation.
+            if (self.transcription.activeRoute() == null)
+                self.removeInactiveModelInstallations();
             self.capture_enabled.store(outcome.configured and self.transcription.available() and !facts.paused, .release);
         }
     }

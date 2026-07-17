@@ -131,6 +131,12 @@ choose `--resume-model` or `--discard-model`. Download and hashing progress are 
 transient retries stop after the displayed budget, and Ctrl-C cooperatively cancels transfer,
 hashing, or the helper smoke test. Activation is the only short non-cancellable stage.
 
+`--model-status` derives update availability by comparing the active receipt with the complete
+identity embedded in the running type-wave release. An older verified installation remains
+ready for offline dictation while `--update-model` stages, verifies, and smoke-tests its
+replacement. Activation waits for active local inference to drain, then atomically switches
+the receipt; failure or cancellation leaves the working installation selected and usable.
+
 After full size/SHA-256 verification and the smoke test, type-wave atomically publishes the
 active receipt. Receipts and provenance contain identities and digests, never credentials,
 signed URLs, audio, or transcript content.
