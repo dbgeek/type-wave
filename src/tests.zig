@@ -19,4 +19,5 @@ test {
     _ = @import("readiness.zig");
     _ = @import("configuration_phase.zig");
     _ = @import("model_store.zig");
+    _ = @import("local_model_recovery.zig");
 }

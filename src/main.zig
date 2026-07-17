@@ -55,8 +55,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
         if (argv.len == 2 and std.mem.eql(u8, arg, "--discard-model")) return discardModel(init.environ);
         if (argv.len == 2 and std.mem.eql(u8, arg, "--model-status")) return modelStatus(init.environ);
+        if (argv.len == 2 and std.mem.eql(u8, arg, "--verify-model")) return verifyModel(init.environ);
+        if (argv.len == 2 and std.mem.eql(u8, arg, "--repair-model")) return repairModel(init.environ);
         std.debug.print(
-            \\usage: type-wave [--set-key | --set-hf-token | --install-model | --update-model | --resume-model | --discard-model | --model-status]
+            \\usage: type-wave [--set-key | --set-hf-token | --install-model | --update-model | --resume-model | --discard-model | --model-status | --verify-model | --repair-model]
             \\
             \\  (no args)   run the dictation daemon
             \\  --set-key   read the OpenAI API key from stdin and store it in the login
@@ -78,6 +80,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
             \\              discard paused model work without changing the active installation.
             \\  --model-status
             \\              inspect paused model work without making a network request.
+            \\  --verify-model
+            \\              hash and verify the complete active Model Installation offline.
+            \\  --repair-model
+            \\              verify first, preserve valid data, and ask before authenticated
+            \\              network acquisition of a missing or invalid artifact.
             \\
         , .{});
         std.process.exit(2);
@@ -271,6 +278,102 @@ fn modelStatus(environ: std.process.Environ) !void {
     var threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
     defer threaded.deinit();
     try reportPausedModel(threaded.io(), environ, true);
+}
+
+fn verifyModel(environ: std.process.Environ) !void {
+    const allocator = std.heap.c_allocator;
+    const home = environ.getPosix("HOME") orelse return error.HomeDirectoryUnavailable;
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try model_store.rootPath(home, &root_buffer);
+    var helper_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const helper = try std.fmt.bufPrint(&helper_buffer, "{s}/.local/libexec/type-wave/type-wave-whisper", .{home});
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+    var transport = model_store.HttpTransport{ .client = &client };
+    var smoke = HelperSmoke{ .allocator = allocator, .io = io, .executable = helper };
+    var operation = model_store.Operation(model_store.HttpTransport, HelperSmoke).init(allocator, io, root, model_store.pinned_manifest, &transport, &smoke);
+    operation.additional_trusted_manifests = &model_store.trusted_manifests;
+    operation.observer = .{ .ctx = &operation, .on_event = printModelEvent };
+    try printIntegrity(try operation.verify());
+}
+
+fn repairModel(environ: std.process.Environ) !void {
+    const allocator = std.heap.c_allocator;
+    const home = environ.getPosix("HOME") orelse return error.HomeDirectoryUnavailable;
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try model_store.rootPath(home, &root_buffer);
+    var helper_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const helper = try std.fmt.bufPrint(&helper_buffer, "{s}/.local/libexec/type-wave/type-wave-whisper", .{home});
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+    var transport = model_store.HttpTransport{ .client = &client };
+    var smoke = HelperSmoke{ .allocator = allocator, .io = io, .executable = helper };
+    var operation = model_store.Operation(model_store.HttpTransport, HelperSmoke).init(allocator, io, root, model_store.pinned_manifest, &transport, &smoke);
+    operation.additional_trusted_manifests = &model_store.trusted_manifests;
+    operation.observer = .{ .ctx = &operation, .on_event = printModelEvent };
+
+    const integrity = try operation.verify();
+    switch (integrity) {
+        .usable => {
+            std.debug.print("Model Installation: usable; Repair preserved all valid data and used no network.\n", .{});
+            return;
+        },
+        .absent => return error.NoModelInstallation,
+        .corrupt => |reason| {
+            std.debug.print("Model Installation: corrupt ({s}).\n", .{@tagName(reason)});
+        },
+    }
+
+    operation.repair(null) catch |failure| switch (failure) {
+        error.MissingHuggingFaceToken => {},
+        else => return failure,
+    };
+    if ((try operation.verify()) == .usable) {
+        std.debug.print("Model Installation: repaired valid local data offline; no network used.\n", .{});
+        return;
+    }
+
+    if (!confirmRepairNetworkUse()) return error.ModelRepairNotConfirmed;
+    var owned_token: ?[:0]const u8 = null;
+    defer if (owned_token) |token| {
+        std.crypto.secureZero(u8, @constCast(token));
+        allocator.free(token);
+    };
+    const token: []const u8 = environ.getPosix("HF_TOKEN") orelse token: {
+        switch (keychain.readHuggingFaceToken(allocator)) {
+            .key => |stored| {
+                owned_token = stored;
+                break :token stored;
+            },
+            .absent => return error.MissingHuggingFaceToken,
+            .err => return error.HuggingFaceKeychainUnavailable,
+        }
+    };
+    try std.Io.Dir.cwd().access(io, helper, .{});
+    try operation.repair(token);
+    std.debug.print("Model Installation: repaired, verified, smoke-tested, and activated.\n", .{});
+}
+
+fn printIntegrity(integrity: model_store.InstallationIntegrity) !void {
+    switch (integrity) {
+        .absent => std.debug.print("Model Installation: absent.\n", .{}),
+        .usable => |identity| std.debug.print("Model Installation: usable; verified {d} bytes, sha256={s}.\n", .{ identity.size, &std.fmt.bytesToHex(identity.sha256, .lower) }),
+        .corrupt => |reason| std.debug.print("Model Installation: corrupt ({s}); Repair or Remove is required.\n", .{@tagName(reason)}),
+    }
+}
+
+fn confirmRepairNetworkUse() bool {
+    std.debug.print("Repair needs authenticated network access for invalid artifact data in the Model Installation. Continue? Type yes: ", .{});
+    var buffer: [16]u8 = undefined;
+    const count = std.posix.read(0, &buffer) catch return false;
+    const answer = std.mem.trim(u8, buffer[0..count], " \t\r\n");
+    return std.mem.eql(u8, answer, "yes");
 }
 
 fn reportPausedModel(io: std.Io, environ: std.process.Environ, show_idle: bool) !void {

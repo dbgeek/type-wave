@@ -68,6 +68,7 @@ const configuration_phase = @import("configuration_phase.zig");
 const backend = @import("transcription_backend.zig");
 const local_backend = @import("local_backend.zig");
 const model_store = @import("model_store.zig");
+const local_model_recovery = @import("local_model_recovery.zig");
 
 const Session = session_mod.Session;
 const LocalAdapter = local_backend.Adapter(local_backend.ProcessHelper);
@@ -418,6 +419,7 @@ const Daemon = struct {
     /// Supervisor-thread-only: owns Configuration Phase memory, including READY
     /// announcements and distinct not-configured reports.
     configuration: configuration_phase.ConfigurationPhase = .{},
+    local_model_recovery: local_model_recovery.Recovery = .{},
 
     /// Always-on live-transcript subscriber: Final Transcripts from the read-loop thread
     /// trampoline into the Coordinator. Installed at every Session.connect, before the read
@@ -453,7 +455,7 @@ const Daemon = struct {
 
     fn localInstallationPresent(self: *Daemon) bool {
         var model_buf: [4096]u8 = undefined;
-        return localModelPath(self.io, &model_buf) != null;
+        return self.local_model_recovery.installationUsable() and localModelPath(self.io, &model_buf) != null;
     }
 
     fn removeInactiveModelInstallations(self: *Daemon) void {
@@ -478,13 +480,33 @@ const Daemon = struct {
         const root = model_store.rootPath(home, &root_buf) catch return null;
         const model_path = localModelPath(self.io, &model_buf) orelse return null;
         const active_artifact = (model_store.activeArtifact(self.io, root) catch return null) orelse return null;
+        if (self.local_model_recovery.current() == .verifying) {
+            const usable = self.verifyLocalInstallation(root) orelse return null;
+            if (self.local_model_recovery.verificationFinished(usable) != .load) return null;
+        }
+        if (self.local_model_recovery.current() == .corrupt or self.local_model_recovery.current() == .runtime_failure) return null;
+
         const helper = local_backend.ProcessHelper.start(self.alloc, self.io, helper_path, model_path, .{
             .size = active_artifact.size,
             .sha256 = active_artifact.sha256,
-        }) catch |failure| {
-            feedback.log("  local KB Whisper unavailable after bounded recovery: {s}; send SIGHUP to Retry\n", .{@errorName(failure)});
-            return null;
+        }) catch |failure| retry: {
+            if (self.local_model_recovery.loadFailed() != .verify) {
+                feedback.log("  local KB Whisper runtime failure after verified installation: {s}; send SIGHUP to Retry\n", .{@errorName(failure)});
+                return null;
+            }
+            feedback.log("  local KB Whisper load failed: {s}; verifying the Model Installation offline\n", .{@errorName(failure)});
+            const usable = self.verifyLocalInstallation(root) orelse return null;
+            if (self.local_model_recovery.verificationFinished(usable) != .load) return null;
+            break :retry local_backend.ProcessHelper.start(self.alloc, self.io, helper_path, model_path, .{
+                .size = active_artifact.size,
+                .sha256 = active_artifact.sha256,
+            }) catch |retry_failure| {
+                _ = self.local_model_recovery.loadFailed();
+                feedback.log("  Model Installation verified, but local runtime load failed again: {s}; send SIGHUP to Retry\n", .{@errorName(retry_failure)});
+                return null;
+            };
         };
+        self.local_model_recovery.loadSucceeded();
         const local = self.alloc.create(LocalAdapter) catch {
             helper.shutdown();
             feedback.log("  local KB Whisper unavailable: adapter allocation failed\n", .{});
@@ -504,12 +526,34 @@ const Daemon = struct {
         return local;
     }
 
+    fn verifyLocalInstallation(self: *Daemon, root: []const u8) ?bool {
+        const cancel = model_store.CancelToken{};
+        const integrity = model_store.verifyActiveInstallation(self.io, root, model_store.pinned_manifest, &model_store.trusted_manifests, &cancel, null) catch |failure| {
+            self.local_model_recovery.verificationFailed();
+            feedback.log("  local Model Installation verification failed: {s}; runtime Retry remains available\n", .{@errorName(failure)});
+            return null;
+        };
+        return switch (integrity) {
+            .usable => true,
+            .absent => {
+                feedback.log("  local Model Installation is absent; Install is required\n", .{});
+                return false;
+            },
+            .corrupt => |reason| {
+                feedback.log("  local Model Installation is corrupt ({s}); Repair or Remove is required\n", .{@tagName(reason)});
+                return false;
+            },
+        };
+    }
+
     fn localRetryLoop(self: *Daemon) void {
         while (!g_quit.load(.acquire)) {
             if (g_retry_local.swap(false, .acq_rel) and self.transcription.selected() == .local_kb_whisper) {
                 if (self.transcription.currentLocal()) |local| {
                     local.retry();
                     feedback.log("  local KB Whisper Retry requested\n", .{});
+                } else if (self.local_model_recovery.retry() != .none) {
+                    feedback.log("  local KB Whisper load Retry requested\n", .{});
                 }
             }
             _ = usleep(50_000);

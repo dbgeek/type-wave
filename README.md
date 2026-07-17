@@ -137,6 +137,14 @@ ready for offline dictation while `--update-model` stages, verifies, and smoke-t
 replacement. Activation waits for active local inference to drain, then atomically switches
 the receipt; failure or cancellation leaves the working installation selected and usable.
 
+Run `--verify-model` for a full offline integrity check of the active Model Installation.
+It hashes every model byte and reports the exact corrupt metadata/artifact class without
+reading credentials or using the network. Run `--repair-model` to verify first and preserve
+valid local data; metadata-only damage is rebuilt offline, while missing or invalid artifact
+data requires typing `yes` before authenticated acquisition begins. A helper load failure
+performs this same offline verification before type-wave offers Repair for corruption or
+runtime Retry for a verified installation that still cannot load.
+
 After full size/SHA-256 verification and the smoke test, type-wave atomically publishes the
 active receipt. Receipts and provenance contain identities and digests, never credentials,
 signed URLs, audio, or transcript content.
@@ -170,9 +178,9 @@ guard, release-anchored deadline, empty or failed transcripts, dropped sessions,
 failed insertions. Hardware and OS effects reach it through seams.
 
 `src/daemon.zig` builds the real adapters, starts the threads, runs the menu/HUD/tap
-main loop, and supervises readiness. Two state machines remain outside the Coordinator:
-configuration readiness in `src/configuration_phase.zig`, and transcription link state
-in `src/session.zig`.
+main loop, and supervises readiness. Three state machines remain outside the Coordinator:
+configuration readiness in `src/configuration_phase.zig`, transcription link state in
+`src/session.zig`, and local load-failure classification in `src/local_model_recovery.zig`.
 
 | Module | Role |
 | --- | --- |
@@ -193,6 +201,7 @@ in `src/session.zig`.
 | `src/feedback.zig` | Sound cues and timestamped logging |
 | `src/keychain.zig` | Separate OpenAI and Hugging Face login-Keychain items |
 | `src/model_store.zig` | Explicit authenticated Model Operation and atomic Model Installation activation |
+| `src/local_model_recovery.zig` | Local integrity verification versus runtime-load recovery policy |
 | `src/info_plist.zig` | Embedded `Info.plist` Mach-O section |
 
 ## Repository Layout
