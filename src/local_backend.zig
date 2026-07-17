@@ -222,6 +222,7 @@ fn spawnWarm(
     io: std.Io,
     executable: []const u8,
     model: []const u8,
+    cancel: ?*const std.atomic.Value(bool),
 ) !ProcessInstance {
     var helper_environment = std.process.Environ.Map.init(allocator);
     defer helper_environment.deinit();
@@ -238,8 +239,15 @@ fn spawnWarm(
     var startup = StartupRead{ .allocator = allocator, .fd = stdout_fd };
     const reader = try std.Thread.spawn(.{}, StartupRead.run, .{&startup});
     var waited_ms: u32 = 0;
-    while (!startup.done.load(.acquire) and waited_ms < startup_timeout_ms) : (waited_ms += 50)
+    while (!startup.done.load(.acquire) and waited_ms < startup_timeout_ms) : (waited_ms += 50) {
+        if (cancel) |requested| if (requested.load(.acquire)) {
+            child.kill(io);
+            reader.join();
+            if (startup.frame) |*frame| frame.deinit(allocator);
+            return error.ModelOperationCancelled;
+        };
         _ = usleep(50_000);
+    }
     if (!startup.done.load(.acquire)) {
         child.kill(io);
         reader.join();
@@ -269,8 +277,9 @@ pub fn smokeTest(
     io: std.Io,
     executable: []const u8,
     model: []const u8,
+    cancel: *const std.atomic.Value(bool),
 ) !void {
-    var process = try spawnWarm(allocator, io, executable, model);
+    var process = try spawnWarm(allocator, io, executable, model, cancel);
     process.child.kill(io);
 }
 
@@ -282,7 +291,7 @@ fn spawnWarmWithRecovery(
 ) !RecoveredInstance {
     var recovery = helper_supervisor.RecoveryBudget{};
     while (true) {
-        const process = spawnWarm(allocator, io, executable, model) catch |failure| {
+        const process = spawnWarm(allocator, io, executable, model, null) catch |failure| {
             const delay = recovery.failed() orelse return failure;
             var waited_ms: u32 = 0;
             while (waited_ms < delay) : (waited_ms += 50) _ = usleep(50_000);
@@ -599,7 +608,7 @@ pub const ProcessHelper = struct {
     }
 
     fn launch(self: *ProcessHelper) !void {
-        var instance = try spawnWarm(self.allocator, self.io, self.executable, self.model);
+        var instance = try spawnWarm(self.allocator, self.io, self.executable, self.model, null);
         errdefer instance.child.kill(self.io);
 
         self.write_mu.lockUncancelable(self.io);

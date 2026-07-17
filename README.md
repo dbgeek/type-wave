@@ -124,10 +124,16 @@ Store it through the installed signed binary, then explicitly start the Model Op
 
 For a foreground development operation, `HF_TOKEN` overrides the Hugging Face login-
 Keychain item for that invocation and is never persisted. The operation authenticates only
-the initial `huggingface.co` request, strips authorization from cross-origin redirects,
-verifies the pinned byte count and SHA-256, smoke-tests the private helper, and only then
-atomically publishes the active receipt. Receipts and provenance contain identities and
-digests, never credentials, signed URLs, audio, or transcript content.
+the initial `huggingface.co` request, strips authorization from cross-origin redirects, and
+checkpoints only exact validator-matched byte ranges. A cancelled or interrupted operation
+never resumes network activity on restart; inspect it with `--model-status`, then explicitly
+choose `--resume-model` or `--discard-model`. Download and hashing progress are byte-accurate,
+transient retries stop after the displayed budget, and Ctrl-C cooperatively cancels transfer,
+hashing, or the helper smoke test. Activation is the only short non-cancellable stage.
+
+After full size/SHA-256 verification and the smoke test, type-wave atomically publishes the
+active receipt. Receipts and provenance contain identities and digests, never credentials,
+signed URLs, audio, or transcript content.
 
 ## Development
 

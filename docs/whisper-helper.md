@@ -59,6 +59,12 @@ non-persisted override. Installation data lives under
 selected by an atomically replaced `active.receipt` only after exact size/digest verification
 and a successful helper load/warm smoke test.
 
+An interruption leaves only validator-bound, byte-counted staging data. Restart reports it
+as paused without network activity. Inspect with `--model-status`, continue explicitly with
+`--resume-model`, or remove only the staged work with `--discard-model`. Ctrl-C cooperatively
+cancels transfer, verification, and helper smoke testing; atomic receipt activation completes
+without interruption once begun.
+
 Select local in `~/.config/type-wave/config.zon`:
 
 ```zig

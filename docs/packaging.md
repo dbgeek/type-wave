@@ -107,7 +107,9 @@ The Hugging Face token for an explicit local-model operation is a second generic
 item under the same service, account `huggingface-token`, label
 `type-wave Hugging Face token`. Store it separately with
 `~/.local/bin/type-wave --set-hf-token`; `HF_TOKEN` is a foreground-only override for
-`--install-model` and is never written to Keychain or the LaunchAgent plist.
+`--install-model` or `--resume-model` and is never written to Keychain or the LaunchAgent
+plist. Interrupted work stays paused without automatic network access; use `--model-status`,
+then explicitly run `--resume-model` or `--discard-model`.
 
 ## Verify grant persistence across a rebuild (the point of #15)
 

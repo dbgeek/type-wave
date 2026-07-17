@@ -17,6 +17,19 @@ const keychain = @import("keychain.zig");
 const model_store = @import("model_store.zig");
 const local_backend = @import("local_backend.zig");
 
+extern "c" fn signal(sig: c_int, handler: *const fn (c_int) callconv(.c) void) callconv(.c) usize;
+const SIGINT: c_int = 2;
+const SIGTERM: c_int = 15;
+var g_model_cancel = std.atomic.Value(usize).init(0);
+
+fn onModelCancel(_: c_int) callconv(.c) void {
+    const address = g_model_cancel.load(.acquire);
+    if (address != 0) {
+        const requested: *std.atomic.Value(bool) = @ptrFromInt(address);
+        requested.store(true, .release);
+    }
+}
+
 // Force the __TEXT,__info_plist section (src/info_plist.zig) to be analysed and kept: it
 // carries the daemon's stable bundle identity + mic usage string (wayfinder #15).
 comptime {
@@ -31,15 +44,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const arg = std.mem.span(argv[1]);
         if (argv.len == 2 and std.mem.eql(u8, arg, "--set-key")) return setKey();
         if (argv.len == 2 and std.mem.eql(u8, arg, "--set-hf-token")) return setHuggingFaceToken();
-        if (argv.len == 2 and std.mem.eql(u8, arg, "--install-model")) {
-            installModel(init.environ) catch |failure| {
-                std.debug.print("--install-model: {s}\n", .{@errorName(failure)});
+        if (argv.len == 2 and (std.mem.eql(u8, arg, "--install-model") or std.mem.eql(u8, arg, "--resume-model"))) {
+            const resume_partial = std.mem.eql(u8, arg, "--resume-model");
+            installModel(init.environ, resume_partial) catch |failure| {
+                std.debug.print("{s}: {s}\n", .{ arg, @errorName(failure) });
                 std.process.exit(1);
             };
             return;
         }
+        if (argv.len == 2 and std.mem.eql(u8, arg, "--discard-model")) return discardModel(init.environ);
+        if (argv.len == 2 and std.mem.eql(u8, arg, "--model-status")) return modelStatus(init.environ);
         std.debug.print(
-            \\usage: type-wave [--set-key | --set-hf-token | --install-model]
+            \\usage: type-wave [--set-key | --set-hf-token | --install-model | --resume-model | --discard-model | --model-status]
             \\
             \\  (no args)   run the dictation daemon
             \\  --set-key   read the OpenAI API key from stdin and store it in the login
@@ -52,6 +68,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             \\              explicitly acquire, verify, smoke-test, and atomically activate
             \\              the pinned KB Whisper Model Installation. HF_TOKEN overrides
             \\              Keychain for this foreground operation and is never persisted.
+            \\  --resume-model
+            \\              explicitly resume validator-matched paused model work.
+            \\  --discard-model
+            \\              discard paused model work without changing the active installation.
+            \\  --model-status
+            \\              inspect paused model work without making a network request.
             \\
         , .{});
         std.process.exit(2);
@@ -60,6 +82,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var threaded = std.Io.Threaded.init(alloc, .{});
     defer threaded.deinit();
     const io = threaded.io();
+
+    reportPausedModel(io, init.environ, false) catch |failure|
+        std.debug.print("Model Operation recovery check: {s}\n", .{@errorName(failure)});
 
     std.debug.print("type-wave — headless dictation daemon (wayfinder #19)\n\n", .{});
     try daemon.run(io, alloc);
@@ -131,13 +156,15 @@ const HelperSmoke = struct {
     io: std.Io,
     executable: []const u8,
 
-    pub fn run(self: *HelperSmoke, model: []const u8) ![32]u8 {
-        try local_backend.smokeTest(self.allocator, self.io, self.executable, model);
+    pub fn run(self: *HelperSmoke, model: []const u8, cancel: *const model_store.CancelToken) ![32]u8 {
+        if (cancel.isRequested()) return error.ModelOperationCancelled;
+        try local_backend.smokeTest(self.allocator, self.io, self.executable, model, cancel.signalFlag());
+        if (cancel.isRequested()) return error.ModelOperationCancelled;
         return model_store.sha256File(self.io, self.executable);
     }
 };
 
-fn installModel(environ: std.process.Environ) !void {
+fn installModel(environ: std.process.Environ, resume_partial: bool) !void {
     const allocator = std.heap.c_allocator;
     const home = environ.getPosix("HOME") orelse return error.HomeDirectoryUnavailable;
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -178,8 +205,71 @@ fn installModel(environ: std.process.Environ) !void {
         &transport,
         &smoke,
     );
+    operation.observer = .{ .ctx = &operation, .on_event = printModelEvent };
+    g_model_cancel.store(@intFromPtr(operation.cancellationSignal()), .release);
+    defer g_model_cancel.store(0, .release);
+    _ = signal(SIGINT, onModelCancel);
+    _ = signal(SIGTERM, onModelCancel);
 
-    std.debug.print("Model Operation: downloading pinned KB Whisper artifact ({d} bytes)\n", .{model_store.pinned_manifest.size});
-    try operation.install(token);
+    const recovery = try operation.recover();
+    if (recovery.phase == .paused and !resume_partial) {
+        std.debug.print(
+            "Model Operation: paused at {d}/{d} bytes; choose --resume-model or --discard-model.\n",
+            .{ recovery.bytes.completed, recovery.bytes.total },
+        );
+        return error.PartialRequiresExplicitResume;
+    }
+    if (resume_partial) {
+        std.debug.print("Model Operation: explicitly resuming pinned KB Whisper artifact at {d}/{d} bytes\n", .{ recovery.bytes.completed, recovery.bytes.total });
+        try operation.resumePartial(token);
+    } else {
+        std.debug.print("Model Operation: downloading pinned KB Whisper artifact ({d} bytes)\n", .{model_store.pinned_manifest.size});
+        try operation.install(token);
+    }
     std.debug.print("Model Operation: verified, smoke-tested, and activated {s}@{s}\n", .{ model_store.pinned_manifest.repository, model_store.pinned_manifest.revision });
+}
+
+fn printModelEvent(_: *anyopaque, event: model_store.OperationEvent) void {
+    switch (event) {
+        .downloading => |bytes| std.debug.print("Model Operation: downloading {d}/{d} bytes\n", .{ bytes.completed, bytes.total }),
+        .retrying => |retry| std.debug.print(
+            "Model Operation: retry {d}/{d} in {d} ms at {d}/{d} bytes\n",
+            .{ retry.attempt, retry.budget, retry.delay_ms, retry.bytes.completed, retry.bytes.total },
+        ),
+        .verifying => |bytes| std.debug.print("Model Operation: verifying {d}/{d} bytes\n", .{ bytes.completed, bytes.total }),
+        .smoke_testing => std.debug.print("Model Operation: smoke testing\n", .{}),
+        .activating => std.debug.print("Model Operation: activating (cancellation deferred)\n", .{}),
+    }
+}
+
+fn discardModel(environ: std.process.Environ) !void {
+    var threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const home = environ.getPosix("HOME") orelse return error.HomeDirectoryUnavailable;
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try model_store.rootPath(home, &root_buffer);
+    try model_store.discardIncomplete(io, root, model_store.pinned_manifest);
+    std.debug.print("Model Operation: discarded paused work; active Model Installation unchanged.\n", .{});
+}
+
+fn modelStatus(environ: std.process.Environ) !void {
+    var threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
+    defer threaded.deinit();
+    try reportPausedModel(threaded.io(), environ, true);
+}
+
+fn reportPausedModel(io: std.Io, environ: std.process.Environ, show_idle: bool) !void {
+    const home = environ.getPosix("HOME") orelse return error.HomeDirectoryUnavailable;
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try model_store.rootPath(home, &root_buffer);
+    const recovery = try model_store.recoveryState(io, root, model_store.pinned_manifest);
+    if (recovery.phase == .paused) {
+        std.debug.print(
+            "Model Operation: paused at {d}/{d} bytes (no network activity); Resume: --resume-model; Discard: --discard-model.\n",
+            .{ recovery.bytes.completed, recovery.bytes.total },
+        );
+    } else if (show_idle) {
+        std.debug.print("Model Operation: no paused work.\n", .{});
+    }
 }
