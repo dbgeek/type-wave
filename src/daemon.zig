@@ -65,6 +65,7 @@ const keychain = @import("keychain.zig");
 const insertion_adapter = @import("insertion_adapter.zig");
 const readiness = @import("readiness.zig");
 const configuration_phase = @import("configuration_phase.zig");
+const backend = @import("transcription_backend.zig");
 
 const Session = session_mod.Session;
 
@@ -84,8 +85,6 @@ const supervisor_tick_ms: usize = 3_000;
 /// Release-anchored Insertion deadline (grilled for #19): armed when the Coordinator enters
 /// `awaiting_final`, so it bounds both the live wait and a reconnect-spanning wait. Past it
 /// the Utterance is dropped rather than inserting stale text or blocking new Utterances.
-const insert_deadline_ms: i64 = 15_000;
-
 /// Raised by the SIGINT/SIGTERM handler (async-signal-safe store only); the quit watcher
 /// polls it and stops the run loop, and the supervisor + adapter threads poll it to end.
 var g_quit = std.atomic.Value(bool).init(false);
@@ -132,6 +131,14 @@ fn keyName(k: tapmod.TalkKey) []const u8 {
 /// process lifetime (reconnects reuse the same Session), so `available()` latches true.
 const TranscriptionAdapter = struct {
     ptr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    active_id: std.atomic.Value(backend.UtteranceId) = std.atomic.Value(backend.UtteranceId).init(0),
+
+    const commands = backend.Commands{
+        .begin = begin,
+        .append_audio = appendAudio,
+        .release = release,
+        .cancel = cancel,
+    };
 
     fn set(self: *TranscriptionAdapter, sess: *Session) void {
         self.ptr.store(@intFromPtr(sess), .release);
@@ -140,26 +147,52 @@ const TranscriptionAdapter = struct {
         const p = self.ptr.load(.acquire);
         return if (p == 0) null else @ptrFromInt(p);
     }
-    // ---- the Coordinator's seam (pub: called cross-file from the generic Coordinator) ----
+    // ---- the Coordinator's backend-neutral lease seam -----------------------------
     pub fn available(self: *TranscriptionAdapter) bool {
         return self.ptr.load(.acquire) != 0;
     }
-    pub fn prepareUtterance(self: *TranscriptionAdapter) void {
-        if (self.current()) |s| s.prepareUtterance();
+    pub fn acquire(self: *TranscriptionAdapter, id: backend.UtteranceId) ?backend.Lease {
+        const session = self.current() orelse return null;
+        return .{
+            .id = id,
+            .backend = .openai,
+            .language = session.leaseLanguage(),
+            .deadline = backend.openai_deadline,
+            .ctx = self,
+            .commands = &commands,
+        };
     }
-    pub fn finishAudio(self: *TranscriptionAdapter) void {
-        if (self.current()) |s| s.finishAudio();
+    fn from(ctx: *anyopaque) *TranscriptionAdapter {
+        return @ptrCast(@alignCast(ctx));
     }
-    pub fn commitUtterance(self: *TranscriptionAdapter) !void {
-        if (self.current()) |s| return s.commitUtterance();
-        return error.NoTranscriptionSession;
+    fn begin(ctx: *anyopaque, id: backend.UtteranceId, language: backend.Language) !void {
+        const self = from(ctx);
+        const session = self.current() orelse return error.NoTranscriptionSession;
+        try session.beginUtterance(id, language);
+        self.active_id.store(id, .release);
     }
-    pub fn discardAudio(self: *TranscriptionAdapter) void {
-        if (self.current()) |s| s.discardAudio();
+    fn appendAudio(ctx: *anyopaque, id: backend.UtteranceId, pcm: []const u8) !void {
+        const self = from(ctx);
+        const session = self.current() orelse return error.NoTranscriptionSession;
+        try session.appendAudio(id, pcm);
     }
-    // ---- used by the audio sink (Capture → current Session), not the Coordinator ----
-    fn appendAudio(self: *TranscriptionAdapter, pcm: []const u8) void {
-        if (self.current()) |s| s.appendAudio(pcm);
+    fn release(ctx: *anyopaque, id: backend.UtteranceId) !void {
+        const self = from(ctx);
+        const session = self.current() orelse return error.NoTranscriptionSession;
+        try session.releaseUtterance(id);
+    }
+    fn cancel(ctx: *anyopaque, id: backend.UtteranceId) void {
+        const self = from(ctx);
+        if (self.current()) |s| s.cancelUtterance(id);
+    }
+    fn appendCurrent(self: *TranscriptionAdapter, pcm: []const u8) !backend.UtteranceId {
+        const id = self.active_id.load(.acquire);
+        if (id == 0) return error.NoActiveUtterance;
+        try commands.append_audio(self, id, pcm);
+        return id;
+    }
+    fn activeId(self: *TranscriptionAdapter) backend.UtteranceId {
+        return self.active_id.load(.acquire);
     }
 };
 
@@ -171,7 +204,7 @@ const RealInsertionDeps = struct {
     store: *config.Store,
 
     co_ctx: *anyopaque = undefined,
-    on_done: *const fn (*anyopaque, coord.InsertResult) void = undefined,
+    on_done: *const fn (*anyopaque, coord.UtteranceId, coord.InsertResult) void = undefined,
 
     pub fn insertionPlan(self: *RealInsertionDeps) insertmod.Plan {
         const s = self.store.current(); // one snapshot: method + settle stay coherent
@@ -180,8 +213,8 @@ const RealInsertionDeps = struct {
     pub fn insert(self: *RealInsertionDeps, plan: insertmod.Plan, text: [*:0]const u8) insertmod.InsertError!void {
         return self.inserter.insert(plan, text);
     }
-    pub fn complete(self: *RealInsertionDeps, result: coord.InsertResult) void {
-        self.on_done(self.co_ctx, result);
+    pub fn complete(self: *RealInsertionDeps, id: coord.UtteranceId, result: coord.InsertResult) void {
+        self.on_done(self.co_ctx, id, result);
     }
     pub fn finishInsert(self: *RealInsertionDeps) void {
         self.inserter.drainDeferredRestore();
@@ -200,24 +233,29 @@ const InsertionAdapter = insertion_adapter.InsertionAdapter(RealInsertionDeps);
 /// window elapses while still armed — the cmpxchg makes a cancel/arm race lose cleanly, and
 /// the Coordinator ignores a stale `.deadline` anyway (phase guard).
 const DeadlineAdapter = struct {
-    fire_at: std.atomic.Value(i64) = std.atomic.Value(i64).init(0), // 0 = disarmed
+    io: std.Io = undefined,
+    mu: std.Io.Mutex = .init,
+    state: backend.DeadlineState = .{},
 
     co_ctx: *anyopaque = undefined,
-    on_fire: *const fn (*anyopaque) void = undefined,
+    on_fire: *const fn (*anyopaque, backend.UtteranceId) void = undefined,
 
-    pub fn arm(self: *DeadlineAdapter) void {
-        self.fire_at.store(session_mod.nowMs() + insert_deadline_ms, .release);
+    pub fn arm(self: *DeadlineAdapter, id: backend.UtteranceId, policy: backend.DeadlinePolicy) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.state.arm(id, session_mod.nowMs(), policy);
     }
-    pub fn cancel(self: *DeadlineAdapter) void {
-        self.fire_at.store(0, .release);
+    pub fn cancel(self: *DeadlineAdapter, id: backend.UtteranceId) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.state.cancel(id);
     }
     fn timerLoop(self: *DeadlineAdapter) void {
         while (!g_quit.load(.acquire)) {
-            const at = self.fire_at.load(.acquire);
-            if (at != 0 and session_mod.nowMs() >= at) {
-                if (self.fire_at.cmpxchgStrong(at, 0, .acq_rel, .monotonic) == null)
-                    self.on_fire(self.co_ctx);
-            }
+            self.mu.lockUncancelable(self.io);
+            const claimed = self.state.claim(session_mod.nowMs());
+            self.mu.unlock(self.io);
+            if (claimed) |id| self.on_fire(self.co_ctx, id);
             _ = usleep(50_000);
         }
     }
@@ -226,7 +264,7 @@ const DeadlineAdapter = struct {
 // The Coordinator's dependency set, wired to the real adapters above.
 const RealDeps = struct {
     audio: *cap.Capture,
-    transcription: *TranscriptionAdapter,
+    backends: *TranscriptionAdapter,
     insertion: *InsertionAdapter,
     deadline: *DeadlineAdapter,
     feedback: *surface.Surface,
@@ -235,13 +273,13 @@ const Coord = coord.Coordinator(RealDeps);
 
 // Reverse-edge trampolines: the adapters' worker/timer threads carry the Coordinator as an
 // opaque pointer and re-enter it here (its concrete type is known at this wiring site).
-fn insertDoneTramp(ctx: *anyopaque, result: coord.InsertResult) void {
+fn insertDoneTramp(ctx: *anyopaque, id: coord.UtteranceId, result: coord.InsertResult) void {
     const co: *Coord = @ptrCast(@alignCast(ctx));
-    co.handle(.{ .inserted = result });
+    co.handle(.{ .inserted = .{ .id = id, .result = result } });
 }
-fn deadlineFireTramp(ctx: *anyopaque) void {
+fn deadlineFireTramp(ctx: *anyopaque, id: backend.UtteranceId) void {
     const co: *Coord = @ptrCast(@alignCast(ctx));
-    co.handle(.deadline);
+    co.handle(.{ .deadline = id });
 }
 
 /// The whole daemon: the long-lived modules, the real adapters, and the Coordinator they
@@ -286,13 +324,13 @@ const Daemon = struct {
     fn observer(self: *Daemon) session_mod.TranscriptObserver {
         return .{ .ctx = self, .on_final = obsFinal, .on_drop = obsDropped };
     }
-    fn obsFinal(ctx: ?*anyopaque, text: []const u8) void {
+    fn obsFinal(ctx: ?*anyopaque, id: backend.UtteranceId, text: []const u8) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
-        self.coordinator.handle(.{ .final = text });
+        self.coordinator.handle(.{ .final = .{ .id = id, .text = text } });
     }
-    fn obsDropped(ctx: ?*anyopaque) void {
+    fn obsDropped(ctx: ?*anyopaque, id: backend.UtteranceId) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
-        self.coordinator.handle(.transcription_dropped);
+        self.coordinator.handle(.{ .backend_failed = id });
     }
 
     /// Capture chunk sink: forward PCM to the current Session (created lazily by the
@@ -300,7 +338,11 @@ const Daemon = struct {
     /// belt-and-braces for a chunk delivered during teardown.
     fn audioSink(ctx: ?*anyopaque, pcm: []const u8) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
-        self.transcription.appendAudio(pcm);
+        const id = self.transcription.activeId();
+        _ = self.transcription.appendCurrent(pcm) catch {
+            self.coordinator.handle(.{ .backend_failed = id });
+            return;
+        };
     }
 
     /// Capture level sink: one raw RMS per 50 ms buffer, straight to the HUD's queue —
@@ -557,10 +599,11 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
 
     // ---- wire the real adapters, then the Coordinator that drives them ----
     daemon.feedback_surface = .{ .cues = &daemon.cues, .hud = &daemon.hud };
+    daemon.deadline.io = io;
     daemon.insertion = InsertionAdapter.init(.{ .inserter = &daemon.inserter, .store = &daemon.store });
     daemon.coordinator = Coord.init(.{
         .audio = &daemon.capture,
-        .transcription = &daemon.transcription,
+        .backends = &daemon.transcription,
         .insertion = &daemon.insertion,
         .deadline = &daemon.deadline,
         .feedback = &daemon.feedback_surface,

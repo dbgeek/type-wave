@@ -30,6 +30,7 @@
 const std = @import("std");
 const websocket = @import("websocket");
 const feedback = @import("feedback.zig");
+const backend = @import("transcription_backend.zig");
 
 pub const host = "api.openai.com";
 
@@ -63,11 +64,91 @@ const sender_tick_ms: i64 = 5;
 
 /// One outbound record: a Capture chunk (base64-framed by the sender at write time) or
 /// a small control message (the commit / input_audio_buffer.clear JSON).
-const OutKind = enum(u8) { audio, control };
+const OutKind = enum(u8) { audio, control, commit };
 const OutRecord = struct {
     kind: OutKind,
+    utterance_id: backend.UtteranceId,
+    identity_registered: bool,
     len: u16,
     data: [out_payload_cap]u8,
+};
+
+const identity_capacity = 16;
+const item_id_capacity = 128;
+
+const ItemBinding = struct {
+    id: backend.UtteranceId = 0,
+    item_id: [item_id_capacity]u8 = undefined,
+    item_id_len: usize = 0,
+};
+
+const PendingIdentity = struct {
+    id: backend.UtteranceId,
+    cancelled: bool = false,
+};
+
+/// Correlates our commit order with OpenAI's item IDs. Kept as a pure value so the
+/// late-reply behavior is deterministic under test; Session supplies synchronization.
+const IdentityMap = struct {
+    pending: [identity_capacity]PendingIdentity = undefined,
+    pending_head: usize = 0,
+    pending_count: usize = 0,
+    bindings: [identity_capacity]ItemBinding = @splat(.{}),
+
+    fn push(self: *IdentityMap, id: backend.UtteranceId) bool {
+        if (self.pending_count == identity_capacity) return false;
+        const tail = (self.pending_head + self.pending_count) % identity_capacity;
+        self.pending[tail] = .{ .id = id };
+        self.pending_count += 1;
+        return true;
+    }
+
+    fn clear(self: *IdentityMap) void {
+        self.pending_head = 0;
+        self.pending_count = 0;
+        self.bindings = @splat(.{});
+    }
+
+    fn bindNext(self: *IdentityMap, item_id: []const u8) ?backend.UtteranceId {
+        if (self.pending_count == 0 or item_id.len > item_id_capacity) return null;
+        const pending = self.pending[self.pending_head];
+        self.pending_head = (self.pending_head + 1) % identity_capacity;
+        self.pending_count -= 1;
+        if (pending.cancelled) return pending.id;
+        for (&self.bindings) |*binding| {
+            if (binding.id != 0) continue;
+            binding.id = pending.id;
+            binding.item_id_len = item_id.len;
+            @memcpy(binding.item_id[0..item_id.len], item_id);
+            return pending.id;
+        }
+        return null;
+    }
+
+    fn cancel(self: *IdentityMap, id: backend.UtteranceId) void {
+        var offset: usize = 0;
+        while (offset < self.pending_count) : (offset += 1) {
+            const index = (self.pending_head + offset) % identity_capacity;
+            if (self.pending[index].id == id) self.pending[index].cancelled = true;
+        }
+        for (&self.bindings) |*binding| {
+            if (binding.id != id) continue;
+            binding.id = 0;
+            binding.item_id_len = 0;
+        }
+    }
+
+    fn take(self: *IdentityMap, item_id: []const u8) ?backend.UtteranceId {
+        for (&self.bindings) |*binding| {
+            if (binding.id == 0) continue;
+            if (!std.mem.eql(u8, binding.item_id[0..binding.item_id_len], item_id)) continue;
+            const id = binding.id;
+            binding.id = 0;
+            binding.item_id_len = 0;
+            return id;
+        }
+        return null;
+    }
 };
 
 /// A subscriber to the live transcript stream (wayfinder #22). The daemon wires this so
@@ -84,11 +165,11 @@ pub const TranscriptObserver = struct {
     /// (#18) regardless.
     on_partial: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
     /// The completed Final Transcript for the Utterance.
-    on_final: *const fn (ctx: ?*anyopaque, text: []const u8) void,
+    on_final: *const fn (ctx: ?*anyopaque, id: backend.UtteranceId, text: []const u8) void,
     /// The live link dropped before the current Utterance could resolve. The Utterance
     /// Coordinator decides whether this invalidates a Capture in progress, abandons an
     /// awaiting Final Transcript, or is irrelevant to the current phase.
-    on_drop: ?*const fn (ctx: ?*anyopaque) void = null,
+    on_drop: ?*const fn (ctx: ?*anyopaque, id: backend.UtteranceId) void = null,
 };
 
 /// The transcription knobs that vary by config (wayfinder #16), fed to the
@@ -155,6 +236,8 @@ pub const Session = struct {
     /// the current Settings snapshot at every connect (wayfinder #32).
     api_key: []const u8,
     params_provider: ParamsProvider,
+    params_mu: std.Io.Mutex = .init,
+    configured_language: backend.Language = "en",
 
     /// Optional live-transcript subscriber (the overlay HUD, wayfinder #22). Set once at
     /// connect, before the read loop starts, so it is never installed mid-stream. Read
@@ -182,6 +265,10 @@ pub const Session = struct {
     /// reconnects between streams and drops stray AudioQueue buffers outside a captured
     /// span. Utterance invalidation lives in the Coordinator, fed by `observer.on_drop`.
     streaming: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    active_id: std.atomic.Value(backend.UtteranceId) = std.atomic.Value(backend.UtteranceId).init(0),
+
+    identity_mu: std.Io.Mutex = .init,
+    identities: IdentityMap = .{},
 
     /// Session deadline in wall-clock ms (from `session.created`'s `expires_at`, or the
     /// conservative fallback). The maintenance thread cycles the session before it.
@@ -291,6 +378,9 @@ pub const Session = struct {
         self.params_dirty.store(false, .release);
         const params = self.params_provider.get(self.params_provider.ctx);
         self.su_len = (try formatSessionUpdate(&self.su_buf, params)).len;
+        self.params_mu.lockUncancelable(self.io);
+        self.configured_language = params.language;
+        self.params_mu.unlock(self.io);
 
         self.client = try websocket.Client.init(self.io, self.alloc, .{
             .host = host,
@@ -352,7 +442,7 @@ pub const Session = struct {
     }
 
     fn notifyLinkDropped(self: *Session) void {
-        if (self.observer) |o| if (o.on_drop) |f| f(o.ctx);
+        if (self.observer) |o| if (o.on_drop) |f| f(o.ctx, self.active_id.load(.acquire));
     }
 
     // ---- writes (all funnel through write_mu + the link_open guard) --------------
@@ -389,7 +479,15 @@ pub const Session = struct {
     /// Prepare the transport for an accepted Utterance. Call on Talk Key press, before
     /// Capture starts. Lifecycle policy stays in the Coordinator; this method only resets
     /// transcript accumulators and transport queues.
-    pub fn prepareUtterance(self: *Session) void {
+    pub fn leaseLanguage(self: *Session) backend.Language {
+        self.params_mu.lockUncancelable(self.io);
+        defer self.params_mu.unlock(self.io);
+        return self.configured_language;
+    }
+
+    pub fn beginUtterance(self: *Session, id: backend.UtteranceId, language: backend.Language) !void {
+        if (!std.mem.eql(u8, self.leaseLanguage(), language)) return error.LeaseLanguageMismatch;
+        self.active_id.store(id, .release);
         self.partial_len = 0;
         self.t0_ms = nowMs();
         // This Utterance owns the outbound ring afresh: purge undelivered records of an
@@ -409,13 +507,13 @@ pub const Session = struct {
         }
         if (dropped > 0) {
             feedback.log("  (purged {d} undelivered records of the previous Utterance)\n", .{dropped});
-            _ = self.enqueueOut(.control, "{\"type\":\"input_audio_buffer.clear\"}");
+            _ = self.enqueueOut(.control, 0, "{\"type\":\"input_audio_buffer.clear\"}");
         }
         self.streaming.store(true, .release);
     }
 
     /// Stop accepting Capture audio. Call after the queue is stopped, before commit.
-    pub fn finishAudio(self: *Session) void {
+    fn finishAudio(self: *Session) void {
         self.t_release_ms = nowMs();
         self.streaming.store(false, .release);
         // The bracketed offset is ms since press, i.e. the hold itself — the anchor the
@@ -429,7 +527,8 @@ pub const Session = struct {
     /// starve the queue's 3×50 ms of buffers (capture.zig). While the link is not ready
     /// the records simply accumulate, so a press during a reconnect does not lose the
     /// Utterance (wayfinder #17).
-    pub fn appendAudio(self: *Session, pcm: []const u8) void {
+    pub fn appendAudio(self: *Session, id: backend.UtteranceId, pcm: []const u8) !void {
+        if (self.active_id.load(.acquire) != id) return error.MismatchedUtterance;
         if (pcm.len == 0) return; // a 0-byte buffer (delivered during stop) => empty append, which errors
         if (!self.streaming.load(.acquire)) return; // not in a Capture stream — drop it
         // Capture hands ≤2400 B chunks (capture.zig buffer_bytes == out_payload_cap);
@@ -437,7 +536,7 @@ pub const Session = struct {
         var off: usize = 0;
         while (off < pcm.len) {
             const end = @min(off + out_payload_cap, pcm.len);
-            if (!self.enqueueOut(.audio, pcm[off..end])) break; // ring full — truncating (logged once)
+            if (!self.enqueueOut(.audio, id, pcm[off..end])) return error.OutboundRingFull;
             off = end;
         }
     }
@@ -448,15 +547,18 @@ pub const Session = struct {
     /// every queued chunk; if the link is down it waits in the ring and replays on
     /// reconnect (the deferred commit of wayfinder #17). Called on the tap's run-loop
     /// thread — enqueue only, no socket write, so the tap callback never blocks on TLS.
-    pub fn commitUtterance(self: *Session) !void {
-        if (!self.enqueueOut(.control, "{\"type\":\"input_audio_buffer.commit\"}"))
+    pub fn releaseUtterance(self: *Session, id: backend.UtteranceId) !void {
+        if (self.active_id.load(.acquire) != id) return error.MismatchedUtterance;
+        self.finishAudio();
+        if (!self.enqueueOut(.commit, id, "{\"type\":\"input_audio_buffer.commit\"}")) {
             return error.OutboundRingFull;
+        }
     }
 
     /// Discard queued audio/control records for an Utterance the Coordinator has already
     /// abandoned. If records were waiting for reconnect, enqueue a clear so the next
     /// ready session cannot inherit stale audio before a later Utterance starts.
-    pub fn discardAudio(self: *Session) void {
+    fn discardAudio(self: *Session) void {
         var dropped: usize = 0;
         {
             self.out_mu.lockUncancelable(self.io);
@@ -468,8 +570,39 @@ pub const Session = struct {
         }
         if (dropped > 0) {
             feedback.log("  (discarded {d} queued transcription records for the abandoned Utterance)\n", .{dropped});
-            _ = self.enqueueOut(.control, "{\"type\":\"input_audio_buffer.clear\"}");
+            _ = self.enqueueOut(.control, 0, "{\"type\":\"input_audio_buffer.clear\"}");
         }
+    }
+
+    pub fn cancelUtterance(self: *Session, id: backend.UtteranceId) void {
+        if (self.active_id.load(.acquire) != id) return;
+        self.streaming.store(false, .release);
+        self.discardAudio();
+        self.cancelIdentity(id);
+    }
+
+    fn registerIdentity(self: *Session, id: backend.UtteranceId) bool {
+        self.identity_mu.lockUncancelable(self.io);
+        defer self.identity_mu.unlock(self.io);
+        return self.identities.push(id);
+    }
+
+    fn bindNextIdentity(self: *Session, item_id: []const u8) ?backend.UtteranceId {
+        self.identity_mu.lockUncancelable(self.io);
+        defer self.identity_mu.unlock(self.io);
+        return self.identities.bindNext(item_id);
+    }
+
+    fn takeIdentity(self: *Session, item_id: []const u8) ?backend.UtteranceId {
+        self.identity_mu.lockUncancelable(self.io);
+        defer self.identity_mu.unlock(self.io);
+        return self.identities.take(item_id);
+    }
+
+    fn cancelIdentity(self: *Session, id: backend.UtteranceId) void {
+        self.identity_mu.lockUncancelable(self.io);
+        defer self.identity_mu.unlock(self.io);
+        self.identities.cancel(id);
     }
 
     /// Session became READY (session.updated). Publish `.ready` — the sender thread then
@@ -490,7 +623,7 @@ pub const Session = struct {
     /// Queue one outbound record (a memcpy under `out_mu` — no socket IO; safe on the
     /// AudioQueue and tap threads). False when the ring is full; the once-per-Utterance
     /// truncation log lives here so every producer degrades the same way.
-    fn enqueueOut(self: *Session, kind: OutKind, payload: []const u8) bool {
+    fn enqueueOut(self: *Session, kind: OutKind, utterance_id: backend.UtteranceId, payload: []const u8) bool {
         std.debug.assert(payload.len <= out_payload_cap);
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
@@ -503,6 +636,8 @@ pub const Session = struct {
         }
         const slot = &self.out[(self.out_head + self.out_count) % self.out.len];
         slot.kind = kind;
+        slot.utterance_id = utterance_id;
+        slot.identity_registered = false;
         slot.len = @intCast(payload.len);
         @memcpy(slot.data[0..payload.len], payload);
         self.out_count += 1;
@@ -515,6 +650,7 @@ pub const Session = struct {
         defer self.out_mu.unlock(self.io);
         if (self.out_count == 0) return false;
         rec.* = self.out[self.out_head];
+        if (rec.kind == .commit) rec.identity_registered = self.registerIdentity(rec.utterance_id);
         self.out_head = (self.out_head + 1) % self.out.len;
         self.out_count -= 1;
         return true;
@@ -537,6 +673,13 @@ pub const Session = struct {
             switch (rec.kind) {
                 .audio => self.rawAppend(rec.data[0..rec.len]),
                 .control => self.sendControl(rec.data[0..rec.len]) catch {},
+                .commit => {
+                    if (!rec.identity_registered) {
+                        if (self.observer) |o| if (o.on_drop) |f| f(o.ctx, rec.utterance_id);
+                        continue;
+                    }
+                    self.sendControl(rec.data[0..rec.len]) catch {};
+                },
             }
         }
     }
@@ -682,6 +825,9 @@ pub const Session = struct {
             t.join();
             self.read_thread = null;
         }
+        self.identity_mu.lockUncancelable(self.io);
+        self.identities.clear();
+        self.identity_mu.unlock(self.io);
         self.client.deinit();
     }
 
@@ -780,6 +926,8 @@ pub const Handler = struct {
             feedback.log("  [{d:>6}ms] partial: {s}\n", .{ nowMs() - s.t0_ms, s.partial[0..s.partial_len] });
             if (s.observer) |o| if (o.on_partial) |f| f(o.ctx, s.partial[0..s.partial_len]);
         } else if (std.mem.eql(u8, typ, "conversation.item.input_audio_transcription.completed")) {
+            const item_id = getStr(root, "item_id") orelse "";
+            const utterance_id = s.takeIdentity(item_id);
             const t = getStr(root, "transcript") orelse "";
             const n = @min(t.len, s.final.len);
             @memcpy(s.final[0..n], t[0..n]);
@@ -789,19 +937,29 @@ pub const Handler = struct {
             // Deliver the Final Transcript to the observer (the Utterance Coordinator, and
             // through it the overlay HUD). This synchronous push IS the delivery — there is
             // no polled got_final flag any more (architecture review 2026-07-08, candidate 1).
-            if (s.observer) |o| o.on_final(o.ctx, s.final[0..s.final_len]);
+            if (utterance_id) |id| {
+                if (s.observer) |o| o.on_final(o.ctx, id, s.final[0..s.final_len]);
+            } else {
+                feedback.log("  FINAL for unknown OpenAI item {s} — ignored\n", .{item_id});
+            }
         } else if (std.mem.eql(u8, typ, "conversation.item.input_audio_transcription.failed")) {
+            const item_id = getStr(root, "item_id") orelse "";
+            const utterance_id = s.takeIdentity(item_id);
             // Operational failure: drop this Utterance, keep the session (crib sheet §).
             // Deliver an EMPTY Final Transcript so the Coordinator resolves the Utterance
             // immediately (error cue, nothing inserted) instead of waiting out the deadline.
             feedback.log("  transcription FAILED: {s}\n", .{errMessage(root)});
             s.final_len = 0; // nothing to insert
-            if (s.observer) |o| o.on_final(o.ctx, s.final[0..s.final_len]);
+            if (utterance_id) |id| if (s.observer) |o| o.on_final(o.ctx, id, s.final[0..s.final_len]);
         } else if (std.mem.eql(u8, typ, "error")) {
             feedback.log("  ERROR event: {s}\n", .{errMessage(root)});
         } else if (std.mem.eql(u8, typ, "input_audio_buffer.committed")) {
+            const item_id = getStr(root, "item_id") orelse "";
+            const utterance_id = s.bindNextIdentity(item_id);
             const now = nowMs();
             feedback.log("  [{d:>6}ms] committed (+{d}ms after release — awaiting transcript)\n", .{ now - s.t0_ms, now - s.t_release_ms });
+            if (utterance_id == null)
+                feedback.log("  OpenAI commit item {s} had no pending Utterance identity\n", .{item_id});
         }
         // else: item.created / item.added / etc. — ignored.
     }
@@ -864,6 +1022,53 @@ test "formatSessionUpdate omits language entirely for auto-detect (empty string)
     const out = try formatSessionUpdate(&buf, .{ .language = "" });
     try std.testing.expect(std.mem.indexOf(u8, out, "\"language\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"model\":\"gpt-realtime-whisper\",\"delay\":\"low\"") != null);
+}
+
+test "OpenAI item identities keep late and out-of-order Final Transcripts tagged" {
+    var ids = IdentityMap{};
+    try std.testing.expect(ids.push(41));
+    try std.testing.expect(ids.push(42));
+    try std.testing.expectEqual(@as(?backend.UtteranceId, 41), ids.bindNext("item_old"));
+    try std.testing.expectEqual(@as(?backend.UtteranceId, 42), ids.bindNext("item_new"));
+
+    // The newer Final Transcript may arrive first; item_id, not arrival time, owns identity.
+    try std.testing.expectEqual(@as(?backend.UtteranceId, 42), ids.take("item_new"));
+    try std.testing.expectEqual(@as(?backend.UtteranceId, 41), ids.take("item_old"));
+    try std.testing.expectEqual(@as(?backend.UtteranceId, null), ids.take("item_old"));
+    try std.testing.expectEqual(@as(?backend.UtteranceId, null), ids.take("unknown"));
+}
+
+test "connection teardown forgets identities that can no longer reply" {
+    var ids = IdentityMap{};
+    try std.testing.expect(ids.push(7));
+    try std.testing.expectEqual(@as(?backend.UtteranceId, 7), ids.bindNext("item_7"));
+    ids.clear();
+    try std.testing.expectEqual(@as(?backend.UtteranceId, null), ids.take("item_7"));
+    try std.testing.expectEqual(@as(?backend.UtteranceId, null), ids.bindNext("item_8"));
+}
+
+test "cancelled pending identity consumes its commit without binding a late Final Transcript" {
+    var ids = IdentityMap{};
+    try std.testing.expect(ids.push(11));
+    try std.testing.expect(ids.push(12));
+    ids.cancel(11);
+
+    try std.testing.expectEqual(@as(?backend.UtteranceId, 11), ids.bindNext("item_old"));
+    try std.testing.expectEqual(@as(?backend.UtteranceId, 12), ids.bindNext("item_new"));
+    try std.testing.expectEqual(@as(?backend.UtteranceId, null), ids.take("item_old"));
+    try std.testing.expectEqual(@as(?backend.UtteranceId, 12), ids.take("item_new"));
+}
+
+test "cancelled bound identity frees its slot and rejects a late Final Transcript" {
+    var ids = IdentityMap{};
+    try std.testing.expect(ids.push(21));
+    try std.testing.expectEqual(@as(?backend.UtteranceId, 21), ids.bindNext("item_old"));
+    ids.cancel(21);
+    try std.testing.expectEqual(@as(?backend.UtteranceId, null), ids.take("item_old"));
+
+    try std.testing.expect(ids.push(22));
+    try std.testing.expectEqual(@as(?backend.UtteranceId, 22), ids.bindNext("item_new"));
+    try std.testing.expectEqual(@as(?backend.UtteranceId, 22), ids.take("item_new"));
 }
 
 test "formatSessionUpdate emits JSON null when noise reduction is disabled" {

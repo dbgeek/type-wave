@@ -31,6 +31,7 @@ pub fn InsertionAdapter(comptime Deps: type) type {
         /// The single insert job (NUL-terminated for insert.paste's NSString). Written by
         /// `submit` before the `pending` release-store; read by the worker after acquire.
         job: [8193]u8 = undefined,
+        job_id: coord.UtteranceId = 0,
         /// When `submit` handed the job over (≈ the Final Transcript's arrival) — anchors
         /// the final→inserted split in the timing logs (issues #36–#38). Ordered across
         /// threads by the `pending` release-store / acquire-swap, like `job`.
@@ -44,7 +45,8 @@ pub fn InsertionAdapter(comptime Deps: type) type {
         /// Coordinator seam. Runs under the Coordinator's mutex; must not block. The
         /// adapter owns the Insertion invariant that every non-empty Final Transcript
         /// lands with exactly one trailing separator.
-        pub fn submit(self: *Self, text: []const u8) void {
+        pub fn submit(self: *Self, id: coord.UtteranceId, text: []const u8) void {
+            self.job_id = id;
             _ = insertmod.ensureTrailingSpace(&self.job, text);
             self.submitted_at_ms = feedback.nowMs();
             self.pending.store(true, .release);
@@ -73,7 +75,7 @@ pub fn InsertionAdapter(comptime Deps: type) type {
             // pads this worker's time, not the lockout. Serialization is the ordering
             // guard — the restore finishes before this loop can drain the next job, so a
             // following paste never interleaves with a pending restore.
-            self.deps.complete(result);
+            self.deps.complete(self.job_id, result);
             self.deps.finishInsert();
             return true;
         }
@@ -96,6 +98,7 @@ const FakeDeps = struct {
     last_len: usize = 0,
     result: insertmod.InsertError!void = {},
     completions: usize = 0,
+    last_completion_id: coord.UtteranceId = 0,
     last_completion: coord.InsertResult = .ok,
     finishes: usize = 0,
     completions_at_finish: usize = 0,
@@ -115,8 +118,9 @@ const FakeDeps = struct {
         return self.result;
     }
 
-    fn complete(self: *FakeDeps, result: coord.InsertResult) void {
+    fn complete(self: *FakeDeps, id: coord.UtteranceId, result: coord.InsertResult) void {
         self.completions += 1;
+        self.last_completion_id = id;
         self.last_completion = result;
     }
 
@@ -142,17 +146,18 @@ const FakeDeps = struct {
 test "submit copies a Final Transcript and applies the Insertion separator" {
     var adapter = InsertionAdapter(FakeDeps).init(.{});
 
-    adapter.submit("hello");
+    adapter.submit(7, "hello");
     try std.testing.expect(adapter.runOnce());
     try std.testing.expectEqualStrings("hello ", adapter.deps.lastText());
     try std.testing.expectEqual(@as(usize, 1), adapter.deps.completions);
+    try std.testing.expectEqual(@as(coord.UtteranceId, 7), adapter.deps.last_completion_id);
     try std.testing.expectEqual(coord.InsertResult.ok, adapter.deps.last_completion);
 }
 
 test "worker reads the Settings Snapshot at job execution time" {
     var adapter = InsertionAdapter(FakeDeps).init(.{ .plan = .{ .method = .paste } });
 
-    adapter.submit("hello");
+    adapter.submit(7, "hello");
     adapter.deps.plan = .{ .method = .keystroke, .pre_paste_ms = 40 };
 
     try std.testing.expect(adapter.runOnce());
@@ -163,7 +168,7 @@ test "worker reads the Settings Snapshot at job execution time" {
 test "insert failure reports a failed completion" {
     var adapter = InsertionAdapter(FakeDeps).init(.{ .result = error.PostEventDenied });
 
-    adapter.submit("hello");
+    adapter.submit(7, "hello");
     try std.testing.expect(adapter.runOnce());
 
     try std.testing.expectEqual(@as(usize, 1), adapter.deps.calls);
@@ -176,7 +181,7 @@ test "insert failure reports a failed completion" {
 test "completion is reported before the deferred clipboard restore (issue #38)" {
     var adapter = InsertionAdapter(FakeDeps).init(.{});
 
-    adapter.submit("hello");
+    adapter.submit(7, "hello");
     try std.testing.expect(adapter.runOnce());
 
     // The Coordinator must leave `.inserting` before the ~300 ms restore runs, so the

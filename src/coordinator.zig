@@ -31,6 +31,9 @@
 
 const std = @import("std");
 const feedback = @import("feedback.zig");
+const backend = @import("transcription_backend.zig");
+
+pub const UtteranceId = backend.UtteranceId;
 
 /// Outcome the insert worker reports back as the `.inserted` event.
 pub const InsertResult = enum { ok, failed };
@@ -44,10 +47,10 @@ pub const InsertResult = enum { ok, failed };
 pub const Event = union(enum) {
     press,
     release,
-    final: []const u8,
-    transcription_dropped,
-    deadline,
-    inserted: InsertResult,
+    final: struct { id: UtteranceId, text: []const u8 },
+    backend_failed: UtteranceId,
+    deadline: UtteranceId,
+    inserted: struct { id: UtteranceId, result: InsertResult },
 };
 
 const Phase = enum { idle, capturing, awaiting_final, inserting };
@@ -75,7 +78,9 @@ pub fn Coordinator(comptime Deps: type) type {
         deps: Deps,
         mu: Mutex = .{},
         phase: Phase = .idle,
-        invalidated: bool = false,
+        next_id: UtteranceId = 1,
+        active: ?backend.Lease = null,
+        poisoned: bool = false,
 
         pub fn init(deps: Deps) Self {
             return .{ .deps = deps };
@@ -88,10 +93,10 @@ pub fn Coordinator(comptime Deps: type) type {
             switch (ev) {
                 .press => self.onPress(),
                 .release => self.onRelease(),
-                .final => |t| self.onFinal(t),
-                .transcription_dropped => self.onTranscriptionDropped(),
-                .deadline => self.onDeadline(),
-                .inserted => |r| self.onInserted(r),
+                .final => |e| self.onFinal(e.id, e.text),
+                .backend_failed => |id| self.onBackendFailed(id),
+                .deadline => |id| self.onDeadline(id),
+                .inserted => |e| self.onInserted(e.id, e.result),
             }
         }
 
@@ -104,19 +109,25 @@ pub fn Coordinator(comptime Deps: type) type {
                 feedback.log("  Talk Key pressed while the previous Utterance is still resolving — ignored\n", .{});
                 return;
             }
-            // The tap can be live before a Transcription Session exists (Input Monitoring
-            // granted, API key not yet present) — nowhere to stream to.
-            if (!self.deps.transcription.available()) {
-                feedback.log("  Talk Key pressed but no Transcription Session yet (missing API key?) — ignored\n", .{});
+            const id = self.next_id;
+            const lease = self.deps.backends.acquire(id) orelse {
+                feedback.log("  Talk Key pressed but the selected Transcription Backend is not ready — ignored\n", .{});
                 self.deps.feedback.abandoned();
                 return;
-            }
-            self.invalidated = false;
-            self.deps.transcription.prepareUtterance();
+            };
+            self.next_id +%= 1;
+            self.poisoned = false;
+            self.active = lease;
+            lease.begin() catch |e| {
+                feedback.log("  backend begin failed: {s} — Utterance aborted\n", .{@errorName(e)});
+                lease.cancel();
+                self.abandon();
+                return;
+            };
             self.deps.audio.start() catch |e| {
                 feedback.log("  capture.start failed: {s} — Utterance aborted\n", .{@errorName(e)});
-                self.deps.transcription.finishAudio();
-                self.deps.feedback.abandoned();
+                lease.cancel();
+                self.abandon();
                 return; // stays .idle
             };
             self.phase = .capturing;
@@ -127,82 +138,81 @@ pub fn Coordinator(comptime Deps: type) type {
         fn onRelease(self: *Self) void {
             if (self.phase != .capturing) return; // press was rejected / no live hold
 
+            const lease = self.active.?;
+
             self.deps.audio.stop(); // synchronous; final buffers flush + forward during this
-            self.deps.transcription.finishAudio(); // stop forwarding before committing
             self.deps.feedback.released();
 
             // Link dropped mid-Utterance: the head audio already streamed live is gone
             // server-side, so committing the buffered tail would insert a truncated Final
             // Transcript. Abandon cleanly rather than commit a fragment.
-            if (self.invalidated) {
-                feedback.log("  Transcription Session dropped mid-Utterance — discarded; hold the Talk Key and say it again\n", .{});
-                self.deps.transcription.discardAudio();
-                self.deps.feedback.abandoned();
-                self.phase = .idle;
+            if (self.poisoned) {
+                feedback.log("  Transcription Backend failed mid-Utterance — discarded; hold the Talk Key and say it again\n", .{});
+                self.abandon();
                 return;
             }
             if (!self.deps.audio.capturedAudio()) {
                 feedback.log("  Utterance produced no audio — nothing to insert\n", .{});
-                self.deps.feedback.abandoned();
-                self.phase = .idle;
+                lease.cancel();
+                self.abandon();
                 return;
             }
             // Mic-silence detection: TCC denial yields all-zero PCM with no error.
             if (!self.deps.audio.heardSound())
                 feedback.log("  microphone captured only silence — is Microphone permission granted to this process?\n", .{});
 
-            self.deps.transcription.commitUtterance() catch |e| {
-                feedback.log("  commit error: {s}\n", .{@errorName(e)});
-                self.deps.feedback.abandoned();
-                self.phase = .idle;
+            lease.release() catch |e| {
+                feedback.log("  backend release failed: {s}\n", .{@errorName(e)});
+                lease.cancel();
+                self.abandon();
                 return;
             };
             self.phase = .awaiting_final;
-            self.deps.deadline.arm(); // release-anchored deadline; final cancels it
+            self.deps.deadline.arm(lease.id, lease.deadline); // release-anchored; final cancels it
         }
 
-        fn onFinal(self: *Self, text: []const u8) void {
-            if (self.phase != .awaiting_final) return; // stale (abandoned, or not awaiting)
-            self.deps.deadline.cancel();
+        fn onFinal(self: *Self, id: UtteranceId, text: []const u8) void {
+            if (!self.matches(id, .awaiting_final)) return;
+            self.deps.deadline.cancel(id);
             if (text.len == 0) {
                 // Empty/failed transcript (mic silence, transcription.failed, …).
                 feedback.log("  empty Final Transcript — nothing to insert\n", .{});
-                self.deps.feedback.abandoned();
-                self.phase = .idle;
+                self.abandon();
                 return;
             }
             // No feedback edge here: the processing dots have been up since `released`
             // and hold until `.inserted` resolves (wayfinder #26/#27).
-            self.deps.insertion.submit(text); // copies text; worker inserts, then .inserted
+            self.deps.insertion.submit(id, text); // copies text; worker inserts, then .inserted
             self.phase = .inserting; // blocking: next hold waits (ADR-0001)
         }
 
-        fn onDeadline(self: *Self) void {
-            if (self.phase != .awaiting_final) return; // final already arrived / not awaiting
+        fn onDeadline(self: *Self, id: UtteranceId) void {
+            if (!self.matches(id, .awaiting_final)) return;
             feedback.log("  no Final Transcript within the deadline — nothing inserted\n", .{});
-            self.deps.feedback.abandoned();
-            self.phase = .idle;
+            self.active.?.cancel();
+            self.abandon();
         }
 
-        fn onTranscriptionDropped(self: *Self) void {
+        fn onBackendFailed(self: *Self, id: UtteranceId) void {
+            if (self.active == null or self.active.?.id != id) return;
             switch (self.phase) {
                 .capturing => {
-                    self.invalidated = true;
-                    feedback.log("  Transcription Session dropped mid-Utterance — will discard this Utterance on release\n", .{});
+                    self.poisoned = true;
+                    self.active.?.cancel();
+                    feedback.log("  Transcription Backend failed mid-Utterance — will discard this Utterance on release\n", .{});
                 },
                 .awaiting_final => {
-                    self.deps.deadline.cancel();
-                    feedback.log("  Transcription Session dropped before a Final Transcript arrived — nothing inserted\n", .{});
-                    self.deps.transcription.discardAudio();
-                    self.deps.feedback.abandoned();
-                    self.phase = .idle;
+                    self.deps.deadline.cancel(id);
+                    self.active.?.cancel();
+                    feedback.log("  Transcription Backend failed before a Final Transcript arrived — nothing inserted\n", .{});
+                    self.abandon();
                 },
                 .idle, .inserting => {},
             }
         }
 
-        fn onInserted(self: *Self, r: InsertResult) void {
-            if (self.phase != .inserting) return; // defensive: only the active insert resolves
+        fn onInserted(self: *Self, id: UtteranceId, r: InsertResult) void {
+            if (!self.matches(id, .inserting)) return;
             switch (r) {
                 .ok => self.deps.feedback.inserted(),
                 .failed => {
@@ -210,6 +220,17 @@ pub fn Coordinator(comptime Deps: type) type {
                     self.deps.feedback.abandoned();
                 },
             }
+            self.active = null;
+            self.phase = .idle;
+        }
+
+        fn matches(self: *Self, id: UtteranceId, phase: Phase) bool {
+            return self.phase == phase and self.active != null and self.active.?.id == id;
+        }
+
+        fn abandon(self: *Self) void {
+            self.deps.feedback.abandoned();
+            self.active = null;
             self.phase = .idle;
         }
     };
@@ -240,37 +261,72 @@ const FakeAudio = struct {
     }
 };
 
-const FakeTranscription = struct {
+const FakeBackends = struct {
     avail: bool = true,
-    commit_result: anyerror!void = {},
+    begin_result: anyerror!void = {},
+    release_result: anyerror!void = {},
+    backend_kind: backend.Backend = .openai,
+    language: []const u8 = "en",
+    policy: backend.DeadlinePolicy = backend.openai_deadline,
     began: usize = 0,
-    ended: usize = 0,
-    committed: usize = 0,
-    discarded: usize = 0,
-    fn available(self: *FakeTranscription) bool {
-        return self.avail;
+    appended: usize = 0,
+    released: usize = 0,
+    cancelled: usize = 0,
+    last_id: UtteranceId = 0,
+
+    const commands = backend.Commands{
+        .begin = begin,
+        .append_audio = appendAudio,
+        .release = release,
+        .cancel = cancel,
+    };
+
+    fn acquire(self: *FakeBackends, id: UtteranceId) ?backend.Lease {
+        if (!self.avail) return null;
+        return .{
+            .id = id,
+            .backend = self.backend_kind,
+            .language = self.language,
+            .deadline = self.policy,
+            .ctx = self,
+            .commands = &commands,
+        };
     }
-    fn prepareUtterance(self: *FakeTranscription) void {
+    fn from(ctx: *anyopaque) *FakeBackends {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn begin(ctx: *anyopaque, id: UtteranceId, _: backend.Language) !void {
+        const self = from(ctx);
         self.began += 1;
+        self.last_id = id;
+        return self.begin_result;
     }
-    fn finishAudio(self: *FakeTranscription) void {
-        self.ended += 1;
+    fn appendAudio(ctx: *anyopaque, id: UtteranceId, _: []const u8) !void {
+        const self = from(ctx);
+        self.appended += 1;
+        self.last_id = id;
     }
-    fn commitUtterance(self: *FakeTranscription) anyerror!void {
-        self.committed += 1;
-        return self.commit_result;
+    fn release(ctx: *anyopaque, id: UtteranceId) !void {
+        const self = from(ctx);
+        self.released += 1;
+        self.last_id = id;
+        return self.release_result;
     }
-    fn discardAudio(self: *FakeTranscription) void {
-        self.discarded += 1;
+    fn cancel(ctx: *anyopaque, id: UtteranceId) void {
+        const self = from(ctx);
+        self.cancelled += 1;
+        self.last_id = id;
     }
 };
 
 const FakeInsertion = struct {
     submits: usize = 0,
+    last_id: UtteranceId = 0,
     last: [256]u8 = undefined,
     last_len: usize = 0,
-    fn submit(self: *FakeInsertion, text: []const u8) void {
+    fn submit(self: *FakeInsertion, id: UtteranceId, text: []const u8) void {
         self.submits += 1;
+        self.last_id = id;
         @memcpy(self.last[0..text.len], text);
         self.last_len = text.len;
     }
@@ -282,11 +338,16 @@ const FakeInsertion = struct {
 const FakeDeadline = struct {
     arms: usize = 0,
     cancels: usize = 0,
-    fn arm(self: *FakeDeadline) void {
+    last_id: UtteranceId = 0,
+    last_policy: backend.DeadlinePolicy = .{ .final_ms = 0 },
+    fn arm(self: *FakeDeadline, id: UtteranceId, policy: backend.DeadlinePolicy) void {
         self.arms += 1;
+        self.last_id = id;
+        self.last_policy = policy;
     }
-    fn cancel(self: *FakeDeadline) void {
+    fn cancel(self: *FakeDeadline, id: UtteranceId) void {
         self.cancels += 1;
+        self.last_id = id;
     }
 };
 
@@ -311,7 +372,7 @@ const FakeFeedback = struct {
 
 const TestDeps = struct {
     audio: *FakeAudio,
-    transcription: *FakeTranscription,
+    backends: *FakeBackends,
     insertion: *FakeInsertion,
     deadline: *FakeDeadline,
     feedback: *FakeFeedback,
@@ -319,7 +380,7 @@ const TestDeps = struct {
 
 const Harness = struct {
     audio: FakeAudio = .{},
-    transcription: FakeTranscription = .{},
+    backends: FakeBackends = .{},
     insertion: FakeInsertion = .{},
     deadline: FakeDeadline = .{},
     feedback: FakeFeedback = .{},
@@ -328,7 +389,7 @@ const Harness = struct {
     fn wire(self: *Harness) *Coordinator(TestDeps) {
         self.co = Coordinator(TestDeps).init(.{
             .audio = &self.audio,
-            .transcription = &self.transcription,
+            .backends = &self.backends,
             .insertion = &self.insertion,
             .deadline = &self.deadline,
             .feedback = &self.feedback,
@@ -345,24 +406,25 @@ test "1 happy path: press → release → final → inserted(ok)" {
     var h = Harness{};
     const co = h.wire();
     co.handle(.press);
-    try expect(h.transcription.began == 1);
+    try expect(h.backends.began == 1);
     try expect(h.audio.started == 1);
     try expect(h.feedback.listenings == 1);
     co.handle(.release);
     try expect(h.audio.stopped == 1);
-    try expect(h.transcription.ended == 1);
-    try expect(h.transcription.committed == 1);
+    try expect(h.backends.released == 1);
     try expect(h.deadline.arms == 1);
-    co.handle(.{ .final = "hello world" });
+    try expectEqual(@as(UtteranceId, 1), h.deadline.last_id);
+    co.handle(.{ .final = .{ .id = 1, .text = "hello world" } });
     try expect(h.deadline.cancels == 1);
     try expect(h.insertion.submits == 1);
     try expectEqualStrings("hello world", h.insertion.lastText());
-    co.handle(.{ .inserted = .ok });
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
     try expect(h.feedback.inserteds == 1);
     try expect(h.feedback.abandoneds == 0);
     // Fully resolved — a fresh press is accepted again.
     co.handle(.press);
-    try expect(h.transcription.began == 2);
+    try expect(h.backends.began == 2);
+    try expectEqual(@as(UtteranceId, 2), h.backends.last_id);
 }
 
 test "2 press while non-idle is dropped" {
@@ -370,17 +432,17 @@ test "2 press while non-idle is dropped" {
     const co = h.wire();
     co.handle(.press); // → capturing
     co.handle(.press); // dropped
-    try expect(h.transcription.began == 1);
+    try expect(h.backends.began == 1);
     try expect(h.audio.started == 1);
     try expect(h.feedback.listenings == 1);
 }
 
-test "3 press with no Transcription Session" {
+test "3 press with no ready Transcription Backend lease" {
     var h = Harness{};
-    h.transcription.avail = false;
+    h.backends.avail = false;
     const co = h.wire();
     co.handle(.press);
-    try expect(h.transcription.began == 0);
+    try expect(h.backends.began == 0);
     try expect(h.audio.started == 0);
     try expect(h.feedback.abandoneds == 1);
     try expect(h.feedback.listenings == 0);
@@ -391,7 +453,7 @@ test "4 release without an accepted press is a no-op" {
     const co = h.wire();
     co.handle(.release);
     try expect(h.audio.stopped == 0);
-    try expect(h.transcription.committed == 0);
+    try expect(h.backends.released == 0);
     try expect(h.feedback.releaseds == 0);
 }
 
@@ -400,24 +462,24 @@ test "5 capture.start failure aborts the Utterance" {
     h.audio.start_result = error.AudioQueueStart;
     const co = h.wire();
     co.handle(.press);
-    try expect(h.transcription.began == 1);
-    try expect(h.transcription.ended == 1); // rolled back
+    try expect(h.backends.began == 1);
+    try expect(h.backends.cancelled == 1); // rolled back
     try expect(h.feedback.abandoneds == 1);
     try expect(h.feedback.listenings == 0);
     // stayed idle — a new press is accepted
     h.audio.start_result = {};
     co.handle(.press);
-    try expect(h.transcription.began == 2);
+    try expect(h.backends.began == 2);
 }
 
-test "6 link drop while capturing abandons on release without committing" {
+test "6 backend failure while capturing abandons on release without releasing backend" {
     var h = Harness{};
     const co = h.wire();
     co.handle(.press);
-    co.handle(.transcription_dropped);
+    co.handle(.{ .backend_failed = 1 });
     co.handle(.release);
-    try expect(h.transcription.committed == 0);
-    try expect(h.transcription.discarded == 1);
+    try expect(h.backends.released == 0);
+    try expect(h.backends.cancelled == 1);
     try expect(h.deadline.arms == 0);
     try expect(h.feedback.abandoneds == 1);
 }
@@ -428,7 +490,7 @@ test "7 silence still commits, just warns" {
     const co = h.wire();
     co.handle(.press);
     co.handle(.release);
-    try expect(h.transcription.committed == 1);
+    try expect(h.backends.released == 1);
     try expect(h.deadline.arms == 1);
     try expect(h.feedback.abandoneds == 0);
 }
@@ -439,13 +501,14 @@ test "8 no audio committed → abandon at release" {
     const co = h.wire();
     co.handle(.press);
     co.handle(.release);
-    try expect(h.transcription.committed == 0);
+    try expect(h.backends.released == 0);
+    try expect(h.backends.cancelled == 1);
     try expect(h.deadline.arms == 0);
     try expect(h.feedback.abandoneds == 1);
     // resolved to idle
     h.audio.captured = true;
     co.handle(.press);
-    try expect(h.transcription.began == 2);
+    try expect(h.backends.began == 2);
 }
 
 test "9 deadline before final abandons" {
@@ -453,26 +516,26 @@ test "9 deadline before final abandons" {
     const co = h.wire();
     co.handle(.press);
     co.handle(.release); // → awaiting_final
-    co.handle(.deadline);
+    co.handle(.{ .deadline = 1 });
     try expect(h.feedback.abandoneds == 1);
     try expect(h.insertion.submits == 0);
     // a stale final afterwards is ignored
-    co.handle(.{ .final = "too late" });
+    co.handle(.{ .final = .{ .id = 1, .text = "too late" } });
     try expect(h.insertion.submits == 0);
 }
 
-test "9b link drop while awaiting final abandons immediately" {
+test "9b backend failure while awaiting final abandons immediately" {
     var h = Harness{};
     const co = h.wire();
     co.handle(.press);
     co.handle(.release); // -> awaiting_final
-    co.handle(.transcription_dropped);
+    co.handle(.{ .backend_failed = 1 });
     try expect(h.deadline.cancels == 1);
-    try expect(h.transcription.discarded == 1);
+    try expect(h.backends.cancelled == 1);
     try expect(h.feedback.abandoneds == 1);
     try expect(h.insertion.submits == 0);
     // a stale final afterwards is ignored
-    co.handle(.{ .final = "too late" });
+    co.handle(.{ .final = .{ .id = 1, .text = "too late" } });
     try expect(h.insertion.submits == 0);
 }
 
@@ -481,7 +544,7 @@ test "10 empty/failed final inserts nothing" {
     const co = h.wire();
     co.handle(.press);
     co.handle(.release);
-    co.handle(.{ .final = "" });
+    co.handle(.{ .final = .{ .id = 1, .text = "" } });
     try expect(h.deadline.cancels == 1);
     try expect(h.insertion.submits == 0);
     try expect(h.feedback.abandoneds == 1);
@@ -491,11 +554,11 @@ test "11 stale final outside awaiting is ignored" {
     var h = Harness{};
     const co = h.wire();
     // final with no Utterance in flight
-    co.handle(.{ .final = "ghost" });
+    co.handle(.{ .final = .{ .id = 99, .text = "ghost" } });
     try expect(h.insertion.submits == 0);
     // final while still capturing (before release) is also ignored
     co.handle(.press);
-    co.handle(.{ .final = "early" });
+    co.handle(.{ .final = .{ .id = 1, .text = "early" } });
     try expect(h.insertion.submits == 0);
 }
 
@@ -504,14 +567,14 @@ test "12 insert failure sounds the error path" {
     const co = h.wire();
     co.handle(.press);
     co.handle(.release);
-    co.handle(.{ .final = "text" });
+    co.handle(.{ .final = .{ .id = 1, .text = "text" } });
     try expect(h.insertion.submits == 1);
-    co.handle(.{ .inserted = .failed });
+    co.handle(.{ .inserted = .{ .id = 1, .result = .failed } });
     try expect(h.feedback.inserteds == 0);
     try expect(h.feedback.abandoneds == 1);
     // resolved to idle regardless of insert outcome
     co.handle(.press);
-    try expect(h.transcription.began == 2);
+    try expect(h.backends.began == 2);
 }
 
 test "13 press during .inserting is dropped (ADR-0001)" {
@@ -519,12 +582,91 @@ test "13 press during .inserting is dropped (ADR-0001)" {
     const co = h.wire();
     co.handle(.press);
     co.handle(.release);
-    co.handle(.{ .final = "landing" }); // → inserting
+    co.handle(.{ .final = .{ .id = 1, .text = "landing" } }); // → inserting
     co.handle(.press); // must be dropped — one Utterance resolves fully first
-    try expect(h.transcription.began == 1);
+    try expect(h.backends.began == 1);
     try expect(h.audio.started == 1);
     // once the paste reports done, the next hold is accepted
-    co.handle(.{ .inserted = .ok });
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
     co.handle(.press);
-    try expect(h.transcription.began == 2);
+    try expect(h.backends.began == 2);
+}
+
+test "14 accepted Utterance pins unique identity backend language and deadline policy" {
+    var h = Harness{};
+    h.backends.backend_kind = .openai;
+    h.backends.language = "sv";
+    h.backends.policy = .{ .final_ms = 12_345 };
+    const co = h.wire();
+
+    co.handle(.press);
+    try expectEqual(@as(UtteranceId, 1), h.backends.last_id);
+    try expectEqual(backend.Backend.openai, co.active.?.backend);
+    try expectEqualStrings("sv", co.active.?.language);
+    h.backends.language = "en";
+    h.backends.policy = .{ .final_ms = 99 };
+    co.handle(.release);
+
+    try expectEqualStrings("sv", co.active.?.language);
+    try expectEqual(@as(UtteranceId, 1), h.deadline.last_id);
+    try expectEqual(@as(u32, 12_345), h.deadline.last_policy.final_ms);
+    co.handle(.{ .deadline = 1 });
+    co.handle(.press);
+    try expectEqual(@as(UtteranceId, 2), h.backends.last_id);
+}
+
+test "15 mismatched duplicate late and phase-invalid events cannot advance an Utterance" {
+    var h = Harness{};
+    const co = h.wire();
+
+    co.handle(.press); // id 1, capturing
+    co.handle(.{ .final = .{ .id = 1, .text = "too early" } });
+    co.handle(.{ .backend_failed = 99 });
+    co.handle(.{ .deadline = 1 });
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
+    try expectEqual(@as(usize, 0), h.insertion.submits);
+    try expectEqual(@as(usize, 0), h.feedback.abandoneds);
+
+    co.handle(.release); // id 1, awaiting_final
+    co.handle(.{ .final = .{ .id = 99, .text = "wrong Utterance" } });
+    co.handle(.{ .deadline = 99 });
+    try expectEqual(@as(usize, 0), h.insertion.submits);
+    co.handle(.{ .final = .{ .id = 1, .text = "right Utterance" } });
+    try expectEqual(@as(usize, 1), h.insertion.submits);
+    try expectEqual(@as(UtteranceId, 1), h.insertion.last_id);
+
+    co.handle(.{ .final = .{ .id = 1, .text = "duplicate" } });
+    co.handle(.{ .deadline = 1 });
+    co.handle(.{ .inserted = .{ .id = 99, .result = .ok } });
+    try expectEqual(@as(usize, 1), h.insertion.submits);
+    try expectEqual(@as(usize, 0), h.feedback.inserteds);
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
+    try expectEqual(@as(usize, 1), h.feedback.inserteds);
+
+    co.handle(.press); // id 2
+    co.handle(.{ .final = .{ .id = 1, .text = "late" } });
+    co.handle(.{ .backend_failed = 1 });
+    try expectEqual(@as(usize, 1), h.insertion.submits);
+    try expectEqual(@as(usize, 0), h.backends.cancelled);
+}
+
+test "16 begin and release failures abandon without leaving the Coordinator busy" {
+    var h = Harness{};
+    h.backends.begin_result = error.BeginFailed;
+    const co = h.wire();
+    co.handle(.press);
+    try expectEqual(@as(usize, 1), h.feedback.abandoneds);
+    try expectEqual(@as(usize, 1), h.backends.cancelled);
+
+    h.backends.begin_result = {};
+    h.backends.release_result = error.ReleaseFailed;
+    co.handle(.press);
+    co.handle(.release);
+    try expectEqual(@as(usize, 2), h.feedback.abandoneds);
+    try expectEqual(@as(usize, 2), h.backends.cancelled);
+
+    h.backends.release_result = {};
+    co.handle(.press);
+    try expectEqual(@as(usize, 3), h.backends.began);
 }

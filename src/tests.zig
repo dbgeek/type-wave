@@ -6,6 +6,7 @@
 
 test {
     _ = @import("coordinator.zig");
+    _ = @import("transcription_backend.zig");
     _ = @import("config.zig");
     _ = @import("session.zig");
     _ = @import("hud.zig");
