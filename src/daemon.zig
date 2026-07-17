@@ -86,7 +86,9 @@ const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
 const SIGHUP: c_int = 1;
 var g_model_operation_pid = std.atomic.Value(c_int).init(0);
-var g_model_operation_action = std.atomic.Value(u8).init(@intFromEnum(menu_mod.ModelAction.install));
+var g_model_operation_phase = std.atomic.Value(u8).init(@intFromEnum(status_item.Operation.idle));
+var g_model_operation_completed = std.atomic.Value(u64).init(0);
+var g_model_operation_total = std.atomic.Value(u64).init(0);
 
 // ---- tuning ----------------------------------------------------------------
 /// Self-heal poll cadence. Fast enough that granting a permission / dropping in the key
@@ -763,6 +765,7 @@ const Daemon = struct {
             .selected_backend = selected,
             .key_present = key_present_now or self.transcription.current() != null,
             .local_installation_present = local_installation,
+            .microphone_granted = cap.microphoneGranted(),
             .backend_present = resource_present,
             .input_monitoring_granted = im,
             .post_event_granted = pe,
@@ -792,31 +795,37 @@ const Daemon = struct {
         ));
         var installation: status_item.Installation = .absent;
         var operation: status_item.Operation = .idle;
+        var operation_bytes: ?status_item.ByteProgress = null;
+        var installation_identity: ?status_item.InstallationIdentity = null;
         if (std.c.getenv("HOME")) |raw_home| {
             var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
             if (model_store.rootPath(std.mem.span(raw_home), &root_buffer)) |root| {
-                if (model_store.activeArtifact(self.io, root) catch null != null) {
+                if (model_store.activeArtifact(self.io, root) catch null) |identity| {
+                    installation_identity = .{ .size = identity.size, .sha256 = identity.sha256 };
                     installation = if (model_store.updateAvailable(self.io, root, model_store.pinned_manifest) catch false)
                         .update_available
                     else
                         .ready;
                 }
                 const recovery = model_store.recoveryState(self.io, root, model_store.pinned_manifest) catch null;
-                if (recovery) |state| operation = switch (state.phase) {
-                    .idle => .idle,
-                    .downloading => switch (std.enums.fromInt(menu_mod.ModelAction, g_model_operation_action.load(.acquire)) orelse .install) {
-                        .update => .updating,
-                        .verify => .verifying,
-                        .remove => .removing,
-                        else => .installing,
-                    },
-                    .paused => .paused,
-                    .verifying => .verifying,
-                    .smoke_testing => .smoke_testing,
-                    .activating => .activating,
-                    .removing => .removing,
-                    .failed => .failed,
-                };
+                if (recovery) |state| {
+                    if (state.phase == .downloading or state.phase == .paused)
+                        operation_bytes = .{ .completed = state.bytes.completed, .total = state.bytes.total };
+                    operation = switch (state.phase) {
+                        .idle => .idle,
+                        .downloading => std.enums.fromInt(status_item.Operation, g_model_operation_phase.load(.acquire)) orelse .installing,
+                        .paused => .paused,
+                        .verifying => .verifying,
+                        .smoke_testing => .smoke_testing,
+                        .activating => .activating,
+                        .removing => .removing,
+                        .failed => .failed,
+                    };
+                    if (state.phase == .downloading) {
+                        const total = g_model_operation_total.load(.acquire);
+                        if (total != 0) operation_bytes = .{ .completed = g_model_operation_completed.load(.acquire), .total = total };
+                    }
+                }
             } else |_| {}
         }
         const recovery_state = self.local_model_recovery.current();
@@ -824,9 +833,11 @@ const Daemon = struct {
         return .{
             .selected_backend = self.store.current().transcription_backend,
             .health = h,
-            .terminal_backend_failure = recovery_state == .runtime_failure,
+            .terminal_backend_failure = self.store.current().transcription_backend == .local_kb_whisper and recovery_state == .runtime_failure,
             .installation = installation,
             .operation = operation,
+            .operation_bytes = operation_bytes,
+            .installation_identity = installation_identity,
         };
     }
 
@@ -897,6 +908,18 @@ const Daemon = struct {
                 if (pid != 0) _ = kill(pid, SIGTERM);
                 return;
             },
+            .diagnostics => {
+                const raw_home = std.c.getenv("HOME") orelse return;
+                var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const path = std.fmt.bufPrint(&path_buffer, "{s}/Library/Logs/type-wave.log", .{std.mem.span(raw_home)}) catch return;
+                var child = std.process.spawn(self.io, .{ .argv = &.{ "/usr/bin/open", path }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return;
+                const waiter = std.Thread.spawn(.{}, waitForDetached, .{ self.io, child }) catch {
+                    child.kill(self.io);
+                    return;
+                };
+                waiter.detach();
+                return;
+            },
             else => {},
         }
         if (g_model_operation_pid.load(.acquire) != 0) return;
@@ -906,26 +929,46 @@ const Daemon = struct {
             .resume_operation => "--resume-model",
             .discard => "--discard-model",
             .verify => "--verify-model",
-            .repair => "--repair-model-confirmed",
-            .remove => "--remove-model-confirmed",
+            .repair => "--repair-model",
+            .remove => "--remove-model",
             .forget_hugging_face_token => "--forget-hf-token",
-            .retry_runtime, .cancel_operation => unreachable,
+            .retry_runtime, .cancel_operation, .diagnostics => unreachable,
         };
         var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
         var executable_size: u32 = executable_buffer.len;
         if (_NSGetExecutablePath(&executable_buffer, &executable_size) != 0) return;
         const executable = std.mem.sliceTo(executable_buffer[0..executable_size], 0);
+        const confirmation: ?[]const u8 = switch (action) {
+            .repair => "yes\n",
+            .remove => "remove\n",
+            else => null,
+        };
         var child = std.process.spawn(self.io, .{
             .argv = &.{ executable, argument },
-            .stdin = .ignore,
+            .stdin = if (confirmation != null) .pipe else .ignore,
             .stdout = .inherit,
-            .stderr = .inherit,
+            .stderr = .pipe,
         }) catch |failure| {
             feedback.log("  menu: could not start Model Operation: {s}\n", .{@errorName(failure)});
             return;
         };
+        if (confirmation) |answer| {
+            child.stdin.?.writeStreamingAll(self.io, answer) catch {
+                child.kill(self.io);
+                return;
+            };
+            child.stdin.?.close(self.io);
+            child.stdin = null;
+        }
         const pid: c_int = @intCast(child.id.?);
-        g_model_operation_action.store(@intFromEnum(action), .release);
+        g_model_operation_phase.store(@intFromEnum(switch (action) {
+            .update => status_item.Operation.updating,
+            .verify => .verifying,
+            .remove => .removing,
+            else => .installing,
+        }), .release);
+        g_model_operation_completed.store(0, .release);
+        g_model_operation_total.store(model_store.pinned_manifest.size, .release);
         g_model_operation_pid.store(pid, .release);
         const waiter = std.Thread.spawn(.{}, waitForModelAction, .{ self.io, child, action }) catch {
             child.kill(self.io);
@@ -937,12 +980,42 @@ const Daemon = struct {
 
     fn waitForModelAction(io: std.Io, child_value: std.process.Child, action: menu_mod.ModelAction) void {
         var child = child_value;
+        var read_buffer: [2048]u8 = undefined;
+        var stderr_reader = child.stderr.?.readerStreaming(io, &read_buffer);
+        while (stderr_reader.interface.takeDelimiter('\n') catch null) |line| {
+            observeModelProgress(line);
+            feedback.log("  model: {s}\n", .{line});
+        }
         const term = child.wait(io) catch {
             g_model_operation_pid.store(0, .release);
             return;
         };
         g_model_operation_pid.store(0, .release);
         feedback.log("  menu: Model Operation {s} {s}\n", .{ @tagName(action), if (term.success()) "finished" else "failed" });
+    }
+
+    fn observeModelProgress(line: []const u8) void {
+        const prefix = "Model Operation: ";
+        const detail = if (std.mem.indexOf(u8, line, prefix)) |at| line[at + prefix.len ..] else return;
+        if (std.mem.startsWith(u8, detail, "verifying ")) g_model_operation_phase.store(@intFromEnum(status_item.Operation.verifying), .release);
+        if (std.mem.startsWith(u8, detail, "smoke testing")) g_model_operation_phase.store(@intFromEnum(status_item.Operation.smoke_testing), .release);
+        if (std.mem.startsWith(u8, detail, "waiting for active local inference")) g_model_operation_phase.store(@intFromEnum(status_item.Operation.waiting_for_inference), .release);
+        if (std.mem.startsWith(u8, detail, "activating")) g_model_operation_phase.store(@intFromEnum(status_item.Operation.activating), .release);
+        if (std.mem.startsWith(u8, detail, "removing")) g_model_operation_phase.store(@intFromEnum(status_item.Operation.removing), .release);
+        const slash = std.mem.indexOfScalar(u8, detail, '/') orelse return;
+        var begin = slash;
+        while (begin > 0 and std.ascii.isDigit(detail[begin - 1])) begin -= 1;
+        var end = slash + 1;
+        while (end < detail.len and std.ascii.isDigit(detail[end])) end += 1;
+        const completed = std.fmt.parseInt(u64, detail[begin..slash], 10) catch return;
+        const total = std.fmt.parseInt(u64, detail[slash + 1 .. end], 10) catch return;
+        g_model_operation_completed.store(completed, .release);
+        g_model_operation_total.store(total, .release);
+    }
+
+    fn waitForDetached(io: std.Io, child_value: std.process.Child) void {
+        var child = child_value;
+        _ = child.wait(io) catch {};
     }
 
     /// Menu Quit: signal every thread, then unwind [NSApp run] — daemon.run's normal
@@ -1028,10 +1101,12 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     //      once Input Monitoring appears. Only a null port is a genuine hard failure. ----
     const listen_ok = tapmod.Tap.requestListenAccess();
     const post_ok = insertmod.requestPostEventAccess();
+    cap.requestMicrophoneAccess();
+    const microphone_ok = cap.microphoneGranted();
     feedback.log("TCC grants for the type-wave daemon:\n", .{});
     feedback.log("  Input Monitoring (Talk Key tap): {s}\n", .{if (listen_ok) "granted" else "NOT granted — waiting"});
     feedback.log("  PostEvent        (Insertion):    {s}\n", .{if (post_ok) "granted" else "NOT granted — waiting"});
-    // (Microphone is prompted lazily on the first Capture start.)
+    feedback.log("  Microphone       (Capture):      {s}\n", .{if (microphone_ok) "granted" else "NOT granted — enable in System Settings"});
 
     daemon.tap = .{ .cbs = .{
         .ctx = &daemon,

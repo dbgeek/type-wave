@@ -70,6 +70,50 @@ extern "c" fn AudioQueueStart(inAQ: AudioQueueRef, inStartTime: ?*const AudioTim
 extern "c" fn AudioQueueStop(inAQ: AudioQueueRef, inImmediate: u8) OSStatus;
 extern "c" fn AudioQueueDispose(inAQ: AudioQueueRef, inImmediate: u8) OSStatus;
 
+const ObjcId = ?*anyopaque;
+const ObjcSel = ?*anyopaque;
+extern "c" fn objc_getClass(name: [*:0]const u8) ObjcId;
+extern "c" fn sel_registerName(name: [*:0]const u8) ObjcSel;
+extern "c" fn objc_msgSend() void;
+extern var AVMediaTypeAudio: ObjcId;
+extern var _NSConcreteStackBlock: anyopaque;
+
+const BlockDescriptor = extern struct { reserved: usize = 0, size: usize };
+const PermissionBlock = extern struct {
+    isa: *anyopaque,
+    flags: c_int = 0,
+    reserved: c_int = 0,
+    invoke: *const fn (*PermissionBlock, bool) callconv(.c) void,
+    descriptor: *const BlockDescriptor,
+};
+const permission_block_descriptor = BlockDescriptor{ .size = @sizeOf(PermissionBlock) };
+
+fn microphoneAuthorizationStatus() c_long {
+    const authorization_status: *const fn (ObjcId, ObjcSel, ObjcId) callconv(.c) c_long = @ptrCast(&objc_msgSend);
+    return authorization_status(objc_getClass("AVCaptureDevice"), sel_registerName("authorizationStatusForMediaType:"), AVMediaTypeAudio);
+}
+
+/// Non-prompting microphone authorization fact for Configuration Phase and the Status
+/// Item. `notDetermined`, denied, and restricted all remain not configured.
+pub fn microphoneGranted() bool {
+    return microphoneAuthorizationStatus() == 3;
+}
+
+fn microphonePermissionFinished(_: *PermissionBlock, _: bool) callconv(.c) void {}
+
+/// Ask only while authorization is undetermined. The supervisor observes the eventual
+/// decision through `microphoneGranted`; the completion block owns no daemon state.
+pub fn requestMicrophoneAccess() void {
+    if (microphoneAuthorizationStatus() != 0) return;
+    var block = PermissionBlock{
+        .isa = &_NSConcreteStackBlock,
+        .invoke = microphonePermissionFinished,
+        .descriptor = &permission_block_descriptor,
+    };
+    const request_access: *const fn (ObjcId, ObjcSel, ObjcId, *PermissionBlock) callconv(.c) void = @ptrCast(&objc_msgSend);
+    request_access(objc_getClass("AVCaptureDevice"), sel_registerName("requestAccessForMediaType:completionHandler:"), AVMediaTypeAudio, &block);
+}
+
 /// 24 kHz * 2 B * 50 ms = one buffer == one append-event's worth (crib sheet §4).
 pub const buffer_bytes: u32 = 2400;
 const buffer_count = 3;

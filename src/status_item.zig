@@ -21,6 +21,7 @@ pub const Operation = enum {
     paused,
     verifying,
     smoke_testing,
+    waiting_for_inference,
     activating,
     removing,
     failed,
@@ -32,10 +33,16 @@ pub const Snapshot = struct {
     terminal_backend_failure: bool = false,
     installation: Installation = .absent,
     operation: Operation = .idle,
+    operation_bytes: ?ByteProgress = null,
+    installation_identity: ?InstallationIdentity = null,
 };
+
+pub const ByteProgress = struct { completed: u64, total: u64 };
+pub const InstallationIdentity = struct { size: u64, sha256: [32]u8 };
 
 pub const Headline = enum {
     paused,
+    microphone_needed,
     input_monitoring_needed,
     accessibility_needed,
     selected_backend_prerequisite_missing,
@@ -67,7 +74,7 @@ pub const Presentation = struct {
 
 pub fn derive(s: Snapshot) Presentation {
     const operation_active = switch (s.operation) {
-        .installing, .updating, .verifying, .smoke_testing, .activating, .removing => true,
+        .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference, .activating, .removing => true,
         .idle, .paused, .failed => false,
     };
     return .{
@@ -86,6 +93,7 @@ pub fn derive(s: Snapshot) Presentation {
 fn headline(s: Snapshot) Headline {
     if (s.health.paused) return .paused;
     switch (s.health.status) {
+        .microphone_needed => return .microphone_needed,
         .input_monitoring_needed => return .input_monitoring_needed,
         .accessibility_needed => return .accessibility_needed,
         else => {},
@@ -99,19 +107,19 @@ fn headline(s: Snapshot) Headline {
         .reconnecting, .preparing_local => .preparing,
         .ready => .ready,
         .ready_offline => .ready_offline,
-        .no_key, .no_local_installation, .input_monitoring_needed, .accessibility_needed => unreachable,
+        .no_key, .no_local_installation, .microphone_needed, .input_monitoring_needed, .accessibility_needed => unreachable,
     };
 }
 
 fn primaryAction(s: Snapshot) PrimaryAction {
+    if (s.selected_backend == .openai)
+        return if (s.health.status == .no_key) .set_openai_api_key else .none;
     if (s.operation == .paused) return .resume_model_operation;
     if (s.operation == .failed) return .retry_model_operation;
     switch (s.operation) {
-        .installing, .updating, .verifying, .smoke_testing, .activating, .removing => return .operation_progress,
+        .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference, .activating, .removing => return .operation_progress,
         .idle, .paused, .failed => {},
     }
-    if (s.selected_backend == .openai)
-        return if (s.health.status == .no_key) .set_openai_api_key else .none;
     if (s.installation == .absent) return .install_local_model;
     if (s.installation == .corrupt) return .repair_local_model;
     if (s.terminal_backend_failure) return .retry_local_runtime;
@@ -137,6 +145,7 @@ fn snap(fields: struct {
 
 test "compact headline follows pause, common prerequisite, selected prerequisite, failure, preparation, ready priority" {
     try std.testing.expectEqual(Headline.paused, derive(snap(.{ .health = .{ .paused = true, .status = .no_local_installation }, .terminal_backend_failure = true })).headline);
+    try std.testing.expectEqual(Headline.microphone_needed, derive(snap(.{ .health = .{ .paused = false, .status = .microphone_needed }, .installation = .absent })).headline);
     try std.testing.expectEqual(Headline.input_monitoring_needed, derive(snap(.{ .health = .{ .paused = false, .status = .input_monitoring_needed }, .installation = .absent })).headline);
     try std.testing.expectEqual(Headline.selected_backend_prerequisite_missing, derive(snap(.{ .health = .{ .paused = false, .status = .no_local_installation }, .terminal_backend_failure = true, .installation = .absent })).headline);
     try std.testing.expectEqual(Headline.backend_failure, derive(snap(.{ .terminal_backend_failure = true })).headline);
@@ -167,13 +176,13 @@ test "local privacy cue survives a network-using Model Operation" {
     try std.testing.expect(!p.show_openai_controls);
 }
 
-test "Local Model operation recovery remains primary under OpenAI selection" {
+test "Local Model operation recovery stays in its submenu under OpenAI selection" {
     const p = derive(snap(.{
         .selected_backend = .openai,
         .health = .{ .paused = false, .status = .ready },
         .operation = .paused,
     }));
-    try std.testing.expectEqual(PrimaryAction.resume_model_operation, p.primary_action);
+    try std.testing.expectEqual(PrimaryAction.none, p.primary_action);
     try std.testing.expect(p.show_openai_controls);
     try std.testing.expect(!p.audio_stays_on_mac);
 }

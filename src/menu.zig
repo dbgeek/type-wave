@@ -175,7 +175,22 @@ pub const ModelAction = enum {
     remove,
     retry_runtime,
     cancel_operation,
+    diagnostics,
     forget_hugging_face_token,
+};
+const ModelActionDefinition = struct { title: [*:0]const u8, action: ModelAction };
+const model_action_definitions = [_]ModelActionDefinition{
+    .{ .title = "Install\xe2\x80\xa6", .action = .install },
+    .{ .title = "Update\xe2\x80\xa6", .action = .update },
+    .{ .title = "Resume Model Operation", .action = .resume_operation },
+    .{ .title = "Discard partial data\xe2\x80\xa6", .action = .discard },
+    .{ .title = "Verify", .action = .verify },
+    .{ .title = "Repair\xe2\x80\xa6", .action = .repair },
+    .{ .title = "Remove\xe2\x80\xa6", .action = .remove },
+    .{ .title = "Retry local runtime", .action = .retry_runtime },
+    .{ .title = "Cancel Model Operation", .action = .cancel_operation },
+    .{ .title = "Open diagnostics", .action = .diagnostics },
+    .{ .title = "Forget Hugging Face token\xe2\x80\xa6", .action = .forget_hugging_face_token },
 };
 
 /// The daemon's side of the menu (wired in daemon.zig). All callbacks run on the main
@@ -215,6 +230,7 @@ const GroupDef = struct {
     title: [*:0]const u8,
     field: []const u8, // the config.zon field name
     session_shaped: bool,
+    openai_only: bool = false,
     opts: []const Opt,
 };
 
@@ -228,7 +244,7 @@ const groups = [_]GroupDef{
         .{ .label = "Left Option", .zon = ".left_option" },
         .{ .label = "Globe (fn)", .zon = ".globe" },
     } },
-    .{ .title = "Model", .field = "model", .session_shaped = true, .opts = &.{
+    .{ .title = "Model", .field = "model", .session_shaped = true, .openai_only = true, .opts = &.{
         .{ .label = "gpt-realtime-whisper", .zon = "\"gpt-realtime-whisper\"" },
     } },
     .{ .title = "Language", .field = "language", .session_shaped = true, .opts = &.{
@@ -236,13 +252,13 @@ const groups = [_]GroupDef{
         .{ .label = "sv", .zon = "\"sv\"" },
         .{ .label = "auto-detect", .zon = "\"\"" },
     } },
-    .{ .title = "Delay", .field = "delay", .session_shaped = true, .opts = &.{
+    .{ .title = "Delay", .field = "delay", .session_shaped = true, .openai_only = true, .opts = &.{
         .{ .label = "minimal", .zon = "\"minimal\"" },
         .{ .label = "low", .zon = "\"low\"" },
         .{ .label = "medium", .zon = "\"medium\"" },
         .{ .label = "high", .zon = "\"high\"" },
     } },
-    .{ .title = "Noise reduction", .field = "noise_reduction", .session_shaped = true, .opts = &.{
+    .{ .title = "Noise reduction", .field = "noise_reduction", .session_shaped = true, .openai_only = true, .opts = &.{
         .{ .label = "near field", .zon = ".near_field" },
         .{ .label = "far field", .zon = ".far_field" },
         .{ .label = "off", .zon = ".off" },
@@ -314,6 +330,7 @@ fn statusText(p: status_item.Presentation, selected: backend.Backend) [*:0]const
         .preparing => if (selected == .openai) "type-wave — Reconnecting\xe2\x80\xa6" else "type-wave — Preparing local backend\xe2\x80\xa6",
         .selected_backend_prerequisite_missing => if (selected == .openai) "type-wave — No OpenAI API key" else "type-wave — No local Model Installation",
         .backend_failure => if (selected == .openai) "type-wave — OpenAI unavailable" else "type-wave — Local backend unavailable",
+        .microphone_needed => "type-wave — Microphone needed",
         .input_monitoring_needed => "type-wave — Input Monitoring needed",
         .accessibility_needed => "type-wave — Accessibility needed",
     };
@@ -333,11 +350,25 @@ fn primaryText(action: status_item.PrimaryAction, operation: status_item.Operati
             .installing => "Installing KB Whisper Small\xe2\x80\xa6",
             .updating => "Staging KB Whisper update\xe2\x80\xa6",
             .verifying => "Verifying Model Installation\xe2\x80\xa6",
-            .smoke_testing => "Smoke-testing local model\xe2\x80\xa6",
+            .smoke_testing => "Smoke-testing Model Installation\xe2\x80\xa6",
+            .waiting_for_inference => "Waiting for local inference to drain\xe2\x80\xa6",
             .activating => "Activating Model Installation\xe2\x80\xa6",
             .removing => "Removing Model Installation\xe2\x80\xa6",
             else => "Model Operation in progress\xe2\x80\xa6",
         },
+    };
+}
+
+fn modelActionVisible(action: ModelAction, snapshot: status_item.Snapshot, operation_active: bool) bool {
+    return switch (action) {
+        .install => snapshot.installation == .absent and !operation_active,
+        .update => snapshot.installation == .update_available and !operation_active,
+        .resume_operation, .discard => snapshot.operation == .paused,
+        .verify, .remove => snapshot.installation != .absent and !operation_active,
+        .repair => snapshot.installation == .corrupt and !operation_active,
+        .retry_runtime => snapshot.terminal_backend_failure and !operation_active,
+        .cancel_operation => operation_active,
+        .diagnostics, .forget_hugging_face_token => true,
     };
 }
 
@@ -372,7 +403,8 @@ pub const Menu = struct {
     group_parent: [groups.len]id = @splat(null),
     local_model_parent: id = null,
     local_model_status: id = null,
-    model_actions: [10]id = @splat(null),
+    local_operation_status: id = null,
+    model_actions: [std.meta.fieldNames(ModelAction).len]id = @splat(null),
 
     last_snapshot: ?status_item.Snapshot = null,
     timer_ctx: CFRunLoopTimerContext = .{},
@@ -405,12 +437,13 @@ pub const Menu = struct {
         const menu = newMenu();
         self.status_line = self.addDisabled(menu, "type-wave");
         addSeparator(menu);
+        const snap = self.store.current();
+        self.addRadioGroup(menu, 0, snap);
         self.primary_item = self.addAction(menu, "", "onPrimary:");
         self.privacy_item = self.addDisabled(menu, "Audio stays on this Mac");
         self.network_item = self.addDisabled(menu, "Network used only for this model operation");
         addSeparator(menu);
-        const snap = self.store.current();
-        for (0..groups.len) |gi| self.addRadioGroup(menu, gi, snap);
+        for (1..groups.len) |gi| self.addRadioGroup(menu, gi, snap);
         self.addLocalModel(menu);
         self.overlay_item = self.addAction(menu, "Overlay HUD", "onOverlay:");
         msgLong(self.overlay_item, "setState:", if (snap.overlay) NSControlStateOn else NSControlStateOff);
@@ -481,23 +514,12 @@ pub const Menu = struct {
     fn addLocalModel(self: *Menu, menu: id) void {
         const sub = newMenu();
         self.local_model_status = self.addDisabled(sub, "KB Whisper Small — not installed");
+        self.local_operation_status = self.addDisabled(sub, "Model Operation — idle");
         addSeparator(sub);
-        const definitions = [_]struct { title: [*:0]const u8, action: ModelAction }{
-            .{ .title = "Install\xe2\x80\xa6", .action = .install },
-            .{ .title = "Update\xe2\x80\xa6", .action = .update },
-            .{ .title = "Resume Model Operation", .action = .resume_operation },
-            .{ .title = "Discard partial data\xe2\x80\xa6", .action = .discard },
-            .{ .title = "Verify", .action = .verify },
-            .{ .title = "Repair\xe2\x80\xa6", .action = .repair },
-            .{ .title = "Remove\xe2\x80\xa6", .action = .remove },
-            .{ .title = "Retry local runtime", .action = .retry_runtime },
-            .{ .title = "Cancel Model Operation", .action = .cancel_operation },
-            .{ .title = "Forget Hugging Face token\xe2\x80\xa6", .action = .forget_hugging_face_token },
-        };
-        for (definitions, 0..) |definition, i| {
+        for (model_action_definitions) |definition| {
             const item = self.addAction(sub, definition.title, "onModelAction:");
             msgLong(item, "setTag:", @intFromEnum(definition.action));
-            self.model_actions[i] = item;
+            self.model_actions[@intFromEnum(definition.action)] = item;
         }
         _ = self.addAction(sub, "Set or Replace Hugging Face token\xe2\x80\xa6", "onSetHuggingFaceToken:");
         const parent = makeItem("Local Model", null);
@@ -548,39 +570,57 @@ pub const Menu = struct {
         msg1v(self.status_line, "setTitle:", nsstr(statusText(presentation, snapshot.selected_backend)));
         msg1v(self.pause_item, "setTitle:", nsstr(if (h.paused) "Resume dictation" else "Pause dictation"));
 
-        const openai = snapshot.selected_backend == .openai;
-        for ([_]usize{ 2, 4, 5 }) |gi| msgBool(self.group_parent[gi], "setHidden:", !openai);
-        msgBool(self.set_api_key_item, "setHidden:", !openai);
+        for (groups, 0..) |group, gi|
+            if (group.openai_only) msgBool(self.group_parent[gi], "setHidden:", !presentation.show_openai_controls);
+        msgBool(self.set_api_key_item, "setHidden:", !presentation.show_openai_controls);
 
-        msg1v(self.primary_item, "setTitle:", nsstr(primaryText(presentation.primary_action, snapshot.operation)));
+        var progress_buffer: [160]u8 = undefined;
+        const primary_title: [*:0]const u8 = if (presentation.primary_action == .operation_progress and snapshot.operation_bytes != null) title: {
+            const printed = std.fmt.bufPrintSentinel(&progress_buffer, "{s} — {d}/{d} bytes", .{
+                std.mem.span(primaryText(presentation.primary_action, snapshot.operation)),
+                snapshot.operation_bytes.?.completed,
+                snapshot.operation_bytes.?.total,
+            }, 0) catch break :title primaryText(presentation.primary_action, snapshot.operation);
+            break :title printed.ptr;
+        } else primaryText(presentation.primary_action, snapshot.operation);
+        msg1v(self.primary_item, "setTitle:", nsstr(primary_title));
         msgBool(self.primary_item, "setHidden:", presentation.primary_action == .none);
         msgBool(self.primary_item, "setEnabled:", presentation.primary_action != .operation_progress);
         msgBool(self.privacy_item, "setHidden:", !presentation.audio_stays_on_mac);
         msgBool(self.network_item, "setHidden:", !presentation.model_operation_uses_network);
 
-        msg1v(self.local_model_status, "setTitle:", nsstr(switch (snapshot.installation) {
+        var identity_buffer: [256]u8 = undefined;
+        const installation_title: [*:0]const u8 = if (snapshot.installation_identity) |identity| title: {
+            const printed = std.fmt.bufPrintSentinel(&identity_buffer, "KB Whisper Small — {d} bytes — sha256 {s} — {s}", .{
+                identity.size,
+                &std.fmt.bytesToHex(identity.sha256, .lower),
+                if (snapshot.installation == .update_available) "update available" else "installed",
+            }, 0) catch break :title "KB Whisper Small — installed";
+            break :title printed.ptr;
+        } else switch (snapshot.installation) {
             .absent => "KB Whisper Small — not installed",
             .ready => "KB Whisper Small — installed",
             .update_available => "KB Whisper Small — update available",
             .corrupt => "KB Whisper Small — corrupt",
-        }));
+        };
+        msg1v(self.local_model_status, "setTitle:", nsstr(installation_title));
+        var operation_buffer: [160]u8 = undefined;
+        const operation_title: [*:0]const u8 = if (snapshot.operation_bytes) |bytes| title: {
+            const printed = std.fmt.bufPrintSentinel(&operation_buffer, "Model Operation — {s} — {d}/{d} bytes", .{ @tagName(snapshot.operation), bytes.completed, bytes.total }, 0) catch break :title "Model Operation";
+            break :title printed.ptr;
+        } else title: {
+            const printed = std.fmt.bufPrintSentinel(&operation_buffer, "Model Operation — {s}", .{@tagName(snapshot.operation)}, 0) catch break :title "Model Operation";
+            break :title printed.ptr;
+        };
+        msg1v(self.local_operation_status, "setTitle:", nsstr(operation_title));
         const operation_active = switch (snapshot.operation) {
-            .installing, .updating, .verifying, .smoke_testing, .activating, .removing => true,
+            .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference, .activating, .removing => true,
             else => false,
         };
-        const visible = [_]bool{
-            snapshot.installation == .absent and !operation_active,
-            snapshot.installation == .update_available and !operation_active,
-            snapshot.operation == .paused,
-            snapshot.operation == .paused,
-            snapshot.installation != .absent and !operation_active,
-            snapshot.installation == .corrupt and !operation_active,
-            snapshot.installation != .absent and !operation_active,
-            snapshot.terminal_backend_failure and !operation_active,
-            operation_active,
-            true,
-        };
-        for (self.model_actions, visible) |item, show| msgBool(item, "setHidden:", !show);
+        for (model_action_definitions) |definition| {
+            const item = self.model_actions[@intFromEnum(definition.action)];
+            msgBool(item, "setHidden:", !modelActionVisible(definition.action, snapshot, operation_active));
+        }
     }
 
     // ---- the settings write path (menu action → snapshot swap → config.zon) ---------

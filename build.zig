@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
             // Transcription Session's vendored websocket rides std.crypto.tls (no extra
             // framework); Capture's AudioQueue lives in AudioToolbox.
             mod.linkFramework("AudioToolbox", .{});
+            mod.linkFramework("AVFoundation", .{}); // non-prompting Microphone authorization status
             // Talk Key tap + Insertion event synthesis.
             mod.linkFramework("CoreGraphics", .{}); // CGEventTap, CGEvent*, CG*EventAccess
             mod.linkFramework("CoreFoundation", .{}); // run loop, CFRelease
@@ -174,6 +175,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     check.root_module.linkFramework("AudioToolbox", .{});
+    check.root_module.linkFramework("AVFoundation", .{});
+    check.root_module.linkSystemLibrary("objc", .{});
     check.root_module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk}) });
     check.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
     const run_check = b.addRunArtifact(check);

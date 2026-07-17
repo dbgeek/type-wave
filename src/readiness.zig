@@ -13,6 +13,7 @@ pub const Snapshot = struct {
     selected_backend: backend.Backend,
     key_present: bool,
     local_installation_present: bool,
+    microphone_granted: bool,
     input_monitoring_granted: bool,
     post_event_granted: bool,
     tap_enabled: bool,
@@ -27,6 +28,7 @@ pub const Status = enum {
     preparing_local,
     no_key,
     no_local_installation,
+    microphone_needed,
     input_monitoring_needed,
     accessibility_needed,
 };
@@ -37,7 +39,7 @@ pub const Health = struct {
 
     pub fn needsAttention(self: Health) bool {
         return self.paused or switch (self.status) {
-            .no_key, .no_local_installation, .input_monitoring_needed, .accessibility_needed => true,
+            .no_key, .no_local_installation, .microphone_needed, .input_monitoring_needed, .accessibility_needed => true,
             .ready, .ready_offline, .reconnecting, .preparing_local => false,
         };
     }
@@ -45,12 +47,13 @@ pub const Health = struct {
 
 const missing_key: u8 = 1;
 const missing_local_installation: u8 = 8;
+const missing_microphone: u8 = 16;
 const missing_input_monitoring: u8 = 2;
 const missing_accessibility: u8 = 4;
 const nothing_reported: u8 = 0xFF;
 
 pub const Report = struct {
-    lines: [3][]const u8 = undefined,
+    lines: [4][]const u8 = undefined,
     count: usize = 0,
 
     pub fn slice(self: *const Report) []const []const u8 {
@@ -81,12 +84,15 @@ pub fn configured(snap: Snapshot) bool {
         .local_kb_whisper => snap.local_installation_present,
     };
     return backend_prerequisite and
+        snap.microphone_granted and
         snap.input_monitoring_granted and
         snap.post_event_granted and
         snap.tap_enabled;
 }
 
 pub fn health(snap: Snapshot) Health {
+    if (!snap.microphone_granted)
+        return .{ .paused = snap.paused, .status = .microphone_needed };
     if (!snap.input_monitoring_granted or !snap.tap_enabled)
         return .{ .paused = snap.paused, .status = .input_monitoring_needed };
     if (!snap.post_event_granted)
@@ -113,6 +119,7 @@ fn missingBits(snap: Snapshot) u8 {
             missing |= missing_local_installation;
         },
     }
+    if (!snap.microphone_granted) missing |= missing_microphone;
     if (!snap.input_monitoring_granted or !snap.tap_enabled) missing |= missing_input_monitoring;
     if (!snap.post_event_granted) missing |= missing_accessibility;
     return missing;
@@ -126,6 +133,10 @@ fn reportFor(missing: u8) Report {
     }
     if ((missing & missing_local_installation) != 0) {
         r.lines[r.count] = "    - verified local KB Whisper Model Installation";
+        r.count += 1;
+    }
+    if ((missing & missing_microphone) != 0) {
+        r.lines[r.count] = "    - Microphone for type-wave (System Settings > Privacy & Security > Microphone)";
         r.count += 1;
     }
     if ((missing & missing_input_monitoring) != 0) {
@@ -143,6 +154,7 @@ fn makeSnapshot(fields: struct {
     selected_backend: backend.Backend = .openai,
     key_present: bool = true,
     local_installation_present: bool = false,
+    microphone_granted: bool = true,
     input_monitoring_granted: bool = true,
     post_event_granted: bool = true,
     tap_enabled: bool = true,
@@ -153,6 +165,7 @@ fn makeSnapshot(fields: struct {
         .selected_backend = fields.selected_backend,
         .key_present = fields.key_present,
         .local_installation_present = fields.local_installation_present,
+        .microphone_granted = fields.microphone_granted,
         .input_monitoring_granted = fields.input_monitoring_granted,
         .post_event_granted = fields.post_event_granted,
         .tap_enabled = fields.tap_enabled,
@@ -166,6 +179,7 @@ test "configured ignores pause and session readiness" {
 }
 
 test "configured requires setup prerequisites and a live tap" {
+    try std.testing.expect(!configured(makeSnapshot(.{ .microphone_granted = false })));
     try std.testing.expect(!configured(makeSnapshot(.{ .key_present = false })));
     try std.testing.expect(!configured(makeSnapshot(.{ .input_monitoring_granted = false })));
     try std.testing.expect(!configured(makeSnapshot(.{ .post_event_granted = false })));
@@ -209,6 +223,7 @@ test "health uses setup priority before link state" {
     try std.testing.expectEqual(Status.accessibility_needed, health(makeSnapshot(.{ .post_event_granted = false })).status);
     try std.testing.expectEqual(Status.reconnecting, health(makeSnapshot(.{ .backend_ready = false })).status);
     try std.testing.expectEqual(Status.ready, health(makeSnapshot(.{})).status);
+    try std.testing.expectEqual(Status.microphone_needed, health(makeSnapshot(.{ .microphone_granted = false, .input_monitoring_granted = false })).status);
 }
 
 test "pause affects attention but not status" {
