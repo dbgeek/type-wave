@@ -1,5 +1,5 @@
 //! menu.zig — the menu-bar status item (wayfinder #34; recipe graduated from
-//! prototypes/menu-bar, #31). The daemon's face: a waveform icon near the clock whose
+//! prototypes/menu-bar, #31). The daemon's face: a dictation icon near the clock whose
 //! two tiers show healthy vs. needs-attention, and a menu that edits every `config.zon`
 //! setting live (checkmark radio submenus writing the canonical file through
 //! config.writeField), manages the API key (NSAlert + secure field → Keychain), and
@@ -93,6 +93,11 @@ inline fn utf8(nsstring: id) [*:0]const u8 {
 inline fn sfSymbol(name: [*:0]const u8) id {
     const f: *const fn (id, SEL, id, id) callconv(.c) id = @ptrCast(&objc_msgSend);
     return f(cls("NSImage"), sel_registerName("imageWithSystemSymbolName:accessibilityDescription:"), nsstr(name), null);
+}
+/// [NSImageSymbolConfiguration configurationWithPointSize:weight:scale:]
+inline fn symbolConfig(point_size: f64, weight: f64, scale: c_long) id {
+    const f: *const fn (id, SEL, f64, f64, c_long) callconv(.c) id = @ptrCast(&objc_msgSend);
+    return f(cls("NSImageSymbolConfiguration"), sel_registerName("configurationWithPointSize:weight:scale:"), point_size, weight, scale);
 }
 inline fn statusItemVariable(bar: id) id {
     const f: *const fn (id, SEL, f64) callconv(.c) id = @ptrCast(&objc_msgSend);
@@ -433,7 +438,7 @@ pub const Menu = struct {
         }
     }
 
-    /// Push health into the icon (two-tier: SF-Symbol swap + alpha dim), the status
+    /// Push health into the icon (two-tier: full-strength or alpha-dimmed), the status
     /// line, and the pause title. Cheap when nothing changed.
     fn refreshChrome(self: *Menu) void {
         const h = self.host.health(self.host.ctx);
@@ -442,9 +447,10 @@ pub const Menu = struct {
         }
         self.last_health = h;
 
-        const symbol: [*:0]const u8 = if (h.needsAttention()) "waveform.slash" else "waveform";
-        const img = sfSymbol(symbol);
+        var img = sfSymbol("waveform.badge.mic");
         if (img != null) {
+            const cfg = symbolConfig(17.0, 0.0, 2); // 17 pt, regular weight, medium scale
+            img = msg1(img, "imageWithSymbolConfiguration:", cfg);
             msgBool(img, "setTemplate:", true); // adopt the menu bar's monochrome light/dark
             msg1v(self.button, "setImage:", img);
             msg1v(self.button, "setTitle:", nsstr(""));
