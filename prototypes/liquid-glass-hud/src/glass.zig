@@ -178,8 +178,10 @@ pub const max_bars = 96; // layers allocated once; presets use a prefix and hide
 
 pub const Mode = enum { hidden, recording, processing };
 
-/// NSGlassEffectViewStyle — the ONLY two public styles (#40 §1.2).
-pub const GlassStyle = enum(c_long) { regular = 0, clear = 1 };
+/// NSGlassEffectViewStyle — the ONLY two public SDK styles (#40 §1.2) —
+/// plus `none`, a harness-only style that hides the material entirely:
+/// bars/dots float bare on the transparent panel, no capsule at all.
+pub const GlassStyle = enum(c_long) { regular = 0, clear = 1, none = 2 };
 
 pub const BarScheme = enum {
     accent, // controlAccentColor bars — the destination sketch
@@ -409,9 +411,20 @@ pub const Pill = struct {
         msgRect(self.glass, "setFrame:", bounds);
         msgRect(self.content, "setFrame:", bounds);
 
-        msgLong(self.glass, "setStyle:", @intFromEnum(look.style));
-        msgDouble(self.glass, "setCornerRadius:", cornerRadius(look));
-        msgBool(self.panel, "setHasShadow:", look.shadow);
+        // `none` = no HUD at all: hide the material and reparent the layer
+        // view straight onto the transparent panel. Going back, glass
+        // setContentView: re-adopts it. Shadow off when bare — macOS would
+        // outline the raw bars otherwise.
+        const bare = (look.style == .none);
+        msgBool(self.glass, "setHidden:", bare);
+        if (bare) {
+            msg1v(msg(self.panel, "contentView"), "addSubview:", self.content);
+        } else {
+            msg1v(self.glass, "setContentView:", self.content);
+            msgLong(self.glass, "setStyle:", @intFromEnum(look.style));
+            msgDouble(self.glass, "setCornerRadius:", cornerRadius(look));
+        }
+        msgBool(self.panel, "setHasShadow:", look.shadow and !bare);
         msgv(self.panel, "invalidateShadow");
 
         const row_w = @as(f64, @floatFromInt(self.nbars)) * (look.bar_w + look.bar_gap) - look.bar_gap;

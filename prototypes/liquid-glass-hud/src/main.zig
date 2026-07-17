@@ -329,7 +329,11 @@ fn handle(ch: u8) void {
             }
         },
         'g' => {
-            s.look.style = if (s.look.style == .regular) .clear else .regular;
+            s.look.style = switch (s.look.style) {
+                .regular => .clear,
+                .clear => .none, // bare: wavs + dots only, no capsule
+                .none => .regular,
+            };
             s.look_dirty = true;
         },
         'n' => {
@@ -495,7 +499,8 @@ pub fn main() void {
         \\Commands (letter + Enter):
         \\  r  recording (scrolling waveform)      p  processing (post-release hold)
         \\  h  hide the pill                       t/w/s  synthetic voice: talk/whisper/silence
-        \\  m  toggle LIVE microphone input        g  glass style: Regular <-> Clear
+        \\  m  toggle LIVE microphone input        g  glass style: Regular / Clear / None
+        \\                                            (None = bare wavs+dots, no capsule)
         \\  n  cycle glass tint (none / accent     c  cycle bar color (accent / label / white)
         \\     soft / accent strong)               k  cycle corner radius (capsule / 16 / 8)
         \\  d  cycle processing animation          x  toggle window shadow

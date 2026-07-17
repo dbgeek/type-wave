@@ -53,7 +53,8 @@ Commands (letter + Enter in the terminal):
 
     r  recording (scrolling waveform)      p  processing (post-release hold)
     h  hide the pill                       t/w/s  synthetic voice: talk/whisper/silence
-    m  toggle LIVE microphone input        g  glass style: Regular <-> Clear
+    m  toggle LIVE microphone input        g  glass style: Regular / Clear / None
+                                              (None = bare wavs+dots, no capsule)
     n  cycle glass tint (none / accent     c  cycle bar color (accent / label / white)
        soft / accent strong)               k  cycle corner radius (capsule / 16 / 8)
     d  cycle processing animation          x  toggle window shadow
@@ -144,6 +145,18 @@ processing freezes the dots and fades the capsule out around them.
 - Animator-driven window/view animations run fine inside the pump's
   disabled-actions transaction (they're explicit animations, unaffected by
   `setDisableActions:`).
+
+## Harness additions from HITL reactions (2026-07-17)
+
+- **300×22 ultra-slim pill** appended to the `z` cycle. Dots scale with pill
+  height (size, gap, bounce) so the sliver doesn't clip them. If this size
+  becomes a candidate, re-check whisper contrast — bar excursion is a third
+  of the 60 pt pill's.
+- **Glass style `none`** appended to the `g` cycle: the material is hidden
+  and the bar/dot layers float bare on the transparent panel (shadow forced
+  off — macOS would outline the raw bars). Caveats while bare: glass tint has
+  no visible target, so `swell` degrades to a plain crossfade and
+  `glass_pulse` reads as frozen bars.
 
 ## Verdict (#44 — motion)
 
