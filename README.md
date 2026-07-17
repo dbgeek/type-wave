@@ -94,6 +94,7 @@ cp packaging/config.example.zon ~/.config/type-wave/config.zon
 
 | Field | Default | Notes |
 | --- | --- | --- |
+| `transcription_backend` | `.openai` | `.openai` or `.local_kb_whisper`; selection is a hard audio boundary |
 | `talk_key` | `.right_option` | `.right_option`, `.left_option`, or `.globe` |
 | `model` | `"gpt-realtime-whisper"` | String, so model experiments do not require a rebuild |
 | `language` | `"en"` | `"en"`, `"sv"`, or `""` for auto-detect |

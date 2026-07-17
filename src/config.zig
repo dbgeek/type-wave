@@ -36,6 +36,7 @@ const std = @import("std");
 const tap = @import("tap.zig");
 const insert = @import("insert.zig");
 const keychain = @import("keychain.zig");
+const backend = @import("transcription_backend.zig");
 
 /// Non-secret settings. The field names + types ARE the accepted `config.zon` schema
 /// (std.zon parses the file straight into this struct). Every field has a default, so
@@ -46,6 +47,7 @@ const keychain = @import("keychain.zig");
 /// alone, no rebuild. `talk_key`/`noise_reduction`/`insertion` are enums — a closed,
 /// validated vocabulary the code switches on.
 pub const Settings = struct {
+    transcription_backend: backend.Backend = .openai,
     talk_key: tap.TalkKey = .right_option,
     model: []const u8 = "gpt-realtime-whisper",
     language: []const u8 = "en",
@@ -256,12 +258,14 @@ pub const Store = struct {
 /// overlay change flips the HUD. Simple fields need nothing (read-at-use).
 pub const Diff = struct {
     any: bool = false,
+    backend_selection: bool = false,
     session_shaped: bool = false, // model / language / delay / noise_reduction
     overlay: bool = false,
 };
 
 pub fn diffSettings(a: *const Settings, b: *const Settings) Diff {
     var d: Diff = .{};
+    if (a.transcription_backend != b.transcription_backend) d.backend_selection = true;
     if (a.talk_key != b.talk_key) d.any = true;
     if (a.insertion != b.insertion) d.any = true;
     if (a.pre_paste_ms != b.pre_paste_ms) d.any = true;
@@ -270,7 +274,7 @@ pub fn diffSettings(a: *const Settings, b: *const Settings) Diff {
     if (!std.mem.eql(u8, a.delay, b.delay)) d.session_shaped = true;
     if (a.noise_reduction != b.noise_reduction) d.session_shaped = true;
     if (a.overlay != b.overlay) d.overlay = true;
-    if (d.session_shaped or d.overlay) d.any = true;
+    if (d.backend_selection or d.session_shaped or d.overlay) d.any = true;
     return d;
 }
 
@@ -405,6 +409,7 @@ fn serializeSettings(gpa: std.mem.Allocator, s: Settings) ?[:0]u8 {
         \\// version was generated because the file was absent or malformed.
         \\//
         \\//   .talk_key        = .right_option | .left_option | .globe
+        \\//   .transcription_backend = .openai | .local_kb_whisper
         \\//   .model           = "<transcription model>"
         \\//   .language        = "<ISO code>"  ("" = auto-detect)
         \\//   .delay           = "minimal" | "low" | "medium" | "high" | "xhigh"
@@ -413,6 +418,7 @@ fn serializeSettings(gpa: std.mem.Allocator, s: Settings) ?[:0]u8 {
         \\//   .pre_paste_ms    = <ms between the pasteboard write and Cmd-V; raise for a slow target>
         \\//   .overlay         = true | false
         \\.{{
+        \\    .transcription_backend = .{s},
         \\    .talk_key = .{s},
         \\    .model = "{s}",
         \\    .language = "{s}",
@@ -424,8 +430,8 @@ fn serializeSettings(gpa: std.mem.Allocator, s: Settings) ?[:0]u8 {
         \\}}
         \\
     , .{
-        @tagName(s.talk_key), s.model, s.language, s.delay,
-        @tagName(s.noise_reduction), @tagName(s.insertion), s.pre_paste_ms, s.overlay,
+        @tagName(s.transcription_backend), @tagName(s.talk_key),  s.model,        s.language, s.delay,
+        @tagName(s.noise_reduction),       @tagName(s.insertion), s.pre_paste_ms, s.overlay,
     }) catch return null;
     return gpa.dupeSentinel(u8, text, 0) catch null;
 }
@@ -548,7 +554,7 @@ test "patchZonField does not confuse a longer field name for a prefix" {
 }
 
 test "serializeSettings round-trips through the ZON parser" {
-    const s = Settings{ .talk_key = .left_option, .language = "", .delay = "high", .overlay = false, .pre_paste_ms = 42 };
+    const s = Settings{ .transcription_backend = .local_kb_whisper, .talk_key = .left_option, .language = "", .delay = "high", .overlay = false, .pre_paste_ms = 42 };
     const text = serializeSettings(talloc, s) orelse return error.SerializeFailed;
     defer talloc.free(text);
     var diag: std.zon.parse.Diagnostics = .{};
@@ -557,10 +563,18 @@ test "serializeSettings round-trips through the ZON parser" {
     // free the parsed strings (all fields present in the file, so no static defaults)
     defer std.zon.parse.free(talloc, parsed);
     try std.testing.expectEqual(Settings.NoiseReduction.near_field, parsed.noise_reduction);
+    try std.testing.expectEqual(@import("transcription_backend.zig").Backend.local_kb_whisper, parsed.transcription_backend);
     try std.testing.expectEqual(tap.TalkKey.left_option, parsed.talk_key);
     try std.testing.expectEqualStrings("", parsed.language);
     try std.testing.expect(!parsed.overlay);
     try std.testing.expectEqual(@as(u32, 42), parsed.pre_paste_ms);
+}
+
+test "OpenAI is the default Transcription Backend when config omits selection" {
+    var diag: std.zon.parse.Diagnostics = .{};
+    defer diag.deinit(talloc);
+    const parsed = try std.zon.parse.fromSliceAlloc(Settings, talloc, ".{}", &diag, .{});
+    try std.testing.expectEqual(@import("transcription_backend.zig").Backend.openai, parsed.transcription_backend);
 }
 
 test "pre_paste_ms parses from config.zon and defaults when absent" {
@@ -590,6 +604,10 @@ test "diffSettings flags session-shaped and overlay changes" {
     b.overlay = false;
     d = diffSettings(&base, &b);
     try std.testing.expect(d.any and !d.session_shaped and d.overlay);
+    b = base;
+    b.transcription_backend = .local_kb_whisper;
+    d = diffSettings(&base, &b);
+    try std.testing.expect(d.any and d.backend_selection and !d.session_shaped and !d.overlay);
     b = base;
     b.talk_key = .globe;
     d = diffSettings(&base, &b);

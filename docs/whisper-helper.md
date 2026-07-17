@@ -41,9 +41,8 @@ a matching `cancel` frame trips whisper.cpp's abort callback.
 
 ## Dictate through the manually provisioned local backend
 
-Until model installation and persisted backend switching land, the thin local path uses
-fixed private locations and an explicit startup selection. Provision the already-built
-helper and the exact pinned artifact there:
+Until managed Model Installation lands, the local path uses fixed private locations.
+Provision the already-built helper and the exact pinned artifact there:
 
 ```sh
 mkdir -p "$HOME/.local/libexec/type-wave"
@@ -55,16 +54,18 @@ install -m 600 /path/to/ggml-model.bin \
   "$HOME/Library/Application Support/type-wave/models/active/ggml-model.bin"
 ```
 
-Start type-wave with local selected:
+Select local in `~/.config/type-wave/config.zon`:
 
-```sh
-TYPE_WAVE_BACKEND=local zig build run
+```zig
+.{
+    .transcription_backend = .local_kb_whisper,
+}
 ```
 
 The helper verifies the pinned size and digest and warms the model before local Capture is
 accepted. The local Transcription Backend reads neither the OpenAI credential nor the
 network, buffers the full 24 kHz mono Capture, and sends exactly one inference request after
-Talk Key release. Omit
-`TYPE_WAVE_BACKEND=local` to retain the default OpenAI backend. Live and persisted switching
-is intentionally deferred to the backend-reconciliation increment; the backend-aware Status
-Item is likewise deferred, so this manually selected thin path runs headless.
+Talk Key release. Omit the field to retain the default OpenAI backend. Selection persists
+across restarts; opening the Status Item picks up a hand-edited selection immediately and
+drains any active Utterance before preparing the latest choice. The full backend chooser and
+local-model actions belong to the backend-aware Status Item increment.

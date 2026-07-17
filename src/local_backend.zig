@@ -699,6 +699,8 @@ const IntegrationBackends = struct {
     pub fn acquire(self: *IntegrationBackends, id: backend.UtteranceId) ?backend.Lease {
         return self.adapter.acquire(id, "sv");
     }
+
+    pub fn resolve(_: *IntegrationBackends, _: backend.UtteranceId) void {}
 };
 
 const IntegrationInsertion = struct {

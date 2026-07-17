@@ -34,8 +34,16 @@ The live connection to the transcription service over which an Utterance's audio
 _Avoid_: websocket (mechanism)
 
 **Transcription Backend**:
-The selected source of Partial and Final Transcripts for an Utterance. OpenAI is the default backend; a local KB Whisper backend is an offline alternative.
+The selected source of a Final Transcript for an Utterance; it may also emit Partial Transcripts. OpenAI is the default backend; a local KB Whisper backend is an offline alternative.
 _Avoid_: transcription provider, engine
+
+**Model Installation**:
+A verified local copy of the pinned KB Whisper artifact that the local Transcription Backend can use offline. It exists independently of both Hugging Face credentials and any Model Operation in progress.
+_Avoid_: downloaded model, model cache
+
+**Model Operation**:
+A user-authorized acquisition, verification, activation, repair, or removal acting on a Model Installation. An operation may be in progress while the current Model Installation remains usable.
+_Avoid_: download state, model task
 
 **Capture**:
 The microphone audio stream feeding a Transcription Session.
@@ -58,8 +66,9 @@ canonical hand-editable form of the same settings.
 _Avoid_: mutable config, live config object
 
 **Configuration Phase**:
-The daemon's setup-readiness state: `not-configured` until the API key, required macOS
-grants, and live Talk Key tap are all present, then `configured`. Transcription Session
+The daemon's setup-readiness state for the selected Transcription Backend. `configured`
+requires the common macOS grants and live Talk Key tap plus that backend's durable
+prerequisite: an OpenAI API key or a verified local Model Installation; transient backend
 readiness and pause state affect status, but do not define this phase.
 _Avoid_: setup state, readiness state, configured flag
 

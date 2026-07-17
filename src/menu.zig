@@ -28,6 +28,7 @@
 const std = @import("std");
 const appkit = @import("appkit.zig");
 const config = @import("config.zig");
+const readiness = @import("readiness.zig");
 const tapmod = @import("tap.zig");
 const insertmod = @import("insert.zig");
 const keychain = @import("keychain.zig");
@@ -160,19 +161,8 @@ const NSAlertFirstButtonReturn: c_long = 1000;
 
 /// What the status line / icon tier reflect, in priority order. `paused` overlays all
 /// of them (a paused daemon reads needs-attention even when otherwise healthy).
-pub const Status = enum { ready, reconnecting, no_key, input_monitoring_needed, accessibility_needed };
-
-pub const Health = struct {
-    paused: bool,
-    status: Status,
-
-    pub fn needsAttention(self: Health) bool {
-        return self.paused or switch (self.status) {
-            .no_key, .input_monitoring_needed, .accessibility_needed => true,
-            .ready, .reconnecting => false,
-        };
-    }
-};
+pub const Status = readiness.Status;
+pub const Health = readiness.Health;
 
 /// The daemon's side of the menu (wired in daemon.zig). All callbacks run on the main
 /// thread, from a menu action or the chrome pump.
@@ -180,6 +170,8 @@ pub const Host = struct {
     ctx: *anyopaque,
     /// Current health for the icon tier + status line.
     health: *const fn (ctx: *anyopaque) Health,
+    /// A complete Settings Snapshot with a new authoritative backend was published.
+    selectBackend: *const fn (ctx: *anyopaque, selected: @import("transcription_backend.zig").Backend) void,
     /// A session-shaped setting changed (menu write or hand-edit found on open) —
     /// mark the Transcription Session dirty so it cycles when idle.
     markSessionDirty: *const fn (ctx: *anyopaque) void,
@@ -293,8 +285,11 @@ fn statusText(h: Health) [*:0]const u8 {
     if (h.paused) return "type-wave — Paused";
     return switch (h.status) {
         .ready => "type-wave — Ready",
+        .ready_offline => "type-wave — Ready offline",
         .reconnecting => "type-wave — Reconnecting\xe2\x80\xa6",
+        .preparing_local => "type-wave — Preparing local backend\xe2\x80\xa6",
         .no_key => "type-wave — No API key",
+        .no_local_installation => "type-wave — No local Model Installation",
         .input_monitoring_needed => "type-wave — Input Monitoring needed",
         .accessibility_needed => "type-wave — Accessibility needed",
     };
@@ -471,6 +466,7 @@ pub const Menu = struct {
         heap.* = next; // leaks by design — see config.Store
         self.store.swap(heap);
         _ = config.writeField(self.io, self.alloc, field, value, next);
+        self.host.selectBackend(self.host.ctx, next.transcription_backend);
         if (session_shaped) self.host.markSessionDirty(self.host.ctx);
     }
 };
@@ -508,7 +504,7 @@ fn onRadio(_: id, _: SEL, sender: id) callconv(.c) void {
     m.commitSettings(next, g.field, g.opts[oi].zon, g.session_shaped);
     m.syncGroup(gi);
     feedback.log("  menu: {s} → {s}{s}\n", .{
-        g.title, g.opts[oi].label,
+        g.title,                                                                 g.opts[oi].label,
         if (g.session_shaped) " (binds at the next idle session cycle)" else "",
     });
 }
@@ -597,6 +593,7 @@ fn onMenuWillOpen(_: id, _: SEL, _: id) callconv(.c) void {
         heap.* = fresh;
         m.store.swap(heap);
         feedback.log("  menu: picked up hand-edited config.zon\n", .{});
+        if (d.backend_selection) m.host.selectBackend(m.host.ctx, fresh.transcription_backend);
         if (d.session_shaped) m.host.markSessionDirty(m.host.ctx);
         if (d.overlay) m.host.setOverlay(m.host.ctx, fresh.overlay);
     }

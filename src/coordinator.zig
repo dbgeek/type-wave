@@ -229,6 +229,7 @@ pub fn Coordinator(comptime Deps: type) type {
                     self.deps.feedback.abandoned();
                 },
             }
+            self.deps.backends.resolve(id);
             self.active = null;
             self.phase = .idle;
         }
@@ -239,6 +240,7 @@ pub fn Coordinator(comptime Deps: type) type {
 
         fn abandon(self: *Self) void {
             self.deps.feedback.abandoned();
+            if (self.active) |lease| self.deps.backends.resolve(lease.id);
             self.active = null;
             self.phase = .idle;
         }
@@ -282,6 +284,8 @@ const FakeBackends = struct {
     released: usize = 0,
     cancellation_requests: usize = 0,
     cancelled: usize = 0,
+    resolved: usize = 0,
+    resolved_id: UtteranceId = 0,
     last_id: UtteranceId = 0,
 
     const commands = backend.Commands{
@@ -332,6 +336,10 @@ const FakeBackends = struct {
         const self = from(ctx);
         self.cancelled += 1;
         self.last_id = id;
+    }
+    fn resolve(self: *FakeBackends, id: UtteranceId) void {
+        self.resolved += 1;
+        self.resolved_id = id;
     }
 };
 
@@ -435,12 +443,24 @@ test "1 happy path: press → release → final → inserted(ok)" {
     try expect(h.insertion.submits == 1);
     try expectEqualStrings("hello world", h.insertion.lastText());
     co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
+    try expectEqual(@as(usize, 1), h.backends.resolved);
+    try expectEqual(@as(UtteranceId, 1), h.backends.resolved_id);
     try expect(h.feedback.inserteds == 1);
     try expect(h.feedback.abandoneds == 0);
     // Fully resolved — a fresh press is accepted again.
     co.handle(.press);
     try expect(h.backends.began == 2);
     try expectEqual(@as(UtteranceId, 2), h.backends.last_id);
+}
+
+test "backend lease is resolved after abandonment" {
+    var h = Harness{};
+    h.audio.captured = false;
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    try expectEqual(@as(usize, 1), h.backends.resolved);
+    try expectEqual(@as(UtteranceId, 1), h.backends.resolved_id);
 }
 
 test "2 press while non-idle is dropped" {

@@ -12,6 +12,10 @@
 // menu's "Set API Key…", or run `~/.local/bin/type-wave --set-key`. A foreground
 // `nix develop` run uses the exported OPENAI_API_KEY env var instead (dev override).
 .{
+    // Selected Transcription Backend. OpenAI remains the default; local uses only the
+    // verified Model Installation and never falls back across this privacy boundary.
+    .transcription_backend = .openai,
+
     // Which held key starts/ends an Utterance:
     //   .right_option / .left_option  — proven live (wayfinder #9)
     //   .globe                        — the Fn / 🌐 key; observation is compile-verified

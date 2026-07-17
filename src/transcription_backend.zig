@@ -9,6 +9,70 @@ pub const Backend = enum {
     local_kb_whisper,
 };
 
+/// Pure drain-then-switch policy. Resource owners prepare the returned ticket and may
+/// publish it only if its generation is still current. An accepted Utterance occupies
+/// `active` through Insertion/abandonment, so selection changes reject Capture without
+/// disturbing its immutable Lease.
+pub const Selection = struct {
+    selected: Backend,
+    generation: u64 = 1,
+    readiness: Readiness = .unavailable,
+    active: ?Active = null,
+
+    pub const Readiness = enum { unavailable, preparing, ready };
+    pub const Ticket = struct { backend: Backend, generation: u64 };
+    pub const Route = struct { id: UtteranceId, backend: Backend };
+    const Active = struct { id: UtteranceId, backend: Backend };
+
+    pub fn init(selected: Backend) Selection {
+        return .{ .selected = selected };
+    }
+
+    pub fn select(self: *Selection, selected: Backend) void {
+        if (self.selected == selected) return;
+        self.selected = selected;
+        self.generation +%= 1;
+        self.readiness = .unavailable;
+    }
+
+    pub fn beginPreparation(self: *Selection, expected: Backend) ?Ticket {
+        if (self.selected != expected or self.active != null or self.readiness != .unavailable) return null;
+        self.readiness = .preparing;
+        return .{ .backend = self.selected, .generation = self.generation };
+    }
+
+    /// Returns whether the prepared resource became authoritative. A stale result must
+    /// be torn down by its owner.
+    pub fn finishPreparation(self: *Selection, ticket: Ticket, ready: bool) bool {
+        if (ticket.generation != self.generation or ticket.backend != self.selected) return false;
+        self.readiness = if (ready) .ready else .unavailable;
+        return ready;
+    }
+
+    pub fn acquire(self: *Selection, id: UtteranceId) ?Backend {
+        if (self.active != null or self.readiness != .ready) return null;
+        self.active = .{ .id = id, .backend = self.selected };
+        return self.selected;
+    }
+
+    pub fn resolve(self: *Selection, id: UtteranceId) bool {
+        const active = self.active orelse return false;
+        if (active.id != id) return false;
+        self.active = null;
+        if (active.backend != self.selected) self.readiness = .unavailable;
+        return true;
+    }
+
+    pub fn activeRoute(self: *const Selection) ?Route {
+        const active = self.active orelse return null;
+        return .{ .id = active.id, .backend = active.backend };
+    }
+
+    pub fn isReady(self: *const Selection) bool {
+        return self.active == null and self.readiness == .ready;
+    }
+};
+
 /// Empty means automatic language detection. The slice belongs to the immutable
 /// Settings Snapshot from which the lease was acquired.
 pub const Language = []const u8;
@@ -197,4 +261,34 @@ test "local deadline requests cancellation at 9.5 seconds and claims the hard de
     try std.testing.expect(state.claim(10_999) == null);
     try std.testing.expectEqualDeep(DeadlineState.Action{ .final = 73 }, state.claim(11_000).?);
     try std.testing.expect(state.claim(11_001) == null);
+}
+
+test "selection drains an active lease before preparing the latest backend" {
+    var state = Selection.init(.openai);
+    const openai = state.beginPreparation(.openai).?;
+    try std.testing.expect(state.finishPreparation(openai, true));
+    try std.testing.expectEqual(Backend.openai, state.acquire(41).?);
+
+    state.select(.local_kb_whisper);
+    try std.testing.expectEqual(Backend.openai, state.activeRoute().?.backend);
+    try std.testing.expect(state.beginPreparation(.local_kb_whisper) == null);
+    try std.testing.expect(state.acquire(42) == null);
+
+    state.select(.openai);
+    state.select(.local_kb_whisper);
+    try std.testing.expect(state.resolve(41));
+    const latest = state.beginPreparation(.local_kb_whisper).?;
+    try std.testing.expectEqual(Backend.local_kb_whisper, latest.backend);
+    try std.testing.expect(state.finishPreparation(latest, true));
+    try std.testing.expectEqual(Backend.local_kb_whisper, state.acquire(42).?);
+}
+
+test "obsolete preparation never becomes ready" {
+    var state = Selection.init(.openai);
+    const obsolete = state.beginPreparation(.openai).?;
+    state.select(.local_kb_whisper);
+    try std.testing.expect(!state.finishPreparation(obsolete, true));
+    try std.testing.expect(state.acquire(1) == null);
+    try std.testing.expect(state.beginPreparation(.openai) == null);
+    try std.testing.expectEqual(Backend.local_kb_whisper, state.beginPreparation(.local_kb_whisper).?.backend);
 }
