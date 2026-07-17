@@ -81,7 +81,21 @@ behind the window continuously).
   likely needs no SDK switch for glass alone; worth one closer side-by-side
   during HITL before the graduation spec relies on it.
 
-## Verdict
+## Verdict (2026-07-17, HITL)
 
-_Pending HITL rounds — react to the running artifact and record the winning
-(style, tint, bar color, radius, shadow, processing animation) here._
+**Look locked.** The winner, in harness terms:
+
+    [glass=regular tint=accent_strong bars=accent radius=capsule shadow=true
+     pill=420x60 bar=3w/2g(76) processing=dots_accent]
+
+Regular glass with a strong accent tint (accent @ 0.45 alpha), accent bars,
+capsule corner radius (pill_h/2), window shadow ON, the proven 420×60 pill
+with fine bars (3 pt wide / 2 pt gap → 76 bars), and accent bouncing dots for
+processing.
+
+- **Whisper check: PASSED** — a whisper still visibly moves the bars against
+  the glass; the −60/−10 dBFS mapping needs no retune (map #39 fog dissolved).
+- The old custom red/green is fully replaced by system accent — recording is
+  signalled by the scrolling bars themselves, processing by the dots.
+- Show/hide and recording→processing **transitions** in the glass language are
+  the follow-on ticket (#44); this prototype is the base to extend.
