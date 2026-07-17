@@ -1,4 +1,4 @@
-//! main.zig — Liquid Glass HUD spike harness (wayfinder #41). Throwaway.
+//! main.zig — Liquid Glass HUD spike harness (wayfinder #41 + #44). Throwaway.
 //!
 //! Wraps the proven waveform (#25: CALayer-per-bar, 20 Hz pump, implicit
 //! anims off) in an NSGlassEffectView capsule and swaps the custom red/green
@@ -9,6 +9,13 @@
 //!   - bar color accent/label/white
 //!   - processing animation: accent dots / neutral dots / glass pulse
 //!   - window shadow on/off, size, bar presets
+//!
+//! #44 adds the motion axes on top of #41's locked look:
+//!
+//!   - show/hide: pop (today) / fade / materialize
+//!   - recording→processing: cut (today) / crossfade / morph / swell
+//!   - a speed dial for slow-mo eyeballing, and a one-key full Utterance
+//!     lifecycle demo (show → record → processing → hide)
 //!
 //! Threading mirrors the daemon (and #25's harness): producers push one level
 //! per 50 ms into a lock-guarded queue; a CFRunLoopTimer on the main thread
@@ -84,7 +91,9 @@ const Shared = struct {
     source: Source = .talk,
     look: glass.Look = .{},
     look_dirty: bool = false,
-    anim: glass.ProcessingAnim = .dots_accent,
+    anim: glass.ProcessingAnim = .dots_neutral, // #44 verdict
+    motion: glass.Motion = .{},
+    demo_running: bool = false,
 
     fn pushLevel(self: *Shared, v: f32) void {
         os_unfair_lock_lock(&self.mu);
@@ -245,13 +254,33 @@ fn renderTick(_: CFRunLoopTimerRef, _: ?*anyopaque) callconv(.c) void {
     const mode = g_shared.mode;
     const anim = g_shared.anim;
     const look = g_shared.look;
+    const motion = g_shared.motion;
     const look_dirty = g_shared.look_dirty;
     g_shared.look_dirty = false;
     os_unfair_lock_unlock(&g_shared.mu);
 
     if (look_dirty) g_pill.applyLook(look);
     if (mode == .recording) for (levels[0..n]) |v| g_pill.pushLevel(v);
-    g_pill.render(mode, anim, CFAbsoluteTimeGetCurrent());
+    g_pill.render(mode, anim, motion, CFAbsoluteTimeGetCurrent());
+}
+
+// ---- lifecycle demo: one full Utterance, so the motion reads as a whole --------
+fn demoSeq() void {
+    const steps = [_]struct { mode: glass.Mode, dwell_ms: u32 }{
+        .{ .mode = .hidden, .dwell_ms = 600 }, // clear the stage first
+        .{ .mode = .recording, .dwell_ms = 2500 }, // press: capsule appears, bars scroll
+        .{ .mode = .processing, .dwell_ms = 1500 }, // release: held over Insertion
+        .{ .mode = .hidden, .dwell_ms = 0 }, // resolution: capsule leaves
+    };
+    for (steps) |step| {
+        os_unfair_lock_lock(&g_shared.mu);
+        g_shared.mode = step.mode;
+        os_unfair_lock_unlock(&g_shared.mu);
+        if (step.dwell_ms > 0) _ = usleep(step.dwell_ms * 1000);
+    }
+    os_unfair_lock_lock(&g_shared.mu);
+    g_shared.demo_running = false;
+    os_unfair_lock_unlock(&g_shared.mu);
 }
 
 // ---- stdin command driver --------------------------------------------------------
@@ -266,13 +295,14 @@ fn printStatus() void {
     const s = g_shared;
     os_unfair_lock_unlock(&g_shared.mu);
     std.debug.print(
-        "  [mode={s} voice={s} glass={s} tint={s} bars={s} radius={s} shadow={} pill={d:.0}x{d:.0} bar={d:.0}w/{d:.0}g({d}) processing={s}]\n",
+        "  [mode={s} voice={s} glass={s} tint={s} bars={s} radius={s} shadow={} pill={d:.0}x{d:.0} bar={d:.0}w/{d:.0}g({d}) processing={s} show={s} switch={s} speed={d:.1}]\n",
         .{
-            @tagName(s.mode),        @tagName(s.source),      @tagName(s.look.style),
-            @tagName(s.look.tint),   @tagName(s.look.bars),   @tagName(s.look.radius),
-            s.look.shadow,           s.look.pill_w,           s.look.pill_h,
-            s.look.bar_w,            s.look.bar_gap,          glass.barCount(s.look),
-            @tagName(s.anim),
+            @tagName(s.mode),          @tagName(s.source),        @tagName(s.look.style),
+            @tagName(s.look.tint),     @tagName(s.look.bars),     @tagName(s.look.radius),
+            s.look.shadow,             s.look.pill_w,             s.look.pill_h,
+            s.look.bar_w,              s.look.bar_gap,            glass.barCount(s.look),
+            @tagName(s.anim),          @tagName(s.motion.show),   @tagName(s.motion.switch_anim),
+            s.motion.speed,
         },
     );
 }
@@ -281,6 +311,7 @@ fn handle(ch: u8) void {
     os_unfair_lock_lock(&g_shared.mu);
     var s = &g_shared;
     var mic_on: ?bool = null;
+    var start_demo = false;
     switch (ch) {
         'r' => s.mode = .recording,
         'p' => s.mode = .processing,
@@ -298,7 +329,11 @@ fn handle(ch: u8) void {
             }
         },
         'g' => {
-            s.look.style = if (s.look.style == .regular) .clear else .regular;
+            s.look.style = switch (s.look.style) {
+                .regular => .clear,
+                .clear => .none, // bare: wavs + dots only, no capsule
+                .none => .regular,
+            };
             s.look_dirty = true;
         },
         'n' => {
@@ -342,6 +377,9 @@ fn handle(ch: u8) void {
             } else if (s.look.pill_w == 340) {
                 s.look.pill_w = 300;
                 s.look.pill_h = 44;
+            } else if (s.look.pill_h == 44) {
+                s.look.pill_w = 300;
+                s.look.pill_h = 22; // ultra-slim: a sliver of glass under the text
             } else {
                 s.look.pill_w = 420;
                 s.look.pill_h = 60;
@@ -357,6 +395,28 @@ fn handle(ch: u8) void {
             };
             s.mode = .processing;
         },
+        // ---- #44 motion axes -------------------------------------------------
+        'a' => s.motion.show = switch (s.motion.show) {
+            .pop => .fade,
+            .fade => .materialize,
+            .materialize => .pop,
+        },
+        'f' => s.motion.switch_anim = switch (s.motion.switch_anim) {
+            .cut => .crossfade,
+            .crossfade => .morph,
+            .morph => .swell,
+            .swell => .cut,
+        },
+        'u' => s.motion.speed = if (s.motion.speed == 1.0)
+            2.5 // slow-mo, to see what the transition actually does
+        else if (s.motion.speed == 2.5)
+            0.7 // snappier than default
+        else
+            1.0,
+        'j' => if (!s.demo_running) {
+            s.demo_running = true;
+            start_demo = true;
+        },
         'q' => {
             os_unfair_lock_unlock(&g_shared.mu);
             std.process.exit(0);
@@ -368,6 +428,16 @@ fn handle(ch: u8) void {
     }
     os_unfair_lock_unlock(&g_shared.mu);
 
+    if (start_demo) {
+        std.debug.print("  demo: one full Utterance — show, record ~2.5s, processing ~1.5s, hide\n", .{});
+        const th = std.Thread.spawn(.{}, demoSeq, .{}) catch {
+            os_unfair_lock_lock(&g_shared.mu);
+            g_shared.demo_running = false;
+            os_unfair_lock_unlock(&g_shared.mu);
+            return;
+        };
+        th.detach();
+    }
     if (mic_on) |on| {
         if (on) {
             if (!micStart()) {
@@ -423,23 +493,30 @@ pub fn main() void {
 
     std.debug.print(
         \\
-        \\Liquid Glass HUD spike (wayfinder #41) — a glass capsule with a scrolling
-        \\accent waveform should be at the bottom-centre of the screen.
+        \\Liquid Glass HUD spike (wayfinder #41 + #44) — a glass capsule with a
+        \\scrolling accent waveform should be at the bottom-centre of the screen.
         \\
         \\Commands (letter + Enter):
         \\  r  recording (scrolling waveform)      p  processing (post-release hold)
         \\  h  hide the pill                       t/w/s  synthetic voice: talk/whisper/silence
-        \\  m  toggle LIVE microphone input        g  glass style: Regular <-> Clear
+        \\  m  toggle LIVE microphone input        g  glass style: Regular / Clear / None
+        \\                                            (None = bare wavs+dots, no capsule)
         \\  n  cycle glass tint (none / accent     c  cycle bar color (accent / label / white)
         \\     soft / accent strong)               k  cycle corner radius (capsule / 16 / 8)
         \\  d  cycle processing animation          x  toggle window shadow
         \\     (accent dots / neutral dots /       1/2/3  bars: fine / thin / medium
-        \\     glass pulse)                        z  cycle size 420x60 / 340x52 / 300x44
+        \\     glass pulse)                        z  cycle size 420x60 / 340x52 / 300x44 / 300x22
+        \\
+        \\Motion (#44):
+        \\  a  cycle show/hide (pop / fade /       f  cycle recording->processing (cut /
+        \\     materialize)                           crossfade / morph / swell)
+        \\  u  cycle speed 1.0 / 2.5 slow-mo /     j  demo one full Utterance lifecycle
+        \\     0.7 snappy                             (show -> record -> processing -> hide)
         \\  q  quit
         \\
-        \\React to: whisper visibility on glass (w, then m over real backdrops), Regular
-        \\vs Clear over light/dark/busy desktops (g), tint (n), radius (k), shadow (x),
-        \\and which processing look wins (d). Also flip macOS Reduce Transparency once.
+        \\React to the motion via j after picking a/f (u for slow-mo): how the capsule
+        \\enters/leaves (a: r then h), and how bars hand over to dots (f: r then p).
+        \\The #41 look verdict is the default look; glass_pulse ignores f (bars stay).
         \\
     , .{});
     printStatus();

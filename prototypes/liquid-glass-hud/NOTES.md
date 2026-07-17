@@ -1,7 +1,9 @@
 # Liquid Glass HUD spike — the question
 
-**Throwaway prototype** for wayfinder ticket #41 ("Prototype the Liquid Glass
-HUD capsule", map #39). Delete or graduate once the look is decided.
+**Throwaway prototype** for wayfinder tickets #41 ("Prototype the Liquid Glass
+HUD capsule") and #44 ("Prototype the glass-native show/hide and
+recording→processing transitions"), map #39. Delete or graduate once look and
+motion are decided.
 
 ## Question
 
@@ -51,12 +53,13 @@ Commands (letter + Enter in the terminal):
 
     r  recording (scrolling waveform)      p  processing (post-release hold)
     h  hide the pill                       t/w/s  synthetic voice: talk/whisper/silence
-    m  toggle LIVE microphone input        g  glass style: Regular <-> Clear
+    m  toggle LIVE microphone input        g  glass style: Regular / Clear / None
+                                              (None = bare wavs+dots, no capsule)
     n  cycle glass tint (none / accent     c  cycle bar color (accent / label / white)
        soft / accent strong)               k  cycle corner radius (capsule / 16 / 8)
     d  cycle processing animation          x  toggle window shadow
        (accent dots / neutral dots /       1/2/3  bars: fine / thin / medium
-       glass pulse)                        z  cycle size 420x60 / 340x52 / 300x44
+       glass pulse)                        z  cycle size 420x60 / 340x52 / 300x44 / 300x22
     q  quit
 
 React to: whisper visibility on glass (`w`, then `m` for the real thing) over
@@ -99,3 +102,81 @@ processing.
   signalled by the scrolling bars themselves, processing by the dots.
 - Show/hide and recording→processing **transitions** in the glass language are
   the follow-on ticket (#44); this prototype is the base to extend.
+
+## The motion question (#44)
+
+The look above is locked and is now the default the harness boots into. #44
+asks how it **moves**: how the capsule appears/disappears around the Utterance
+lifecycle, and how recording hands over to processing. The lifecycle mapping
+itself is fixed (map Notes) — only the rendered transitions change.
+
+Candidates, live-switchable:
+
+- **Show/hide** (`a`): `pop` (today's hard cut) / `fade` (window alpha) /
+  `materialize` (alpha fade + the capsule condenses from ~90% scale —
+  glass + content frames animate in tandem).
+- **Recording→processing** (`f`): `cut` (today's hard swap) / `crossfade`
+  (bars fade out while dots fade in, 0.22 s) / `morph` (bars gather onto the
+  three dot positions while fading, 0.30 s) / `swell` (crossfade + a one-shot
+  accent tint swell that decays over 0.45 s).
+- **Speed** (`u`): 1.0 / 2.5 slow-mo (to see what a transition actually does)
+  / 0.7 snappy. Durations: show 0.20 s, hide 0.16 s — all × speed.
+- **Lifecycle demo** (`j`): one full synthetic Utterance — show, record
+  ~2.5 s, processing ~1.5 s, hide — so a candidate reads as a whole, the way
+  the daemon would play it.
+
+Mechanics worth keeping for graduation: transitions ride explicit
+`NSAnimationContext` groupings (window `alphaValue`, view frames via
+`animator`) and nested actions-enabled `CATransaction`s (bar/dot layer
+opacity/frame), so CA interpolates in the render server — the 20 Hz pump only
+*starts* transitions and finishes deferred hides (`orderOut` after the fade).
+The pump's per-tick `setDisableActions:` stays as #25 decreed. `glass_pulse`
+keeps its bars, so `f` doesn't apply to it; a hide that starts from
+processing freezes the dots and fades the capsule out around them.
+
+## Motion smoke-test findings (2026-07-17, scripted run — pre-HITL)
+
+- Every path exercised end-to-end (fade/materialize show+hide, crossfade,
+  morph, swell, `j` demo, quick re-press mid-hide): no crash, clean quit.
+- Screencaptures confirm real interpolation, not hard cuts: a mid-hide frame
+  catches the capsule at partial alpha; a mid-crossfade frame catches dots at
+  partial opacity over fading bars; a mid-morph frame catches the bars
+  gathered onto the dot positions.
+- Animator-driven window/view animations run fine inside the pump's
+  disabled-actions transaction (they're explicit animations, unaffected by
+  `setDisableActions:`).
+
+## Harness additions from HITL reactions (2026-07-17)
+
+- **300×22 ultra-slim pill** appended to the `z` cycle. Dots scale with pill
+  height (size, gap, bounce) so the sliver doesn't clip them. If this size
+  becomes a candidate, re-check whisper contrast — bar excursion is a third
+  of the 60 pt pill's.
+- **Glass style `none`** appended to the `g` cycle: the material is hidden
+  and the bar/dot layers float bare on the transparent panel (shadow forced
+  off — macOS would outline the raw bars). Caveats while bare: glass tint has
+  no visible target, so `swell` degrades to a plain crossfade and
+  `glass_pulse` reads as frozen bars.
+
+## Verdict (#44 — motion, 2026-07-17 HITL)
+
+**Motion locked — and the look revised with it.** The winner, in harness
+terms (now the boot default):
+
+    [glass=none tint=accent_strong bars=label radius=capsule shadow=true
+     pill=300x22 bar=6w/4g(26) processing=dots_neutral show=fade
+     switch=crossfade speed=0.7]
+
+- **Motion**: show/hide **fade** (window alpha), recording→processing
+  **crossfade**, both at **0.7×** — show ≈0.14 s, hide ≈0.11 s,
+  crossfade ≈0.15 s.
+- **The winner is bare**: glass style `none` — no capsule at all. The final
+  design is just the marks: label-color bars (6 pt wide / 4 pt gap → 26
+  bars) in a 300×22 sliver, `secondaryLabelColor` dots for processing.
+  This **supersedes #41's** Regular-glass capsule + accent verdict; with the
+  material gone, tint/radius/shadow are moot (they remain in the string but
+  have no visible target while bare).
+- Caveat carried to the graduation spec (#45): whisper contrast for the
+  22 pt label-color bars deserves one deliberate `w`/`m` pass over light and
+  dark backdrops — bar excursion is a third of the 60 pt pill's, and there
+  is no material behind the bars to guarantee contrast.
