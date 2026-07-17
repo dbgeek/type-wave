@@ -14,6 +14,7 @@ pub const Backend = enum {
 pub const Language = []const u8;
 
 pub const DeadlinePolicy = struct {
+    cooperative_cancel_ms: ?u32 = null,
     final_ms: u32,
 };
 
@@ -22,23 +23,37 @@ pub const openai_deadline = DeadlinePolicy{ .final_ms = 15_000 };
 /// Mutable timer state. The real adapter protects this value with one mutex so the
 /// fire time and identity are armed, cancelled, and claimed as one generation.
 pub const DeadlineState = struct {
+    cooperative_at_ms: i64 = 0,
     fire_at_ms: i64 = 0,
     id: UtteranceId = 0,
 
+    pub const Action = union(enum) {
+        cooperative_cancel: UtteranceId,
+        final: UtteranceId,
+    };
+
     pub fn arm(self: *DeadlineState, id: UtteranceId, now_ms: i64, policy: DeadlinePolicy) void {
         self.id = id;
+        self.cooperative_at_ms = if (policy.cooperative_cancel_ms) |delay| now_ms + delay else 0;
         self.fire_at_ms = now_ms + policy.final_ms;
     }
 
     pub fn cancel(self: *DeadlineState, id: UtteranceId) void {
-        if (self.id == id) self.fire_at_ms = 0;
+        if (self.id == id) self.* = .{};
     }
 
-    pub fn claim(self: *DeadlineState, now_ms: i64) ?UtteranceId {
-        if (self.fire_at_ms == 0 or now_ms < self.fire_at_ms) return null;
-        const claimed = self.id;
-        self.fire_at_ms = 0;
-        return claimed;
+    pub fn claim(self: *DeadlineState, now_ms: i64) ?Action {
+        if (self.fire_at_ms == 0) return null;
+        if (now_ms >= self.fire_at_ms) {
+            const id = self.id;
+            self.* = .{};
+            return .{ .final = id };
+        }
+        if (self.cooperative_at_ms != 0 and now_ms >= self.cooperative_at_ms) {
+            self.cooperative_at_ms = 0;
+            return .{ .cooperative_cancel = self.id };
+        }
+        return null;
     }
 };
 
@@ -48,6 +63,7 @@ pub const Commands = struct {
     begin: *const fn (ctx: *anyopaque, id: UtteranceId, language: Language) anyerror!void,
     append_audio: *const fn (ctx: *anyopaque, id: UtteranceId, pcm: []const u8) anyerror!void,
     release: *const fn (ctx: *anyopaque, id: UtteranceId) anyerror!void,
+    request_cancel: *const fn (ctx: *anyopaque, id: UtteranceId) void,
     cancel: *const fn (ctx: *anyopaque, id: UtteranceId) void,
 };
 
@@ -71,13 +87,17 @@ pub const Lease = struct {
         try self.commands.release(self.ctx, self.id);
     }
 
+    pub fn requestCancellation(self: Lease) void {
+        self.commands.request_cancel(self.ctx, self.id);
+    }
+
     pub fn cancel(self: Lease) void {
         self.commands.cancel(self.ctx, self.id);
     }
 };
 
 const Recorder = struct {
-    calls: [4]u8 = undefined,
+    calls: [5]u8 = undefined,
     call_count: usize = 0,
     last_id: UtteranceId = 0,
     last_language: [16]u8 = undefined,
@@ -89,6 +109,7 @@ const Recorder = struct {
         .begin = begin,
         .append_audio = appendAudio,
         .release = release,
+        .request_cancel = requestCancel,
         .cancel = cancel,
     };
 
@@ -115,6 +136,9 @@ const Recorder = struct {
     fn release(ctx: *anyopaque, id: UtteranceId) !void {
         from(ctx).record('r', id);
     }
+    fn requestCancel(ctx: *anyopaque, id: UtteranceId) void {
+        from(ctx).record('q', id);
+    }
     fn cancel(ctx: *anyopaque, id: UtteranceId) void {
         from(ctx).record('c', id);
     }
@@ -136,9 +160,10 @@ test "lease pins metadata and forwards identity-tagged backend commands" {
     try lease.appendAudio(&borrowed);
     borrowed[0] = 99; // adapter consumed/copied the borrowed PCM synchronously
     try lease.release();
+    lease.requestCancellation();
     lease.cancel();
 
-    try std.testing.expectEqualStrings("barc", recorder.calls[0..recorder.call_count]);
+    try std.testing.expectEqualStrings("barqc", recorder.calls[0..recorder.call_count]);
     try std.testing.expectEqual(@as(UtteranceId, 73), recorder.last_id);
     try std.testing.expectEqualStrings("sv", recorder.last_language[0..recorder.last_language_len]);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, recorder.pcm[0..recorder.pcm_len]);
@@ -149,16 +174,27 @@ test "lease pins metadata and forwards identity-tagged backend commands" {
 test "deadline claim cannot borrow the identity of a later arm" {
     var state = DeadlineState{};
     state.arm(1, 1_000, .{ .final_ms = 100 });
-    try std.testing.expectEqual(@as(?UtteranceId, 1), state.claim(1_100));
+    try std.testing.expectEqualDeep(DeadlineState.Action{ .final = 1 }, state.claim(1_100).?);
 
     state.arm(2, 1_100, .{ .final_ms = 100 });
-    try std.testing.expectEqual(@as(?UtteranceId, null), state.claim(1_100));
-    try std.testing.expectEqual(@as(?UtteranceId, 2), state.claim(1_200));
+    try std.testing.expect(state.claim(1_100) == null);
+    try std.testing.expectEqualDeep(DeadlineState.Action{ .final = 2 }, state.claim(1_200).?);
 }
 
 test "deadline cancellation is identity matched" {
     var state = DeadlineState{};
     state.arm(8, 1_000, .{ .final_ms = 100 });
     state.cancel(7);
-    try std.testing.expectEqual(@as(?UtteranceId, 8), state.claim(1_100));
+    try std.testing.expectEqualDeep(DeadlineState.Action{ .final = 8 }, state.claim(1_100).?);
+}
+
+test "local deadline requests cancellation at 9.5 seconds and claims the hard deadline at 10 seconds" {
+    var state = DeadlineState{};
+    state.arm(73, 1_000, .{ .cooperative_cancel_ms = 9_500, .final_ms = 10_000 });
+
+    try std.testing.expect(state.claim(10_499) == null);
+    try std.testing.expectEqualDeep(DeadlineState.Action{ .cooperative_cancel = 73 }, state.claim(10_500).?);
+    try std.testing.expect(state.claim(10_999) == null);
+    try std.testing.expectEqualDeep(DeadlineState.Action{ .final = 73 }, state.claim(11_000).?);
+    try std.testing.expect(state.claim(11_001) == null);
 }

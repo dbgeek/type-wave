@@ -11,6 +11,34 @@ pub const Event = union(enum) {
     failed: ipc.Diagnostic,
 };
 
+/// Automatic helper-recovery budget. Recovery attempts are delayed by one, two, and
+/// four seconds. If all three attempts fail, automatic recovery latches until an explicit
+/// reset (Retry/backend reselection) or a successful Final Transcript.
+pub const RecoveryBudget = struct {
+    consecutive_failures: u8 = 0,
+
+    const delays_ms = [_]u32{ 1_000, 2_000, 4_000 };
+
+    pub fn failed(self: *RecoveryBudget) ?u32 {
+        if (self.latched()) return null;
+        const delay = delays_ms[self.consecutive_failures];
+        self.consecutive_failures += 1;
+        return delay;
+    }
+
+    pub fn latched(self: RecoveryBudget) bool {
+        return self.consecutive_failures == delays_ms.len;
+    }
+
+    pub fn reset(self: *RecoveryBudget) void {
+        self.* = .{};
+    }
+
+    pub fn receivedFinal(self: *RecoveryBudget, text: []const u8) void {
+        if (text.len != 0) self.reset();
+    }
+};
+
 pub const Supervisor = struct {
     state: State = .starting,
     expected_digest: [32]u8,
@@ -136,4 +164,33 @@ test "startup and inference failures stay structured" {
         try inference.receive(.{ .failed = .{ .id = 8, .code = 9, .message = "cancelled" } }),
     );
     try std.testing.expectEqual(State.ready, inference.state);
+}
+
+test "helper recovery waits 1 2 and 4 seconds then latches after three failed attempts" {
+    var recovery = RecoveryBudget{};
+
+    try std.testing.expectEqual(@as(?u32, 1_000), recovery.failed());
+    try std.testing.expectEqual(@as(?u32, 2_000), recovery.failed());
+    try std.testing.expectEqual(@as(?u32, 4_000), recovery.failed());
+
+    try std.testing.expect(recovery.latched());
+    try std.testing.expectEqual(@as(?u32, null), recovery.failed());
+}
+
+test "explicit reset and successful Final Transcript restore the recovery budget" {
+    var recovery = RecoveryBudget{};
+    _ = recovery.failed();
+    _ = recovery.failed();
+
+    recovery.reset();
+    try std.testing.expectEqual(@as(?u32, 1_000), recovery.failed());
+    recovery.receivedFinal("restored");
+    try std.testing.expectEqual(@as(?u32, 1_000), recovery.failed());
+}
+
+test "empty Final Transcript does not restore the recovery budget" {
+    var recovery = RecoveryBudget{};
+    _ = recovery.failed();
+    recovery.receivedFinal("");
+    try std.testing.expectEqual(@as(?u32, 2_000), recovery.failed());
 }

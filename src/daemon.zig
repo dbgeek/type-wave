@@ -79,6 +79,7 @@ extern "c" fn CFRunLoopStop(rl: CFRunLoopRef) void;
 extern "c" fn signal(sig: c_int, handler: *const fn (c_int) callconv(.c) void) callconv(.c) usize;
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
+const SIGHUP: c_int = 1;
 
 // ---- tuning ----------------------------------------------------------------
 /// Self-heal poll cadence. Fast enough that granting a permission / dropping in the key
@@ -90,9 +91,14 @@ const supervisor_tick_ms: usize = 3_000;
 /// Raised by the SIGINT/SIGTERM handler (async-signal-safe store only); the quit watcher
 /// polls it and stops the run loop, and the supervisor + adapter threads poll it to end.
 var g_quit = std.atomic.Value(bool).init(false);
+var g_retry_local = std.atomic.Value(bool).init(false);
 
 fn onSignal(_: c_int) callconv(.c) void {
     g_quit.store(true, .release);
+}
+
+fn onRetryLocal(_: c_int) callconv(.c) void {
+    g_retry_local.store(true, .release);
 }
 
 /// Waits for the quit signal, then unwinds the main loop. Under the status item that
@@ -142,13 +148,14 @@ const TranscriptionAdapter = struct {
     ptr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     active_id: std.atomic.Value(backend.UtteranceId) = std.atomic.Value(backend.UtteranceId).init(0),
     selected: backend.Backend = .openai,
-    local: ?*LocalAdapter = null,
+    local_ptr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     store: *config.Store = undefined,
 
     const commands = backend.Commands{
         .begin = begin,
         .append_audio = appendAudio,
         .release = release,
+        .request_cancel = cancel,
         .cancel = cancel,
     };
 
@@ -159,17 +166,24 @@ const TranscriptionAdapter = struct {
         const p = self.ptr.load(.acquire);
         return if (p == 0) null else @ptrFromInt(p);
     }
+    fn setLocal(self: *TranscriptionAdapter, local: *LocalAdapter) bool {
+        return self.local_ptr.cmpxchgStrong(0, @intFromPtr(local), .release, .acquire) == null;
+    }
+    fn currentLocal(self: *TranscriptionAdapter) ?*LocalAdapter {
+        const p = self.local_ptr.load(.acquire);
+        return if (p == 0) null else @ptrFromInt(p);
+    }
     // ---- the Coordinator's backend-neutral lease seam -----------------------------
     pub fn available(self: *TranscriptionAdapter) bool {
         return switch (self.selected) {
             .openai => self.ptr.load(.acquire) != 0,
-            .local_kb_whisper => if (self.local) |local| local.isReady() else false,
+            .local_kb_whisper => if (self.currentLocal()) |local| local.isReady() else false,
         };
     }
     pub fn acquire(self: *TranscriptionAdapter, id: backend.UtteranceId) ?backend.Lease {
         self.active_id.store(id, .release);
         if (self.selected == .local_kb_whisper) {
-            const local = self.local orelse return null;
+            const local = self.currentLocal() orelse return null;
             return local.acquire(id, self.store.current().language);
         }
         const session = self.current() orelse return null;
@@ -210,7 +224,7 @@ const TranscriptionAdapter = struct {
         if (id == 0) return error.NoActiveUtterance;
         switch (self.selected) {
             .openai => try commands.append_audio(self, id, pcm),
-            .local_kb_whisper => try (self.local orelse return error.NoLocalBackend).appendAudio(id, pcm),
+            .local_kb_whisper => try (self.currentLocal() orelse return error.NoLocalBackend).appendAudio(id, pcm),
         }
         return id;
     }
@@ -251,16 +265,16 @@ const RealInsertionDeps = struct {
 };
 const InsertionAdapter = insertion_adapter.InsertionAdapter(RealInsertionDeps);
 
-/// Deadline seam: a small timer thread. `arm` (Coordinator entering `awaiting_final`) sets
-/// a fire time; `cancel` (final arrived) clears it. The loop fires `.deadline` once if the
-/// window elapses while still armed — the cmpxchg makes a cancel/arm race lose cleanly, and
-/// the Coordinator ignores a stale `.deadline` anyway (phase guard).
+/// Deadline seam: a small timer thread. `arm` (Coordinator releasing an Utterance) sets
+/// the backend's cooperative and final fire times; `cancel` (Final Transcript) clears both.
+/// Claimed actions re-enter the Coordinator, whose identity/phase guard rejects stale races.
 const DeadlineAdapter = struct {
     io: std.Io = undefined,
     mu: std.Io.Mutex = .init,
     state: backend.DeadlineState = .{},
 
     co_ctx: *anyopaque = undefined,
+    on_cooperative_cancel: *const fn (*anyopaque, backend.UtteranceId) void = undefined,
     on_fire: *const fn (*anyopaque, backend.UtteranceId) void = undefined,
 
     pub fn arm(self: *DeadlineAdapter, id: backend.UtteranceId, policy: backend.DeadlinePolicy) void {
@@ -278,8 +292,11 @@ const DeadlineAdapter = struct {
             self.mu.lockUncancelable(self.io);
             const claimed = self.state.claim(session_mod.nowMs());
             self.mu.unlock(self.io);
-            if (claimed) |id| self.on_fire(self.co_ctx, id);
-            _ = usleep(50_000);
+            if (claimed) |action| switch (action) {
+                .cooperative_cancel => |id| self.on_cooperative_cancel(self.co_ctx, id),
+                .final => |id| self.on_fire(self.co_ctx, id),
+            };
+            _ = usleep(1_000);
         }
     }
 };
@@ -303,6 +320,10 @@ fn insertDoneTramp(ctx: *anyopaque, id: coord.UtteranceId, result: coord.InsertR
 fn deadlineFireTramp(ctx: *anyopaque, id: backend.UtteranceId) void {
     const co: *Coord = @ptrCast(@alignCast(ctx));
     co.handle(.{ .deadline = id });
+}
+fn cooperativeCancelTramp(ctx: *anyopaque, id: backend.UtteranceId) void {
+    const co: *Coord = @ptrCast(@alignCast(ctx));
+    co.handle(.{ .cooperative_cancel = id });
 }
 
 /// The whole daemon: the long-lived modules, the real adapters, and the Coordinator they
@@ -360,6 +381,57 @@ const Daemon = struct {
     }
     fn localFailed(ctx: *anyopaque, id: backend.UtteranceId) void {
         obsDropped(ctx, id);
+    }
+
+    fn ensureLocalHelper(self: *Daemon) void {
+        if (self.transcription.currentLocal()) |local| {
+            local.retry();
+            feedback.log("  local KB Whisper Retry requested\n", .{});
+            return;
+        }
+
+        const raw_home = std.c.getenv("HOME") orelse {
+            feedback.log("  local KB Whisper unavailable: HOME is not set\n", .{});
+            return;
+        };
+        const home = std.mem.span(raw_home);
+        var helper_buf: [4096]u8 = undefined;
+        var model_buf: [4096]u8 = undefined;
+        const helper_path = std.fmt.bufPrint(&helper_buf, "{s}/.local/libexec/type-wave/type-wave-whisper", .{home}) catch {
+            feedback.log("  local KB Whisper unavailable: helper path is too long\n", .{});
+            return;
+        };
+        const model_path = std.fmt.bufPrint(&model_buf, "{s}/Library/Application Support/type-wave/models/active/ggml-model.bin", .{home}) catch {
+            feedback.log("  local KB Whisper unavailable: model path is too long\n", .{});
+            return;
+        };
+        const helper = local_backend.ProcessHelper.start(self.alloc, self.io, helper_path, model_path) catch |failure| {
+            feedback.log("  local KB Whisper unavailable after bounded recovery: {s}; send SIGHUP to Retry\n", .{@errorName(failure)});
+            return;
+        };
+        const local = self.alloc.create(LocalAdapter) catch {
+            helper.shutdown();
+            feedback.log("  local KB Whisper unavailable: adapter allocation failed\n", .{});
+            return;
+        };
+        local.* = LocalAdapter.init(self.alloc, self.io, helper, .{
+            .ctx = self,
+            .final = Daemon.localFinal,
+            .failed = Daemon.localFailed,
+        });
+        local.bindHelperEvents();
+        if (!self.transcription.setLocal(local)) {
+            local.shutdown();
+            return;
+        }
+        feedback.log("  local KB Whisper helper warm — Capture stays on this Mac\n", .{});
+    }
+
+    fn localRetryLoop(self: *Daemon) void {
+        while (!g_quit.load(.acquire)) {
+            if (g_retry_local.swap(false, .acq_rel)) self.ensureLocalHelper();
+            _ = usleep(50_000);
+        }
     }
 
     /// Capture chunk sink: forward PCM to the current Session (created lazily by the
@@ -661,36 +733,13 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     daemon.insertion.deps.co_ctx = &daemon.coordinator;
     daemon.insertion.deps.on_done = insertDoneTramp;
     daemon.deadline.co_ctx = &daemon.coordinator;
+    daemon.deadline.on_cooperative_cancel = cooperativeCancelTramp;
     daemon.deadline.on_fire = deadlineFireTramp;
 
     // The #72 thin path deliberately uses fixed, manually provisioned locations. The
     // helper verifies the exact pinned artifact before declaring ready; no credential or
     // network-capable component is touched with the local Transcription Backend selected.
-    if (selected_backend == .local_kb_whisper) {
-        const home_ptr = std.c.getenv("HOME");
-        if (home_ptr) |raw_home| {
-            const home = std.mem.span(raw_home);
-            var helper_buf: [4096]u8 = undefined;
-            var model_buf: [4096]u8 = undefined;
-            const helper_path = std.fmt.bufPrint(&helper_buf, "{s}/.local/libexec/type-wave/type-wave-whisper", .{home}) catch "";
-            const model_path = std.fmt.bufPrint(&model_buf, "{s}/Library/Application Support/type-wave/models/active/ggml-model.bin", .{home}) catch "";
-            if (local_backend.ProcessHelper.start(alloc, io, helper_path, model_path)) |helper| {
-                const local = try alloc.create(LocalAdapter);
-                local.* = LocalAdapter.init(alloc, io, helper, .{
-                    .ctx = &daemon,
-                    .final = Daemon.localFinal,
-                    .failed = Daemon.localFailed,
-                });
-                local.bindHelperEvents();
-                daemon.transcription.local = local;
-                feedback.log("  local KB Whisper helper warm — Capture stays on this Mac\n", .{});
-            } else |failure| {
-                feedback.log("  local KB Whisper unavailable: {s}\n", .{@errorName(failure)});
-            }
-        } else {
-            feedback.log("  local KB Whisper unavailable: HOME is not set\n", .{});
-        }
-    }
+    if (selected_backend == .local_kb_whisper) daemon.ensureLocalHelper();
 
     // ---- Talk Key tap: prompt for the two event grants once, then create the tap on THIS
     //      (main) run loop. A created-but-disabled tap is fine — the supervisor enables it
@@ -744,13 +793,18 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     timer.detach();
     // The supervisor is JOINED at shutdown (below), so it can't race the session teardown.
     const supervisor = try std.Thread.spawn(.{}, Daemon.supervisorLoop, .{&daemon});
+    const local_retry = if (selected_backend == .local_kb_whisper)
+        try std.Thread.spawn(.{}, Daemon.localRetryLoop, .{&daemon})
+    else
+        null;
 
     _ = signal(SIGINT, onSignal);
     _ = signal(SIGTERM, onSignal);
+    if (selected_backend == .local_kb_whisper) _ = signal(SIGHUP, onRetryLocal);
     const watcher = try std.Thread.spawn(.{}, quitWatcher, .{CFRunLoopGetMain()});
     watcher.detach();
 
-    feedback.log("type-wave daemon up — self-healing. SIGTERM/Ctrl-C to quit.\n", .{});
+    feedback.log("type-wave daemon up — self-healing. SIGTERM/Ctrl-C to quit{s}.\n", .{if (selected_backend == .local_kb_whisper) "; SIGHUP to Retry local inference" else ""});
 
     // The main loop. With the status item up this MUST be [NSApp run] — a bare
     // CFRunLoopRun never runs AppKit's nextEvent→sendEvent: dispatch, so status-item
@@ -767,7 +821,8 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     // still hold the pointer (same process-lifetime-singleton stance as config).
     feedback.log("shutting down…\n", .{});
     supervisor.join();
-    if (daemon.transcription.local) |local|
+    if (local_retry) |thread| thread.join();
+    if (daemon.transcription.currentLocal()) |local|
         local.shutdown()
     else if (daemon.transcription.current()) |sess|
         sess.shutdown();

@@ -49,6 +49,7 @@ pub const Event = union(enum) {
     release,
     final: struct { id: UtteranceId, text: []const u8 },
     backend_failed: UtteranceId,
+    cooperative_cancel: UtteranceId,
     deadline: UtteranceId,
     inserted: struct { id: UtteranceId, result: InsertResult },
 };
@@ -95,6 +96,7 @@ pub fn Coordinator(comptime Deps: type) type {
                 .release => self.onRelease(),
                 .final => |e| self.onFinal(e.id, e.text),
                 .backend_failed => |id| self.onBackendFailed(id),
+                .cooperative_cancel => |id| self.onCooperativeCancel(id),
                 .deadline => |id| self.onDeadline(id),
                 .inserted => |e| self.onInserted(e.id, e.result),
             }
@@ -161,14 +163,15 @@ pub fn Coordinator(comptime Deps: type) type {
             if (!self.deps.audio.heardSound())
                 feedback.log("  microphone captured only silence — is Microphone permission granted to this process?\n", .{});
 
+            self.deps.deadline.arm(lease.id, lease.deadline); // release-anchored; final cancels it
             lease.release() catch |e| {
+                self.deps.deadline.cancel(lease.id);
                 feedback.log("  backend release failed: {s}\n", .{@errorName(e)});
                 lease.cancel();
                 self.abandon();
                 return;
             };
             self.phase = .awaiting_final;
-            self.deps.deadline.arm(lease.id, lease.deadline); // release-anchored; final cancels it
         }
 
         fn onFinal(self: *Self, id: UtteranceId, text: []const u8) void {
@@ -192,6 +195,11 @@ pub fn Coordinator(comptime Deps: type) type {
             feedback.log("  no Final Transcript within the deadline — nothing inserted\n", .{});
             self.active.?.cancel();
             self.abandon();
+        }
+
+        fn onCooperativeCancel(self: *Self, id: UtteranceId) void {
+            if (!self.matches(id, .awaiting_final)) return;
+            self.active.?.requestCancellation();
         }
 
         fn onBackendFailed(self: *Self, id: UtteranceId) void {
@@ -272,6 +280,7 @@ const FakeBackends = struct {
     began: usize = 0,
     appended: usize = 0,
     released: usize = 0,
+    cancellation_requests: usize = 0,
     cancelled: usize = 0,
     last_id: UtteranceId = 0,
 
@@ -279,6 +288,7 @@ const FakeBackends = struct {
         .begin = begin,
         .append_audio = appendAudio,
         .release = release,
+        .request_cancel = requestCancel,
         .cancel = cancel,
     };
 
@@ -312,6 +322,11 @@ const FakeBackends = struct {
         self.released += 1;
         self.last_id = id;
         return self.release_result;
+    }
+    fn requestCancel(ctx: *anyopaque, id: UtteranceId) void {
+        const self = from(ctx);
+        self.cancellation_requests += 1;
+        self.last_id = id;
     }
     fn cancel(ctx: *anyopaque, id: UtteranceId) void {
         const self = from(ctx);
@@ -523,6 +538,23 @@ test "9 deadline before final abandons" {
     // a stale final afterwards is ignored
     co.handle(.{ .final = .{ .id = 1, .text = "too late" } });
     try expect(h.insertion.submits == 0);
+}
+
+test "9a cooperative deadline requests cancellation without resolving the Utterance" {
+    var h = Harness{};
+    h.backends.policy = .{ .cooperative_cancel_ms = 9_500, .final_ms = 10_000 };
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+
+    co.handle(.{ .cooperative_cancel = 1 });
+    try expectEqual(@as(usize, 1), h.backends.cancellation_requests);
+    try expectEqual(@as(usize, 0), h.backends.cancelled);
+    try expectEqual(@as(usize, 0), h.feedback.abandoneds);
+
+    co.handle(.{ .deadline = 1 });
+    try expectEqual(@as(usize, 1), h.backends.cancelled);
+    try expectEqual(@as(usize, 1), h.feedback.abandoneds);
 }
 
 test "9b backend failure while awaiting final abandons immediately" {
