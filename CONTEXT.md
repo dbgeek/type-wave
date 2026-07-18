@@ -80,6 +80,16 @@ _Avoid_: downloaded model, model cache
 A user-authorized acquisition, verification, activation, repair, or removal acting on a Model Installation. An operation may be in progress while the current Model Installation remains usable.
 _Avoid_: download state, model task
 
+**Model Operation Runner**:
+The daemon's one route from a Status Item action to a Model Operation child process, and
+the owner of that operation's observation — the phase and byte progress the Status Item
+reflects. It drives one operation from launch to a terminal outcome (success / cancelled /
+failed), reaching every effect (spawn, cancel-kill, log) through a dependency seam it is
+handed, so it is exercised by fed operation-channel events, not real subprocesses. It
+consumes the operation-channel wire; it does not warm the local helper — that is the
+Backend Router's path. Lives in `src/model_operation.zig`.
+_Avoid_: model manager, operation orchestrator, download manager
+
 **Capture**:
 The microphone audio stream feeding a Transcription Session.
 _Avoid_: recording
