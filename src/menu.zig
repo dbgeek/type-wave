@@ -156,6 +156,7 @@ const chrome_interval_s: f64 = 2.0;
 const NSControlStateOn: c_long = 1;
 const NSControlStateOff: c_long = 0;
 const NSAlertFirstButtonReturn: c_long = 1000;
+const NSStatusWindowLevel: c_long = 25; // floats above ordinary windows (matches hud.zig)
 
 // =====================================================================================
 // The daemon-facing seams.
@@ -784,11 +785,27 @@ fn confirmationForModelAction(action: ModelAction) ?ModelActionConfirmation {
 
 fn confirmModelAction(action: ModelAction) bool {
     const content = confirmationForModelAction(action) orelse return true;
+    const pool = objc_autoreleasePoolPush();
+    defer objc_autoreleasePoolPop(pool);
+
+    // Unlike the top-level Set-API-Key item, Install/Remove fire from the Local Model
+    // submenu, whose tracking run loop is still tearing down as we present. An accessory
+    // app is never frontmost, so activateIgnoringOtherApps: alone lands too late and the
+    // alert opens behind the frontmost app. Activate, then raise the alert's own window
+    // above ordinary windows and order it front regardless of active state — hud.zig's
+    // #20 recipe — so the confirmation always surfaces focused (#31).
+    msgBool(appkit.app(), "activateIgnoringOtherApps:", true);
+
     const alert = msg(msg(cls("NSAlert"), "alloc"), "init");
     msg1v(alert, "setMessageText:", nsstr(content.title));
     msg1v(alert, "setInformativeText:", nsstr(content.detail));
     _ = msg1(alert, "addButtonWithTitle:", nsstr(content.button));
     _ = msg1(alert, "addButtonWithTitle:", nsstr("Cancel"));
+
+    const win = msg(alert, "window");
+    msgLong(win, "setLevel:", NSStatusWindowLevel);
+    _ = msg(win, "orderFrontRegardless");
+
     return msgLongR(alert, "runModal") == NSAlertFirstButtonReturn;
 }
 
