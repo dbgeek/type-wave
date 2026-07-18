@@ -141,12 +141,15 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run the unit tests (Coordinator lifecycle + pure functions)");
     test_step.dependOn(&run_tests.step);
+    const install_test_binary = b.addInstallArtifact(tests, .{ .dest_sub_path = "type-wave-lifecycle-tests" });
+    const lifecycle_test_binary_step = b.step("lifecycle-test-binary", "Build an independently runnable lifecycle test artifact");
+    lifecycle_test_binary_step.dependOn(&install_test_binary.step);
 
     // The local-backend release gate is a stdlib-only Python program so it can score
     // checked-in evidence without building or loading the native inference runtime.
     // Python is pinned in flake.nix alongside Zig.
     const acceptance_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s", "acceptance/local_backend", "-p", "test_*.py", "-v" });
-    const acceptance_types = b.addSystemCommand(&.{ "mypy", "--strict", "acceptance/local_backend/gate.py" });
+    const acceptance_types = b.addSystemCommand(&.{ "mypy", "--strict", "acceptance/local_backend/gate.py", "acceptance/local_backend/collect.py", "acceptance/local_backend/finalize.py", "acceptance/local_backend/probe_runtime.py" });
     const acceptance_test_step = b.step("acceptance-test", "Run the deterministic local-backend release-gate tests");
     acceptance_test_step.dependOn(&acceptance_tests.step);
     acceptance_test_step.dependOn(&acceptance_types.step);

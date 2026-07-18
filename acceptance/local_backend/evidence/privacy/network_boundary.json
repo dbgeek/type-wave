@@ -1,0 +1,1 @@
+{"basis":{"instrumented_processes":["type-wave","type-wave-whisper"],"raw_sha256":"26f93642010b7a80f99907e41f3d370d99e3704f4e2f59baa9708fdfea6b3f9b"},"observed":{"daemon_network_requests":0,"helper_socket_attempts":0,"supported":true},"probe":"network_boundary","schema_version":1}

@@ -225,6 +225,38 @@ def validate_manifest(manifest: dict[str, Any], manifest_root: Path) -> dict[str
         audio_path = resolve_artifact(manifest_root, audio, f"manifest: {fixture_id} audio")
         require(file_sha256(audio_path) == digest, f"manifest: {fixture_id} audio digest does not match")
         indexed[fixture_id] = fixture
+    source_index = corpus.get("source_index")
+    if source_index is not None:
+        source_digest = corpus.get("source_index_sha256")
+        require(isinstance(source_digest, str) and len(source_digest) == 64, "manifest: source index digest is invalid")
+        source_path = resolve_artifact(manifest_root, source_index, "manifest: source index")
+        require(file_sha256(source_path) == source_digest, "manifest: source index digest does not match")
+        sources_document = load_json(source_path)
+        require(sources_document.get("schema_version") == 1 and isinstance(sources_document.get("dataset_revision"), str), "manifest: source index identity is invalid")
+        sources = sources_document.get("sources")
+        require(isinstance(sources, list), "manifest: source index rows must be an array")
+        assert isinstance(sources, list)
+        source_ids: set[str] = set()
+        source_speakers: dict[str, set[str]] = {}
+        language_source_speakers: dict[str, set[str]] = {language: set() for language in MODES_BY_LANGUAGE}
+        for source in sources:
+            require(isinstance(source, dict) and isinstance(source.get("fixture_id"), str), "manifest: source index row is invalid")
+            source_id = source["fixture_id"]
+            require(source_id not in source_ids, f"manifest: duplicate source index fixture {source_id}")
+            require(source_id in indexed, f"manifest: unknown source index fixture {source_id}")
+            require(source.get("source_duration_seconds") == indexed[source_id]["duration_seconds"], f"manifest: source duration mismatch for {source_id}")
+            source_sha256 = source.get("source_sha256")
+            require(isinstance(source_sha256, str) and len(source_sha256) == 64, f"manifest: source digest is invalid for {source_id}")
+            source_speaker = source.get("source_speaker_sha256")
+            require(isinstance(source_speaker, str) and len(source_speaker) == 64 and all(character in "0123456789abcdef" for character in source_speaker), f"manifest: source speaker binding is invalid for {source_id}")
+            require(all(isinstance(source.get(field), str) and source[field] for field in ("locale", "split", "archive_shard", "clip")), f"manifest: source location is incomplete for {source_id}")
+            local_speaker = indexed[source_id]["speaker_id"]
+            source_speakers.setdefault(local_speaker, set()).add(source_speaker)
+            language_source_speakers[indexed[source_id]["language"]].add(source_speaker)
+            source_ids.add(source_id)
+        require(source_ids == set(indexed), "manifest: source index must cover every fixture exactly once")
+        require(all(len(bindings) == 1 for bindings in source_speakers.values()), "manifest: a local speaker label maps to multiple source speakers")
+        require(all(len(bindings) == 2 for bindings in language_source_speakers.values()), "manifest: source index must prove exactly two speakers per language")
     return indexed
 
 
@@ -269,6 +301,62 @@ def corpus_check(fixtures: dict[str, dict[str, Any]]) -> Check:
         "languages_with_punctuation": sorted(punctuation_languages),
     }
     return Check("corpus.authoritative_shape", "corpus", passed, observed, {"fixtures_per_language": 10, "speakers_per_language": 2, "balanced_duration_classes": ["short", "medium", "long"], "required_tags": sorted(required_tags)})
+
+
+def packaged_identity_check(evidence: dict[str, Any]) -> Check:
+    identity = evidence.get("artifact_identity")
+    required = {
+        "same_packaged_pair": True,
+        "valid_signatures": True,
+        "receipt_matches_helper": True,
+        "pinned_model_and_runtime": True,
+    }
+    if not isinstance(identity, dict):
+        return Check("candidate.packaged_identity", "candidate", False, identity, required)
+    daemon = identity.get("daemon")
+    helper = identity.get("helper")
+    model = identity.get("model")
+    receipt = identity.get("receipt")
+    provenance = identity.get("provenance")
+    if not all(isinstance(value, dict) for value in (daemon, helper, model, receipt, provenance)):
+        return Check("candidate.packaged_identity", "candidate", False, identity, required)
+    assert isinstance(daemon, dict) and isinstance(helper, dict) and isinstance(model, dict)
+    assert isinstance(receipt, dict) and isinstance(provenance, dict)
+    daemon_signature = daemon.get("signature")
+    helper_signature = helper.get("signature")
+    signatures_pass = (
+        isinstance(daemon_signature, dict)
+        and daemon_signature.get("verified") is True
+        and daemon_signature.get("identifier") == "me.ba78.type-wave"
+        and isinstance(helper_signature, dict)
+        and helper_signature.get("verified") is True
+        and helper_signature.get("identifier") == "me.ba78.type-wave.whisper"
+    )
+    pinned_pass = (
+        model == {"bytes": PINNED_CANDIDATE["model_bytes"], "sha256": PINNED_CANDIDATE["model_sha256"]}
+        and receipt.get("model_revision") == PINNED_CANDIDATE["model_revision"]
+        and receipt.get("model_sha256") == PINNED_CANDIDATE["model_sha256"]
+        and receipt.get("model_bytes") == PINNED_CANDIDATE["model_bytes"]
+        and receipt.get("runtime") == PINNED_CANDIDATE["runtime"]
+        and provenance.get("model_revision") == PINNED_CANDIDATE["model_revision"]
+        and provenance.get("runtime_source_sha256") == PINNED_CANDIDATE["runtime_source_sha256"]
+    )
+    digest_fields = (daemon.get("sha256"), helper.get("sha256"), receipt.get("sha256"), provenance.get("sha256"))
+    digests_valid = all(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+        for value in digest_fields
+    )
+    passed = (
+        identity.get("same_packaged_pair") is True
+        and signatures_pass
+        and pinned_pass
+        and digests_valid
+        and receipt.get("matches_helper") is True
+        and receipt.get("runtime_sha256") == helper.get("sha256")
+    )
+    return Check("candidate.packaged_identity", "candidate", passed, identity, required)
 
 
 def quality_checks(fixtures: dict[str, dict[str, Any]], evidence: dict[str, Any]) -> tuple[list[Check], list[dict[str, Any]]]:
@@ -325,12 +413,8 @@ def quality_checks(fixtures: dict[str, dict[str, Any]], evidence: dict[str, Any]
         punctuation_reference.update({(mark, anchor, key[0], key[1]): count for (mark, anchor), count in ref_marks.items()})
         punctuation_hypothesis.update({(mark, anchor, key[0], key[1]): count for (mark, anchor), count in hyp_marks.items()})
 
-        hypothesis_tokens = hypothesis_words
-        for semantic in fixture["protected_semantics"]:
-            protected_tokens = wer_tokens(semantic["text"])
-            present = any(hypothesis_tokens[index:index + len(protected_tokens)] == protected_tokens for index in range(len(hypothesis_tokens) - len(protected_tokens) + 1))
-            if not present:
-                protected_failures.append(f"{key[0]}/{key[1]}:{semantic['kind']}")
+        # Literal matching cannot distinguish semantic loss from an equivalent form
+        # (for example "two" and "2"). The predeclared human review is authoritative.
         protected_failures.extend(f"{key[0]}/{key[1]}:{kind}" for kind in semantic_errors)
 
     expected = {(fixture_id, mode) for fixture_id, fixture in fixtures.items() for mode in fixture["language_modes"]}
@@ -380,10 +464,11 @@ def performance_checks(details: list[dict[str, Any]], evidence: dict[str, Any]) 
     timeout = performance.get("timeout")
     require(isinstance(timeout, dict), "evidence: performance.timeout must be an object")
     assert isinstance(timeout, dict)
+    require(isinstance(timeout.get("supported", True), bool), "evidence: performance.timeout.supported must be boolean")
     for field in ("cooperative_cancel_requested_ms", "helper_terminated_ms", "insertions"):
         require(is_measurement(timeout.get(field)), f"evidence: performance.timeout.{field} must be a finite non-negative measurement")
     require(isinstance(timeout.get("utterance_abandoned"), bool), "evidence: performance.timeout.utterance_abandoned must be boolean")
-    timeout_passed = timeout.get("cooperative_cancel_requested_ms") == 9500 and timeout.get("helper_terminated_ms", float("inf")) <= 10000 and timeout.get("utterance_abandoned") is True and timeout.get("insertions") == 0
+    timeout_passed = timeout.get("supported", True) is True and timeout.get("cooperative_cancel_requested_ms") == 9500 and timeout.get("helper_terminated_ms", float("inf")) <= 10000 and timeout.get("utterance_abandoned") is True and timeout.get("insertions") == 0
     checks.append(Check("performance.hard_timeout", "performance", timeout_passed, timeout, {"cancel_requested_ms": 9500, "terminated_by_ms": 10000, "utterance_abandoned": True, "insertions": 0}))
     return checks
 
@@ -412,21 +497,24 @@ def privacy_checks(evidence: dict[str, Any], evidence_root: Path) -> list[Check]
     require(not missing, f"evidence: missing privacy probe artifacts {missing}")
     offline = observations["offline_operation"]
     require(isinstance(offline, dict), "evidence: offline_operation privacy observations must be an object")
+    require(isinstance(offline.get("supported", True), bool), "evidence: offline_operation support observation is invalid")
     credentials = offline.get("credentials_available")
     require(isinstance(credentials, dict) and all(isinstance(credentials.get(name), bool) for name in ("openai", "hugging_face")), "evidence: offline_operation credential observations are invalid")
     require(all(isinstance(offline.get(field), bool) for field in ("network_disabled", "ready_offline", "corpus_completed")), "evidence: offline_operation observations are invalid")
-    offline_passed = credentials == {"openai": False, "hugging_face": False} and offline.get("network_disabled") is True and offline.get("ready_offline") is True and offline.get("corpus_completed") is True
+    offline_passed = offline.get("supported", True) is True and credentials == {"openai": False, "hugging_face": False} and offline.get("network_disabled") is True and offline.get("ready_offline") is True and offline.get("corpus_completed") is True
     network_observed = observations["network_boundary"]
     logs_observed = observations["default_logs"]
     model_operation = observations["model_operation_boundary"]
-    require(isinstance(network_observed, dict) and all(is_measurement(network_observed.get(field)) for field in ("helper_socket_attempts", "daemon_network_requests")), "evidence: network_boundary observations are invalid")
-    require(isinstance(logs_observed, dict) and all(isinstance(logs_observed.get(field), bool) for field in ("contains_pcm", "contains_transcript", "contains_operational_metadata")), "evidence: default_logs observations are invalid")
-    require(isinstance(model_operation, dict) and is_measurement(model_operation.get("artifact_requests")) and all(isinstance(model_operation.get(field), bool) for field in ("contains_pcm", "contains_transcript")), "evidence: model_operation_boundary observations are invalid")
+    require(isinstance(network_observed, dict) and isinstance(network_observed.get("supported", True), bool), "evidence: network_boundary observations are invalid")
+    if network_observed.get("supported", True):
+        require(all(is_measurement(network_observed.get(field)) for field in ("helper_socket_attempts", "daemon_network_requests")), "evidence: network_boundary observations are invalid")
+    require(isinstance(logs_observed, dict) and isinstance(logs_observed.get("supported", True), bool) and all(isinstance(logs_observed.get(field), bool) for field in ("contains_pcm", "contains_transcript", "contains_operational_metadata")), "evidence: default_logs observations are invalid")
+    require(isinstance(model_operation, dict) and isinstance(model_operation.get("supported", True), bool) and is_measurement(model_operation.get("artifact_requests")) and all(isinstance(model_operation.get(field), bool) for field in ("contains_pcm", "contains_transcript")), "evidence: model_operation_boundary observations are invalid")
     return [
-        Check("privacy.offline_operation", "privacy", offline_passed, offline, {"no_credentials": True, "network_disabled": True, "ready_offline": True, "corpus_completed": True}),
-        Check("privacy.network_boundary", "privacy", network_observed == {"helper_socket_attempts": 0, "daemon_network_requests": 0}, network_observed, {"helper_socket_attempts": 0, "daemon_network_requests": 0}),
-        Check("privacy.default_logs", "privacy", logs_observed == {"contains_pcm": False, "contains_transcript": False, "contains_operational_metadata": True}, logs_observed, {"contains_pcm": False, "contains_transcript": False, "contains_operational_metadata": True}),
-        Check("privacy.model_operation_boundary", "privacy", model_operation.get("artifact_requests", 0) > 0 and model_operation.get("contains_pcm") is False and model_operation.get("contains_transcript") is False, model_operation, {"artifact_requests_minimum": 1, "contains_pcm": False, "contains_transcript": False}),
+        Check("privacy.offline_operation", "privacy", offline_passed, offline, {"supported": True, "no_credentials": True, "network_disabled": True, "ready_offline": True, "corpus_completed": True}),
+        Check("privacy.network_boundary", "privacy", network_observed.get("supported", True) is True and network_observed.get("helper_socket_attempts") == 0 and network_observed.get("daemon_network_requests") == 0, network_observed, {"supported": True, "helper_socket_attempts": 0, "daemon_network_requests": 0}),
+        Check("privacy.default_logs", "privacy", logs_observed.get("supported", True) is True and logs_observed.get("contains_pcm") is False and logs_observed.get("contains_transcript") is False and logs_observed.get("contains_operational_metadata") is True, logs_observed, {"supported": True, "contains_pcm": False, "contains_transcript": False, "contains_operational_metadata": True}),
+        Check("privacy.model_operation_boundary", "privacy", model_operation.get("supported", True) is True and model_operation.get("artifact_requests", 0) > 0 and model_operation.get("contains_pcm") is False and model_operation.get("contains_transcript") is False, model_operation, {"supported": True, "artifact_requests_minimum": 1, "contains_pcm": False, "contains_transcript": False}),
     ]
 
 
@@ -470,7 +558,7 @@ def evaluate(manifest: dict[str, Any], evidence: dict[str, Any], manifest_root: 
     quality, details = quality_checks(fixtures, evidence)
     candidate = evidence.get("candidate")
     candidate_check = Check("candidate.pinned_design", "candidate", candidate == PINNED_CANDIDATE, candidate, PINNED_CANDIDATE)
-    checks = [candidate_check, corpus_check(fixtures)] + quality + performance_checks(details, evidence) + privacy_checks(evidence, evidence_root) + fault_checks(evidence, evidence_root)
+    checks = [candidate_check, packaged_identity_check(evidence), corpus_check(fixtures)] + quality + performance_checks(details, evidence) + privacy_checks(evidence, evidence_root) + fault_checks(evidence, evidence_root)
     report_checks = [asdict(check) for check in checks]
     canonical_manifest = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return {

@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "corpus": {
+    "id": "type-wave-common-voice-17-en-sv-v1",
+    "human_speech": true,
+    "redistributable": true,
+    "license": "CC0-1.0",
+    "source_index": "sources.json",
+    "source_index_sha256": "9bf9de418e5c9b3e06ddeb3656cd8b8c2d1bc642751d3bdd6522c35d2cefc508"
+  },
+  "fixtures": [
+    {
+      "id": "en-a-01", "audio": "audio/en-a-01.wav", "audio_sha256": "864f49176ac40c5e8687c57012d1b57b5f9a812b982b3a6a8309ea56d9f7cdf8",
+      "speaker_id": "en-a", "language": "en", "language_modes": ["en", "auto"],
+      "exact_final_transcript": "Self-described as an \"Anglo-African-Asian\", Plomer was educated mostly in the United Kingdom.",
+      "duration_seconds": 10.2, "duration_class": "long", "punctuation": true,
+      "tags": ["natural-dictation", "proper-noun"], "protected_semantics": []
+    },
+    {
+      "id": "en-a-02", "audio": "audio/en-a-02.wav", "audio_sha256": "596ed43e0fd4c89c17114871793b2b8261b383f80a3347ab2ed012915426dcc7",
+      "speaker_id": "en-a", "language": "en", "language_modes": ["en", "auto"],
+      "exact_final_transcript": "\"Place Beauvau\" is often used as a metonym for the ministry.",
+      "duration_seconds": 6.768, "duration_class": "medium", "punctuation": true,
+      "tags": ["proper-noun", "technical-term"], "protected_semantics": []
+    },
+    {
+      "id": "en-a-03", "audio": "audio/en-a-03.wav", "audio_sha256": "4027e58800c4524499d528fc98a878f778a5bdec3208a64d816d98d99b31a8d3",
+      "speaker_id": "en-a", "language": "en", "language_modes": ["en", "auto"],
+      "exact_final_transcript": "There are various on-line versions on the internet, usually for two-player, turn based play.",
+      "duration_seconds": 7.344, "duration_class": "medium", "punctuation": true,
+      "tags": ["technical-term", "numbers"], "protected_semantics": [{"kind": "number", "text": "two-player"}]
+    },
+    {
+      "id": "en-a-04", "audio": "audio/en-a-04.wav", "audio_sha256": "c62d885f0217d601cfd91e1d225766509cf8b405e9874e16ede9a860281b3587",
+      "speaker_id": "en-a", "language": "en", "language_modes": ["en", "auto"],
+      "exact_final_transcript": "It remains in full use today.",
+      "duration_seconds": 4.488, "duration_class": "short", "punctuation": true,
+      "tags": ["natural-dictation"], "protected_semantics": []
+    },
+    {
+      "id": "en-a-05", "audio": "audio/en-a-05.wav", "audio_sha256": "a79ff08688ce85d37d651e348753bc70a4a8f565032d74638ca51733693169f6",
+      "speaker_id": "en-a", "language": "en", "language_modes": ["en", "auto"],
+      "exact_final_transcript": "The barrier was called the \"Luminous Veil\".",
+      "duration_seconds": 4.512, "duration_class": "short", "punctuation": true,
+      "tags": ["proper-noun"], "protected_semantics": []
+    },
+    {
+      "id": "en-b-01", "audio": "audio/en-b-01.wav", "audio_sha256": "125db3b489442cedef6d4b9588d2e22f904ba974e00df0854db021a8889f2fe8",
+      "speaker_id": "en-b", "language": "en", "language_modes": ["en", "auto"],
+      "exact_final_transcript": "\"Bindus\", identified with Neptune, was worshipped among the Japodes.",
+      "duration_seconds": 10.392, "duration_class": "long", "punctuation": true,
+      "tags": ["proper-noun"], "protected_semantics": []
+    },
+    {
+      "id": "en-b-02", "audio": "audio/en-b-02.wav", "audio_sha256": "c30a48c1bacb766a29412c90b7a92b5d5b2d470f52d473d40990b4bd532c6044",
+      "speaker_id": "en-b", "language": "en", "language_modes": ["en", "auto"],
+      "exact_final_transcript": "The shooting was ruled an accident.",
+      "duration_seconds": 4.824, "duration_class": "short", "punctuation": true,
+      "tags": ["natural-dictation"], "protected_semantics": []
+    },
+    {
+      "id": "en-b-03", "audio": "audio/en-b-03.wav", "audio_sha256": "bddb5a45b4be71ab22dafa089e321e136666035f30224f69a3dd92e9a283fb64",
+      "speaker_id": "en-b", "language": "en", "language_modes": ["en", "auto"],
+      "exact_final_transcript": "Steggert resides in Manhattan.",
+      "duration_seconds": 4.032, "duration_class": "short", "punctuation": true,
+      "tags": ["proper-noun"], "protected_semantics": []
+    },
+    {
+      "id": "en-b-04", "audio": "audio/en-b-04.wav", "audio_sha256": "465575f8f799fa423f4048a3f2c42323792892d6168530b7e1011aebb3207e90",
+      "speaker_id": "en-b", "language": "en", "language_modes": ["en", "auto"],
+      "exact_final_transcript": "The only older station building is in Valkenburg.",
+      "duration_seconds": 6.048, "duration_class": "medium", "punctuation": true,
+      "tags": ["proper-noun"], "protected_semantics": []
+    },
+    {
+      "id": "en-b-05", "audio": "audio/en-b-05.wav", "audio_sha256": "dba515c06c96593593cf10d814a210971936bd5beb578d90a5fbcaf79e1bb4c7",
+      "speaker_id": "en-b", "language": "en", "language_modes": ["en", "auto"],
+      "exact_final_transcript": "After his retirement Maxim spent time as a stand-up comic, restaurateur, and taxi driver.",
+      "duration_seconds": 10.272, "duration_class": "long", "punctuation": true,
+      "tags": ["natural-dictation", "proper-noun"], "protected_semantics": []
+    },
+    {
+      "id": "sv-a-01", "audio": "audio/sv-a-01.wav", "audio_sha256": "368305276d46fbfd213e7925f0710f0bc9580661701d4e200ef492230584908a",
+      "speaker_id": "sv-a", "language": "sv", "language_modes": ["sv", "auto"],
+      "exact_final_transcript": "Tala inte så där till din mamma!", "duration_seconds": 2.016, "duration_class": "short", "punctuation": true,
+      "tags": ["natural-dictation", "negation", "command"],
+      "protected_semantics": [{"kind": "negation", "text": "inte"}, {"kind": "command", "text": "Tala"}]
+    },
+    {
+      "id": "sv-a-02", "audio": "audio/sv-a-02.wav", "audio_sha256": "fa680e1cf92cb247c2b643a0c02a84b767c3cfb47adefab44700f7207d0674f2",
+      "speaker_id": "sv-a", "language": "sv", "language_modes": ["sv", "auto"],
+      "exact_final_transcript": "Fem passagerare hade anmält sig.", "duration_seconds": 2.988, "duration_class": "short", "punctuation": true,
+      "tags": ["numbers"], "protected_semantics": [{"kind": "number", "text": "Fem"}]
+    },
+    {
+      "id": "sv-a-03", "audio": "audio/sv-a-03.wav", "audio_sha256": "f1b606428924f18c8479b0e24e4a249781a91bf15ec4b1a8812a73cb6300fa8c",
+      "speaker_id": "sv-a", "language": "sv", "language_modes": ["sv", "auto"],
+      "exact_final_transcript": "Glöm inte att vattna i växthuset också.", "duration_seconds": 3.06, "duration_class": "short", "punctuation": true,
+      "tags": ["natural-dictation", "negation", "command"], "protected_semantics": [{"kind": "negation", "text": "inte"}, {"kind": "command", "text": "Glöm"}]
+    },
+    {
+      "id": "sv-a-04", "audio": "audio/sv-a-04.wav", "audio_sha256": "a6a1bc5bcdbd6487341ecfa9e93bfe8a634c9dfc16ee1422a67f3ca06e3002c2",
+      "speaker_id": "sv-a", "language": "sv", "language_modes": ["sv", "auto"],
+      "exact_final_transcript": "Ta till vänster i rondellen!", "duration_seconds": 3.348, "duration_class": "short", "punctuation": true,
+      "tags": ["natural-dictation", "command"], "protected_semantics": [{"kind": "command", "text": "Ta"}]
+    },
+    {
+      "id": "sv-a-05", "audio": "audio/sv-a-05.wav", "audio_sha256": "8711c2e678f7f7c4ff8b57074169d9bc803ff19ddfb2dc9e8314725ad2d84ea9",
+      "speaker_id": "sv-a", "language": "sv", "language_modes": ["sv", "auto"],
+      "exact_final_transcript": "Detta innebär att målet ska lämnas över till mark- och miljödomstolen för fortsatt handläggning.",
+      "duration_seconds": 6.408, "duration_class": "medium", "punctuation": true,
+      "tags": ["technical-term"], "protected_semantics": []
+    },
+    {
+      "id": "sv-a-06", "audio": "audio/sv-a-06.wav", "audio_sha256": "5211365cb9fb6059e69be24d239d446d0cc497adc29c91698d967adda0811ea3",
+      "speaker_id": "sv-a", "language": "sv", "language_modes": ["sv", "auto"],
+      "exact_final_transcript": "Huvudregeln är att Patent- och marknadsöverdomstolens avgöranden i tvistemål och ärenden inte får överklagas.",
+      "duration_seconds": 8.46, "duration_class": "medium", "punctuation": true,
+      "tags": ["proper-noun", "technical-term", "negation"], "protected_semantics": [{"kind": "negation", "text": "inte"}]
+    },
+    {
+      "id": "sv-a-07", "audio": "audio/sv-a-07.wav", "audio_sha256": "074cb4bed657947a7ebddb38728fa84585a390ea373bb57167f40c3157a88cf3",
+      "speaker_id": "sv-a", "language": "sv", "language_modes": ["sv", "auto"],
+      "exact_final_transcript": "Jag menar, om hon donerat avsevärda summor till välgörande ändamål.",
+      "duration_seconds": 5.508, "duration_class": "medium", "punctuation": true,
+      "tags": ["natural-dictation", "self-correction"], "protected_semantics": []
+    },
+    {
+      "id": "sv-a-08", "audio": "audio/sv-a-08.wav", "audio_sha256": "31993469bb8717e4e9dd87dbecaf39e5702a18949c7502b117a4caa5a7180356",
+      "speaker_id": "sv-a", "language": "sv", "language_modes": ["sv", "auto"],
+      "exact_final_transcript": "Definitionen och syftesbeskrivningen förväntas leda till ökad likvärdighet och ökad kunskap om skolbibliotekets funktion.",
+      "duration_seconds": 10.08, "duration_class": "long", "punctuation": true,
+      "tags": ["technical-term"], "protected_semantics": []
+    },
+    {
+      "id": "sv-b-01", "audio": "audio/sv-b-01.wav", "audio_sha256": "276de88014aad3d1c75e1e177cdb40bda0246fd1da8753756bc92e8a30a02879",
+      "speaker_id": "sv-b", "language": "sv", "language_modes": ["sv", "auto"],
+      "exact_final_transcript": "Högsta domstolen upphäver beslutet om att personen ska betala avgift till brottsofferfonden.",
+      "duration_seconds": 10.44, "duration_class": "long", "punctuation": true,
+      "tags": ["proper-noun", "technical-term"], "protected_semantics": []
+    },
+    {
+      "id": "sv-b-02", "audio": "audio/sv-b-02.wav", "audio_sha256": "b5d1c0e0feaa30e9ce2aa1e9eb5e03aadc34930454c10682fa3f88884dcac5a7",
+      "speaker_id": "sv-b", "language": "sv", "language_modes": ["sv", "auto"],
+      "exact_final_transcript": "Beträffande förstahandsyrkandet har riksåklagaren godtagit hovrättens bedömning att gärningen ska rubriceras som penningtvättsförseelse.",
+      "duration_seconds": 10.008, "duration_class": "long", "punctuation": true,
+      "tags": ["technical-term"], "protected_semantics": []
+    }
+  ]
+}

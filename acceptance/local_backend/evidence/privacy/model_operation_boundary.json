@@ -1,0 +1,1 @@
+{"basis":{"owning_test":"model_store.test.Model Operation transport observes only pinned artifact coordinates","raw_sha256":"606b4cd070c70468adab75de381f856bf36d863b83fb0b0a979b57d39ea5dcbe"},"observed":{"artifact_requests":1,"contains_pcm":false,"contains_transcript":false,"supported":true},"probe":"model_operation_boundary","schema_version":1}

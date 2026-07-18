@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "performance": {
+    "machine": {"chip": "Apple M1", "memory_gib": 8},
+    "first_metal_ready_ms": 3351,
+    "first_metal_visible_preparing": true,
+    "first_metal_capture_accepted": true
+  },
+  "basis": {
+    "first_metal": {
+      "daemon_log_observation": "Capture was accepted after READY and only then compiled inference Metal pipelines",
+      "selection_to_helper_warm_ms": 3351,
+      "result": "capture acceptance before inference-pipeline preparation completed"
+    }
+  }
+}

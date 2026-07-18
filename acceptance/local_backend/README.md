@@ -17,9 +17,60 @@ python3 acceptance/local_backend/gate.py \
   --report path/to/release-report.json
 ```
 
+For a real candidate, assemble the raw transcription and operational observations, run the
+complete deterministic suite once, materialize all digest-bound traces, and emit the report:
+
+```sh
+python3 acceptance/local_backend/finalize.py \
+  --observations path/to/transcription-observations.json \
+  --operational path/to/operational-observations.json \
+  --evidence path/to/candidate-evidence.json \
+  --report path/to/release-report.json
+```
+
+Finalization exits `0` for go, `1` for a valid no-go report, and `2` for an invalid contract
+or failing deterministic suite.
+
+Collect the packaged helper's raw Final Transcripts, three warmed timings per
+fixture/mode, cached readiness, and helper RSS through the public IPC boundary:
+
+```sh
+python3 acceptance/local_backend/collect.py \
+  --manifest path/to/corpus-manifest.json \
+  --helper ~/.local/libexec/type-wave/current/type-wave-whisper \
+  --daemon ~/.local/libexec/type-wave/current/type-wave \
+  --model "$HOME/Library/Application Support/type-wave/models/installations/3564d61a42fc-f16/ggml-model.bin" \
+  --receipt "$HOME/Library/Application Support/type-wave/models/active.receipt" \
+  --provenance ~/.local/libexec/type-wave/current/share/PROVENANCE \
+  --semantic-review path/to/semantic-review.json \
+  --deny-helper-network \
+  --diagnostics-output path/to/helper-diagnostics.log \
+  --output path/to/transcription-observations.json
+```
+
+The collector hashes and validates the model, receipt, packaged provenance, paired daemon and
+helper, and both code signatures. A stale receipt-to-helper binding remains visible as a gate
+failure. It also rejects a helper that does not identify the pinned model, a fixture that is
+not mono 24 kHz signed-16 WAV, malformed or timed-out IPC, failed inference, or a semantic
+review that does not cover the exact fixture/mode set. It retains all three raw Final
+Transcripts and uses the first pre-declared run for gate scoring, so a varying result cannot
+be selected after observation. Timeout/privacy/lifecycle observations remain separately
+retained release evidence. When `--diagnostics-output` is supplied, the full helper stderr is
+retained and scanned for raw, hexadecimal, and base64 PCM chunks plus exact and partial
+reference/observed transcripts; daemon diagnostics must be retained and assessed separately.
+
+`--deny-helper-network` launches the exact hashed helper inside a macOS sandbox that denies
+all network operations while leaving the collector outside that sandbox for RSS sampling.
+For an instrumented qualification, compile `network_trace.c` as a dynamic library, set
+`TYPE_WAVE_NETWORK_TRACE` and `DYLD_INSERT_LIBRARIES` while collecting, then run
+`probe_runtime.py` with the same library and trace path. The probe launches the exact daemon
+under the same network sandbox, can temporarily select an empty keychain, restores the original
+keychain configuration in a `finally` block, and retains daemon diagnostics plus its observation.
+Finalization requires those raw artifacts and derives the four privacy gates from them.
+
 Exit status is `0` for a passing candidate, `1` for measured gate failures, and `2` for an
-invalid manifest/evidence contract. Output and reports contain no wall-clock timestamp or
-machine-specific path, so identical inputs produce byte-identical evidence. A report contains
+invalid manifest/evidence contract. Gate reports contain no wall-clock timestamp or
+machine-specific path, so identical evidence inputs produce byte-identical reports. A report contains
 fixture IDs, modes, scores, timings, and operational probe results, but never audio or Final
 Transcript content.
 
@@ -110,8 +161,9 @@ also reported.
 
 Punctuation F1 covers `. , ? ! : ;`. A mark is matched only when both the mark and its position
 after the same reference word count agree, preserving placement rather than scoring a bag of
-marks. Protected negation, number, and command phrases must remain present after word
-normalization, and each run records any manually reviewed `meaning_changing_errors`. Proper
+marks. Protected negation, number, and command cases receive a predeclared human semantic
+review so equivalent forms such as `two` and `2` do not become false failures; each run records
+any `meaning_changing_errors`. Proper
 names and technical terms affect WER but have no separate threshold.
 
 Thresholds are fixed in `gate.py`: 15% explicit WER, 20% auto WER per language, 40% maximum

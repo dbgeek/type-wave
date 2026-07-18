@@ -1625,6 +1625,35 @@ test "confirmed Repair replaces only an invalid artifact through authenticated a
     try std.testing.expect((try operation.verify()) == .usable);
 }
 
+test "Model Operation transport observes only pinned artifact coordinates" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    var transport = FakeTransport{};
+    var smoke = FakeSmoke{};
+    var operation = Operation(FakeTransport, FakeSmoke).init(
+        std.testing.allocator,
+        std.testing.io,
+        root_buf[0..root_len],
+        test_manifest,
+        &transport,
+        &smoke,
+    );
+
+    try operation.install("hf_secret");
+
+    try std.testing.expect(transport.calls > 0);
+    try std.testing.expectEqualStrings(test_manifest.url, transport.last_url.?);
+    try std.testing.expectEqualStrings("hf_secret", transport.last_token.?);
+    try std.testing.expect(transport.last_request != null);
+    // DownloadRequest is deliberately an artifact-only type: it has byte range,
+    // validator, and cancellation state, with no PCM or transcript field.
+    try std.testing.expect(@hasField(DownloadRequest, "offset"));
+    try std.testing.expect(!@hasField(DownloadRequest, "pcm"));
+    try std.testing.expect(!@hasField(DownloadRequest, "transcript"));
+}
+
 test "Repair preserves and resumes validator-bound valid partial data" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2238,9 +2267,15 @@ fn replacementManifest() Manifest {
 
 const FakeTransport = struct {
     calls: usize = 0,
+    last_url: ?[]const u8 = null,
+    last_token: ?[]const u8 = null,
+    last_request: ?DownloadRequest = null,
 
-    pub fn download(self: *FakeTransport, _: []const u8, _: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+    pub fn download(self: *FakeTransport, url: []const u8, token: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
         self.calls += 1;
+        self.last_url = url;
+        self.last_token = token;
+        self.last_request = request;
         try writer.writeAll(test_bytes[@intCast(request.offset)..@intCast(request.end + 1)]);
         return DownloadResult.fromValidator(.etag, "\"immutable-test\"");
     }

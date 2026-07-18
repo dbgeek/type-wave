@@ -1,0 +1,72 @@
+type-wave — headless dictation daemon (wayfinder #19)
+
+config: backend=local_kb_whisper talk_key=globe model="gpt-realtime-whisper" language="en" delay="low" noise_reduction=near_field insertion=keystroke pre_paste_ms=25 overlay=true
+2026-07-18 13:06:14.051   overlay HUD: on — the waveform pill carries start/processing feedback; the error cue is kept
+2026-07-18 13:06:14.081 TCC grants for the type-wave daemon:
+2026-07-18 13:06:14.081   Input Monitoring (Talk Key tap): granted
+2026-07-18 13:06:14.081   PostEvent        (Insertion):    granted
+2026-07-18 13:06:14.081   Microphone       (Capture):      granted
+2026-07-18 13:06:14.088   Talk Key tap: live
+2026-07-18 13:06:14.178   menu bar: status item up
+2026-07-18 13:06:14.178 type-wave daemon up — self-healing. SIGTERM/Ctrl-C to quit; SIGHUP retries selected local inference.
+whisper_init_with_params_no_state: use gpu    = 1
+whisper_init_with_params_no_state: flash attn = 1
+whisper_init_with_params_no_state: gpu_device = 0
+whisper_init_with_params_no_state: dtw        = 0
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_init: loaded in 0.034 sec
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0 (Apple M1)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple7  (1007)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  =  5726.63 MB
+whisper_init_with_params_no_state: devices    = 3
+whisper_init_with_params_no_state: backends   = 3
+whisper_model_load: loading model
+whisper_model_load: n_vocab       = 51865
+whisper_model_load: n_audio_ctx   = 1500
+whisper_model_load: n_audio_state = 768
+whisper_model_load: n_audio_head  = 12
+whisper_model_load: n_audio_layer = 12
+whisper_model_load: n_text_ctx    = 448
+whisper_model_load: n_text_state  = 768
+whisper_model_load: n_text_head   = 12
+whisper_model_load: n_text_layer  = 12
+whisper_model_load: n_mels        = 80
+whisper_model_load: ftype         = 1
+whisper_model_load: qntvr         = 0
+whisper_model_load: type          = 3 (small)
+whisper_model_load: adding 1607 extra tokens
+whisper_model_load: n_langs       = 99
+whisper_model_load:         MTL0 total size =   487.01 MB
+whisper_model_load: model size    =  487.01 MB
+whisper_backend_init_gpu: device 0: MTL0 (type: 1)
+whisper_backend_init_gpu: found GPU device 0: MTL0 (type: 1, cnt: 0)
+whisper_backend_init_gpu: using MTL0 backend
+ggml_metal_init: allocating
+ggml_metal_init: found device: Apple M1
+ggml_metal_init: picking default device: Apple M1
+ggml_metal_init: use fusion         = true
+ggml_metal_init: use concurrency    = true
+ggml_metal_init: use graph optimize = true
+whisper_backend_init: using BLAS backend
+whisper_init_state: kv self size  =   18.87 MB
+whisper_init_state: kv cross size =   56.62 MB
+whisper_init_state: kv pad  size  =    4.72 MB
+whisper_init_state: compute buffer (conv)   =   23.38 MB
+whisper_init_state: compute buffer (encode) =   39.45 MB
+whisper_init_state: compute buffer (cross)  =   79.93 MB
+whisper_init_state: compute buffer (decode) =   98.21 MB
+2026-07-18 13:06:14.785   local KB Whisper helper warm — Capture stays on this Mac
+2026-07-18 13:06:14.811   READY — hold Globe/Fn, speak, release; the transcript lands at the cursor.
+2026-07-18 13:06:28.796 shutting down…
+2026-07-18 13:06:28.815 bye.

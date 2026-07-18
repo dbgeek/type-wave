@@ -97,6 +97,26 @@ def evidence() -> dict[str, Any]:
             "runtime": "whisper.cpp-v1.9.1",
             "runtime_source_sha256": "147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447",
         },
+        "artifact_identity": {
+            "same_packaged_pair": True,
+            "daemon": {"sha256": "11" * 32, "signature": {"verified": True, "identifier": "me.ba78.type-wave"}},
+            "helper": {"sha256": "22" * 32, "signature": {"verified": True, "identifier": "me.ba78.type-wave.whisper"}},
+            "model": {"bytes": 487601984, "sha256": "de6911330cbdc131362f7a955682b65c8a5a2394caba73e7ea821a9822efb8c6"},
+            "receipt": {
+                "sha256": "33" * 32,
+                "model_revision": "3564d61a42fc210ceaa55a22a96dd64478959c78",
+                "model_sha256": "de6911330cbdc131362f7a955682b65c8a5a2394caba73e7ea821a9822efb8c6",
+                "model_bytes": 487601984,
+                "runtime": "whisper.cpp-v1.9.1",
+                "runtime_sha256": "22" * 32,
+                "matches_helper": True,
+            },
+            "provenance": {
+                "sha256": "44" * 32,
+                "model_revision": "3564d61a42fc210ceaa55a22a96dd64478959c78",
+                "runtime_source_sha256": "147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447",
+            },
+        },
         "transcription_runs": [
             {
                 "fixture_id": fixture["id"],
@@ -190,6 +210,7 @@ class GateCliTests(unittest.TestCase):
                     "corpus_completed": privacy["corpus_completed"],
                 },
                 "network_boundary": {
+                    "supported": privacy.get("network_supported", True),
                     "helper_socket_attempts": privacy["helper_socket_attempts"],
                     "daemon_network_requests": privacy["daemon_network_requests"],
                 },
@@ -268,6 +289,16 @@ class GateCliTests(unittest.TestCase):
         failed = [check["id"] for check in report["checks"] if not check["passed"]]
         self.assertEqual(["candidate.pinned_design"], failed)
 
+    def test_receipt_must_bind_the_tested_helper(self) -> None:
+        changed = evidence()
+        changed["artifact_identity"]["receipt"]["matches_helper"] = False
+
+        completed, report = self.run_gate(manifest(), changed)
+
+        self.assertEqual(1, completed.returncode)
+        failed = [check["id"] for check in report["checks"] if not check["passed"]]
+        self.assertEqual(["candidate.packaged_identity"], failed)
+
     def test_incomplete_corpus_fails_its_own_gate(self) -> None:
         incomplete = manifest()
         incomplete["fixtures"] = incomplete["fixtures"][:-1]
@@ -327,6 +358,16 @@ class GateCliTests(unittest.TestCase):
                 changed = evidence()
                 self.set_nested(changed["privacy"], path, value)
                 self.assertEqual({expected}, self.failed_checks(changed))
+
+    def test_unsupported_network_observation_is_reported_as_a_gate_failure(self) -> None:
+        changed = evidence()
+        changed["privacy"]["network_supported"] = False
+        changed["privacy"]["helper_socket_attempts"] = None
+        changed["privacy"]["daemon_network_requests"] = None
+        completed, report = self.run_gate(manifest(), changed)
+
+        self.assertEqual(1, completed.returncode)
+        self.assertIn("privacy.network_boundary", {check["id"] for check in report["checks"] if not check["passed"]})
 
     def test_missing_or_failed_fault_probe_fails_lifecycle_gate(self) -> None:
         missing = evidence()

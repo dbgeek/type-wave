@@ -368,6 +368,8 @@ pub const ProcessHelper = struct {
     failure_in_progress: bool = false,
     recovering: bool = false,
     generation: u64 = 1,
+    forced_terminations: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    recovery_schedules: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     const TerminalNotification = struct {
         events: HelperEvents,
@@ -526,9 +528,10 @@ pub const ProcessHelper = struct {
             self.mu.unlock(self.io);
             return;
         }
-        if (self.supervisor.active_id == id)
-            _ = self.failActiveLocked(id)
-        else
+        if (self.supervisor.active_id == id) {
+            _ = self.failActiveLocked(id);
+            _ = self.forced_terminations.fetchAdd(1, .release);
+        } else
             self.lease_id = null;
         self.mu.unlock(self.io);
     }
@@ -615,6 +618,7 @@ pub const ProcessHelper = struct {
     fn beginProcessFailureLocked(self: *ProcessHelper, known_id: ?backend.UtteranceId) ?TerminalNotification {
         const failed = self.failActiveLocked(known_id);
         self.recovering = true;
+        _ = self.recovery_schedules.fetchAdd(1, .release);
         return failed;
     }
 
@@ -695,6 +699,83 @@ pub const ProcessHelper = struct {
         return self.events;
     }
 };
+
+test "hard cancellation terminates a non-responsive helper process" {
+    var helper = try ProcessHelper.start(
+        std.testing.allocator,
+        std.testing.io,
+        "acceptance/local_backend/stalling_helper.py",
+        "stall",
+        helper_core.pinnedArtifact(),
+    );
+    defer {
+        helper.shutdown();
+        _ = usleep(200_000);
+        std.testing.allocator.free(helper.executable);
+        std.testing.allocator.free(helper.model);
+        std.testing.allocator.destroy(helper);
+    }
+    try helper.reserveUtterance(991);
+    try helper.submit(991, .english, &.{ 0, 0, 0, 0 });
+
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    _ = usleep(9_500_000);
+    const cooperative_ms: u64 = @intCast(@divTrunc(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started, 1_000_000));
+    helper.requestCancel(991);
+    const remaining_ns = 10_000_000_000 -| (std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started);
+    if (remaining_ns > 0) _ = usleep(@intCast(@divTrunc(remaining_ns, 1_000)));
+    helper.cancel(991);
+    const terminated_ms: u64 = @intCast(@divTrunc(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started, 1_000_000));
+    std.debug.print("ACCEPTANCE_TIMEOUT cooperative_ms={d} terminated_ms={d}\n", .{ cooperative_ms, terminated_ms });
+
+    try std.testing.expectEqual(@as(usize, 1), helper.forced_terminations.load(.acquire));
+    try std.testing.expect(!helper.isReady());
+}
+
+const AtomicFaultRecorder = struct {
+    failures: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    fn events(self: *AtomicFaultRecorder) Events {
+        return .{ .ctx = self, .final = final, .failed = failed };
+    }
+    fn final(_: *anyopaque, _: backend.UtteranceId, _: []const u8) void {}
+    fn failed(ctx: *anyopaque, _: backend.UtteranceId) void {
+        const self: *AtomicFaultRecorder = @ptrCast(@alignCast(ctx));
+        _ = self.failures.fetchAdd(1, .release);
+    }
+};
+
+test "helper crash malformed IPC and inference failure abandon active Utterances and schedule restart" {
+    for ([_][]const u8{ "crash", "malformed", "inference" }) |mode| {
+        var helper = try ProcessHelper.start(
+            std.testing.allocator,
+            std.testing.io,
+            "acceptance/local_backend/stalling_helper.py",
+            mode,
+            helper_core.pinnedArtifact(),
+        );
+        var events = AtomicFaultRecorder{};
+        var adapter = Adapter(ProcessHelper).init(std.testing.allocator, std.testing.io, helper, events.events());
+        adapter.bindHelperEvents();
+        defer adapter.pcm.deinit(std.testing.allocator);
+
+        try adapter.begin(881, "en");
+        try adapter.appendAudio(881, &.{ 0, 0, 0, 0 });
+        try adapter.release(881);
+        var waited_ms: usize = 0;
+        while (events.failures.load(.acquire) == 0 and waited_ms < 1_000) : (waited_ms += 10) _ = usleep(10_000);
+
+        try std.testing.expectEqual(@as(usize, 1), events.failures.load(.acquire));
+        try std.testing.expect(adapter.active_id == null);
+        try std.testing.expect(helper.recovery_schedules.load(.acquire) >= 1);
+
+        helper.shutdown();
+        _ = usleep(200_000);
+        std.testing.allocator.free(helper.executable);
+        std.testing.allocator.free(helper.model);
+        std.testing.allocator.destroy(helper);
+    }
+}
 
 const FakeHelper = struct {
     activations: usize = 0,
@@ -943,4 +1024,5 @@ test "local Transcription Backend drives one Insertion and abandons empty or fai
     try std.testing.expectEqual(@as(usize, 3), helper.submits);
     try std.testing.expectEqual(@as(usize, 1), insertion.submits);
     try std.testing.expectEqual(@as(usize, 3), surface.abandoned_count);
+    try std.testing.expectEqual(@as(usize, 0), helper.retries);
 }

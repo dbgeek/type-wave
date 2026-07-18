@@ -1,0 +1,162 @@
+whisper_init_with_params_no_state: use gpu    = 1
+whisper_init_with_params_no_state: flash attn = 1
+whisper_init_with_params_no_state: gpu_device = 0
+whisper_init_with_params_no_state: dtw        = 0
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_init: loaded in 0.039 sec
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0 (Apple M1)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple7  (1007)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  =  5726.63 MB
+whisper_init_with_params_no_state: devices    = 3
+whisper_init_with_params_no_state: backends   = 3
+whisper_model_load: loading model
+whisper_model_load: n_vocab       = 51865
+whisper_model_load: n_audio_ctx   = 1500
+whisper_model_load: n_audio_state = 768
+whisper_model_load: n_audio_head  = 12
+whisper_model_load: n_audio_layer = 12
+whisper_model_load: n_text_ctx    = 448
+whisper_model_load: n_text_state  = 768
+whisper_model_load: n_text_head   = 12
+whisper_model_load: n_text_layer  = 12
+whisper_model_load: n_mels        = 80
+whisper_model_load: ftype         = 1
+whisper_model_load: qntvr         = 0
+whisper_model_load: type          = 3 (small)
+whisper_model_load: adding 1607 extra tokens
+whisper_model_load: n_langs       = 99
+whisper_model_load:         MTL0 total size =   487.01 MB
+whisper_model_load: model size    =  487.01 MB
+whisper_backend_init_gpu: device 0: MTL0 (type: 1)
+whisper_backend_init_gpu: found GPU device 0: MTL0 (type: 1, cnt: 0)
+whisper_backend_init_gpu: using MTL0 backend
+ggml_metal_init: allocating
+ggml_metal_init: found device: Apple M1
+ggml_metal_init: picking default device: Apple M1
+ggml_metal_init: use fusion         = true
+ggml_metal_init: use concurrency    = true
+ggml_metal_init: use graph optimize = true
+whisper_backend_init: using BLAS backend
+whisper_init_state: kv self size  =   18.87 MB
+whisper_init_state: kv cross size =   56.62 MB
+whisper_init_state: kv pad  size  =    4.72 MB
+whisper_init_state: compute buffer (conv)   =   23.38 MB
+whisper_init_state: compute buffer (encode) =   39.45 MB
+whisper_init_state: compute buffer (cross)  =   79.93 MB
+whisper_init_state: compute buffer (decode) =   98.21 MB
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_im2col_f16', name = 'kernel_im2col_f16'
+ggml_metal_library_compile_pipeline: loaded kernel_im2col_f16                             0x103033050 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f16_f16', name = 'kernel_mul_mm_f16_f16_bci=1_bco=1_ne12=1_ne13=1_r2=1_r3=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f16_f16_bci=1_bco=1_ne12=1_ne13=1_r2=1_r3=1      0x103033350 | th_max =  896 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32', name = 'kernel_bin_fuse_f32_f32_f32_op=0_nf=1_rb=0_cb=1'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_op=0_nf=1_rb=0_cb=1      0x103034d90 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_unary_f32_f32_4', name = 'kernel_unary_f32_f32_4_op=103_cnt=0'
+ggml_metal_library_compile_pipeline: loaded kernel_unary_f32_f32_4_op=103_cnt=0           0x103037590 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f16_f16', name = 'kernel_mul_mm_f16_f16_bci=0_bco=1_ne12=1_ne13=1_r2=1_r3=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f16_f16_bci=0_bco=1_ne12=1_ne13=1_r2=1_r3=1      0x103035090 | th_max =  896 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_cpy_f32_f32', name = 'kernel_cpy_f32_f32'
+ggml_metal_library_compile_pipeline: loaded kernel_cpy_f32_f32                            0x103036610 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32_4', name = 'kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=0_cb=0'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=0_cb=0      0x103036910 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_norm_mul_add_f32_4', name = 'kernel_norm_mul_add_f32_4'
+ggml_metal_library_compile_pipeline: loaded kernel_norm_mul_add_f32_4                     0xb6f1bc000 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mm_f16_f32', name = 'kernel_mul_mm_f16_f32_bci=0_bco=1_ne12=1_ne13=1_r2=1_r3=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mm_f16_f32_bci=0_bco=1_ne12=1_ne13=1_r2=1_r3=1      0xb6f1bc300 | th_max =  896 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_cpy_f32_f16', name = 'kernel_cpy_f32_f16'
+ggml_metal_library_compile_pipeline: loaded kernel_cpy_f32_f16                            0xb6f1bc600 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_flash_attn_ext_f16_dk64_dv64', name = 'kernel_flash_attn_ext_f16_dk64_dv64_mask=0_sinks=0_bias=0_scap=0_kvpad=0_bcm=0_ns10=768_ns20=768_nsg=4'
+ggml_metal_library_compile_pipeline: loaded kernel_flash_attn_ext_f16_dk64_dv64_mask=0_sinks=0_bias=0_scap=0_kvpad=0_bcm=0_ns10=768_ns20=768_nsg=4      0xb6f1bc900 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_unary_f32_f32_4', name = 'kernel_unary_f32_f32_4_op=10_cnt=0'
+ggml_metal_library_compile_pipeline: loaded kernel_unary_f32_f32_4_op=10_cnt=0            0xb6f1bcc00 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_get_rows_f16', name = 'kernel_get_rows_f16'
+ggml_metal_library_compile_pipeline: loaded kernel_get_rows_f16                           0xb6f1bcf00 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_get_rows_f32', name = 'kernel_get_rows_f32'
+ggml_metal_library_compile_pipeline: loaded kernel_get_rows_f32                           0xb6f1bd200 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mv_ext_f16_f32_r1_4', name = 'kernel_mul_mv_ext_f16_f32_r1_4_nsg=2_nxpsg=8_ne12=1_r2=1_r3=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mv_ext_f16_f32_r1_4_nsg=2_nxpsg=8_ne12=1_r2=1_r3=1      0xb6f1bd500 | th_max =  832 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_unary_f32_f32_4', name = 'kernel_unary_f32_f32_4_op=10_cnt=1'
+ggml_metal_library_compile_pipeline: loaded kernel_unary_f32_f32_4_op=10_cnt=1            0xb6f1bd800 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_bin_fuse_f32_f32_f32_4', name = 'kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=1_cb=0'
+ggml_metal_library_compile_pipeline: loaded kernel_bin_fuse_f32_f32_f32_4_op=0_nf=1_rb=1_cb=0      0xb6f1bdb00 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_flash_attn_ext_vec_f16_dk64_dv64', name = 'kernel_flash_attn_ext_vec_f16_dk64_dv64_mask=1_sink=0_bias=0_scap=0_kvpad=0_ns10=768_ns20=768_nsg=1_nwg=32'
+ggml_metal_library_compile_pipeline: loaded kernel_flash_attn_ext_vec_f16_dk64_dv64_mask=1_sink=0_bias=0_scap=0_kvpad=0_ns10=768_ns20=768_nsg=1_nwg=32      0xb6f1bde00 | th_max =  768 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_flash_attn_ext_vec_reduce', name = 'kernel_flash_attn_ext_vec_reduce_dv=64_nwg=32'
+ggml_metal_library_compile_pipeline: loaded kernel_flash_attn_ext_vec_reduce_dv=64_nwg=32      0xb6f1be100 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_flash_attn_ext_vec_f16_dk64_dv64', name = 'kernel_flash_attn_ext_vec_f16_dk64_dv64_mask=0_sink=0_bias=0_scap=0_kvpad=0_ns10=768_ns20=768_nsg=1_nwg=32'
+ggml_metal_library_compile_pipeline: loaded kernel_flash_attn_ext_vec_f16_dk64_dv64_mask=0_sink=0_bias=0_scap=0_kvpad=0_ns10=768_ns20=768_nsg=1_nwg=32      0xb6f1be400 | th_max =  704 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_unary_f32_f32_4', name = 'kernel_unary_f32_f32_4_op=103_cnt=1'
+ggml_metal_library_compile_pipeline: loaded kernel_unary_f32_f32_4_op=103_cnt=1           0xb6f1be700 | th_max = 1024 | th_width =   32
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'kernel_mul_mv_f16_f32_4', name = 'kernel_mul_mv_f16_f32_4_nsg=4_ne12=1_r2=1_r3=1'
+ggml_metal_library_compile_pipeline: loaded kernel_mul_mv_f16_f32_4_nsg=4_ne12=1_r2=1_r3=1      0xb6f1bea00 | th_max = 1024 | th_width =   32
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+whisper_full_with_state: auto-detected language: sv (p = 1.000000)
+ggml_metal_free: deallocating
