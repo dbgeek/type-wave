@@ -37,6 +37,15 @@ _Avoid_: websocket (mechanism)
 The selected source of a Final Transcript for an Utterance; it may also emit Partial Transcripts. OpenAI is the default backend; the local Whisper backend is an offline alternative.
 _Avoid_: transcription provider, engine
 
+**Backend Router**:
+The daemon's one route from an accepted Utterance to the selected Transcription Backend,
+and the owner of the drain-then-switch policy: an accepted Utterance pins its backend
+through Insertion or abandonment; a backend switch — or a Model Installation activating
+under the warm helper — drains first, then tears down the obsolete resource and warms a
+generation-tagged replacement. It reaches every effect (connect, warm, narrate) through
+a dependency seam it is handed, so it is exercised by scripted events, not hardware.
+_Avoid_: transcription adapter, backend manager
+
 **Model Installation**:
 A verified local copy of the pinned model artifact (currently ggml-large-v3-turbo; see `packaging/share/type-wave/PROVENANCE`) that the local Transcription Backend can use offline. Downloaded credential-free; it exists independently of any Model Operation in progress.
 _Avoid_: downloaded model, model cache

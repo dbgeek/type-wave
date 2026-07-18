@@ -434,6 +434,56 @@ pub const Session = struct {
         return self.state.load(.acquire) == .ready;
     }
 
+    // ---- Backend Router resource contract (isReady/shutdown/stillValid/acquire) ----
+
+    const lease_commands = backend.Commands{
+        .begin = leaseBegin,
+        .append_audio = leaseAppend,
+        .release = leaseRelease,
+        .request_cancel = leaseCancel,
+        .cancel = leaseCancel,
+    };
+
+    fn leaseSelf(ctx: *anyopaque) *Session {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn leaseBegin(ctx: *anyopaque, id: backend.UtteranceId, language: backend.Language) !void {
+        try leaseSelf(ctx).beginUtterance(id, language);
+    }
+    fn leaseAppend(ctx: *anyopaque, id: backend.UtteranceId, pcm: []const u8) !void {
+        try leaseSelf(ctx).appendAudio(id, pcm);
+    }
+    fn leaseRelease(ctx: *anyopaque, id: backend.UtteranceId) !void {
+        try leaseSelf(ctx).releaseUtterance(id);
+    }
+    fn leaseCancel(ctx: *anyopaque, id: backend.UtteranceId) void {
+        leaseSelf(ctx).cancelUtterance(id);
+    }
+
+    /// Build the Utterance's Lease. Admission is deliberately NOT gated on `isReady`:
+    /// a press during a reconnect buffers on the outbound ring and replays when the
+    /// link returns (#17). The Lease pins the language bound at connect (session.update),
+    /// not the requested one — a Settings change cycles the session when idle (#32), so
+    /// the two converge between Utterances.
+    pub fn acquire(self: *Session, id: backend.UtteranceId, requested: backend.Language) ?backend.Lease {
+        _ = requested;
+        return .{
+            .id = id,
+            .backend = .openai,
+            .language = self.leaseLanguage(),
+            .deadline = backend.openai_deadline,
+            .ctx = self,
+            .commands = &lease_commands,
+        };
+    }
+
+    /// Nothing swaps underneath a connected session (unlike a Model Installation under
+    /// a warm local helper), so a ready session never goes stale.
+    pub fn stillValid(self: *Session) bool {
+        _ = self;
+        return true;
+    }
+
     /// A session-shaped setting changed (wayfinder #32) — request an idle cycle so the
     /// next connect re-reads the snapshot. Safe from any thread; never disturbs an
     /// in-flight Utterance (the maintenance loop's existing idle gate).
@@ -1076,6 +1126,38 @@ test "formatSessionUpdate emits JSON null when noise reduction is disabled" {
     const out = try formatSessionUpdate(&buf, .{ .noise_reduction = null });
     try std.testing.expect(std.mem.endsWith(u8, out, "\"turn_detection\":null,\"noise_reduction\":null}}}}"));
     try std.testing.expect(std.mem.indexOf(u8, out, "\"type\":\"near_field\"") == null);
+}
+
+test "the Session's lease surface pins the connect-time language and forwards identity-tagged commands" {
+    var out_buf: [8]OutRecord = undefined;
+    var sess = Session{
+        .io = std.testing.io,
+        .alloc = std.testing.allocator,
+        .client = undefined, // never touched: no link is opened, so every write no-ops on link_open
+        .api_key = "",
+        .params_provider = .{ .ctx = null, .get = undefined },
+        .out = &out_buf,
+    };
+    sess.configured_language = "sv";
+
+    try std.testing.expect(sess.stillValid());
+    const lease = sess.acquire(73, "en").?; // the requested language loses to the bound one
+    try std.testing.expectEqual(backend.Backend.openai, lease.backend);
+    try std.testing.expectEqualStrings("sv", lease.language);
+    try std.testing.expectEqual(backend.openai_deadline.final_ms, lease.deadline.final_ms);
+
+    try lease.begin();
+    try std.testing.expectEqual(@as(backend.UtteranceId, 73), sess.active_id.load(.acquire));
+    var pcm = [_]u8{ 1, 2, 3 };
+    try lease.appendAudio(&pcm);
+    try lease.release();
+    try std.testing.expectEqual(@as(usize, 2), sess.out_count); // the audio + its deferred commit
+    try std.testing.expectEqual(OutKind.audio, sess.out[0].kind);
+    try std.testing.expectEqual(OutKind.commit, sess.out[1].kind);
+
+    lease.cancel(); // discards the queued records; a clear guards the next ready link
+    try std.testing.expectEqual(@as(usize, 1), sess.out_count);
+    try std.testing.expectEqual(OutKind.control, sess.out[sess.out_head].kind);
 }
 
 test "backoffMs ramps 0.5s→8s and caps" {

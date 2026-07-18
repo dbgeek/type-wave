@@ -79,6 +79,12 @@ pub fn Adapter(comptime Helper: type) type {
             return self.helper.isReady() and self.usesActiveInstallation();
         }
 
+        /// Backend Router resource contract: a warm helper goes stale once it stops
+        /// using the active Model Installation (an update activated underneath it).
+        pub fn stillValid(self: *Self) bool {
+            return self.usesActiveInstallation();
+        }
+
         pub fn usesActiveInstallation(self: *Self) bool {
             if (self.inference_root_len == 0) return true;
             if (model_store.modelRemovalPending(self.io, self.inference_root[0..self.inference_root_len])) return false;
