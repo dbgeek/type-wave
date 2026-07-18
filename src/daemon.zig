@@ -72,6 +72,9 @@ const local_backend = @import("local_backend.zig");
 const model_store = @import("model_store.zig");
 const local_model_recovery = @import("local_model_recovery.zig");
 const status_item = @import("status_item.zig");
+const failure_observation = @import("failure_observation.zig");
+
+const FailureObservation = failure_observation.FailureObservation;
 
 const Session = session_mod.Session;
 const LocalAdapter = local_backend.Adapter(local_backend.ProcessHelper);
@@ -87,17 +90,6 @@ extern "c" fn signal(sig: c_int, handler: *const fn (c_int) callconv(.c) void) c
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
 const SIGHUP: c_int = 1;
-const ObservationMutex = struct {
-    value: std.atomic.Mutex = .unlocked,
-
-    fn lock(self: *ObservationMutex) void {
-        while (!self.value.tryLock()) std.atomic.spinLoopHint();
-    }
-
-    fn unlock(self: *ObservationMutex) void {
-        self.value.unlock();
-    }
-};
 
 const ModelOperationObservation = struct {
     pid: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(0),
@@ -210,36 +202,6 @@ const ModelOperationObservation = struct {
     }
 };
 var g_model_operation: ModelOperationObservation = .{};
-
-const FailureObservation = struct {
-    mutex: ObservationMutex = .{},
-    detail: ?status_item.FailureDetail = null,
-
-    fn set(self: *FailureObservation, value: []const u8) void {
-        const detail = status_item.FailureDetail.init(value) catch return;
-        self.mutex.lock();
-        self.detail = detail;
-        self.mutex.unlock();
-    }
-
-    fn setError(self: *FailureObservation, prefix: []const u8, failure: anyerror) void {
-        var buffer: [256]u8 = undefined;
-        const detail = std.fmt.bufPrint(&buffer, "{s}: {s}", .{ prefix, @errorName(failure) }) catch return;
-        self.set(detail);
-    }
-
-    fn clear(self: *FailureObservation) void {
-        self.mutex.lock();
-        self.detail = null;
-        self.mutex.unlock();
-    }
-
-    fn current(self: *FailureObservation) ?status_item.FailureDetail {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.detail;
-    }
-};
 
 test "Model Operation observation retains the actionable terminal failure" {
     var observation = ModelOperationObservation{};
