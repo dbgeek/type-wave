@@ -67,6 +67,7 @@ const readiness = @import("readiness.zig");
 const configuration_phase = @import("configuration_phase.zig");
 const backend = @import("transcription_backend.zig");
 const backend_router = @import("backend_router.zig");
+const operation_channel = @import("operation_channel.zig");
 const local_backend = @import("local_backend.zig");
 const model_store = @import("model_store.zig");
 const local_model_recovery = @import("local_model_recovery.zig");
@@ -105,6 +106,7 @@ const ModelOperationObservation = struct {
     total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     retry_action: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(menu_mod.ModelAction.install)),
     cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    typed_failure: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     failure: FailureObservation = .{},
 
     const Current = struct { phase: status_item.Operation, bytes: ?status_item.ByteProgress, active: bool, failure_detail: ?status_item.FailureDetail };
@@ -128,12 +130,42 @@ const ModelOperationObservation = struct {
         self.cancel_requested.store(false, .release);
         self.completed.store(0, .release);
         self.total.store(0, .release);
+        self.typed_failure.store(false, .release);
         self.failure.clear();
         self.pid.store(pid, .release);
     }
 
+    /// A decoded typed event from the child's stdout channel — the only source of
+    /// phase and byte progress. Stderr prose is log and failure fallback, never
+    /// mined for numbers.
+    fn apply(self: *ModelOperationObservation, event: operation_channel.Event) void {
+        switch (event) {
+            .operation => |op| switch (op) {
+                .downloading => |bytes| self.setProgress(bytes.completed, bytes.total),
+                // A retry carries its own byte position — attempt/budget never
+                // masquerades as progress (the old prose mining's latent bug).
+                .retrying => |retry| self.setProgress(retry.bytes.completed, retry.bytes.total),
+                .verifying => |bytes| {
+                    self.setPhase(.verifying);
+                    self.setProgress(bytes.completed, bytes.total);
+                },
+                .smoke_testing => self.setPhase(.smoke_testing),
+                .waiting_for_inference => self.setPhase(.waiting_for_inference),
+                .activating => self.setPhase(.activating),
+                .removing => self.setPhase(.removing),
+            },
+            .failed => |name| {
+                self.typed_failure.store(true, .release);
+                self.failure.set(name);
+            },
+        }
+    }
+
+    /// Stderr fallback for deaths that never emit a typed `failed` event (a panic,
+    /// OOM): retain the last non-progress line. A typed failure is authoritative.
     fn observeFailure(self: *ModelOperationObservation, line: []const u8) void {
         if (std.mem.indexOf(u8, line, "Model Operation:") != null) return;
+        if (self.typed_failure.load(.acquire)) return;
         self.failure.set(line);
     }
 
@@ -218,6 +250,36 @@ test "Model Operation observation retains the actionable terminal failure" {
     const current = observation.current().?;
     try std.testing.expectEqual(status_item.Operation.failed, current.phase);
     try std.testing.expectEqualStrings("--install-model: ModelDownloadRejected", current.failure_detail.?.value());
+}
+
+test "typed channel events drive phase and bytes; a retry never corrupts progress" {
+    var observation = ModelOperationObservation{};
+    observation.begin(42, .installing, .install);
+
+    observation.apply(.{ .operation = .{ .downloading = .{ .completed = 100, .total = 1_000 } } });
+    var current = observation.current().?;
+    try std.testing.expectEqual(status_item.Operation.installing, current.phase);
+    try std.testing.expectEqualDeep(status_item.ByteProgress{ .completed = 100, .total = 1_000 }, current.bytes.?);
+
+    // The prose mining this replaced read "retry 2/5" as 2/5 bytes.
+    observation.apply(.{ .operation = .{ .retrying = .{ .attempt = 2, .budget = 5, .delay_ms = 4_000, .bytes = .{ .completed = 100, .total = 1_000 } } } });
+    current = observation.current().?;
+    try std.testing.expectEqualDeep(status_item.ByteProgress{ .completed = 100, .total = 1_000 }, current.bytes.?);
+
+    observation.apply(.{ .operation = .{ .verifying = .{ .completed = 1_000, .total = 1_000 } } });
+    try std.testing.expectEqual(status_item.Operation.verifying, observation.current().?.phase);
+}
+
+test "a typed failure is authoritative over trailing stderr prose" {
+    var observation = ModelOperationObservation{};
+    observation.begin(42, .installing, .install);
+    observation.apply(.{ .failed = "ModelDownloadRejected" });
+    observation.observeFailure("--install-model: ModelDownloadRejected"); // prose may still trail in
+    observation.finish(false);
+
+    const current = observation.current().?;
+    try std.testing.expectEqual(status_item.Operation.failed, current.phase);
+    try std.testing.expectEqualStrings("ModelDownloadRejected", current.failure_detail.?.value());
 }
 
 // ---- tuning ----------------------------------------------------------------
@@ -929,8 +991,8 @@ const Daemon = struct {
             .argv = &.{ executable, argument },
             .environ_map = self.process_environ,
             .stdin = if (confirmation != null) .pipe else .ignore,
-            .stdout = .inherit,
-            .stderr = .pipe,
+            .stdout = .pipe, // the typed Model Operation channel (operation_channel.zig)
+            .stderr = .pipe, // human prose: daemon log + failure fallback
         }) catch |failure| {
             feedback.log("  menu: could not start Model Operation: {s}\n", .{@errorName(failure)});
             return;
@@ -961,13 +1023,16 @@ const Daemon = struct {
 
     fn waitForModelAction(io: std.Io, child_value: std.process.Child, action: menu_mod.ModelAction) void {
         var child = child_value;
+        const channel_thread: ?std.Thread = std.Thread.spawn(.{}, observeOperationChannel, .{ io, child.stdout.? }) catch null;
+        if (channel_thread == null)
+            feedback.log("  menu: Model Operation channel reader unavailable — progress will not update\n", .{});
         var read_buffer: [2048]u8 = undefined;
         var stderr_reader = child.stderr.?.readerStreaming(io, &read_buffer);
         while (stderr_reader.interface.takeDelimiter('\n') catch null) |line| {
-            observeModelProgress(line);
             g_model_operation.observeFailure(line);
             feedback.log("  model: {s}\n", .{line});
         }
+        if (channel_thread) |thread| thread.join(); // both pipes hit EOF at child exit
         const term = child.wait(io) catch {
             g_model_operation.finish(false);
             return;
@@ -976,22 +1041,15 @@ const Daemon = struct {
         feedback.log("  menu: Model Operation {s} {s}\n", .{ @tagName(action), if (term.success()) "finished" else "failed" });
     }
 
-    fn observeModelProgress(line: []const u8) void {
-        const prefix = "Model Operation: ";
-        const detail = if (std.mem.indexOf(u8, line, prefix)) |at| line[at + prefix.len ..] else return;
-        if (std.mem.startsWith(u8, detail, "verifying ")) g_model_operation.setPhase(.verifying);
-        if (std.mem.startsWith(u8, detail, "smoke testing")) g_model_operation.setPhase(.smoke_testing);
-        if (std.mem.startsWith(u8, detail, "waiting for active local inference")) g_model_operation.setPhase(.waiting_for_inference);
-        if (std.mem.startsWith(u8, detail, "activating")) g_model_operation.setPhase(.activating);
-        if (std.mem.startsWith(u8, detail, "removing")) g_model_operation.setPhase(.removing);
-        const slash = std.mem.indexOfScalar(u8, detail, '/') orelse return;
-        var begin = slash;
-        while (begin > 0 and std.ascii.isDigit(detail[begin - 1])) begin -= 1;
-        var end = slash + 1;
-        while (end < detail.len and std.ascii.isDigit(detail[end])) end += 1;
-        const completed = std.fmt.parseInt(u64, detail[begin..slash], 10) catch return;
-        const total = std.fmt.parseInt(u64, detail[slash + 1 .. end], 10) catch return;
-        g_model_operation.setProgress(completed, total);
+    /// Drain the child's stdout channel: decoded events drive the observation;
+    /// anything undecodable on this stream is silently skipped.
+    fn observeOperationChannel(io: std.Io, stdout_value: std.Io.File) void {
+        var stdout = stdout_value;
+        var read_buffer: [2048]u8 = undefined;
+        var reader = stdout.readerStreaming(io, &read_buffer);
+        while (reader.interface.takeDelimiter('\n') catch null) |line| {
+            if (operation_channel.decode(line)) |event| g_model_operation.apply(event);
+        }
     }
 
     fn waitForDetached(io: std.Io, child_value: std.process.Child) void {
