@@ -1,3 +1,4 @@
 /.zig-cache/
 /zig-out/
 .DS_Store
+/acceptance/local_backend/network_trace.dylib

@@ -1,0 +1,687 @@
+{
+  "candidate": {
+    "model_bytes": 1624555275,
+    "model_revision": "98aa99a0a9db05ae2342309f5096248665f7cba3",
+    "model_sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+    "runtime": "whisper.cpp-v1.9.1",
+    "runtime_source_sha256": "147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447"
+  },
+  "checks": [
+    {
+      "category": "candidate",
+      "id": "candidate.pinned_design",
+      "observed": {
+        "model_bytes": 1624555275,
+        "model_revision": "98aa99a0a9db05ae2342309f5096248665f7cba3",
+        "model_sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+        "runtime": "whisper.cpp-v1.9.1",
+        "runtime_source_sha256": "147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447"
+      },
+      "passed": true,
+      "required": {
+        "model_bytes": 1624555275,
+        "model_revision": "98aa99a0a9db05ae2342309f5096248665f7cba3",
+        "model_sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+        "runtime": "whisper.cpp-v1.9.1",
+        "runtime_source_sha256": "147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447"
+      }
+    },
+    {
+      "category": "candidate",
+      "id": "candidate.packaged_identity",
+      "observed": {
+        "daemon": {
+          "sha256": "b82e0f71bf9bf41ee7f2d7fef93649742578fb49879e11877de4ab58ec80cf44",
+          "signature": {
+            "cdhash_sha256": "7ad3eb23d66d231fdaed5c21345d4cfdc8a8d0e9c272fce5bb9725f18b5e0fb6",
+            "identifier": "me.ba78.type-wave",
+            "verified": true
+          }
+        },
+        "helper": {
+          "sha256": "a8dd158a56335bfb8ab830701cdaea96c1c083bd47d826d01db8508e2b38a2cd",
+          "signature": {
+            "cdhash_sha256": "f2f1b8ad90919a9d013861ae95d7b44214aa366e8be26c000be4325129166a60",
+            "identifier": "me.ba78.type-wave.whisper",
+            "verified": true
+          }
+        },
+        "model": {
+          "bytes": 1624555275,
+          "sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
+        },
+        "provenance": {
+          "model_revision": "98aa99a0a9db05ae2342309f5096248665f7cba3",
+          "runtime_source_sha256": "147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447",
+          "sha256": "c965dedbf294be2abb93220c53f2c8a5b1b85e4f8f0ff0e2455d68b3d871c4ed"
+        },
+        "receipt": {
+          "matches_helper": true,
+          "model_bytes": 1624555275,
+          "model_revision": "98aa99a0a9db05ae2342309f5096248665f7cba3",
+          "model_sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+          "runtime": "whisper.cpp-v1.9.1",
+          "runtime_sha256": "a8dd158a56335bfb8ab830701cdaea96c1c083bd47d826d01db8508e2b38a2cd",
+          "sha256": "262a1647e60fd29d00021cbe059cd82b78e845e932072598d583eb6d88d991e9"
+        },
+        "same_packaged_pair": true
+      },
+      "passed": true,
+      "required": {
+        "pinned_model_and_runtime": true,
+        "receipt_matches_helper": true,
+        "same_packaged_pair": true,
+        "valid_signatures": true
+      }
+    },
+    {
+      "category": "corpus",
+      "id": "corpus.authoritative_shape",
+      "observed": {
+        "duration_classes_per_language": {
+          "en": {
+            "long": 3,
+            "medium": 3,
+            "short": 4
+          },
+          "sv": {
+            "long": 3,
+            "medium": 3,
+            "short": 4
+          }
+        },
+        "fixtures_per_language": {
+          "en": 10,
+          "sv": 10
+        },
+        "languages_with_punctuation": [
+          "en",
+          "sv"
+        ],
+        "missing_protected_semantics": [],
+        "missing_tags": [],
+        "speakers_per_language": {
+          "en": 2,
+          "sv": 2
+        }
+      },
+      "passed": true,
+      "required": {
+        "balanced_duration_classes": [
+          "short",
+          "medium",
+          "long"
+        ],
+        "fixtures_per_language": 10,
+        "required_tags": [
+          "command",
+          "natural-dictation",
+          "negation",
+          "numbers",
+          "proper-noun",
+          "self-correction",
+          "technical-term"
+        ],
+        "speakers_per_language": 2
+      }
+    },
+    {
+      "category": "quality",
+      "id": "quality.wer.en",
+      "observed": 0.103093,
+      "passed": true,
+      "required": {
+        "maximum": 0.12
+      }
+    },
+    {
+      "category": "quality",
+      "id": "quality.wer.sv",
+      "observed": 0.168317,
+      "passed": true,
+      "required": {
+        "maximum": 0.2
+      }
+    },
+    {
+      "category": "quality",
+      "id": "quality.wer.auto:en",
+      "observed": 0.103093,
+      "passed": true,
+      "required": {
+        "maximum": 0.12
+      }
+    },
+    {
+      "category": "quality",
+      "id": "quality.wer.auto:sv",
+      "observed": 0.227723,
+      "passed": true,
+      "required": {
+        "maximum": 0.26
+      }
+    },
+    {
+      "category": "quality",
+      "id": "quality.per_utterance_wer",
+      "observed": {
+        "over_cap": [],
+        "worst": 0.75
+      },
+      "passed": true,
+      "required": {
+        "maximum": 0.4,
+        "waivers": {
+          "sv-b-01/auto": 0.8,
+          "sv-b-02/auto": 0.8,
+          "sv-b-02/sv": 0.8
+        }
+      }
+    },
+    {
+      "category": "quality",
+      "id": "quality.punctuation_f1",
+      "observed": 0.763636,
+      "passed": true,
+      "required": {
+        "minimum": 0.72
+      }
+    },
+    {
+      "category": "quality",
+      "id": "quality.protected_semantics",
+      "observed": [],
+      "passed": true,
+      "required": {
+        "maximum_errors": 0
+      }
+    },
+    {
+      "category": "performance",
+      "id": "performance.base_m1",
+      "observed": {
+        "chip": "Apple M1",
+        "memory_gib": 8
+      },
+      "passed": true,
+      "required": {
+        "chip": "Apple M1",
+        "memory_gib": 8
+      }
+    },
+    {
+      "category": "performance",
+      "id": "performance.transcription_latency.explicit",
+      "observed": 2293.333,
+      "passed": true,
+      "required": {
+        "maximum_ms": 2600,
+        "runs_per_utterance": 3
+      }
+    },
+    {
+      "category": "performance",
+      "id": "performance.transcription_latency.auto",
+      "observed": 4271.15,
+      "passed": true,
+      "required": {
+        "maximum_ms": 4800,
+        "runs_per_utterance": 3
+      }
+    },
+    {
+      "category": "performance",
+      "id": "performance.cached_ready",
+      "observed": 1813.498,
+      "passed": true,
+      "required": {
+        "maximum_ms": 4000
+      }
+    },
+    {
+      "category": "performance",
+      "id": "performance.first_metal_preparation",
+      "observed": {
+        "capture_accepted": false,
+        "ready_ms": 11922,
+        "visible_preparing": true
+      },
+      "passed": true,
+      "required": {
+        "capture_accepted": false,
+        "maximum_ms": 15000,
+        "visible_preparing": true
+      }
+    },
+    {
+      "category": "performance",
+      "id": "performance.idle_rss",
+      "observed": 221.578,
+      "passed": true,
+      "required": {
+        "maximum_mib": 300
+      }
+    },
+    {
+      "category": "performance",
+      "id": "performance.peak_rss",
+      "observed": 409.438,
+      "passed": true,
+      "required": {
+        "maximum_mib": 500
+      }
+    },
+    {
+      "category": "performance",
+      "id": "performance.hard_timeout",
+      "observed": {
+        "cooperative_cancel_requested_ms": 9510,
+        "helper_terminated_ms": 10010,
+        "insertions": 0,
+        "raw_sha256": "d36674ce8bb401918c4862008a1d73d4197143f0d17b1ee088f5a06edf621cfa",
+        "supported": true,
+        "utterance_abandoned": true
+      },
+      "passed": true,
+      "required": {
+        "cancel_requested_ms_maximum": 9750,
+        "cancel_requested_ms_minimum": 9500,
+        "insertions": 0,
+        "terminated_observed_by_ms": 10250,
+        "utterance_abandoned": true
+      }
+    },
+    {
+      "category": "privacy",
+      "id": "privacy.offline_operation",
+      "observed": {
+        "corpus_completed": true,
+        "credentials_available": {
+          "hugging_face": false,
+          "openai": false
+        },
+        "network_disabled": true,
+        "ready_offline": true,
+        "supported": true
+      },
+      "passed": true,
+      "required": {
+        "corpus_completed": true,
+        "network_disabled": true,
+        "no_credentials": true,
+        "ready_offline": true,
+        "supported": true
+      }
+    },
+    {
+      "category": "privacy",
+      "id": "privacy.network_boundary",
+      "observed": {
+        "daemon_network_requests": 0,
+        "helper_socket_attempts": 0,
+        "supported": true
+      },
+      "passed": true,
+      "required": {
+        "daemon_network_requests": 0,
+        "helper_socket_attempts": 0,
+        "supported": true
+      }
+    },
+    {
+      "category": "privacy",
+      "id": "privacy.default_logs",
+      "observed": {
+        "contains_operational_metadata": true,
+        "contains_pcm": false,
+        "contains_transcript": false,
+        "supported": true
+      },
+      "passed": true,
+      "required": {
+        "contains_operational_metadata": true,
+        "contains_pcm": false,
+        "contains_transcript": false,
+        "supported": true
+      }
+    },
+    {
+      "category": "privacy",
+      "id": "privacy.model_operation_boundary",
+      "observed": {
+        "artifact_requests": 1,
+        "contains_pcm": false,
+        "contains_transcript": false,
+        "supported": true
+      },
+      "passed": true,
+      "required": {
+        "artifact_requests_minimum": 1,
+        "contains_pcm": false,
+        "contains_transcript": false,
+        "supported": true
+      }
+    },
+    {
+      "category": "lifecycle",
+      "id": "lifecycle.deterministic_fault_matrix",
+      "observed": {
+        "failed": [],
+        "missing": [],
+        "trace_sha256": "70f7e8d56049e54672fc2da3b0536ac44a43b8af1bd2d06ea8a68a2fa0ec1fe6"
+      },
+      "passed": true,
+      "required": {
+        "all_passed": true,
+        "required_probes": [
+          "successful_lifecycle",
+          "empty_capture",
+          "empty_final_transcript",
+          "helper_loss_during_capture",
+          "helper_crash",
+          "malformed_ipc",
+          "inference_failure",
+          "restart_backoff_and_latch",
+          "successful_final_resets_failures",
+          "cooperative_cancellation",
+          "forced_termination",
+          "final_timeout_race",
+          "stale_events",
+          "non_idle_press",
+          "backend_switch",
+          "prerequisite_loss",
+          "helper_recovery",
+          "abandonment_has_no_side_effects"
+        ]
+      }
+    }
+  ],
+  "corpus": {
+    "id": "type-wave-common-voice-17-en-sv-v1",
+    "manifest_sha256": "3ef873bf646b00e49c84049d41f3e0ff4dbf0b1d188a1255546d3ee95a3d8916"
+  },
+  "schema_version": 1,
+  "utterances": [
+    {
+      "fixture_id": "en-a-01",
+      "latency_ms_median": 3672.423,
+      "latency_ms_worst": 3758.499,
+      "mode": "auto",
+      "wer": 0.066667
+    },
+    {
+      "fixture_id": "en-a-01",
+      "latency_ms_median": 2164.343,
+      "latency_ms_worst": 2293.333,
+      "mode": "en",
+      "wer": 0.066667
+    },
+    {
+      "fixture_id": "en-a-02",
+      "latency_ms_median": 3656.813,
+      "latency_ms_worst": 3684.261,
+      "mode": "auto",
+      "wer": 0.181818
+    },
+    {
+      "fixture_id": "en-a-02",
+      "latency_ms_median": 1860.584,
+      "latency_ms_worst": 1867.236,
+      "mode": "en",
+      "wer": 0.181818
+    },
+    {
+      "fixture_id": "en-a-03",
+      "latency_ms_median": 3608.987,
+      "latency_ms_worst": 3641.655,
+      "mode": "auto",
+      "wer": 0.1875
+    },
+    {
+      "fixture_id": "en-a-03",
+      "latency_ms_median": 1904.005,
+      "latency_ms_worst": 2021.064,
+      "mode": "en",
+      "wer": 0.1875
+    },
+    {
+      "fixture_id": "en-a-04",
+      "latency_ms_median": 3497.747,
+      "latency_ms_worst": 3525.604,
+      "mode": "auto",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "en-a-04",
+      "latency_ms_median": 1781.565,
+      "latency_ms_worst": 1787.938,
+      "mode": "en",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "en-a-05",
+      "latency_ms_median": 3501.175,
+      "latency_ms_worst": 3569.972,
+      "mode": "auto",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "en-a-05",
+      "latency_ms_median": 1820.117,
+      "latency_ms_worst": 1883.626,
+      "mode": "en",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "en-b-01",
+      "latency_ms_median": 3559.131,
+      "latency_ms_worst": 3612.254,
+      "mode": "auto",
+      "wer": 0.111111
+    },
+    {
+      "fixture_id": "en-b-01",
+      "latency_ms_median": 1853.441,
+      "latency_ms_worst": 1857.104,
+      "mode": "en",
+      "wer": 0.111111
+    },
+    {
+      "fixture_id": "en-b-02",
+      "latency_ms_median": 3686.389,
+      "latency_ms_worst": 3755.156,
+      "mode": "auto",
+      "wer": 0.166667
+    },
+    {
+      "fixture_id": "en-b-02",
+      "latency_ms_median": 1781.293,
+      "latency_ms_worst": 1855.104,
+      "mode": "en",
+      "wer": 0.166667
+    },
+    {
+      "fixture_id": "en-b-03",
+      "latency_ms_median": 3680.355,
+      "latency_ms_worst": 3699.439,
+      "mode": "auto",
+      "wer": 0.25
+    },
+    {
+      "fixture_id": "en-b-03",
+      "latency_ms_median": 1934.733,
+      "latency_ms_worst": 1953.821,
+      "mode": "en",
+      "wer": 0.25
+    },
+    {
+      "fixture_id": "en-b-04",
+      "latency_ms_median": 3858.944,
+      "latency_ms_worst": 3865.894,
+      "mode": "auto",
+      "wer": 0.125
+    },
+    {
+      "fixture_id": "en-b-04",
+      "latency_ms_median": 1920.875,
+      "latency_ms_worst": 1924.892,
+      "mode": "en",
+      "wer": 0.125
+    },
+    {
+      "fixture_id": "en-b-05",
+      "latency_ms_median": 3987.71,
+      "latency_ms_worst": 4031.817,
+      "mode": "auto",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "en-b-05",
+      "latency_ms_median": 2094.261,
+      "latency_ms_worst": 2126.902,
+      "mode": "en",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "sv-a-01",
+      "latency_ms_median": 3900.5,
+      "latency_ms_worst": 4006.227,
+      "mode": "auto",
+      "wer": 0.285714
+    },
+    {
+      "fixture_id": "sv-a-01",
+      "latency_ms_median": 1975.434,
+      "latency_ms_worst": 1984.009,
+      "mode": "sv",
+      "wer": 0.285714
+    },
+    {
+      "fixture_id": "sv-a-02",
+      "latency_ms_median": 3913.17,
+      "latency_ms_worst": 4190.636,
+      "mode": "auto",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "sv-a-02",
+      "latency_ms_median": 2134.476,
+      "latency_ms_worst": 2169.431,
+      "mode": "sv",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "sv-a-03",
+      "latency_ms_median": 3880.474,
+      "latency_ms_worst": 3881.282,
+      "mode": "auto",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "sv-a-03",
+      "latency_ms_median": 1992.382,
+      "latency_ms_worst": 2020.159,
+      "mode": "sv",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "sv-a-04",
+      "latency_ms_median": 3839.024,
+      "latency_ms_worst": 3846.336,
+      "mode": "auto",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "sv-a-04",
+      "latency_ms_median": 1945.897,
+      "latency_ms_worst": 1979.102,
+      "mode": "sv",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "sv-a-05",
+      "latency_ms_median": 3974.161,
+      "latency_ms_worst": 4006.954,
+      "mode": "auto",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "sv-a-05",
+      "latency_ms_median": 2113.352,
+      "latency_ms_worst": 2137.33,
+      "mode": "sv",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "sv-a-06",
+      "latency_ms_median": 4126.275,
+      "latency_ms_worst": 4155.39,
+      "mode": "auto",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "sv-a-06",
+      "latency_ms_median": 2183.212,
+      "latency_ms_worst": 2236.336,
+      "mode": "sv",
+      "wer": 0.0
+    },
+    {
+      "fixture_id": "sv-a-07",
+      "latency_ms_median": 4051.222,
+      "latency_ms_worst": 4064.139,
+      "mode": "auto",
+      "wer": 0.2
+    },
+    {
+      "fixture_id": "sv-a-07",
+      "latency_ms_median": 2119.506,
+      "latency_ms_worst": 2123.201,
+      "mode": "sv",
+      "wer": 0.2
+    },
+    {
+      "fixture_id": "sv-a-08",
+      "latency_ms_median": 4158.854,
+      "latency_ms_worst": 4216.447,
+      "mode": "auto",
+      "wer": 0.071429
+    },
+    {
+      "fixture_id": "sv-a-08",
+      "latency_ms_median": 2230.92,
+      "latency_ms_worst": 2239.856,
+      "mode": "sv",
+      "wer": 0.071429
+    },
+    {
+      "fixture_id": "sv-b-01",
+      "latency_ms_median": 4015.822,
+      "latency_ms_worst": 4040.677,
+      "mode": "auto",
+      "wer": 0.75
+    },
+    {
+      "fixture_id": "sv-b-01",
+      "latency_ms_median": 2138.428,
+      "latency_ms_worst": 2144.967,
+      "mode": "sv",
+      "wer": 0.25
+    },
+    {
+      "fixture_id": "sv-b-02",
+      "latency_ms_median": 4185.401,
+      "latency_ms_worst": 4271.15,
+      "mode": "auto",
+      "wer": 0.692308
+    },
+    {
+      "fixture_id": "sv-b-02",
+      "latency_ms_median": 2265.153,
+      "latency_ms_worst": 2283.34,
+      "mode": "sv",
+      "wer": 0.692308
+    }
+  ],
+  "verdict": "pass"
+}

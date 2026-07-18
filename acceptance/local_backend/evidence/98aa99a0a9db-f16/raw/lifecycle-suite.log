@@ -1,0 +1,204 @@
+1/150 tests.test_0...OK
+2/150 coordinator.test.1 happy path: press → release → final → inserted(ok)...2026-07-18 16:48:58.048   [REC] listening — release the Talk Key to insert
+2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+OK
+3/150 coordinator.test.backend lease is resolved after abandonment...2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+2026-07-18 16:48:58.049   Utterance produced no audio — nothing to insert
+OK
+4/150 coordinator.test.2 press while non-idle is dropped...2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+2026-07-18 16:48:58.049   Talk Key pressed while the previous Utterance is still resolving — ignored
+OK
+5/150 coordinator.test.3 press with no ready Transcription Backend lease...2026-07-18 16:48:58.049   Talk Key pressed but the selected Transcription Backend is not ready — ignored
+OK
+6/150 coordinator.test.4 release without an accepted press is a no-op...OK
+7/150 coordinator.test.5 capture.start failure aborts the Utterance...2026-07-18 16:48:58.049   capture.start failed: AudioQueueStart — Utterance aborted
+2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+OK
+8/150 coordinator.test.6 backend failure while capturing abandons on release without releasing backend...2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+2026-07-18 16:48:58.049   Transcription Backend failed mid-Utterance — will discard this Utterance on release
+2026-07-18 16:48:58.049   Transcription Backend failed mid-Utterance — discarded; hold the Talk Key and say it again
+OK
+9/150 coordinator.test.7 silence still commits, just warns...2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+2026-07-18 16:48:58.049   microphone captured only silence — is Microphone permission granted to this process?
+OK
+10/150 coordinator.test.8 no audio committed → abandon at release...2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+2026-07-18 16:48:58.049   Utterance produced no audio — nothing to insert
+2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+OK
+11/150 coordinator.test.9 deadline before final abandons...2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+2026-07-18 16:48:58.049   no Final Transcript within the deadline — nothing inserted
+OK
+12/150 coordinator.test.9a cooperative deadline requests cancellation without resolving the Utterance...2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+2026-07-18 16:48:58.049   no Final Transcript within the deadline — nothing inserted
+OK
+13/150 coordinator.test.9b backend failure while awaiting final abandons immediately...2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+2026-07-18 16:48:58.049   Transcription Backend failed before a Final Transcript arrived — nothing inserted
+OK
+14/150 coordinator.test.10 empty/failed final inserts nothing...2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+2026-07-18 16:48:58.049   empty Final Transcript — nothing to insert
+OK
+15/150 coordinator.test.11 stale final outside awaiting is ignored...2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+OK
+16/150 coordinator.test.12 insert failure sounds the error path...2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+2026-07-18 16:48:58.049   insertion failed — nothing landed at the cursor
+2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+OK
+17/150 coordinator.test.13 press during .inserting is dropped (ADR-0001)...2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+2026-07-18 16:48:58.049   Talk Key pressed while the previous Utterance is still resolving — ignored
+2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+OK
+18/150 coordinator.test.14 accepted Utterance pins unique identity backend language and deadline policy...2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+2026-07-18 16:48:58.049   no Final Transcript within the deadline — nothing inserted
+2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+OK
+19/150 coordinator.test.15 mismatched duplicate late and phase-invalid events cannot advance an Utterance...2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+OK
+20/150 coordinator.test.16 begin and release failures abandon without leaving the Coordinator busy...2026-07-18 16:48:58.049   backend begin failed: BeginFailed — Utterance aborted
+2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+2026-07-18 16:48:58.049   backend release failed: ReleaseFailed
+2026-07-18 16:48:58.049   [REC] listening — release the Talk Key to insert
+OK
+21/150 transcription_backend.test.lease pins metadata and forwards identity-tagged backend commands...OK
+22/150 transcription_backend.test.deadline claim cannot borrow the identity of a later arm...OK
+23/150 transcription_backend.test.deadline cancellation is identity matched...OK
+24/150 transcription_backend.test.local deadline requests cancellation at 9.5 seconds and claims the hard deadline at 10 seconds...OK
+25/150 transcription_backend.test.selection drains an active lease before preparing the latest backend...OK
+26/150 transcription_backend.test.obsolete preparation never becomes ready...OK
+27/150 transcription_backend.test.invalidating a ready resource rejects leases until its replacement is prepared...OK
+28/150 local_backend.test.hard cancellation terminates a non-responsive helper process...ACCEPTANCE_TIMEOUT cooperative_ms=9510 terminated_ms=10010
+OK
+29/150 local_backend.test.helper crash malformed IPC and inference failure abandon active Utterances and schedule restart...OK
+30/150 local_backend.test.local Transcription Backend buffers complete Capture and submits once after release in every language mode...OK
+31/150 local_backend.test.local Transcription Backend emits only matching terminal events and cancellation never falls back...OK
+32/150 local_backend.test.local Transcription Backend drives one Insertion and abandons empty or failed Utterances without OpenAI...2026-07-18 16:49:09.237   [REC] listening — release the Talk Key to insert
+2026-07-18 16:49:09.237   [REC] listening — release the Talk Key to insert
+2026-07-18 16:49:09.237   Transcription Backend failed before a Final Transcript arrived — nothing inserted
+2026-07-18 16:49:09.237   [REC] listening — release the Talk Key to insert
+2026-07-18 16:49:09.237   empty Final Transcript — nothing to insert
+2026-07-18 16:49:09.237   [REC] listening — release the Talk Key to insert
+2026-07-18 16:49:09.237   Utterance produced no audio — nothing to insert
+OK
+33/150 whisper_ipc.test.version 1 protocol round-trips every identity-tagged frame...OK
+34/150 whisper_ipc.test.protocol rejects malformed frames instead of interpreting their bytes...OK
+35/150 whisper_ipc.test.transcribe validates language reserved bytes PCM shape and payload ceiling...OK
+36/150 whisper_helper_core.test.helper declares readiness only after exact artifact load and warm-up...OK
+37/150 whisper_helper_core.test.helper preparation accepts the verified active receipt identity during an update handoff...OK
+38/150 whisper_helper_core.test.helper keeps one identity-tagged inference active and cancels only its identity...OK
+39/150 whisper_helper_core.test.helper converts signed 24 kHz PCM to bounded 16 kHz float samples...OK
+40/150 whisper_supervisor.test.supervisor becomes ready only for the active receipt digest...OK
+41/150 whisper_supervisor.test.supervisor accepts one matching terminal response and rejects stale identities...OK
+42/150 whisper_supervisor.test.startup and inference failures stay structured...OK
+43/150 whisper_supervisor.test.helper recovery waits 1 2 and 4 seconds then latches after three failed attempts...OK
+44/150 whisper_supervisor.test.explicit reset and successful Final Transcript restore the recovery budget...OK
+45/150 whisper_supervisor.test.empty Final Transcript does not restore the recovery budget...OK
+46/150 config.test.parseEnvKey reads a bare assignment...OK
+47/150 config.test.parseEnvKey accepts an export prefix...OK
+48/150 config.test.parseEnvKey strips one layer of matching quotes...OK
+49/150 config.test.parseEnvKey: last assignment wins, blanks and comments ignored...OK
+50/150 config.test.parseEnvKey ignores a near-miss key and an absent key...OK
+51/150 config.test.patchZonField rewrites an enum value in place...OK
+52/150 config.test.patchZonField preserves comments — including ones naming other fields...OK
+53/150 config.test.patchZonField handles a quoted value containing a comma...OK
+54/150 config.test.patchZonField inserts an absent field before the closing brace...OK
+55/150 config.test.patchZonField does not confuse a longer field name for a prefix...OK
+56/150 config.test.serializeSettings round-trips through the ZON parser...OK
+57/150 config.test.OpenAI is the default Transcription Backend when config omits selection...OK
+58/150 config.test.pre_paste_ms parses from config.zon and defaults when absent...OK
+59/150 config.test.diffSettings flags a pre_paste_ms change as plain (read-at-use)...OK
+60/150 config.test.diffSettings flags session-shaped and overlay changes...OK
+61/150 session.test.formatSessionUpdate defaults reproduce the #8-proven string...OK
+62/150 session.test.formatSessionUpdate omits language entirely for auto-detect (empty string)...OK
+63/150 session.test.OpenAI item identities keep late and out-of-order Final Transcripts tagged...OK
+64/150 session.test.connection teardown forgets identities that can no longer reply...OK
+65/150 session.test.cancelled pending identity consumes its commit without binding a late Final Transcript...OK
+66/150 session.test.cancelled bound identity frees its slot and rejects a late Final Transcript...OK
+67/150 session.test.formatSessionUpdate emits JSON null when noise reduction is disabled...OK
+68/150 session.test.backoffMs ramps 0.5s→8s and caps...OK
+69/150 hud.test.bare-marks geometry: 26 bars derive from the 300 pt pill...OK
+70/150 hud.test.bare-marks geometry: dots never clip the 22 pt pill...OK
+71/150 hud.test.levelToNorm: floor and below read flat...OK
+72/150 hud.test.levelToNorm: ceiling and above read full...OK
+73/150 hud.test.levelToNorm: linear in dB between floor and ceiling...OK
+74/150 hud.test.motion 1: press from idle starts the show fade with bars...OK
+75/150 hud.test.motion 2: release crossfades the bars into the dots...OK
+76/150 hud.test.motion 3: resolution starts the hide fade, order-out deferred to its deadline...OK
+77/150 hud.test.motion 4: order-out fires exactly once, only past the deadline...OK
+78/150 hud.test.motion 5: a press during the hide fade cancels it and records normally...OK
+79/150 insert.test.ensureTrailingSpace appends one space to a bare transcript...OK
+80/150 insert.test.ensureTrailingSpace is idempotent when the transcript already ends in whitespace...OK
+81/150 insert.test.ensureTrailingSpace leaves empty in as empty out (no lone space)...OK
+82/150 insert.test.ensureTrailingSpace keeps content within dst so keystroke's UTF-16 dest can't overflow...OK
+83/150 insert.test.drainDeferredRestore with nothing pending is a no-op...OK
+84/150 insertion_adapter.test.submit copies a Final Transcript and applies the Insertion separator...2026-07-18 16:49:09.240   inserted at the cursor (+0ms after the Final Transcript; mechanism 0ms)
+OK
+85/150 insertion_adapter.test.worker reads the Settings Snapshot at job execution time...2026-07-18 16:49:09.240   inserted at the cursor (+0ms after the Final Transcript; mechanism 0ms)
+OK
+86/150 insertion_adapter.test.insert failure reports a failed completion...2026-07-18 16:49:09.240   insertion failed: no PostEvent grant — enable type-wave under System Settings > Privacy & Security > Accessibility
+OK
+87/150 insertion_adapter.test.completion is reported before the deferred clipboard restore (issue #38)...2026-07-18 16:49:09.240   inserted at the cursor (+0ms after the Final Transcript; mechanism 0ms)
+OK
+88/150 insertion_adapter.test.runOnce reports idle without touching dependencies...OK
+89/150 readiness.test.configured ignores pause and session readiness...OK
+90/150 readiness.test.configured requires setup prerequisites and a live tap...OK
+91/150 readiness.test.Configuration Phase uses only the selected backend durable prerequisite...OK
+92/150 readiness.test.local readiness is offline and reports a missing Model Installation distinctly...OK
+93/150 readiness.test.health uses setup priority before link state...OK
+94/150 readiness.test.pause affects attention but not status...OK
+95/150 readiness.test.reporter reports only distinct missing prerequisite sets...OK
+96/150 readiness.test.reporter resets after configured...OK
+97/150 configuration_phase.test.missing prerequisites report once until the set changes...OK
+98/150 configuration_phase.test.READY announces once on configured entry and again after leaving...OK
+99/150 configuration_phase.test.session readiness affects health but not configured phase...OK
+100/150 configuration_phase.test.commands Session construction and announces only after backend readiness...OK
+101/150 configuration_phase.test.commands tap enable and reports the current missing set...OK
+102/150 configuration_phase.test.session construction and missing prerequisite reporting are independent...OK
+103/150 configuration_phase.test.local Configuration Phase prepares offline without an OpenAI key...OK
+104/150 model_store.test.capacity preflight retains the working installation plus staging overhead...OK
+105/150 model_store.test.Model Operation verifies and smoke-tests before publishing the active receipt...OK
+106/150 model_store.test.explicit Verify reads every artifact byte and distinguishes usable from corrupt...OK
+107/150 model_store.test.explicit Verify rejects self-consistent metadata outside the trusted manifest...OK
+108/150 model_store.test.Repair preserves a usable Model Installation without network access...OK
+109/150 model_store.test.confirmed Repair replaces only an invalid artifact through authenticated acquisition...OK
+110/150 model_store.test.Model Operation transport observes only pinned artifact coordinates...OK
+111/150 model_store.test.Repair preserves and resumes validator-bound valid partial data...OK
+112/150 model_store.test.Repair rebuilds invalid installation metadata without network access...OK
+113/150 model_store.test.Repair reconstructs an invalid receipt from verified pinned local data...OK
+114/150 model_store.test.an interrupted receipt publish is recoverable and startup rejects changed model metadata...OK
+115/150 model_store.test.failed verification or smoke test cannot replace the active receipt...OK
+116/150 model_store.test.a working older Model Installation remains active when the embedded identity changes...OK
+117/150 model_store.test.a schema-one receipt remains usable and reports an embedded replacement...OK
+118/150 model_store.test.a failed replacement leaves the working Model Installation unchanged and usable...OK
+119/150 model_store.test.replacement activation waits for the active inference lease to drain...OK
+120/150 model_store.test.confirmed removal rejects new local Utterances, drains the helper, and removes the Model Installation and staged Model Operation data...OK
+121/150 model_store.test.acquisition starts only at the exact trusted artifact origin...OK
+122/150 model_store.test.restart exposes a validator-bound partial as paused without network activity...OK
+123/150 model_store.test.restart discards a partial whose immutable identity no longer matches...OK
+124/150 model_store.test.restart discards staging directories for obsolete immutable identities...OK
+125/150 model_store.test.explicit resume appends only a matching validated 206 range...OK
+126/150 model_store.test.resume discards a partial when the server validator does not match...OK
+127/150 model_store.test.resume discards a partial when the server range is incompatible...OK
+128/150 model_store.test.resume discards a partial when the server validator is malformed...OK
+129/150 model_store.test.range response validation requires exact 206 identity validator and byte interval...OK
+130/150 model_store.test.transient download retries stop at a bounded visible budget...OK
+131/150 model_store.test.retry budget is bounded across the complete multi-chunk operation...OK
+132/150 model_store.test.a truncated transfer is retried visibly before installation continues...OK
+133/150 model_store.test.cancellation during hashing preserves the active installation boundary...OK
+134/150 model_store.test.cancellation during transfer leaves the working receipt untouched...OK
+135/150 model_store.test.cancellation during smoke testing pauses the verified download before activation...OK
+136/150 local_model_recovery.test.a load failure verifies locally before choosing Repair or runtime Retry...OK
+137/150 local_model_recovery.test.runtime Retry preserves configured installation state...OK
+138/150 status_item.test.compact headline follows pause, common prerequisite, selected prerequisite, failure, preparation, ready priority...OK
+139/150 status_item.test.compact hierarchy exposes only the selected backend primary action...OK
+140/150 status_item.test.local privacy cues survive every active Model Operation stage...OK
+141/150 status_item.test.local Model Operation recovery stays in its submenu under OpenAI selection...OK
+142/150 status_item.test.unselected local corruption and runtime failure do not change OpenAI headline...OK
+143/150 status_item.test.restart-paused Model Operation exposes only Resume and Discard recovery...OK
+144/150 status_item.test.failed and cancelled Model Operations retry instead of pretending to resume partial data...OK
+145/150 status_item.test.Cancel is offered only while a Model Operation stage is cancellable...OK
+146/150 status_item.test.Local Model failures identify the actionable recovery...OK
+147/150 menu.test.Install confirmation names the pinned large artifact and its privacy boundary...OK
+148/150 menu.test.state-changing Local Model confirmations explain their containment boundary...OK
+149/150 installation_identity.test.identity text owns the receipt value...OK
+150/150 artifact_identity.test.artifact identity parser matches complete keys rather than substrings...OK
+All 150 tests passed.

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "performance": {
+    "machine": {"chip": "Apple M1", "memory_gib": 8},
+    "first_metal_ready_ms": 11922,
+    "first_metal_visible_preparing": true,
+    "first_metal_capture_accepted": false
+  },
+  "basis": {
+    "first_metal": {
+      "method": "com.apple.metal and com.apple.metalfe user caches moved aside before a foreground daemon launch, restored afterwards; deltas taken from the daemon's own timestamped log",
+      "daemon_log": "raw/first-metal-daemon.log",
+      "launch_to_helper_warm_ms": 11922,
+      "launch_to_ready_ms": 11937,
+      "visible_preparing_basis": "Status Item is up 0.06 s after launch and the READY line lands only after the helper-warm line; the selected-backend headline reads preparing until then",
+      "capture_accepted_basis": "no Capture accepted before READY: the READY print gates acceptance and the lifecycle suite's helper_recovery scenario (ready_only_after_warmup) covers the gating; warm-cache launch-to-warm on the same install measured 2028 ms (runtime probe)"
+    }
+  }
+}

@@ -1,0 +1,836 @@
+{
+  "schema_version": 1,
+  "candidate": {
+    "model_revision": "98aa99a0a9db05ae2342309f5096248665f7cba3",
+    "model_sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+    "model_bytes": 1624555275,
+    "runtime": "whisper.cpp-v1.9.1",
+    "runtime_source_sha256": "147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447"
+  },
+  "artifact_identity": {
+    "same_packaged_pair": true,
+    "daemon": {
+      "sha256": "b82e0f71bf9bf41ee7f2d7fef93649742578fb49879e11877de4ab58ec80cf44",
+      "signature": {
+        "verified": true,
+        "identifier": "me.ba78.type-wave",
+        "cdhash_sha256": "7ad3eb23d66d231fdaed5c21345d4cfdc8a8d0e9c272fce5bb9725f18b5e0fb6"
+      }
+    },
+    "helper": {
+      "sha256": "a8dd158a56335bfb8ab830701cdaea96c1c083bd47d826d01db8508e2b38a2cd",
+      "signature": {
+        "verified": true,
+        "identifier": "me.ba78.type-wave.whisper",
+        "cdhash_sha256": "f2f1b8ad90919a9d013861ae95d7b44214aa366e8be26c000be4325129166a60"
+      }
+    },
+    "model": {
+      "bytes": 1624555275,
+      "sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
+    },
+    "receipt": {
+      "sha256": "262a1647e60fd29d00021cbe059cd82b78e845e932072598d583eb6d88d991e9",
+      "model_revision": "98aa99a0a9db05ae2342309f5096248665f7cba3",
+      "model_sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+      "model_bytes": 1624555275,
+      "runtime": "whisper.cpp-v1.9.1",
+      "runtime_sha256": "a8dd158a56335bfb8ab830701cdaea96c1c083bd47d826d01db8508e2b38a2cd",
+      "matches_helper": true
+    },
+    "provenance": {
+      "sha256": "c965dedbf294be2abb93220c53f2c8a5b1b85e4f8f0ff0e2455d68b3d871c4ed",
+      "model_revision": "98aa99a0a9db05ae2342309f5096248665f7cba3",
+      "runtime_source_sha256": "147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447"
+    }
+  },
+  "semantic_review_sha256": "900fe48b96657e713e67851b511bc782f02a5532e7a624d3a464a724a3d7e579",
+  "transcription_runs": [
+    {
+      "fixture_id": "en-a-01",
+      "mode": "en",
+      "final_transcript": "Self-described as an Anglo-African-Asian, Plumer was educated mostly in the United Kingdom.",
+      "final_transcript_runs": [
+        "Self-described as an Anglo-African-Asian, Plumer was educated mostly in the United Kingdom.",
+        "Self-described as an Anglo-African-Asian, Plumer was educated mostly in the United Kingdom.",
+        "Self-described as an Anglo-African-Asian, Plumer was educated mostly in the United Kingdom."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        2293.333,
+        2164.343,
+        2066.258
+      ]
+    },
+    {
+      "fixture_id": "en-a-01",
+      "mode": "auto",
+      "final_transcript": "Self-described as an Anglo-African-Asian, Plumer was educated mostly in the United Kingdom.",
+      "final_transcript_runs": [
+        "Self-described as an Anglo-African-Asian, Plumer was educated mostly in the United Kingdom.",
+        "Self-described as an Anglo-African-Asian, Plumer was educated mostly in the United Kingdom.",
+        "Self-described as an Anglo-African-Asian, Plumer was educated mostly in the United Kingdom."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        3758.499,
+        3672.423,
+        3667.863
+      ]
+    },
+    {
+      "fixture_id": "en-a-02",
+      "mode": "en",
+      "final_transcript": "Plasboval is often used as a metonym for the ministry.",
+      "final_transcript_runs": [
+        "Plasboval is often used as a metonym for the ministry.",
+        "Plasboval is often used as a metonym for the ministry.",
+        "Plasboval is often used as a metonym for the ministry."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        1867.236,
+        1860.584,
+        1843.705
+      ]
+    },
+    {
+      "fixture_id": "en-a-02",
+      "mode": "auto",
+      "final_transcript": "Plasboval is often used as a metonym for the ministry.",
+      "final_transcript_runs": [
+        "Plasboval is often used as a metonym for the ministry.",
+        "Plasboval is often used as a metonym for the ministry.",
+        "Plasboval is often used as a metonym for the ministry."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        3684.261,
+        3621.912,
+        3656.813
+      ]
+    },
+    {
+      "fixture_id": "en-a-03",
+      "mode": "en",
+      "final_transcript": "There are various online versions on the internet, usually for a two-player turn-based play.",
+      "final_transcript_runs": [
+        "There are various online versions on the internet, usually for a two-player turn-based play.",
+        "There are various online versions on the internet, usually for a two-player turn-based play.",
+        "There are various online versions on the internet, usually for a two-player turn-based play."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        1904.005,
+        2021.064,
+        1891.667
+      ]
+    },
+    {
+      "fixture_id": "en-a-03",
+      "mode": "auto",
+      "final_transcript": "There are various online versions on the internet, usually for a two-player turn-based play.",
+      "final_transcript_runs": [
+        "There are various online versions on the internet, usually for a two-player turn-based play.",
+        "There are various online versions on the internet, usually for a two-player turn-based play.",
+        "There are various online versions on the internet, usually for a two-player turn-based play."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        3641.655,
+        3608.987,
+        3592.05
+      ]
+    },
+    {
+      "fixture_id": "en-a-04",
+      "mode": "en",
+      "final_transcript": "It remains in full use today.",
+      "final_transcript_runs": [
+        "It remains in full use today.",
+        "It remains in full use today.",
+        "It remains in full use today."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        1781.565,
+        1787.938,
+        1776.371
+      ]
+    },
+    {
+      "fixture_id": "en-a-04",
+      "mode": "auto",
+      "final_transcript": "It remains in full use today.",
+      "final_transcript_runs": [
+        "It remains in full use today.",
+        "It remains in full use today.",
+        "It remains in full use today."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        3497.747,
+        3495.431,
+        3525.604
+      ]
+    },
+    {
+      "fixture_id": "en-a-05",
+      "mode": "en",
+      "final_transcript": "The barrier was called the luminous veil.",
+      "final_transcript_runs": [
+        "The barrier was called the luminous veil.",
+        "The barrier was called the luminous veil.",
+        "The barrier was called the luminous veil."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        1883.626,
+        1820.117,
+        1803.698
+      ]
+    },
+    {
+      "fixture_id": "en-a-05",
+      "mode": "auto",
+      "final_transcript": "The barrier was called the luminous veil.",
+      "final_transcript_runs": [
+        "The barrier was called the luminous veil.",
+        "The barrier was called the luminous veil.",
+        "The barrier was called the luminous veil."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        3488.119,
+        3501.175,
+        3569.972
+      ]
+    },
+    {
+      "fixture_id": "en-b-01",
+      "mode": "en",
+      "final_transcript": "Bindus, identified with Neptune, was worshipped among the Japons.",
+      "final_transcript_runs": [
+        "Bindus, identified with Neptune, was worshipped among the Japons.",
+        "Bindus, identified with Neptune, was worshipped among the Japons.",
+        "Bindus, identified with Neptune, was worshipped among the Japons."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        1849.184,
+        1853.441,
+        1857.104
+      ]
+    },
+    {
+      "fixture_id": "en-b-01",
+      "mode": "auto",
+      "final_transcript": "Bindus, identified with Neptune, was worshipped among the Japons.",
+      "final_transcript_runs": [
+        "Bindus, identified with Neptune, was worshipped among the Japons.",
+        "Bindus, identified with Neptune, was worshipped among the Japons.",
+        "Bindus, identified with Neptune, was worshipped among the Japons."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        3559.131,
+        3612.254,
+        3524.692
+      ]
+    },
+    {
+      "fixture_id": "en-b-02",
+      "mode": "en",
+      "final_transcript": "The shooting has ruled an accident.",
+      "final_transcript_runs": [
+        "The shooting has ruled an accident.",
+        "The shooting has ruled an accident.",
+        "The shooting has ruled an accident."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        1769.937,
+        1781.293,
+        1855.104
+      ]
+    },
+    {
+      "fixture_id": "en-b-02",
+      "mode": "auto",
+      "final_transcript": "The shooting has ruled an accident.",
+      "final_transcript_runs": [
+        "The shooting has ruled an accident.",
+        "The shooting has ruled an accident.",
+        "The shooting has ruled an accident."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        3648.148,
+        3686.389,
+        3755.156
+      ]
+    },
+    {
+      "fixture_id": "en-b-03",
+      "mode": "en",
+      "final_transcript": "Steggart resides in Manhattan.",
+      "final_transcript_runs": [
+        "Steggart resides in Manhattan.",
+        "Steggart resides in Manhattan.",
+        "Steggart resides in Manhattan."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        1953.821,
+        1934.733,
+        1910.24
+      ]
+    },
+    {
+      "fixture_id": "en-b-03",
+      "mode": "auto",
+      "final_transcript": "Steggart resides in Manhattan.",
+      "final_transcript_runs": [
+        "Steggart resides in Manhattan.",
+        "Steggart resides in Manhattan.",
+        "Steggart resides in Manhattan."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        3680.355,
+        3635.714,
+        3699.439
+      ]
+    },
+    {
+      "fixture_id": "en-b-04",
+      "mode": "en",
+      "final_transcript": "The only older station building is in Halkenburg.",
+      "final_transcript_runs": [
+        "The only older station building is in Halkenburg.",
+        "The only older station building is in Halkenburg.",
+        "The only older station building is in Halkenburg."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        1907.709,
+        1924.892,
+        1920.875
+      ]
+    },
+    {
+      "fixture_id": "en-b-04",
+      "mode": "auto",
+      "final_transcript": "The only older station building is in Halkenburg.",
+      "final_transcript_runs": [
+        "The only older station building is in Halkenburg.",
+        "The only older station building is in Halkenburg.",
+        "The only older station building is in Halkenburg."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        3791.432,
+        3865.894,
+        3858.944
+      ]
+    },
+    {
+      "fixture_id": "en-b-05",
+      "mode": "en",
+      "final_transcript": "After his retirement, Maxim spent time as a stand-up comic, restaurateur, and taxi driver.",
+      "final_transcript_runs": [
+        "After his retirement, Maxim spent time as a stand-up comic, restaurateur, and taxi driver.",
+        "After his retirement, Maxim spent time as a stand-up comic, restaurateur, and taxi driver.",
+        "After his retirement, Maxim spent time as a stand-up comic, restaurateur, and taxi driver."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        2126.902,
+        2085.342,
+        2094.261
+      ]
+    },
+    {
+      "fixture_id": "en-b-05",
+      "mode": "auto",
+      "final_transcript": "After his retirement, Maxim spent time as a stand-up comic, restaurateur, and taxi driver.",
+      "final_transcript_runs": [
+        "After his retirement, Maxim spent time as a stand-up comic, restaurateur, and taxi driver.",
+        "After his retirement, Maxim spent time as a stand-up comic, restaurateur, and taxi driver.",
+        "After his retirement, Maxim spent time as a stand-up comic, restaurateur, and taxi driver."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        3987.71,
+        4031.817,
+        3962.97
+      ]
+    },
+    {
+      "fixture_id": "sv-a-01",
+      "mode": "sv",
+      "final_transcript": "Tala inte sådär till din mamma.",
+      "final_transcript_runs": [
+        "Tala inte sådär till din mamma.",
+        "Tala inte sådär till din mamma.",
+        "Tala inte sådär till din mamma."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        1975.434,
+        1970.28,
+        1984.009
+      ]
+    },
+    {
+      "fixture_id": "sv-a-01",
+      "mode": "auto",
+      "final_transcript": "Tala inte sådär till din mamma.",
+      "final_transcript_runs": [
+        "Tala inte sådär till din mamma.",
+        "Tala inte sådär till din mamma.",
+        "Tala inte sådär till din mamma."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        3843.409,
+        3900.5,
+        4006.227
+      ]
+    },
+    {
+      "fixture_id": "sv-a-02",
+      "mode": "sv",
+      "final_transcript": "Fem passagerare hade anmält sig.",
+      "final_transcript_runs": [
+        "Fem passagerare hade anmält sig.",
+        "Fem passagerare hade anmält sig.",
+        "Fem passagerare hade anmält sig."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        2022.077,
+        2169.431,
+        2134.476
+      ]
+    },
+    {
+      "fixture_id": "sv-a-02",
+      "mode": "auto",
+      "final_transcript": "Fem passagerare hade anmält sig.",
+      "final_transcript_runs": [
+        "Fem passagerare hade anmält sig.",
+        "Fem passagerare hade anmält sig.",
+        "Fem passagerare hade anmält sig."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        4190.636,
+        3897.53,
+        3913.17
+      ]
+    },
+    {
+      "fixture_id": "sv-a-03",
+      "mode": "sv",
+      "final_transcript": "Glöm inte att vattna i växthuset också.",
+      "final_transcript_runs": [
+        "Glöm inte att vattna i växthuset också.",
+        "Glöm inte att vattna i växthuset också.",
+        "Glöm inte att vattna i växthuset också."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        2020.159,
+        1991.612,
+        1992.382
+      ]
+    },
+    {
+      "fixture_id": "sv-a-03",
+      "mode": "auto",
+      "final_transcript": "Glöm inte att vattna i växthuset också.",
+      "final_transcript_runs": [
+        "Glöm inte att vattna i växthuset också.",
+        "Glöm inte att vattna i växthuset också.",
+        "Glöm inte att vattna i växthuset också."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        3880.474,
+        3865.112,
+        3881.282
+      ]
+    },
+    {
+      "fixture_id": "sv-a-04",
+      "mode": "sv",
+      "final_transcript": "Ta till vänster i rondellen.",
+      "final_transcript_runs": [
+        "Ta till vänster i rondellen.",
+        "Ta till vänster i rondellen.",
+        "Ta till vänster i rondellen."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        1945.897,
+        1942.06,
+        1979.102
+      ]
+    },
+    {
+      "fixture_id": "sv-a-04",
+      "mode": "auto",
+      "final_transcript": "Ta till vänster i rondellen.",
+      "final_transcript_runs": [
+        "Ta till vänster i rondellen.",
+        "Ta till vänster i rondellen.",
+        "Ta till vänster i rondellen."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        3817.165,
+        3846.336,
+        3839.024
+      ]
+    },
+    {
+      "fixture_id": "sv-a-05",
+      "mode": "sv",
+      "final_transcript": "Detta innebär att målet ska lämnas över till mark- och miljödomstolen för fortsatt handläggning.",
+      "final_transcript_runs": [
+        "Detta innebär att målet ska lämnas över till mark- och miljödomstolen för fortsatt handläggning.",
+        "Detta innebär att målet ska lämnas över till mark- och miljödomstolen för fortsatt handläggning.",
+        "Detta innebär att målet ska lämnas över till mark- och miljödomstolen för fortsatt handläggning."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        2113.352,
+        2137.33,
+        2100.381
+      ]
+    },
+    {
+      "fixture_id": "sv-a-05",
+      "mode": "auto",
+      "final_transcript": "Detta innebär att målet ska lämnas över till mark- och miljödomstolen för fortsatt handläggning.",
+      "final_transcript_runs": [
+        "Detta innebär att målet ska lämnas över till mark- och miljödomstolen för fortsatt handläggning.",
+        "Detta innebär att målet ska lämnas över till mark- och miljödomstolen för fortsatt handläggning.",
+        "Detta innebär att målet ska lämnas över till mark- och miljödomstolen för fortsatt handläggning."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        3974.161,
+        4006.954,
+        3962.239
+      ]
+    },
+    {
+      "fixture_id": "sv-a-06",
+      "mode": "sv",
+      "final_transcript": "Huvudregeln är att patent och marknadsöverdomstolens avgöranden i tvistemål och ärenden inte får överklagas.",
+      "final_transcript_runs": [
+        "Huvudregeln är att patent och marknadsöverdomstolens avgöranden i tvistemål och ärenden inte får överklagas.",
+        "Huvudregeln är att patent och marknadsöverdomstolens avgöranden i tvistemål och ärenden inte får överklagas.",
+        "Huvudregeln är att patent och marknadsöverdomstolens avgöranden i tvistemål och ärenden inte får överklagas."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        2183.212,
+        2164.984,
+        2236.336
+      ]
+    },
+    {
+      "fixture_id": "sv-a-06",
+      "mode": "auto",
+      "final_transcript": "Huvudregeln är att patent och marknadsöverdomstolens avgöranden i tvistemål och ärenden inte får överklagas.",
+      "final_transcript_runs": [
+        "Huvudregeln är att patent och marknadsöverdomstolens avgöranden i tvistemål och ärenden inte får överklagas.",
+        "Huvudregeln är att patent och marknadsöverdomstolens avgöranden i tvistemål och ärenden inte får överklagas.",
+        "Huvudregeln är att patent och marknadsöverdomstolens avgöranden i tvistemål och ärenden inte får överklagas."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        4040.98,
+        4155.39,
+        4126.275
+      ]
+    },
+    {
+      "fixture_id": "sv-a-07",
+      "mode": "sv",
+      "final_transcript": "Jag menar om hon tonerat avsevara summor till välgörande ändamål.",
+      "final_transcript_runs": [
+        "Jag menar om hon tonerat avsevara summor till välgörande ändamål.",
+        "Jag menar om hon tonerat avsevara summor till välgörande ändamål.",
+        "Jag menar om hon tonerat avsevara summor till välgörande ändamål."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        2095.969,
+        2123.201,
+        2119.506
+      ]
+    },
+    {
+      "fixture_id": "sv-a-07",
+      "mode": "auto",
+      "final_transcript": "Jag menar om hon tonerat avsevara summor till välgörande ändamål.",
+      "final_transcript_runs": [
+        "Jag menar om hon tonerat avsevara summor till välgörande ändamål.",
+        "Jag menar om hon tonerat avsevara summor till välgörande ändamål.",
+        "Jag menar om hon tonerat avsevara summor till välgörande ändamål."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        3991.019,
+        4051.222,
+        4064.139
+      ]
+    },
+    {
+      "fixture_id": "sv-a-08",
+      "mode": "sv",
+      "final_transcript": "Definitionen och syftesförskrivningen förväntas leda till ökad likvärdighet och ökad kunskap om skolbibliotekets funktion.",
+      "final_transcript_runs": [
+        "Definitionen och syftesförskrivningen förväntas leda till ökad likvärdighet och ökad kunskap om skolbibliotekets funktion.",
+        "Definitionen och syftesförskrivningen förväntas leda till ökad likvärdighet och ökad kunskap om skolbibliotekets funktion.",
+        "Definitionen och syftesförskrivningen förväntas leda till ökad likvärdighet och ökad kunskap om skolbibliotekets funktion."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        2230.92,
+        2224.088,
+        2239.856
+      ]
+    },
+    {
+      "fixture_id": "sv-a-08",
+      "mode": "auto",
+      "final_transcript": "Definitionen och syftesförskrivningen förväntas leda till ökad likvärdighet och ökad kunskap om skolbibliotekets funktion.",
+      "final_transcript_runs": [
+        "Definitionen och syftesförskrivningen förväntas leda till ökad likvärdighet och ökad kunskap om skolbibliotekets funktion.",
+        "Definitionen och syftesförskrivningen förväntas leda till ökad likvärdighet och ökad kunskap om skolbibliotekets funktion.",
+        "Definitionen och syftesförskrivningen förväntas leda till ökad likvärdighet och ökad kunskap om skolbibliotekets funktion."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        4153.995,
+        4216.447,
+        4158.854
+      ]
+    },
+    {
+      "fixture_id": "sv-b-01",
+      "mode": "sv",
+      "final_transcript": "Högsta domstolen upphefur beslutat om att personen ska betala avgiften till brottsofferfonden.",
+      "final_transcript_runs": [
+        "Högsta domstolen upphefur beslutat om att personen ska betala avgiften till brottsofferfonden.",
+        "Högsta domstolen upphefur beslutat om att personen ska betala avgiften till brottsofferfonden.",
+        "Högsta domstolen upphefur beslutat om att personen ska betala avgiften till brottsofferfonden."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        2144.967,
+        2125.354,
+        2138.428
+      ]
+    },
+    {
+      "fixture_id": "sv-b-01",
+      "mode": "auto",
+      "final_transcript": "Högsta dómstolen upphefur beslutinni um að personin skal betala afgiften til brottsofferfonden.",
+      "final_transcript_runs": [
+        "Högsta dómstolen upphefur beslutinni um að personin skal betala afgiften til brottsofferfonden.",
+        "Högsta dómstolen upphefur beslutinni um að personin skal betala afgiften til brottsofferfonden.",
+        "Högsta dómstolen upphefur beslutinni um að personin skal betala afgiften til brottsofferfonden."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        4015.822,
+        3990.352,
+        4040.677
+      ]
+    },
+    {
+      "fixture_id": "sv-b-02",
+      "mode": "sv",
+      "final_transcript": "Betraffande försäljande har Riksöggen lagrann gått tag i hovrätens bedömning att gärningen ska rubriceras som penningtvätförsäljelse.",
+      "final_transcript_runs": [
+        "Betraffande försäljande har Riksöggen lagrann gått tag i hovrätens bedömning att gärningen ska rubriceras som penningtvätförsäljelse.",
+        "Betraffande försäljande har Riksöggen lagrann gått tag i hovrätens bedömning att gärningen ska rubriceras som penningtvätförsäljelse.",
+        "Betraffande försäljande har Riksöggen lagrann gått tag i hovrätens bedömning att gärningen ska rubriceras som penningtvätförsäljelse."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        2283.34,
+        2259.224,
+        2265.153
+      ]
+    },
+    {
+      "fixture_id": "sv-b-02",
+      "mode": "auto",
+      "final_transcript": "Betraffande försäljande har Riksöggen lagrann gått tag i hovrätens bedömning att gärningen ska rubriceras som penningtvätförsäljelse.",
+      "final_transcript_runs": [
+        "Betraffande försäljande har Riksöggen lagrann gått tag i hovrätens bedömning att gärningen ska rubriceras som penningtvätförsäljelse.",
+        "Betraffande försäljande har Riksöggen lagrann gått tag i hovrätens bedömning att gärningen ska rubriceras som penningtvätförsäljelse.",
+        "Betraffande försäljande har Riksöggen lagrann gått tag i hovrätens bedömning att gärningen ska rubriceras som penningtvätförsäljelse."
+      ],
+      "meaning_changing_errors": [],
+      "latency_ms": [
+        4148.689,
+        4185.401,
+        4271.15
+      ]
+    }
+  ],
+  "performance": {
+    "cached_ready_ms": 1813.498,
+    "idle_rss_mib": 221.578,
+    "peak_rss_mib": 409.438,
+    "machine": {
+      "chip": "Apple M1",
+      "memory_gib": 8
+    },
+    "first_metal_ready_ms": 11922,
+    "first_metal_visible_preparing": true,
+    "first_metal_capture_accepted": false,
+    "timeout": {
+      "supported": true,
+      "cooperative_cancel_requested_ms": 9510,
+      "helper_terminated_ms": 10010,
+      "utterance_abandoned": true,
+      "insertions": 0,
+      "raw_sha256": "d36674ce8bb401918c4862008a1d73d4197143f0d17b1ee088f5a06edf621cfa"
+    }
+  },
+  "default_diagnostics_scan": {
+    "sha256": "55601d1fc4567998305a5a38df014d4db2839061869229112f9110b8537828e0",
+    "bytes": 13155,
+    "contains_pcm": false,
+    "contains_transcript": false,
+    "contains_operational_metadata": true,
+    "pcm_marker_count": 295191,
+    "transcript_marker_count": 470,
+    "artifact": "acceptance/local_backend/evidence/98aa99a0a9db-f16/helper-diagnostics.log"
+  },
+  "privacy": {
+    "artifacts": [
+      {
+        "name": "offline_operation",
+        "trace": "privacy/offline_operation.json",
+        "trace_sha256": "b05ed34523b04a93e5e6f51cd2b8235b84a8d5e8c730e25ae1372ec7fd1cd724"
+      },
+      {
+        "name": "network_boundary",
+        "trace": "privacy/network_boundary.json",
+        "trace_sha256": "c79834c0067b79242241ecb1d0420a79c648baf1d5538a31868d5e4481dd2f77"
+      },
+      {
+        "name": "default_logs",
+        "trace": "privacy/default_logs.json",
+        "trace_sha256": "32c0c6f0f91a33d5039f62cf394e206507c420114e0546ceccc6658e2b87991d"
+      },
+      {
+        "name": "model_operation_boundary",
+        "trace": "privacy/model_operation_boundary.json",
+        "trace_sha256": "a2e424e9ce6d13d9b96b37bb1fc16f809b537eb675add4f4c851376919f0c2b8"
+      }
+    ]
+  },
+  "fault_probes": [
+    {
+      "name": "successful_lifecycle",
+      "trace": "traces/successful_lifecycle.json",
+      "trace_sha256": "3a0989982c0b4edca37252c1bf244a53238e71a688b7b0906ff4d134ca20a7b6"
+    },
+    {
+      "name": "empty_capture",
+      "trace": "traces/empty_capture.json",
+      "trace_sha256": "991717f0cf52ab2e0e3b1405eb01499429d93d96cdf5fc9ea13f09430107fe22"
+    },
+    {
+      "name": "empty_final_transcript",
+      "trace": "traces/empty_final_transcript.json",
+      "trace_sha256": "ede7da8c99cc8218cf8e6ab99215be53855261d3312e3e1f95f01d79c5e20494"
+    },
+    {
+      "name": "helper_loss_during_capture",
+      "trace": "traces/helper_loss_during_capture.json",
+      "trace_sha256": "f26360e656b68ae0e61619184bbad43c7c09b6269cd217540a7dda95f9555313"
+    },
+    {
+      "name": "helper_crash",
+      "trace": "traces/helper_crash.json",
+      "trace_sha256": "21b94204faed79a8a68edd8d42bb58d876bd5ee02165c63df0119e708377f69b"
+    },
+    {
+      "name": "malformed_ipc",
+      "trace": "traces/malformed_ipc.json",
+      "trace_sha256": "acf3d30024e3096d2fcfd1dd8b85d7a00343f718ebdd14d913f4e15405fa9bba"
+    },
+    {
+      "name": "inference_failure",
+      "trace": "traces/inference_failure.json",
+      "trace_sha256": "372dc7cf6197068827171a4d8c1964a91f13b325e18af15cb6bb82ce3348b5f6"
+    },
+    {
+      "name": "restart_backoff_and_latch",
+      "trace": "traces/restart_backoff_and_latch.json",
+      "trace_sha256": "6d823bd31faa67ad37625bac4ea3b76f98fc20402f5b8f913111bb4200838a7c"
+    },
+    {
+      "name": "successful_final_resets_failures",
+      "trace": "traces/successful_final_resets_failures.json",
+      "trace_sha256": "c67308da25d4cb311da3c800e062d8c98c216e1ed08dc8d90ca9778823add8d6"
+    },
+    {
+      "name": "cooperative_cancellation",
+      "trace": "traces/cooperative_cancellation.json",
+      "trace_sha256": "d8778b2a3cbfb1982fe308b61bea9b4893d207551aada07fb3081ef24c8c186a"
+    },
+    {
+      "name": "forced_termination",
+      "trace": "traces/forced_termination.json",
+      "trace_sha256": "ee2a5f53921b0ec5c7a48de73d51a20c7d2fbde9505b126ac482b27dde140390"
+    },
+    {
+      "name": "final_timeout_race",
+      "trace": "traces/final_timeout_race.json",
+      "trace_sha256": "77818c88f3be5177b04941693d7eaa59b62fee713acb3a50e7dea22c95a79fde"
+    },
+    {
+      "name": "stale_events",
+      "trace": "traces/stale_events.json",
+      "trace_sha256": "eb46cac33c5b24277e3bc071b793fde7924aba09943fd2a45e0179219b9f20a3"
+    },
+    {
+      "name": "non_idle_press",
+      "trace": "traces/non_idle_press.json",
+      "trace_sha256": "1c9997fcc6c6b12c6cb66ec810d3ba263db9aff5f3f38f95c7293d42cfa8ab08"
+    },
+    {
+      "name": "backend_switch",
+      "trace": "traces/backend_switch.json",
+      "trace_sha256": "528028f8d2712c96b8f1fa1fab1fca486c988403cf671f3920d77bff7d5ec13f"
+    },
+    {
+      "name": "prerequisite_loss",
+      "trace": "traces/prerequisite_loss.json",
+      "trace_sha256": "46e8d2bcbe1a4e72e24daa88a18a77a2c18f64b316dad7d5f3cadb89c6d94712"
+    },
+    {
+      "name": "helper_recovery",
+      "trace": "traces/helper_recovery.json",
+      "trace_sha256": "aab9e13e46b714022bf515f287d181b3d1ada8eec243c26d026cff6b48974243"
+    },
+    {
+      "name": "abandonment_has_no_side_effects",
+      "trace": "traces/abandonment_has_no_side_effects.json",
+      "trace_sha256": "17be5e3be7f89beb89b8187cacdf1f4b272123b26914a451c73b155fb2921eed"
+    }
+  ]
+}

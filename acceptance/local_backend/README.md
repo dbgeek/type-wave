@@ -1,8 +1,8 @@
 # Local-backend release gate
 
-This directory contains the deterministic release gate for **Local — KB Whisper Small**.
+This directory contains the deterministic release gate for **Local — Whisper Large v3 Turbo**.
 It implements `ACCEPT-1` through `ACCEPT-14` from
-[`docs/local-kb-whisper-backend.md`](../../docs/local-kb-whisper-backend.md) and issue #69.
+[`docs/local-backend.md`](../../docs/local-backend.md) and issue #69.
 Every check is release-blocking; the JSON report never averages one category into another.
 
 The harness uses only the Python standard library. Enter the pinned development environment
@@ -39,7 +39,7 @@ python3 acceptance/local_backend/collect.py \
   --manifest path/to/corpus-manifest.json \
   --helper ~/.local/libexec/type-wave/current/type-wave-whisper \
   --daemon ~/.local/libexec/type-wave/current/type-wave \
-  --model "$HOME/Library/Application Support/type-wave/models/installations/3564d61a42fc-f16/ggml-model.bin" \
+  --model "$HOME/Library/Application Support/type-wave/models/installations/98aa99a0a9db-f16/ggml-large-v3-turbo.bin" \
   --receipt "$HOME/Library/Application Support/type-wave/models/active.receipt" \
   --provenance ~/.local/libexec/type-wave/current/share/PROVENANCE \
   --semantic-review path/to/semantic-review.json \
@@ -56,8 +56,11 @@ review that does not cover the exact fixture/mode set. It retains all three raw 
 Transcripts and uses the first pre-declared run for gate scoring, so a varying result cannot
 be selected after observation. Timeout/privacy/lifecycle observations remain separately
 retained release evidence. When `--diagnostics-output` is supplied, the full helper stderr is
-retained and scanned for raw, hexadecimal, and base64 PCM chunks plus exact and partial
-reference/observed transcripts; daemon diagnostics must be retained and assessed separately.
+retained and scanned for raw, hexadecimal, and base64 PCM chunks plus exact
+reference/observed transcripts and word-boundary three-word phrases from them (shorter
+runs are not markers: operational metadata legitimately contains natural-language words
+and function-word pairs, while any real transcript echo discloses three or more
+consecutive words); daemon diagnostics must be retained and assessed separately.
 
 `--deny-helper-network` launches the exact hashed helper inside a macOS sandbox that denies
 all network operations while leaving the collector outside that sandbox for RSS sampling.
@@ -82,7 +85,7 @@ The manifest root has `schema_version: 1`, corpus identity/licensing facts, and 
 {
   "schema_version": 1,
   "corpus": {
-    "id": "local-kb-whisper-human-v1",
+    "id": "type-wave-common-voice-17-en-sv-v1",
     "human_speech": true,
     "redistributable": true,
     "license": "SPDX license identifier or distribution grant"
@@ -166,7 +169,12 @@ review so equivalent forms such as `two` and `2` do not become false failures; e
 any `meaning_changing_errors`. Proper
 names and technical terms affect WER but have no separate threshold.
 
-Thresholds are fixed in `gate.py`: 15% explicit WER, 20% auto WER per language, 40% maximum
-per-Utterance WER, 0.75 punctuation F1, zero protected errors; 2 seconds warmed latency/cached
-readiness, 15 seconds first Metal preparation, 600/750 MiB idle/peak RSS; cancellation requested
-at 9.5 seconds and forced termination by 10 seconds; and zero privacy/lifecycle violations.
+Thresholds are fixed in `gate.py` and are per-model calibration for the pinned turbo
+candidate (#88): 12% English and 20% Swedish explicit WER, 12%/26% English/Swedish auto WER,
+40% maximum per-Utterance WER with pinned waivers (`sv-b-02` both modes and `sv-b-01` auto,
+each <=80%), 0.72 punctuation F1, zero protected errors; 2.6/4.8 seconds warmed
+explicit/auto latency, 4 seconds cached readiness, 15 seconds first Metal preparation (cold system Metal cache),
+300/500 MiB idle/peak RSS as helper leak detectors; cancellation requested at 9.5 seconds
+and forced termination by 10 seconds (both timer-driven; the retained observation may
+carry up to 250 ms of scheduling overshoot, never an early firing); and zero
+privacy/lifecycle violations.

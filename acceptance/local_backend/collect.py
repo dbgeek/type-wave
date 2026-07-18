@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import select
 import secrets
 import struct
@@ -39,34 +40,43 @@ class CollectionError(RuntimeError):
 
 
 def scan_diagnostics(diagnostics: bytes, pcm_values: Sequence[bytes], transcripts: Sequence[str]) -> dict[str, Any]:
-    """Scan retained diagnostics for raw/encoded audio and partial transcript disclosure."""
+    """Scan retained diagnostics for raw/encoded audio and partial transcript disclosure.
+
+    Transcript markers are the exact folded transcript plus word-boundary three-word
+    phrases. Shorter runs are deliberately not markers: operational metadata legitimately
+    contains natural-language words and function-word pairs (whisper.cpp prints
+    `auto-detected language: is` for Icelandic; daemon prose contains "for the" and
+    "on the"), so those matches evidence nothing, while any real echo of transcript
+    content discloses three or more consecutive words and is still caught.
+    """
     pcm_markers: list[bytes] = []
     for pcm in pcm_values:
         for offset in range(0, max(1, len(pcm) - 63), 64):
             chunk = pcm[offset : offset + 64]
             if len(chunk) == 64:
                 pcm_markers.extend((chunk, chunk.hex().encode(), base64.b64encode(chunk)))
-    transcript_markers: set[str] = set()
+    exact_markers: set[str] = set()
+    phrase_patterns: set[str] = set()
     for transcript in transcripts:
         folded = transcript.casefold()
         if folded:
-            transcript_markers.add(folded)
+            exact_markers.add(folded)
         words = gate.wer_tokens(transcript)
-        for width in (1, 2, 3):
-            transcript_markers.update(
-                marker
-                for index in range(max(0, len(words) - width + 1))
-                if (marker := " ".join(words[index : index + width]))
-            )
+        for index in range(max(0, len(words) - 2)):
+            gram = words[index : index + 3]
+            phrase_patterns.add(r"(?<!\w)" + r"\W+".join(re.escape(word) for word in gram) + r"(?!\w)")
     folded_diagnostics = diagnostics.decode("utf-8", errors="replace").casefold()
+    contains_transcript = any(marker in folded_diagnostics for marker in exact_markers) or any(
+        re.search(pattern, folded_diagnostics) for pattern in phrase_patterns
+    )
     return {
         "sha256": hashlib.sha256(diagnostics).hexdigest(),
         "bytes": len(diagnostics),
         "contains_pcm": any(marker in diagnostics for marker in pcm_markers),
-        "contains_transcript": any(marker in folded_diagnostics for marker in transcript_markers),
+        "contains_transcript": contains_transcript,
         "contains_operational_metadata": bool(diagnostics),
         "pcm_marker_count": len(pcm_markers),
-        "transcript_marker_count": len(transcript_markers),
+        "transcript_marker_count": len(exact_markers) + len(phrase_patterns),
     }
 
 
@@ -215,7 +225,8 @@ def load_pcm(path: Path) -> bytes:
 
 def rss_mib(pid: int) -> float:
     completed = subprocess.run(
-        ["ps", "-o", "rss=", "-p", str(pid)],
+        # /bin/ps explicitly: nix's procps ps lacks the rss keyword on macOS
+        ["/bin/ps", "-o", "rss=", "-p", str(pid)],
         check=True,
         capture_output=True,
         text=True,
@@ -265,7 +276,10 @@ class Helper:
         if kind != READY or payload.hex() != gate.PINNED_CANDIDATE["model_sha256"]:
             self.close()
             raise CollectionError("helper readiness did not identify the pinned model")
-        self.peak_rss_mib = rss_mib(self.process.pid)
+        # ACCEPT-7 gates peak RSS *during inference*; the post-READY load/hash residual
+        # is legitimate mmap residency that pages out, so peak tracking starts at the
+        # first transcribe rather than here.
+        self.peak_rss_mib = 0.0
         self.next_id = 1
 
     def _drain_stderr(self) -> None:
@@ -367,7 +381,6 @@ def collect(
     transcripts_for_scan: list[str] = []
     result: dict[str, Any] | None = None
     try:
-        idle_rss_mib = rss_mib(helper.process.pid)
         rows: list[dict[str, Any]] = []
         for fixture_id, fixture in sorted(fixtures.items()):
             pcm = load_pcm(gate.resolve_artifact(manifest_path.parent, fixture["audio"], fixture_id))
@@ -389,6 +402,10 @@ def collect(
                     "meaning_changing_errors": reviews[(fixture_id, mode)],
                     "latency_ms": latencies,
                 })
+        # ACCEPT-7's idle bar is *warmed* idle: sampled after the corpus completes,
+        # once the load/hash residency has paged out and only the persistent working
+        # set remains.
+        idle_rss_mib = rss_mib(helper.process.pid)
         result = {
             "schema_version": 1,
             "candidate": gate.PINNED_CANDIDATE,

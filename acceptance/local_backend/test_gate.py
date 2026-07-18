@@ -91,9 +91,9 @@ def evidence() -> dict[str, Any]:
     return {
         "schema_version": 1,
         "candidate": {
-            "model_revision": "3564d61a42fc210ceaa55a22a96dd64478959c78",
-            "model_sha256": "de6911330cbdc131362f7a955682b65c8a5a2394caba73e7ea821a9822efb8c6",
-            "model_bytes": 487601984,
+            "model_revision": "98aa99a0a9db05ae2342309f5096248665f7cba3",
+            "model_sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+            "model_bytes": 1624555275,
             "runtime": "whisper.cpp-v1.9.1",
             "runtime_source_sha256": "147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447",
         },
@@ -101,19 +101,19 @@ def evidence() -> dict[str, Any]:
             "same_packaged_pair": True,
             "daemon": {"sha256": "11" * 32, "signature": {"verified": True, "identifier": "me.ba78.type-wave"}},
             "helper": {"sha256": "22" * 32, "signature": {"verified": True, "identifier": "me.ba78.type-wave.whisper"}},
-            "model": {"bytes": 487601984, "sha256": "de6911330cbdc131362f7a955682b65c8a5a2394caba73e7ea821a9822efb8c6"},
+            "model": {"bytes": 1624555275, "sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"},
             "receipt": {
                 "sha256": "33" * 32,
-                "model_revision": "3564d61a42fc210ceaa55a22a96dd64478959c78",
-                "model_sha256": "de6911330cbdc131362f7a955682b65c8a5a2394caba73e7ea821a9822efb8c6",
-                "model_bytes": 487601984,
+                "model_revision": "98aa99a0a9db05ae2342309f5096248665f7cba3",
+                "model_sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+                "model_bytes": 1624555275,
                 "runtime": "whisper.cpp-v1.9.1",
                 "runtime_sha256": "22" * 32,
                 "matches_helper": True,
             },
             "provenance": {
                 "sha256": "44" * 32,
-                "model_revision": "3564d61a42fc210ceaa55a22a96dd64478959c78",
+                "model_revision": "98aa99a0a9db05ae2342309f5096248665f7cba3",
                 "runtime_source_sha256": "147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447",
             },
         },
@@ -131,11 +131,11 @@ def evidence() -> dict[str, Any]:
         "performance": {
             "machine": {"chip": "Apple M1", "memory_gib": 8},
             "cached_ready_ms": 420,
-            "first_metal_ready_ms": 10830,
+            "first_metal_ready_ms": 3210,
             "first_metal_visible_preparing": True,
             "first_metal_capture_accepted": False,
-            "idle_rss_mib": 516,
-            "peak_rss_mib": 540,
+            "idle_rss_mib": 180,
+            "peak_rss_mib": 410,
             "timeout": {
                 "cooperative_cancel_requested_ms": 9500,
                 "helper_terminated_ms": 10000,
@@ -327,14 +327,51 @@ class GateCliTests(unittest.TestCase):
                 mutate(changed)
                 self.assertIn(expected, self.failed_checks(changed))
 
+    def test_waived_fixture_may_exceed_the_global_per_utterance_cap(self) -> None:
+        waived_manifest = manifest()
+        waived_evidence = evidence()
+        for fixture in waived_manifest["fixtures"]:
+            if fixture["id"] == "sv-02":
+                fixture["id"] = "sv-b-02"
+                fixture["audio"] = "audio/sv-b-02.wav"
+        for run in waived_evidence["transcription_runs"]:
+            if run["fixture_id"] == "sv-02":
+                run["fixture_id"] = "sv-b-02"
+                run["final_transcript"] = "helt andra ord 2."
+
+        completed, report = self.run_gate(waived_manifest, waived_evidence)
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        checks = {check["id"]: check for check in report["checks"]}
+        self.assertTrue(checks["quality.per_utterance_wer"]["passed"])
+        self.assertEqual(0.75, checks["quality.per_utterance_wer"]["observed"]["worst"])
+
+    def test_waiver_is_a_cap_not_a_pardon(self) -> None:
+        waived_manifest = manifest()
+        waived_evidence = evidence()
+        for fixture in waived_manifest["fixtures"]:
+            if fixture["id"] == "sv-02":
+                fixture["id"] = "sv-b-02"
+                fixture["audio"] = "audio/sv-b-02.wav"
+        for run in waived_evidence["transcription_runs"]:
+            if run["fixture_id"] == "sv-02":
+                run["fixture_id"] = "sv-b-02"
+                run["final_transcript"] = "helt andra ord nu."
+
+        completed, report = self.run_gate(waived_manifest, waived_evidence)
+
+        self.assertEqual(1, completed.returncode)
+        self.assertIn("quality.per_utterance_wer", {check["id"] for check in report["checks"] if not check["passed"]})
+
     def test_each_performance_threshold_fails_independently(self) -> None:
         cases = [
             ("performance.base_m1", ("machine", "chip"), "Apple M2"),
-            ("performance.cached_ready", ("cached_ready_ms",), 2001),
+            ("performance.cached_ready", ("cached_ready_ms",), 4001),
             ("performance.first_metal_preparation", ("first_metal_ready_ms",), 15001),
-            ("performance.idle_rss", ("idle_rss_mib",), 601),
-            ("performance.peak_rss", ("peak_rss_mib",), 751),
-            ("performance.hard_timeout", ("timeout", "helper_terminated_ms"), 10001),
+            ("performance.idle_rss", ("idle_rss_mib",), 301),
+            ("performance.peak_rss", ("peak_rss_mib",), 501),
+            ("performance.hard_timeout", ("timeout", "helper_terminated_ms"), 10251),
+            ("performance.hard_timeout", ("timeout", "cooperative_cancel_requested_ms"), 9499),
         ]
         for expected, path, value in cases:
             with self.subTest(expected):
@@ -342,9 +379,20 @@ class GateCliTests(unittest.TestCase):
                 self.set_nested(changed["performance"], path, value)
                 self.assertIn(expected, self.failed_checks(changed))
 
+        explicit = evidence()
+        explicit["transcription_runs"][0]["latency_ms"] = [2599, 2600, 2601]
+        self.assertIn("performance.transcription_latency.explicit", self.failed_checks(explicit))
+
+        auto = evidence()
+        auto["transcription_runs"][1]["latency_ms"] = [4799, 4800, 4801]
+        self.assertIn("performance.transcription_latency.auto", self.failed_checks(auto))
+
+    def test_auto_latency_headroom_does_not_leak_into_explicit_modes(self) -> None:
         changed = evidence()
-        changed["transcription_runs"][0]["latency_ms"] = [1999, 2000, 2001]
-        self.assertIn("performance.transcription_latency", self.failed_checks(changed))
+        changed["transcription_runs"][0]["latency_ms"] = [2601, 2700, 2800]
+        failed = self.failed_checks(changed)
+        self.assertIn("performance.transcription_latency.explicit", failed)
+        self.assertNotIn("performance.transcription_latency.auto", failed)
 
     def test_each_privacy_threshold_fails_independently(self) -> None:
         cases = [

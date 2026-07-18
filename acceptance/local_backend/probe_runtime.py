@@ -82,7 +82,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         "credentials_environment_unset": not os.environ.get("OPENAI_API_KEY") and not os.environ.get("HF_TOKEN"),
         "network_sandbox": "deny network*",
         "diagnostics_sha256": hashlib.sha256(raw).hexdigest(),
-        "ready_offline": b"READY" in raw and b"local KB Whisper helper warm" in raw,
+        "ready_offline": b"READY" in raw and b"local Whisper helper warm" in raw,
     }
     args.observation.parent.mkdir(parents=True, exist_ok=True)
     args.observation.write_text(json.dumps(observation, sort_keys=True, separators=(",", ":")), encoding="utf-8")

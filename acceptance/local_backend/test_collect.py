@@ -53,7 +53,7 @@ class CollectTests(unittest.TestCase):
             fake_helper.write_text(textwrap.dedent("""\
                 #!/usr/bin/env python3
                 import struct, sys
-                digest = bytes.fromhex("de6911330cbdc131362f7a955682b65c8a5a2394caba73e7ea821a9822efb8c6")
+                digest = bytes.fromhex("1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69")
                 sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 1, 1, len(digest)) + digest)
                 sys.stdout.buffer.flush()
                 count = 0
@@ -111,8 +111,14 @@ class CollectTests(unittest.TestCase):
         self.assertTrue(scan["contains_pcm"])
         self.assertTrue(scan["contains_transcript"])
 
-        swedish = collect.scan_diagnostics(" ÄNDRING ".encode(), [], ["En viktig ändring kommer"])
+        swedish = collect.scan_diagnostics(" VIKTIG  ÄNDRING  KOMMER ".encode(), [], ["En viktig ändring kommer"])
         self.assertTrue(swedish["contains_transcript"])
+
+        word_pair = collect.scan_diagnostics(" VIKTIG ÄNDRING ".encode(), [], ["En viktig ändring kommer"])
+        self.assertFalse(word_pair["contains_transcript"])
+
+        operational = collect.scan_diagnostics(b"auto-detected language: is (p = 0.98) for the run", [], ["There is a plan for the party"])
+        self.assertFalse(operational["contains_transcript"])
 
     def test_helper_rejects_diagnostics_that_cannot_be_fully_retained(self) -> None:
         helper = object.__new__(collect.Helper)
@@ -136,7 +142,7 @@ class CollectTests(unittest.TestCase):
                 fake_helper.write_text(textwrap.dedent(f"""\
                     #!/usr/bin/env python3
                     import struct, sys
-                    digest = bytes.fromhex("de6911330cbdc131362f7a955682b65c8a5a2394caba73e7ea821a9822efb8c6")
+                    digest = bytes.fromhex("1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69")
                     sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 1, 1, len(digest)) + digest)
                     sys.stdout.buffer.flush()
                     header = sys.stdin.buffer.read(12)
@@ -160,7 +166,7 @@ class CollectTests(unittest.TestCase):
             fake_helper.write_text(textwrap.dedent("""\
                 #!/usr/bin/env python3
                 import struct, sys, time
-                digest = bytes.fromhex("de6911330cbdc131362f7a955682b65c8a5a2394caba73e7ea821a9822efb8c6")
+                digest = bytes.fromhex("1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69")
                 sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 1, 1, len(digest)) + digest)
                 sys.stdout.buffer.flush()
                 header = sys.stdin.buffer.read(12)

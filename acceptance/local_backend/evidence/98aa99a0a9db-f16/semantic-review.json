@@ -1,0 +1,206 @@
+{
+ "schema_version": 1,
+ "review_method": "manual_reference_comparison",
+ "reviews": [
+  {
+   "fixture_id": "en-a-01",
+   "mode": "en",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-a-01",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-a-02",
+   "mode": "en",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-a-02",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-a-03",
+   "mode": "en",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-a-03",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-a-04",
+   "mode": "en",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-a-04",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-a-05",
+   "mode": "en",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-a-05",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-b-01",
+   "mode": "en",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-b-01",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-b-02",
+   "mode": "en",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-b-02",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-b-03",
+   "mode": "en",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-b-03",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-b-04",
+   "mode": "en",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-b-04",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-b-05",
+   "mode": "en",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "en-b-05",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-01",
+   "mode": "sv",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-01",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-02",
+   "mode": "sv",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-02",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-03",
+   "mode": "sv",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-03",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-04",
+   "mode": "sv",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-04",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-05",
+   "mode": "sv",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-05",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-06",
+   "mode": "sv",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-06",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-07",
+   "mode": "sv",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-07",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-08",
+   "mode": "sv",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-a-08",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-b-01",
+   "mode": "sv",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-b-01",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-b-02",
+   "mode": "sv",
+   "meaning_changing_errors": []
+  },
+  {
+   "fixture_id": "sv-b-02",
+   "mode": "auto",
+   "meaning_changing_errors": []
+  }
+ ]
+}

@@ -1,11 +1,19 @@
-# Local KB Whisper Transcription Backend specification
+# Local Transcription Backend specification
 
-Status: implementation handoff
+Status: released design (Whisper Large v3 Turbo)
 
-Source: [Specify a local KB Whisper transcription backend](https://github.com/dbgeek/type-wave/issues/56)
+Source: [Specify a local KB Whisper transcription backend](https://github.com/dbgeek/type-wave/issues/56),
+superseded on the model and credential axes by
+[Local backend: switch to ggml-large-v3-turbo](https://github.com/dbgeek/type-wave/issues/85)
 
-Canonical model: `KBLab/kb-whisper-small` at revision
-`3564d61a42fc210ceaa55a22a96dd64478959c78`
+Canonical model: `ggml-large-v3-turbo.bin` (F16) from `ggerganov/whisper.cpp` at revision
+`98aa99a0a9db05ae2342309f5096248665f7cba3` — display name "Local — Whisper Large v3 Turbo"
+
+This file was `docs/local-kb-whisper-backend.md` while the pinned model was
+`KBLab/kb-whisper-small`; that candidate failed its release gate (see
+`acceptance/local_backend/evidence/3564d61a42fc-f16/`) and map #85 replaced it. Requirement
+identifiers are stable across the switch: `MODEL-1`–`MODEL-5` (the Hugging Face credential
+contract) are **retired**, not renumbered.
 
 This is the self-contained normative specification for adding a selectable local
 Transcription Backend alongside the existing OpenAI backend. Linked issues explain why
@@ -48,7 +56,7 @@ The names below fix ownership and public seams, not private helper functions.
 | IPC codec | new `src/whisper_ipc.zig` | Framing, validation, limits, structured failures |
 | Model lifecycle | new `src/model_store.zig` | Model Installation, Model Operation, receipt, staging, verification, activation, removal |
 | Readiness reconciliation | new `src/backend_supervisor.zig`, extending `src/configuration_phase.zig` | Independent configuration, selected-backend readiness, operation, pause, and recovery axes |
-| Credentials | extend `src/keychain.zig` and `src/config.zig` | Separate OpenAI and Hugging Face items and explicit CLI capture |
+| Credentials | extend `src/keychain.zig` and `src/config.zig` | OpenAI key only; the local backend needs no credential |
 | User interface | extend `src/menu.zig` | Backend chooser, relevant primary action, Local Model submenu, secure prompts |
 | Process composition | `src/daemon.zig` | Construct components and connect events only; it must not absorb their state machines |
 | Build and install | `build.zig`, `packaging/install.sh`, `docs/packaging.md` | Pinned runtime build, paired installation/signing, attribution |
@@ -125,9 +133,10 @@ const BackendEvent = union(enum) {
   SHA-256 `147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447` and Metal enabled.
 - **RUNTIME-2:** Statically link the runtime into a private executable named
   `type-wave-whisper`; users must not need runtime libraries or a package manager.
-- **RUNTIME-3:** Use only KBLab's official F16 `ggml-model.bin` from the pinned revision.
-  Its size must be 487,601,984 bytes and SHA-256 must be
-  `de6911330cbdc131362f7a955682b65c8a5a2394caba73e7ea821a9822efb8c6`.
+- **RUNTIME-3:** Use only the official F16 `ggml-large-v3-turbo.bin` from the pinned
+  `ggerganov/whisper.cpp` revision. Its size must be 1,624,555,275 bytes and SHA-256 must be
+  `1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69`. The artifact downloads
+  credential-free; no Hugging Face account or token is involved.
 - **RUNTIME-4:** The helper must accept 24 kHz mono signed 16-bit little-endian PCM and own
   deterministic conversion to whisper.cpp's required 16 kHz input. It must reject malformed,
   oversized, odd-length, or unsupported audio rather than infer over it.
@@ -190,21 +199,14 @@ Type-wave owns its model data under
 `~/Library/Application Support/type-wave/models/`; it must neither use nor mutate the
 shared Hugging Face cache.
 
-### 4.1 Credential contract
+### 4.1 Credential contract (retired)
 
-- **MODEL-1:** Store the Hugging Face token as a generic password in the file-based login
-  Keychain with service `me.ba78.type-wave`, account `huggingface-token`, and label
-  `type-wave Hugging Face token`. It must be independent of the OpenAI key.
-- **MODEL-2:** Capture the token through the secure Status Item prompt or
-  `type-wave --set-hf-token`. For an explicitly started foreground-development operation,
-  `HF_TOKEN` must take precedence without persistence.
-- **MODEL-3:** Validate a token only through the artifact request for a user-started Model
-  Operation. Do not perform background account validation.
-- **MODEL-4:** Rejection, Keychain lock, denial, or temporary failure must not erase or
-  overwrite the stored token. Removal of the Model Installation must preserve it.
-- **MODEL-5:** Forgetting the token during transfer must stop network activity, preserve
-  safely resumable data, and then delete only the Hugging Face item. Installed offline
-  inference must remain unaffected.
+- **MODEL-1** through **MODEL-5** governed Hugging Face token storage, capture, validation,
+  and forgetting. The pinned artifact downloads credential-free, so these requirements are
+  retired with the model switch (#90): the daemon stores no Hugging Face credential, exposes
+  no token capture or forget action, and sends no `Authorization` header for a Model
+  Operation. The OpenAI API key remains the only stored credential and is unrelated to the
+  local backend.
 
 ### 4.2 Acquisition, staging, and activation
 
@@ -213,9 +215,9 @@ shared Hugging Face cache.
   is an available update.
 - **MODEL-7:** Install and update only after explicit user action. Startup and ordinary
   status checks must not perform network requests, update checks, or automatic downloads.
-- **MODEL-8:** Send authentication only to `huggingface.co`. Follow fresh signed cross-origin
-  redirects without forwarding authentication. Resume only from a validated `206` tied to
-  the matching revision and validators.
+- **MODEL-8:** Send no authentication with artifact requests. Follow fresh signed
+  cross-origin redirects. Resume only from a validated `206` tied to the matching revision
+  and validators.
 - **MODEL-9:** Stage on the same filesystem as the installation. Preflight space for the
   full stage plus overhead while retaining the working installation.
 - **MODEL-10:** Serialize download, update, verify, repair, activation, and removal with one
@@ -244,12 +246,12 @@ shared Hugging Face cache.
   change, interrupted installation, load failure, or explicit Verify/Repair.
 - **MODEL-18:** Corruption or unloadability must make local unavailable without fallback or
   automatic download. Repair must verify first and, after confirmation, fetch only missing
-  or invalid data when credentials are available.
+  or invalid data under an explicitly network-allowed operation.
 - **MODEL-19:** Confirmed removal must reject new local Utterances, allow an active local
   lease to resolve, unload the helper, and remove installed and staged data. It must leave
-  local selected but unavailable and retain the Hugging Face token.
-- **MODEL-20:** Ship Apache-2.0 text and KBLab attribution with type-wave and place a
-  non-secret provenance notice beside every installation.
+  local selected but unavailable.
+- **MODEL-20:** Ship the OpenAI Whisper MIT license text and GGML-conversion attribution
+  with type-wave and place a non-secret provenance notice beside every installation.
 
 The public state is two independent axes:
 
@@ -293,7 +295,7 @@ identity; it is not another installation state.
 - **READY-9:** Explicit OpenAI-key removal must reject new OpenAI Utterances immediately but
   allow an authenticated active lease to finish, then close the session and make OpenAI
   not-configured. Temporary Keychain unavailability must preserve a healthy session and retry.
-- **READY-10:** With local selected and a valid receipt, startup must read neither credential
+- **READY-10:** With local selected and a valid receipt, startup must read no credential
   and make no network request. It must verify the offline-startup contract, launch/warm the
   helper, and then report `Ready offline`.
 - **READY-11:** A helper load failure must trigger offline integrity verification. Failed
@@ -316,7 +318,7 @@ identity; it is not another installation state.
 - **PRIV-2:** The daemon may use the network in local mode only during an explicit Model
   Operation. Artifact requests must contain no Capture PCM or transcript content.
 - **PRIV-3:** Credential access must be demand-scoped: OpenAI credentials only while OpenAI
-  is selected; Hugging Face credentials only inside an explicit Model Operation that needs one.
+  is selected. The local backend and its Model Operations read no credential at all.
 - **PRIV-4:** Logs may contain backend identity, timings, language, byte counts, lifecycle
   stages, HTTP status, retry timing, and digest mismatch facts. They must never contain tokens,
   authorization headers, signed redirect URLs/query strings, PCM, or transcript text by default.
@@ -343,14 +345,13 @@ release-pinned and is not a free-form setting.
   failure, and Set OpenAI API key when that selected backend lacks its credential.
 - **UX-4:** A `Local Model` submenu must remain available under either selected backend. It
   must show exact installation/operation identity and secondary actions: cancel/discard
-  partial, Verify/Repair, Remove, Retry, diagnostics, Replace token, and Forget token.
+  partial, Verify/Repair, Remove, Retry, and diagnostics.
 - **UX-5:** OpenAI model and credential controls must appear only in OpenAI context. There
   must be no backend-neutral `Model` row.
 - **UX-6:** Destructive confirmations must say whether the active Utterance may finish,
-  distinguish staged data from the working Model Installation, state that there is no
-  fallback, and state that model removal does not forget the token.
-- **UX-7:** The secure Hugging Face prompt must identify login-Keychain storage, say the
-  token is used only for an explicit Model Operation, and say Capture audio is never uploaded.
+  distinguish staged data from the working Model Installation, and state that there is no
+  fallback.
+- **UX-7:** *(retired with MODEL-1–MODEL-5: there is no Hugging Face prompt.)*
 - **UX-8:** Progress must use byte-accurate transfer text and named verification, smoke-test,
   and activation stages. It must distinguish a staged update from the working installation.
 - **UX-9:** Backend selection and all menu actions must publish complete Settings Snapshots
@@ -365,11 +366,12 @@ release-pinned and is not a free-form setting.
   at their fixed paths before reloading either. A partial pair must not replace a working pair.
 - **PACK-3:** The helper must share the daemon's stable signing workflow. Distribution
   notarization remains outside this specification.
-- **PACK-4:** The installed documentation/data must include Apache-2.0 license text, KBLab
-  attribution, pinned revision, artifact digest, and whisper.cpp version/source digest.
+- **PACK-4:** The installed documentation/data must include the OpenAI Whisper MIT license
+  text, GGML-conversion attribution, pinned revision, artifact digest, and whisper.cpp
+  version/source digest.
 - **PACK-5:** Uninstall guidance must separately identify daemon/helper files, Model
-  Installation data, the two Keychain items, and TCC grants; model data and credentials must
-  not be silently removed merely because binaries are upgraded.
+  Installation data, the OpenAI Keychain item, and TCC grants; model data and credentials
+  must not be silently removed merely because binaries are upgraded.
 
 ## 8. Implementation sequence
 
@@ -386,8 +388,8 @@ Each increment must leave the existing OpenAI path working and its tests green.
    forced termination, crash containment, and stale-result rejection.
 4. **Readiness and selection.** Add supervisor axes, persisted backend choice,
    drain-then-switch, offline startup, helper warm/restart/latch policy, and privacy assertions.
-5. **Managed installation.** Add separate Hugging Face credential handling, staging,
-   resume/cancel, verification, receipt, atomic activation, repair, update, and removal.
+5. **Managed installation.** Add credential-free acquisition, staging, resume/cancel,
+   verification, receipt, atomic activation, repair, update, and removal.
 6. **Status Item.** Graduate the accepted compact hierarchy and dialogs, keeping state
    ownership in the supervisor/model store.
 7. **Packaging and release pass.** Pair-install/sign the helper, ship provenance, run every
@@ -408,26 +410,38 @@ Each increment must leave the existing OpenAI path working and its tests green.
 - **ACCEPT-3:** Report corpus-wide micro-averaged WER after case-folding and punctuation
   removal, separately for explicit English, explicit Swedish, and each language in auto mode;
   also report per-Utterance WER.
-- **ACCEPT-4:** Release requires explicit-English WER <=15%, explicit-Swedish WER <=15%,
-  auto-detect WER <=20% for each language, no Utterance above 40% WER, punctuation-mark F1
-  >=0.75 for `. , ? ! : ;`, and zero meaning-changing errors in protected fixtures.
+- **ACCEPT-4:** Release requires explicit-English WER <=12%, explicit-Swedish WER <=20%,
+  auto-detect WER <=12% for English and <=26% for Swedish, no Utterance above 40% WER
+  except the pinned waivers (`sv-b-02` in both modes and `sv-b-01` in auto, each <=80%),
+  punctuation-mark F1 >=0.72 for `. , ? ! : ;`, and zero meaning-changing errors in
+  protected fixtures. Thresholds are per-model calibration against the benchmarked
+  turbo candidate (#87, #88), asserting "no worse than the turbo we qualified"; the
+  zero-protected-errors rule is product law.
 
 ### 9.2 Base-M1 performance and resources
 
 - **ACCEPT-5:** On a base Apple M1 with 8 GB RAM, run each corpus Utterance three times after
-  warm-up. Every <=15-second Utterance must produce its Final Transcript within 2.0 seconds
-  after Talk Key release; report median and worst case and gate on the worst case.
-- **ACCEPT-6:** Cached helper launch plus warm-up must reach ready within 2.0 seconds. First
-  Metal preparation may take up to 15 seconds while visibly preparing and rejecting Capture.
-- **ACCEPT-7:** Peak helper RSS during inference must be <=750 MiB and warmed idle RSS
-  <=600 MiB.
+  warm-up. Every <=15-second Utterance must produce its Final Transcript within 2.6 seconds
+  after Talk Key release in explicit-language mode and 4.8 seconds in auto-detect mode
+  (auto pays a language-detection pass); report median and worst case and gate on the
+  worst case per mode.
+- **ACCEPT-6:** Cached helper launch plus warm-up must reach ready within 4.0 seconds
+  (readiness is hash-bound: the full 1.6 GiB artifact is re-hashed before READY). First
+  Metal preparation may take up to 15 seconds while visibly preparing and rejecting
+  Capture (a cold system Metal cache compiles the embedded pipeline library:
+  ~11.9 seconds measured on the base M1).
+- **ACCEPT-7:** Peak helper RSS during inference must be <=500 MiB and warmed idle RSS
+  <=300 MiB. RSS cannot observe mmap'd weights or Metal memory, so these bars detect
+  helper-process leaks and accidental heap copies of the model, not model footprint.
 - **ACCEPT-8:** A forced overrun must request cooperative cancellation at 9.5 seconds,
   terminate the helper by 10.0 seconds, abandon the Utterance, and produce no Insertion.
+  Both actions are timer-driven at their exact deadlines; the retained wall-clock
+  observation may carry bounded scheduling overshoot (≤250 ms, never an early firing).
 
 ### 9.3 Offline, privacy, and lifecycle
 
-- **ACCEPT-9:** With local selected, remove access to both credentials, disable networking,
-  restart, reach `Ready offline`, and complete the corpus.
+- **ACCEPT-9:** With local selected, remove access to every stored credential, disable
+  networking, restart, reach `Ready offline`, and complete the corpus.
 - **ACCEPT-10:** Deny helper networking and instrument the daemon network boundary. Any
   helper socket attempt or daemon request during local startup, warm-up, Capture,
   transcription, or Insertion fails release.

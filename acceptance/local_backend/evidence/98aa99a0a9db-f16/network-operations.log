@@ -1,0 +1,2 @@
+run=1eb5486e9cba76ef06942d4cb795a8b6 pid=65594 process=type-wave-whisper operation=instrumentation_loaded
+run=1eb5486e9cba76ef06942d4cb795a8b6 pid=83802 process=type-wave operation=instrumentation_loaded
