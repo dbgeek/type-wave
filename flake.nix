@@ -16,6 +16,7 @@
           packages = [
             zig-overlay.packages.${system}.master
             pkgs.cmake
+            pkgs.curl
             pkgs.ninja
             pkgs.python3
             pkgs.mypy

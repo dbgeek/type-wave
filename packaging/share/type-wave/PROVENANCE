@@ -1,0 +1,19 @@
+schema=1
+
+[model]
+name=KB Whisper Small
+publisher=KBLab, National Library of Sweden
+repository=KBLab/kb-whisper-small
+revision=3564d61a42fc210ceaa55a22a96dd64478959c78
+artifact=ggml-model.bin
+format=GGML F16
+size=487601984
+sha256=de6911330cbdc131362f7a955682b65c8a5a2394caba73e7ea821a9822efb8c6
+license=Apache-2.0
+
+[runtime]
+name=whisper.cpp v1.9.1
+source=https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.9.1.tar.gz
+source_size=9012805
+source_sha256=147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447
+license=MIT

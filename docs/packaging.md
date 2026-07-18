@@ -63,11 +63,26 @@ re-check the command above.
 nix develop --command zig build install-agent
 ```
 
-This builds the binary, **code-signs** it with `type-wave dev` (identifier
-`me.ba78.type-wave`), installs it to `~/.local/bin/type-wave`, and renders +
-installs the LaunchAgent plist to `~/Library/LaunchAgents/me.ba78.type-wave.plist`
-(absolute paths baked in — launchd does not expand `~`/`$HOME`). It does **not** start
-the daemon; loading it triggers the permission prompts, so that stays a deliberate step.
+This builds the daemon and its pinned whisper.cpp helper, stages and **code-signs both**
+with `type-wave dev`, and verifies both signatures before touching a working installation.
+It publishes the daemon at `~/.local/bin/type-wave`, the private helper at
+`~/.local/libexec/type-wave/type-wave-whisper`, and license/provenance material at
+`~/.local/share/type-wave/`. Those fixed paths resolve through one `current` pair pointer;
+an upgrade writes an immutable pair directory and atomically switches that single pointer.
+The old pair is restored if publication or installed-signature verification fails, so an
+incomplete upgrade cannot expose a mixed pair. The LaunchAgent plist is rendered
+to `~/Library/LaunchAgents/me.ba78.type-wave.plist` with absolute paths (launchd does not
+expand `~`/`$HOME`). The installer does **not** reload the daemon; loading remains a
+deliberate step after the compatible pair is fully in place.
+
+The normal build acquires the whisper.cpp v1.9.1 source archive and rejects it unless its
+size and SHA-256 match the pinned provenance. For an offline build, provision that exact
+archive explicitly:
+
+```sh
+nix develop --command zig build \
+  -Dwhisper-archive=/path/to/whisper.cpp-v1.9.1.tar.gz
+```
 
 ## Load / unload
 
@@ -141,14 +156,41 @@ different cdhash-based requirement and the grants would have dropped.
 
 ## Uninstall
 
+Uninstallation has four independent resource classes. Removing one does not authorize
+removing any other.
+
+### 1. Installed daemon/helper package
+
 ```sh
 launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/me.ba78.type-wave.plist 2>/dev/null || true
 rm -f ~/Library/LaunchAgents/me.ba78.type-wave.plist
 rm -f ~/.local/bin/type-wave
-# optionally: remove the three entries under System Settings → Privacy & Security,
-# and delete the "type-wave dev" cert from Keychain Access.
+rm -rf ~/.local/libexec/type-wave
+rm -rf ~/.local/share/type-wave
 ```
 
-This leaves Model Installations and both login-Keychain items intact. Remove model data
-under `~/Library/Application Support/type-wave/models/`, the `openai-api-key` item, and the
-`huggingface-token` item only as separate, explicit actions.
+Removing the libexec directory removes the `type-wave-whisper` fixed path and the immutable
+daemon/helper pair directories behind it. This leaves Model Installations, both
+login-Keychain items, and TCC grants intact.
+
+### 2. Model Installation data
+
+While the installed daemon is available, use `~/.local/bin/type-wave --remove-model` so an
+active local Utterance may finish and the helper unloads first. After removing the installed
+package, the user may separately remove
+`~/Library/Application Support/type-wave/models/`. Neither path removes credentials.
+
+### 3. Login-Keychain items
+
+The two credentials are separate generic-password items and neither is removed with binaries
+or model data. Forget the Hugging Face item with
+`~/.local/bin/type-wave --forget-hf-token` before removing the binary, or delete the account
+`huggingface-token` manually in Keychain Access. Delete the distinct `openai-api-key` account
+only through a separate Keychain Access action (service `me.ba78.type-wave`).
+
+### 4. TCC grants and signing identity
+
+System Settings → Privacy & Security owns the Input Monitoring, Accessibility, and
+Microphone grants. Revoke those entries separately if desired. The `type-wave dev` signing
+certificate is another user-controlled Keychain Access resource; deleting it is optional and
+prevents later upgrades from retaining the same TCC identity.

@@ -7,17 +7,18 @@ It has no downloader, credential input, network client, or OpenAI fallback.
 
 ## Build from the pinned runtime
 
-Provision the upstream `whisper.cpp-v1.9.1.tar.gz` archive. The build rejects anything
-other than the 9,012,805-byte archive with SHA-256
-`147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447`:
+Every normal build acquires the upstream `whisper.cpp-v1.9.1.tar.gz` archive and rejects
+anything other than the 9,012,805-byte archive with SHA-256
+`147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447`. For an offline build,
+provide the same verified archive explicitly:
 
 ```sh
 nix develop --command zig build \
   -Dwhisper-archive=/path/to/whisper.cpp-v1.9.1.tar.gz
 ```
 
-The build statically links whisper.cpp with its embedded Metal library. It neither
-downloads nor modifies the supplied archive.
+The build statically links whisper.cpp with its embedded Metal library. It never uses a
+preinstalled runtime and does not modify an explicitly supplied archive.
 
 ## Exercise a manually provisioned artifact
 
@@ -41,17 +42,17 @@ a matching `cancel` frame trips whisper.cpp's abort callback.
 
 ## Install the model explicitly
 
-Provision the already-built helper at its private path, then let type-wave acquire and
-activate the exact pinned artifact:
+Install the already-built daemon/helper pair, then let type-wave acquire and activate the
+exact pinned artifact:
 
 ```sh
-mkdir -p "$HOME/.local/libexec/type-wave"
-install -m 755 zig-out/bin/type-wave-whisper \
-  "$HOME/.local/libexec/type-wave/type-wave-whisper"
-
+nix develop --command zig build install-agent
 ~/.local/bin/type-wave --set-hf-token
 ~/.local/bin/type-wave --install-model
 ```
+
+The paired installer signs and publishes both executables together and installs exact model
+and runtime provenance plus their license texts under `~/.local/share/type-wave/`.
 
 For foreground development, `HF_TOKEN=hf_... zig-out/bin/type-wave --install-model` is a
 non-persisted override. Installation data lives under

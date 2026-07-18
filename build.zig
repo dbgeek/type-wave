@@ -63,58 +63,61 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // The private local-inference helper is built only from a manually provisioned,
-    // byte-verified whisper.cpp v1.9.1 source archive. The build owns no downloader or
-    // credential path. Pass `-Dwhisper-archive=/path/to/v1.9.1.tar.gz`.
+    // The private local-inference helper is part of every normal build. Its build action
+    // acquires and byte-verifies the exact whisper.cpp v1.9.1 source archive; an explicit
+    // archive remains available for offline/reproducible builders.
     const helper_step = b.step("whisper-helper", "Build the pinned private KB Whisper helper");
-    const whisper_archive = b.option([]const u8, "whisper-archive", "Verified whisper.cpp v1.9.1 source archive");
+    const whisper_archive = b.option([]const u8, "whisper-archive", "Use the local pinned whisper.cpp source archive instead of acquiring it");
+    const runtime_build = b.addSystemCommand(&.{"bash"});
+    runtime_build.addFileArg(b.path("tools/build-whisper-runtime.sh"));
     if (whisper_archive) |archive_path| {
-        const runtime_build = b.addSystemCommand(&.{"bash"});
-        runtime_build.addFileArg(b.path("tools/build-whisper-runtime.sh"));
         runtime_build.addFileArg(.{ .cwd_relative = archive_path });
-        const runtime_output = runtime_build.addOutputDirectoryArg("whisper-cpp-v1.9.1");
-
-        const artifact = b.addExecutable(.{
-            .name = "type-wave-whisper",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/whisper_helper.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-                .link_libcpp = true,
-            }),
-        });
-        artifact.root_module.addIncludePath(b.path("src"));
-        artifact.root_module.addIncludePath(runtime_output.path(b, "source/include"));
-        artifact.root_module.addIncludePath(runtime_output.path(b, "source/ggml/include"));
-        artifact.root_module.addCSourceFile(.{
-            .file = b.path("src/whisper_bridge.cpp"),
-            .flags = &.{ "-std=c++17", "-fno-exceptions" },
-        });
-        inline for (.{
-            "build/src/libwhisper.a",
-            "build/ggml/src/libggml.a",
-            "build/ggml/src/libggml-base.a",
-            "build/ggml/src/libggml-cpu.a",
-            "build/ggml/src/ggml-blas/libggml-blas.a",
-            "build/ggml/src/ggml-metal/libggml-metal.a",
-        }) |library| artifact.root_module.addObjectFile(runtime_output.path(b, library));
-        artifact.root_module.linkFramework("Accelerate", .{});
-        artifact.root_module.linkFramework("Foundation", .{});
-        artifact.root_module.linkFramework("Metal", .{});
-        artifact.root_module.linkFramework("MetalKit", .{});
-        artifact.root_module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk}) });
-        artifact.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
-        artifact.step.dependOn(&runtime_build.step);
-        b.installArtifact(artifact);
-        helper_step.dependOn(&artifact.step);
     } else {
-        const missing = b.addSystemCommand(&.{
-            "sh",                                                                                            "-c",
-            "echo 'error: -Dwhisper-archive must name the verified whisper.cpp v1.9.1 archive' >&2; exit 1",
-        });
-        helper_step.dependOn(&missing.step);
+        runtime_build.addArg("--download-pinned");
     }
+    runtime_build.addFileArg(b.path("packaging/share/type-wave/PROVENANCE"));
+    const runtime_output = runtime_build.addOutputDirectoryArg("whisper-cpp-runtime");
+
+    const helper = b.addExecutable(.{
+        .name = "type-wave-whisper",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/whisper_helper.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        }),
+    });
+    helper.root_module.addIncludePath(b.path("src"));
+    helper.root_module.addIncludePath(runtime_output.path(b, "source/include"));
+    helper.root_module.addIncludePath(runtime_output.path(b, "source/ggml/include"));
+    helper.root_module.addCSourceFile(.{
+        .file = b.path("src/whisper_bridge.cpp"),
+        .flags = &.{ "-std=c++17", "-fno-exceptions" },
+    });
+    inline for (.{
+        "build/src/libwhisper.a",
+        "build/ggml/src/libggml.a",
+        "build/ggml/src/libggml-base.a",
+        "build/ggml/src/libggml-cpu.a",
+        "build/ggml/src/ggml-blas/libggml-blas.a",
+        "build/ggml/src/ggml-metal/libggml-metal.a",
+    }) |library| helper.root_module.addObjectFile(runtime_output.path(b, library));
+    helper.root_module.linkFramework("Accelerate", .{});
+    helper.root_module.linkFramework("Foundation", .{});
+    helper.root_module.linkFramework("Metal", .{});
+    helper.root_module.linkFramework("MetalKit", .{});
+    helper.root_module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk}) });
+    helper.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
+    helper.step.dependOn(&runtime_build.step);
+    b.installArtifact(helper);
+    helper_step.dependOn(&helper.step);
+
+    b.installDirectory(.{
+        .source_dir = b.path("packaging/share/type-wave"),
+        .install_dir = .prefix,
+        .install_subdir = "share/type-wave",
+    });
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -150,15 +153,19 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&acceptance_tests.step);
     test_step.dependOn(&acceptance_types.step);
 
-    // `zig build install-agent` — package the daemon as a signed headless LaunchAgent
-    // (wayfinder #15): codesign the freshly-built binary with the stable "type-wave dev"
-    // identity, install it to ~/.local/bin/type-wave, and render+install the LaunchAgent
-    // plist. The macOS-specific work (codesign/launchctl/absolute paths) lives in the
-    // script so build.zig stays host-agnostic; the built binary is passed as its argument.
+    const packaging_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "packaging.test_packaging", "-v" });
+    test_step.dependOn(&packaging_tests.step);
+    b.getInstallStep().dependOn(test_step);
+
+    // `zig build install-agent` — package the daemon/helper pair as a signed headless
+    // LaunchAgent. Both freshly-built binaries use the stable "type-wave dev" identity and
+    // publish through one atomic pair pointer before the LaunchAgent plist is rendered.
+    // The macOS-specific work (codesign/launchctl/absolute paths) lives in the script.
     // One-time cert setup and grant-persistence verification: docs/packaging.md.
     const install_agent = b.addSystemCommand(&.{"bash"});
     install_agent.addFileArg(b.path("packaging/install.sh"));
     install_agent.addFileArg(exe.getEmittedBin());
+    install_agent.addFileArg(helper.getEmittedBin());
     const agent_step = b.step("install-agent", "Codesign + install the daemon as a headless LaunchAgent (macOS; see docs/packaging.md)");
     agent_step.dependOn(&install_agent.step);
 

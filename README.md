@@ -75,10 +75,12 @@ nix develop --command zig build install-agent
 ~/.local/bin/type-wave --set-key
 ```
 
-The install step signs the binary with the local `type-wave dev` identity, installs it
-to `~/.local/bin/type-wave`, and writes the LaunchAgent plist. Running `--set-key`
-through the installed signed binary stores the OpenAI key in the login keychain so the
-daemon can read it without prompts across rebuilds.
+The install step signs and atomically upgrades the compatible daemon/helper pair through one
+shared pair pointer with the local `type-wave dev` identity, exposes them at
+`~/.local/bin/type-wave` and `~/.local/libexec/type-wave/type-wave-whisper`, and writes the
+LaunchAgent plist. It also installs pinned runtime/model provenance and license material under
+`~/.local/share/type-wave/`. Running `--set-key` through the installed signed daemon stores
+the OpenAI key in the login keychain so it can be read without prompts across rebuilds.
 
 The one-time signing identity setup, LaunchAgent load/unload commands, and TCC grant
 persistence checks are documented in [docs/packaging.md](./docs/packaging.md). Logs go
@@ -166,7 +168,9 @@ nix develop --command zig build -Doptimize=ReleaseSafe
 nix develop --command zig build -Doptimize=ReleaseSmall
 ```
 
-Plain builds default to `ReleaseFast`, matching the installed daemon. `capture-check`
+Plain builds default to `ReleaseFast`, matching the installed daemon, and produce both the
+daemon and the private helper from the byte-verified whisper.cpp v1.9.1 source archive. Use
+`-Dwhisper-archive=/path/to/whisper.cpp-v1.9.1.tar.gz` for an offline build. `capture-check`
 is a live CoreAudio start/stop probe and uses real microphone IO.
 
 ## Architecture
