@@ -5,6 +5,8 @@
 
 const std = @import("std");
 const backend = @import("transcription_backend.zig");
+const credential = @import("credential.zig");
+const installation_identity = @import("installation_identity.zig");
 const readiness = @import("readiness.zig");
 
 pub const Installation = enum {
@@ -63,7 +65,7 @@ pub const ModelAction = enum {
     forget_hugging_face_token,
 };
 
-pub const CredentialState = enum { absent, present, unavailable };
+pub const CredentialState = credential.Presence;
 pub const TokenAction = enum { set, replace, unavailable };
 pub const ModelFailure = enum {
     none,
@@ -84,10 +86,26 @@ pub const Snapshot = struct {
     installation_identity: ?InstallationIdentity = null,
     hugging_face_credential: CredentialState = .absent,
     hugging_face_environment_override: bool = false,
+    failure_detail: ?FailureDetail = null,
 };
 
 pub const ByteProgress = struct { completed: u64, total: u64 };
-pub const InstallationIdentity = struct { size: u64, sha256: [32]u8 };
+pub const InstallationIdentity = installation_identity.Identity;
+pub const FailureDetail = struct {
+    bytes: [256]u8 = @splat(0),
+    len: u16 = 0,
+
+    pub fn init(detail: []const u8) !FailureDetail {
+        if (detail.len == 0 or detail.len > 256) return error.InvalidFailureDetail;
+        var result = FailureDetail{ .len = @intCast(detail.len) };
+        @memcpy(result.bytes[0..detail.len], detail);
+        return result;
+    }
+
+    pub fn value(self: *const FailureDetail) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
 
 pub const Headline = enum {
     paused,

@@ -381,6 +381,10 @@ pub const Menu = struct {
     group_parent: [groups.len]id = @splat(null),
     local_model_parent: id = null,
     local_model_status: id = null,
+    local_model_source: id = null,
+    local_model_artifact: id = null,
+    local_model_runtime: id = null,
+    local_model_installer: id = null,
     local_operation_status: id = null,
     local_failure_status: id = null,
     local_credential_status: id = null,
@@ -495,6 +499,10 @@ pub const Menu = struct {
     fn addLocalModel(self: *Menu, menu: id) void {
         const sub = newMenu();
         self.local_model_status = self.addDisabled(sub, "KB Whisper Small — not installed");
+        self.local_model_source = self.addDisabled(sub, "");
+        self.local_model_artifact = self.addDisabled(sub, "");
+        self.local_model_runtime = self.addDisabled(sub, "");
+        self.local_model_installer = self.addDisabled(sub, "");
         self.local_operation_status = self.addDisabled(sub, "Model Operation — idle");
         self.local_failure_status = self.addDisabled(sub, "");
         self.local_credential_status = self.addDisabled(sub, "Hugging Face token — not set");
@@ -572,21 +580,40 @@ pub const Menu = struct {
         msgBool(self.privacy_item, "setHidden:", !presentation.audio_stays_on_mac);
         msgBool(self.network_item, "setHidden:", !presentation.model_operation_uses_network);
 
-        var identity_buffer: [256]u8 = undefined;
-        const installation_title: [*:0]const u8 = if (snapshot.installation_identity) |identity| title: {
-            const printed = std.fmt.bufPrintSentinel(&identity_buffer, "KB Whisper Small — {d} bytes — sha256 {s} — {s}", .{
-                identity.size,
-                &std.fmt.bytesToHex(identity.sha256, .lower),
-                if (snapshot.installation == .update_available) "update available" else "installed",
-            }, 0) catch break :title "KB Whisper Small — installed";
-            break :title printed.ptr;
-        } else switch (snapshot.installation) {
+        const installation_title: [*:0]const u8 = switch (snapshot.installation) {
             .absent => "KB Whisper Small — not installed",
             .ready => "KB Whisper Small — installed",
             .update_available => "KB Whisper Small — update available",
             .corrupt => "KB Whisper Small — corrupt",
         };
         msg1v(self.local_model_status, "setTitle:", nsstr(installation_title));
+        var source_buffer: [384]u8 = undefined;
+        var artifact_buffer: [384]u8 = undefined;
+        var runtime_buffer: [384]u8 = undefined;
+        var installer_buffer: [192]u8 = undefined;
+        if (snapshot.installation_identity) |identity| {
+            const source = std.fmt.bufPrintSentinel(&source_buffer, "Repository — {s}@{s} — installation {s}", .{
+                identity.repository.value(),
+                identity.revision.value(),
+                if (identity.installation_id) |installation_id| installation_id.value() else "legacy",
+            }, 0) catch "Repository identity unavailable";
+            const artifact = std.fmt.bufPrintSentinel(&artifact_buffer, "Artifact — {s} — {d} bytes — sha256 {s}", .{
+                identity.artifact.value(),
+                identity.artifact_size,
+                &std.fmt.bytesToHex(identity.artifact_sha256, .lower),
+            }, 0) catch "Artifact identity unavailable";
+            const runtime = std.fmt.bufPrintSentinel(&runtime_buffer, "Runtime — {s} — sha256 {s}", .{
+                identity.runtime.value(),
+                &std.fmt.bytesToHex(identity.runtime_sha256, .lower),
+            }, 0) catch "Runtime identity unavailable";
+            const installer = std.fmt.bufPrintSentinel(&installer_buffer, "Installed by — {s}", .{identity.installed_by.value()}, 0) catch "Installer identity unavailable";
+            msg1v(self.local_model_source, "setTitle:", nsstr(source.ptr));
+            msg1v(self.local_model_artifact, "setTitle:", nsstr(artifact.ptr));
+            msg1v(self.local_model_runtime, "setTitle:", nsstr(runtime.ptr));
+            msg1v(self.local_model_installer, "setTitle:", nsstr(installer.ptr));
+        }
+        for ([_]id{ self.local_model_source, self.local_model_artifact, self.local_model_runtime, self.local_model_installer }) |item|
+            msgBool(item, "setHidden:", snapshot.installation_identity == null);
         var operation_buffer: [160]u8 = undefined;
         const operation_title: [*:0]const u8 = if (snapshot.operation_bytes) |bytes| title: {
             const printed = std.fmt.bufPrintSentinel(&operation_buffer, "Model Operation — {s} — {d}/{d} bytes", .{ @tagName(snapshot.operation), bytes.completed, bytes.total }, 0) catch break :title "Model Operation";
@@ -597,7 +624,18 @@ pub const Menu = struct {
         };
         msg1v(self.local_operation_status, "setTitle:", nsstr(operation_title));
 
-        const failure_title: [*:0]const u8 = switch (presentation.model_failure) {
+        var failure_buffer: [512]u8 = undefined;
+        const recovery: []const u8 = switch (presentation.model_failure) {
+            .none => "",
+            .installation_corrupt => "Repair or Remove",
+            .runtime_unavailable => "Retry or Open diagnostics",
+            .operation_failed => "Retry or Open diagnostics",
+            .operation_cancelled => "Retry if still needed",
+        };
+        const failure_title: [*:0]const u8 = if (snapshot.failure_detail) |detail| title: {
+            const printed = std.fmt.bufPrintSentinel(&failure_buffer, "Failure — {s} — {s}", .{ detail.value(), recovery }, 0) catch break :title "Failure — Open diagnostics";
+            break :title printed.ptr;
+        } else switch (presentation.model_failure) {
             .none => "",
             .installation_corrupt => "Failure — Model Installation corrupt; Repair or Remove",
             .runtime_unavailable => "Failure — Local runtime unavailable; Retry or Open diagnostics",

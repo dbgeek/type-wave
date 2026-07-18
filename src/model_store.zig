@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const artifact_identity = @import("artifact_identity.zig");
+const installation_identity = @import("installation_identity.zig");
 
 const StatFs = extern struct {
     block_size: u32,
@@ -102,6 +103,7 @@ pub const Recovery = struct {
 };
 
 pub const ArtifactIdentity = artifact_identity.Identity;
+pub const InstallationIdentity = installation_identity.Identity;
 
 pub const Corruption = enum {
     invalid_receipt,
@@ -1281,6 +1283,25 @@ pub fn activeArtifact(io: std.Io, root: []const u8) !?ArtifactIdentity {
     return receiptArtifact(actual);
 }
 
+pub fn activeInstallationIdentity(io: std.Io, root: []const u8) !?InstallationIdentity {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    if ((try activeModelPath(io, root, &path_buffer)) == null) return null;
+    var receipt_buffer: [1024]u8 = undefined;
+    const actual = (try activeReceipt(io, root, &receipt_buffer)) orelse return null;
+    const parsed = parseActiveReceipt(actual) orelse return null;
+    return .{
+        .repository = installation_identity.Text.init(receiptValue(actual, "repository=") orelse return null) catch return null,
+        .revision = installation_identity.Text.init(receiptValue(actual, "revision=") orelse return null) catch return null,
+        .runtime = installation_identity.Text.init(receiptValue(actual, "runtime=") orelse return null) catch return null,
+        .runtime_sha256 = receiptRuntimeDigest(actual) orelse return null,
+        .artifact = installation_identity.Text.init(parsed.artifact) catch return null,
+        .installation_id = if (parsed.installation_id) |value| installation_identity.Text.init(value) catch return null else null,
+        .artifact_size = parsed.identity.size,
+        .artifact_sha256 = parsed.identity.sha256,
+        .installed_by = installation_identity.Text.init(receiptValue(actual, "installed_by=") orelse return null) catch return null,
+    };
+}
+
 /// Retire superseded immutable installations after the old helper has drained and shut
 /// down. The operation and inference locks make this safe against another process starting
 /// maintenance or a late local Utterance.
@@ -1492,6 +1513,16 @@ test "Model Operation verifies and smoke-tests before publishing the active rece
     try std.testing.expect(std.mem.indexOf(u8, published, "hf_secret") == null);
     try std.testing.expect(std.mem.indexOf(u8, published, "https://") == null);
     try std.testing.expect(std.mem.indexOf(u8, published, "runtime_sha256=5a5a5a5a") != null);
+
+    const identity = (try activeInstallationIdentity(std.testing.io, root_buf[0..root_len])).?;
+    try std.testing.expectEqualStrings(test_manifest.repository, identity.repository.value());
+    try std.testing.expectEqualStrings(test_manifest.revision, identity.revision.value());
+    try std.testing.expectEqualStrings(test_manifest.runtime, identity.runtime.value());
+    try std.testing.expectEqualStrings(test_manifest.artifact, identity.artifact.value());
+    try std.testing.expectEqualStrings(test_manifest.installation_id, identity.installation_id.?.value());
+    try std.testing.expectEqualStrings("type-wave-v0.0.0", identity.installed_by.value());
+    try std.testing.expectEqual(@as(u8, 0x5a), identity.runtime_sha256[0]);
+    try std.testing.expectEqual(test_manifest.size, identity.artifact_size);
 }
 
 test "explicit Verify reads every artifact byte and distinguishes usable from corrupt" {

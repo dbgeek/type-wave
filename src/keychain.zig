@@ -24,6 +24,7 @@
 //! policy (precedence, migration, log dedup) lives in config.zig.
 
 const std = @import("std");
+const credential = @import("credential.zig");
 
 // ---- CoreFoundation (hand-written externs, same style as insert.zig / hud.zig) ------
 
@@ -136,12 +137,10 @@ pub fn readHuggingFaceToken(gpa: std.mem.Allocator) ReadResult {
     return readSecret(gpa, hugging_face_account);
 }
 
-pub const Presence = enum { absent, present, unavailable };
-
 /// Query only the item's identity, never its secret bytes. This keeps Status Item chrome
 /// refreshes non-sensitive while still distinguishing a missing item from a locked or
 /// denied Keychain that must not be presented as missing.
-pub fn huggingFaceTokenPresence() Presence {
+pub fn huggingFaceTokenPresence() credential.Presence {
     const svc = cfStr(service);
     defer CFRelease(svc);
     const acct = cfStr(hugging_face_account);

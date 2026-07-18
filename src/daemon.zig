@@ -85,6 +85,20 @@ extern "c" fn signal(sig: c_int, handler: *const fn (c_int) callconv(.c) void) c
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
 const SIGHUP: c_int = 1;
+const ObservationMutex = struct {
+    value: extern struct { _opaque: u32 = 0 } = .{},
+
+    fn lock(self: *ObservationMutex) void {
+        os_unfair_lock_lock(&self.value);
+    }
+
+    fn unlock(self: *ObservationMutex) void {
+        os_unfair_lock_unlock(&self.value);
+    }
+};
+extern "c" fn os_unfair_lock_lock(lock: *anyopaque) void;
+extern "c" fn os_unfair_lock_unlock(lock: *anyopaque) void;
+
 const ModelOperationObservation = struct {
     pid: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(0),
     phase: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(status_item.Operation.idle)),
@@ -92,18 +106,23 @@ const ModelOperationObservation = struct {
     total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     retry_action: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(menu_mod.ModelAction.install)),
     cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    failure_mutex: ObservationMutex = .{},
+    failure_detail: ?status_item.FailureDetail = null,
 
-    const Current = struct { phase: status_item.Operation, bytes: ?status_item.ByteProgress, active: bool };
+    const Current = struct { phase: status_item.Operation, bytes: ?status_item.ByteProgress, active: bool, failure_detail: ?status_item.FailureDetail };
 
-    fn current(self: *const ModelOperationObservation) ?Current {
+    fn current(self: *ModelOperationObservation) ?Current {
         const active = self.pid.load(.acquire) != 0;
         const phase = std.enums.fromInt(status_item.Operation, self.phase.load(.acquire)) orelse .installing;
         if (!active and phase != .failed and phase != .cancelled) return null;
         const total = self.total.load(.acquire);
+        self.failure_mutex.lock();
+        defer self.failure_mutex.unlock();
         return .{
             .phase = phase,
             .bytes = if (!phase.reportsByteProgress() or total == 0) null else .{ .completed = self.completed.load(.acquire), .total = total },
             .active = active,
+            .failure_detail = self.failure_detail,
         };
     }
 
@@ -113,7 +132,18 @@ const ModelOperationObservation = struct {
         self.cancel_requested.store(false, .release);
         self.completed.store(0, .release);
         self.total.store(0, .release);
+        self.failure_mutex.lock();
+        self.failure_detail = null;
+        self.failure_mutex.unlock();
         self.pid.store(pid, .release);
+    }
+
+    fn observeFailure(self: *ModelOperationObservation, line: []const u8) void {
+        if (std.mem.indexOf(u8, line, "Model Operation:") != null) return;
+        const detail = status_item.FailureDetail.init(line) catch return;
+        self.failure_mutex.lock();
+        self.failure_detail = detail;
+        self.failure_mutex.unlock();
     }
 
     fn finish(self: *ModelOperationObservation, succeeded: bool) void {
@@ -157,6 +187,47 @@ const ModelOperationObservation = struct {
     }
 };
 var g_model_operation: ModelOperationObservation = .{};
+
+const FailureObservation = struct {
+    mutex: ObservationMutex = .{},
+    detail: ?status_item.FailureDetail = null,
+
+    fn set(self: *FailureObservation, value: []const u8) void {
+        const detail = status_item.FailureDetail.init(value) catch return;
+        self.mutex.lock();
+        self.detail = detail;
+        self.mutex.unlock();
+    }
+
+    fn setError(self: *FailureObservation, prefix: []const u8, failure: anyerror) void {
+        var buffer: [256]u8 = undefined;
+        const detail = std.fmt.bufPrint(&buffer, "{s}: {s}", .{ prefix, @errorName(failure) }) catch return;
+        self.set(detail);
+    }
+
+    fn clear(self: *FailureObservation) void {
+        self.mutex.lock();
+        self.detail = null;
+        self.mutex.unlock();
+    }
+
+    fn current(self: *FailureObservation) ?status_item.FailureDetail {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.detail;
+    }
+};
+
+test "Model Operation observation retains the actionable terminal failure" {
+    var observation = ModelOperationObservation{};
+    observation.begin(42, .installing, .install);
+    observation.observeFailure("--install-model: HuggingFaceAuthenticationFailed");
+    observation.finish(false);
+
+    const current = observation.current().?;
+    try std.testing.expectEqual(status_item.Operation.failed, current.phase);
+    try std.testing.expectEqualStrings("--install-model: HuggingFaceAuthenticationFailed", current.failure_detail.?.value());
+}
 
 // ---- tuning ----------------------------------------------------------------
 /// Self-heal poll cadence. Fast enough that granting a permission / dropping in the key
@@ -496,6 +567,7 @@ const Daemon = struct {
     /// announcements and distinct not-configured reports.
     configuration: configuration_phase.ConfigurationPhase = .{},
     local_model_recovery: local_model_recovery.Recovery = .{},
+    local_failure: FailureObservation = .{},
 
     /// Always-on live-transcript subscriber: Final Transcripts from the read-loop thread
     /// trampoline into the Coordinator. Installed at every Session.connect, before the read
@@ -573,6 +645,7 @@ const Daemon = struct {
             .sha256 = active_artifact.sha256,
         }) catch |failure| retry: {
             if (self.local_model_recovery.loadFailed() != .verify) {
+                self.local_failure.setError("Local runtime load failed", failure);
                 feedback.log("  local KB Whisper runtime failure after verified installation: {s}; send SIGHUP to Retry\n", .{@errorName(failure)});
                 return null;
             }
@@ -584,11 +657,13 @@ const Daemon = struct {
                 .sha256 = active_artifact.sha256,
             }) catch |retry_failure| {
                 _ = self.local_model_recovery.loadFailed();
+                self.local_failure.setError("Local runtime load failed", retry_failure);
                 feedback.log("  Model Installation verified, but local runtime load failed again: {s}; send SIGHUP to Retry\n", .{@errorName(retry_failure)});
                 return null;
             };
         };
         self.local_model_recovery.loadSucceeded();
+        self.local_failure.clear();
         const local = self.alloc.create(LocalAdapter) catch {
             helper.shutdown();
             feedback.log("  local KB Whisper unavailable: adapter allocation failed\n", .{});
@@ -612,6 +687,7 @@ const Daemon = struct {
         const cancel = model_store.CancelToken{};
         const integrity = model_store.verifyActiveInstallation(self.io, root, model_store.pinned_manifest, &model_store.trusted_manifests, &cancel, null) catch |failure| {
             self.local_model_recovery.verificationFailed();
+            self.local_failure.setError("Model Installation verification failed", failure);
             feedback.log("  local Model Installation verification failed: {s}; runtime Retry remains available\n", .{@errorName(failure)});
             return null;
         };
@@ -622,6 +698,10 @@ const Daemon = struct {
                 return false;
             },
             .corrupt => |reason| {
+                var buffer: [256]u8 = undefined;
+                if (std.fmt.bufPrint(&buffer, "Model Installation corrupt: {s}", .{@tagName(reason)})) |detail|
+                    self.local_failure.set(detail)
+                else |_| {}
                 feedback.log("  local Model Installation is corrupt ({s}); Repair or Remove is required\n", .{@tagName(reason)});
                 return false;
             },
@@ -866,11 +946,13 @@ const Daemon = struct {
         var operation: status_item.Operation = .idle;
         var operation_bytes: ?status_item.ByteProgress = null;
         var installation_identity: ?status_item.InstallationIdentity = null;
+        var failure_detail = self.local_failure.current();
         if (std.c.getenv("HOME")) |raw_home| {
             var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
             if (model_store.rootPath(std.mem.span(raw_home), &root_buffer)) |root| {
                 if (model_store.activeArtifact(self.io, root) catch null) |identity| {
-                    installation_identity = .{ .size = identity.size, .sha256 = identity.sha256 };
+                    _ = identity;
+                    installation_identity = model_store.activeInstallationIdentity(self.io, root) catch null;
                     installation = if (model_store.updateAvailable(self.io, root, model_store.pinned_manifest) catch false)
                         .update_available
                     else
@@ -900,6 +982,7 @@ const Daemon = struct {
                 operation = observed.phase;
                 operation_bytes = observed.bytes;
             }
+            failure_detail = observed.failure_detail;
         }
         return .{
             .selected_backend = self.store.current().transcription_backend,
@@ -910,12 +993,9 @@ const Daemon = struct {
             .operation = operation,
             .operation_bytes = operation_bytes,
             .installation_identity = installation_identity,
-            .hugging_face_credential = switch (keychain.huggingFaceTokenPresence()) {
-                .absent => .absent,
-                .present => .present,
-                .unavailable => .unavailable,
-            },
+            .hugging_face_credential = keychain.huggingFaceTokenPresence(),
             .hugging_face_environment_override = std.c.getenv("HF_TOKEN") != null,
+            .failure_detail = failure_detail,
         };
     }
 
@@ -1065,6 +1145,7 @@ const Daemon = struct {
         var stderr_reader = child.stderr.?.readerStreaming(io, &read_buffer);
         while (stderr_reader.interface.takeDelimiter('\n') catch null) |line| {
             observeModelProgress(line);
+            g_model_operation.observeFailure(line);
             feedback.log("  model: {s}\n", .{line});
         }
         const term = child.wait(io) catch {
