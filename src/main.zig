@@ -43,7 +43,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (argv.len > 1) {
         const arg = std.mem.span(argv[1]);
         if (argv.len == 2 and std.mem.eql(u8, arg, "--set-key")) return setKey();
-        if (argv.len == 2 and std.mem.eql(u8, arg, "--set-hf-token")) return setHuggingFaceToken();
         if (argv.len == 2 and (std.mem.eql(u8, arg, "--install-model") or std.mem.eql(u8, arg, "--update-model") or std.mem.eql(u8, arg, "--resume-model"))) {
             const resume_partial = std.mem.eql(u8, arg, "--resume-model");
             const update_only = std.mem.eql(u8, arg, "--update-model");
@@ -55,24 +54,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
         if (argv.len == 2 and std.mem.eql(u8, arg, "--discard-model")) return discardModel(init.environ);
         if (argv.len == 2 and std.mem.eql(u8, arg, "--remove-model")) return removeModel(init.environ);
-        if (argv.len == 2 and std.mem.eql(u8, arg, "--forget-hf-token")) return forgetHuggingFaceToken(init.environ);
         if (argv.len == 2 and std.mem.eql(u8, arg, "--model-status")) return modelStatus(init.environ);
         if (argv.len == 2 and std.mem.eql(u8, arg, "--verify-model")) return verifyModel(init.environ);
         if (argv.len == 2 and std.mem.eql(u8, arg, "--repair-model")) return repairModel(init.environ);
         std.debug.print(
-            \\usage: type-wave [--set-key | --set-hf-token | --install-model | --update-model | --resume-model | --discard-model | --remove-model | --forget-hf-token | --model-status | --verify-model | --repair-model]
+            \\usage: type-wave [--set-key | --install-model | --update-model | --resume-model | --discard-model | --remove-model | --model-status | --verify-model | --repair-model]
             \\
             \\  (no args)   run the dictation daemon
             \\  --set-key   read the OpenAI API key from stdin and store it in the login
             \\              keychain. Run via the installed signed binary
             \\              (~/.local/bin/type-wave) so the daemon reads it prompt-free.
-            \\  --set-hf-token
-            \\              read a Hugging Face token from stdin and store it in its own
-            \\              login-Keychain item.
             \\  --install-model
             \\              explicitly acquire, verify, smoke-test, and atomically activate
-            \\              the pinned KB Whisper Model Installation. HF_TOKEN overrides
-            \\              Keychain for this foreground operation and is never persisted.
+            \\              the pinned local Model Installation. The download is
+            \\              credential-free.
             \\  --update-model
             \\              explicitly stage and validate the embedded replacement while
             \\              the working Model Installation remains available, then activate.
@@ -83,18 +78,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
             \\  --remove-model
             \\              after confirmation, drain local dictation, unload the helper, and
             \\              remove the Model Installation and staged Model Operation data
-            \\              without changing selection
-            \\              or the Hugging Face token.
-            \\  --forget-hf-token
-            \\              cooperatively stop authenticated transfer, preserve resumable data,
-            \\              and delete only the Hugging Face login-Keychain item.
+            \\              without changing selection.
             \\  --model-status
             \\              inspect paused model work without making a network request.
             \\  --verify-model
             \\              hash and verify the complete active Model Installation offline.
             \\  --repair-model
-            \\              verify first, preserve valid data, and ask before authenticated
-            \\              network acquisition of a missing or invalid artifact.
+            \\              verify first, preserve valid data, and ask before network
+            \\              acquisition of a missing or invalid artifact.
             \\
         , .{});
         std.process.exit(2);
@@ -118,10 +109,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
 /// works the same. The input buffer is zeroed before exit.
 fn setKey() !void {
     try setSecret("OpenAI API key", keychain.account, keychain.storeKey);
-}
-
-fn setHuggingFaceToken() !void {
-    try setSecret("Hugging Face token", keychain.hugging_face_account, keychain.storeHuggingFaceToken);
 }
 
 fn setSecret(
@@ -163,8 +150,7 @@ fn setSecret(
     const st = store(key);
     if (st == keychain.errSecSuccess) {
         std.debug.print(
-            "Stored in the login keychain (service \"{s}\", account \"{s}\").\n" ++
-                "The credential remains separate from type-wave's other login-Keychain item.\n",
+            "Stored in the login keychain (service \"{s}\", account \"{s}\").\n",
             .{ keychain.service, item_account },
         );
     } else {
@@ -204,22 +190,6 @@ fn installModel(environ: std.process.Environ, resume_partial: bool, update_only:
         return;
     }
 
-    var owned_token: ?[:0]const u8 = null;
-    defer if (owned_token) |token| {
-        std.crypto.secureZero(u8, @constCast(token));
-        allocator.free(token);
-    };
-    const token: []const u8 = environ.getPosix("HF_TOKEN") orelse token: {
-        switch (keychain.readHuggingFaceToken(allocator)) {
-            .key => |stored| {
-                owned_token = stored;
-                break :token stored;
-            },
-            .absent => return error.MissingHuggingFaceToken,
-            .err => return error.HuggingFaceKeychainUnavailable,
-        }
-    };
-
     try std.Io.Dir.cwd().access(io, helper, .{});
 
     var client = std.http.Client{ .allocator = allocator, .io = io };
@@ -249,14 +219,14 @@ fn installModel(environ: std.process.Environ, resume_partial: bool, update_only:
         return error.PartialRequiresExplicitResume;
     }
     if (resume_partial) {
-        std.debug.print("Model Operation: explicitly resuming pinned KB Whisper artifact at {d}/{d} bytes\n", .{ recovery.bytes.completed, recovery.bytes.total });
-        try operation.resumePartial(token);
+        std.debug.print("Model Operation: explicitly resuming pinned Whisper Large v3 Turbo artifact at {d}/{d} bytes\n", .{ recovery.bytes.completed, recovery.bytes.total });
+        try operation.resumePartial();
     } else {
         if (update_available)
             std.debug.print("Model Operation: staging replacement beside the working Model Installation ({d} bytes)\n", .{model_store.pinned_manifest.size})
         else
-            std.debug.print("Model Operation: downloading pinned KB Whisper artifact ({d} bytes)\n", .{model_store.pinned_manifest.size});
-        try operation.install(token);
+            std.debug.print("Model Operation: downloading pinned Whisper Large v3 Turbo artifact ({d} bytes)\n", .{model_store.pinned_manifest.size});
+        try operation.install();
     }
     std.debug.print("Model Operation: verified, smoke-tested, and activated {s}@{s}\n", .{ model_store.pinned_manifest.repository, model_store.pinned_manifest.revision });
 }
@@ -308,28 +278,7 @@ fn removeModel(environ: std.process.Environ) !void {
     _ = signal(SIGINT, onModelCancel);
     _ = signal(SIGTERM, onModelCancel);
     try operation.remove();
-    std.debug.print("Model Installation: removed. Local remains selected when configured and is unavailable until Install. Hugging Face token preserved.\n", .{});
-}
-
-fn forgetHuggingFaceToken(environ: std.process.Environ) !void {
-    const home = environ.getPosix("HOME") orelse return error.HomeDirectoryUnavailable;
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try model_store.rootPath(home, &root_buffer);
-    var threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    try model_store.requestCredentialRevocation(io, root);
-    std.debug.print("Hugging Face token: stopping any active authenticated Model Operation before forgetting it…\n", .{});
-    var revocation = try model_store.finishCredentialRevocation(io, root);
-    defer revocation.deinit();
-    const status = keychain.deleteHuggingFaceToken();
-    if (status != keychain.errSecSuccess and status != keychain.errSecItemNotFound) {
-        var message: [256]u8 = undefined;
-        std.debug.print("Hugging Face token: keychain delete failed: {s}\n", .{keychain.describe(status, &message)});
-        return error.HuggingFaceKeychainUnavailable;
-    }
-    std.debug.print("Hugging Face token: forgotten. Installed and safely resumable model data retained.\n", .{});
+    std.debug.print("Model Installation: removed. Local remains selected when configured and is unavailable until Install.\n", .{});
 }
 
 fn modelStatus(environ: std.process.Environ) !void {
@@ -388,8 +337,8 @@ fn repairModel(environ: std.process.Environ) !void {
         },
     }
 
-    operation.repair(null) catch |failure| switch (failure) {
-        error.MissingHuggingFaceToken => {},
+    operation.repair(.offline_only) catch |failure| switch (failure) {
+        error.ModelRepairRequiresNetwork => {},
         else => return failure,
     };
     if ((try operation.verify()) == .usable) {
@@ -398,23 +347,8 @@ fn repairModel(environ: std.process.Environ) !void {
     }
 
     if (!confirmRepairNetworkUse()) return error.ModelRepairNotConfirmed;
-    var owned_token: ?[:0]const u8 = null;
-    defer if (owned_token) |token| {
-        std.crypto.secureZero(u8, @constCast(token));
-        allocator.free(token);
-    };
-    const token: []const u8 = environ.getPosix("HF_TOKEN") orelse token: {
-        switch (keychain.readHuggingFaceToken(allocator)) {
-            .key => |stored| {
-                owned_token = stored;
-                break :token stored;
-            },
-            .absent => return error.MissingHuggingFaceToken,
-            .err => return error.HuggingFaceKeychainUnavailable,
-        }
-    };
     try std.Io.Dir.cwd().access(io, helper, .{});
-    try operation.repair(token);
+    try operation.repair(.allow_network);
     std.debug.print("Model Installation: repaired, verified, smoke-tested, and activated.\n", .{});
 }
 
@@ -427,7 +361,7 @@ fn printIntegrity(integrity: model_store.InstallationIntegrity) !void {
 }
 
 fn confirmRepairNetworkUse() bool {
-    std.debug.print("Repair needs authenticated network access for invalid artifact data in the Model Installation. Continue? Type yes: ", .{});
+    std.debug.print("Repair needs network access for invalid artifact data in the Model Installation. Continue? Type yes: ", .{});
     var buffer: [16]u8 = undefined;
     const count = std.posix.read(0, &buffer) catch return false;
     const answer = std.mem.trim(u8, buffer[0..count], " \t\r\n");
@@ -435,7 +369,7 @@ fn confirmRepairNetworkUse() bool {
 }
 
 fn confirmModelRemoval() bool {
-    std.debug.print("Remove the local Model Installation and all staged Model Operation data? Local backend selection and Hugging Face token will be preserved. Type remove: ", .{});
+    std.debug.print("Remove the local Model Installation and all staged Model Operation data? Local backend selection will be preserved. Type remove: ", .{});
     var buffer: [16]u8 = undefined;
     const count = std.posix.read(0, &buffer) catch return false;
     const answer = std.mem.trim(u8, buffer[0..count], " \t\r\n");

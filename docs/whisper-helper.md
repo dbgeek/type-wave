@@ -1,7 +1,7 @@
-# Private KB Whisper helper
+# Private Whisper helper
 
 `type-wave-whisper` is the persistent, offline inference process for the pinned
-KB Whisper Small F16 artifact. It accepts only a model path and version 1 frames on
+Whisper Large v3 Turbo F16 artifact. It accepts only a model path and version 1 frames on
 stdin, writes frames on stdout, and reserves stderr for bounded operational diagnostics.
 It has no downloader, credential input, network client, or OpenAI fallback.
 
@@ -22,8 +22,8 @@ preinstalled runtime and does not modify an explicitly supplied archive.
 
 ## Exercise a manually provisioned artifact
 
-The model must be the 487,601,984-byte `ggml-model.bin` with SHA-256
-`de6911330cbdc131362f7a955682b65c8a5a2394caba73e7ea821a9822efb8c6`.
+The model must be the 1,624,555,275-byte `ggml-large-v3-turbo.bin` with SHA-256
+`1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69`.
 The helper hashes it before model load and emits `ready` only after context creation and
 Metal preparation succeed. Probe readiness, or optionally submit a mono 24 kHz signed-16
 WAV:
@@ -31,7 +31,7 @@ WAV:
 ```sh
 python3 tools/probe-whisper-helper.py \
   zig-out/bin/type-wave-whisper \
-  /path/to/ggml-model.bin \
+  /path/to/ggml-large-v3-turbo.bin \
   --wav /path/to/utterance-24khz.wav \
   --language auto
 ```
@@ -47,15 +47,13 @@ exact pinned artifact:
 
 ```sh
 nix develop --command zig build install-agent
-~/.local/bin/type-wave --set-hf-token
 ~/.local/bin/type-wave --install-model
 ```
 
 The paired installer signs and publishes both executables together and installs exact model
 and runtime provenance plus their license texts under `~/.local/share/type-wave/`.
 
-For foreground development, `HF_TOKEN=hf_... zig-out/bin/type-wave --install-model` is a
-non-persisted override. Installation data lives under
+The download is credential-free. Installation data lives under
 `~/Library/Application Support/type-wave/models/`; immutable installation directories are
 selected by an atomically replaced `active.receipt` only after exact size/digest verification
 and a successful helper load/warm smoke test.
@@ -69,15 +67,13 @@ without interruption once begun.
 Remove all local model data explicitly with `--remove-model`. After confirmation, the
 running daemon rejects new local Utterances, lets an accepted Utterance finish, unloads the
 helper, and removes the Model Installation plus staged Model Operation data. The configured local backend remains selected
-and reports unavailable; the Hugging Face token is not touched. `--forget-hf-token` is the
-separate credential action: it first cooperatively stops any authenticated transfer, keeps
-validator-bound resumable data, and then deletes only the Hugging Face login-Keychain item.
+and reports unavailable.
 
 Select local in `~/.config/type-wave/config.zon`:
 
 ```zig
 .{
-    .transcription_backend = .local_kb_whisper,
+    .transcription_backend = .local,
 }
 ```
 

@@ -179,7 +179,6 @@ const model_action_definitions = [_]ModelActionDefinition{
     .{ .title = "Retry local runtime", .action = .retry_runtime },
     .{ .title = "Cancel Model Operation", .action = .cancel_operation },
     .{ .title = "Open diagnostics", .action = .diagnostics },
-    .{ .title = "Forget Hugging Face token\xe2\x80\xa6", .action = .forget_hugging_face_token },
 };
 
 /// The daemon's side of the menu (wired in daemon.zig). All callbacks run on the main
@@ -198,7 +197,6 @@ pub const Host = struct {
     setPaused: *const fn (ctx: *anyopaque, paused: bool) void,
     /// Store the API key (Keychain). Returns whether the store succeeded.
     storeApiKey: *const fn (ctx: *anyopaque, key: []const u8) bool,
-    storeHuggingFaceToken: *const fn (ctx: *anyopaque, token: []const u8) bool,
     modelAction: *const fn (ctx: *anyopaque, action: ModelAction) void,
     /// Menu Quit — begin the clean shutdown (ends in appkit.stop()).
     quit: *const fn (ctx: *anyopaque) void,
@@ -226,7 +224,7 @@ const GroupDef = struct {
 const groups = [_]GroupDef{
     .{ .title = "Transcription Backend", .field = "transcription_backend", .session_shaped = false, .opts = &.{
         .{ .label = "OpenAI", .zon = ".openai" },
-        .{ .label = "Local — KB Whisper Small", .zon = ".local_kb_whisper" },
+        .{ .label = "Local — Whisper Large v3 Turbo", .zon = ".local" },
     } },
     .{ .title = "Talk Key", .field = "talk_key", .session_shaped = false, .opts = &.{
         .{ .label = "Right Option", .zon = ".right_option" },
@@ -259,7 +257,7 @@ const groups = [_]GroupDef{
 };
 
 const talk_keys = [_]tapmod.TalkKey{ .right_option, .left_option, .globe };
-const backends = [_]backend.Backend{ .openai, .local_kb_whisper };
+const backends = [_]backend.Backend{ .openai, .local };
 const languages = [_][]const u8{ "en", "sv", "" }; // "" = auto-detect (session omits the field)
 // "minimal" earned its slot via the issue #36 benchmark: ~30-50ms faster to Final
 // Transcript than "low" but measurably worse WER on quiet speech, so "low" stays the
@@ -329,22 +327,21 @@ fn primaryText(action: status_item.PrimaryAction, operation: status_item.Operati
     return switch (action) {
         .none => "",
         .set_openai_api_key => "Set OpenAI API key\xe2\x80\xa6",
-        .install_local_model => "Install KB Whisper Small\xe2\x80\xa6",
-        .update_local_model => "KB Whisper update available\xe2\x80\xa6",
+        .install_local_model => "Install Whisper Large v3 Turbo\xe2\x80\xa6",
+        .update_local_model => "Local model update available\xe2\x80\xa6",
         .resume_model_operation => "Resume Model Operation",
         .retry_model_operation => "Retry Model Operation",
         .repair_local_model => "Repair local model\xe2\x80\xa6",
         .retry_local_runtime => "Retry local runtime",
         .operation_progress => switch (operation) {
-            .installing => "Installing KB Whisper Small\xe2\x80\xa6",
-            .updating => "Staging KB Whisper update\xe2\x80\xa6",
+            .installing => "Installing Whisper Large v3 Turbo\xe2\x80\xa6",
+            .updating => "Staging local model update\xe2\x80\xa6",
             .verifying => "Verifying Model Installation\xe2\x80\xa6",
             .smoke_testing => "Smoke-testing Model Installation\xe2\x80\xa6",
             .waiting_for_inference => "Waiting for local inference to drain\xe2\x80\xa6",
             .activating => "Activating Model Installation\xe2\x80\xa6",
             .removing => "Removing Model Installation\xe2\x80\xa6",
             .discarding => "Discarding staged model data\xe2\x80\xa6",
-            .forgetting_credential => "Forgetting Hugging Face token\xe2\x80\xa6",
             else => "Model Operation in progress\xe2\x80\xa6",
         },
     };
@@ -387,8 +384,6 @@ pub const Menu = struct {
     local_model_installer: id = null,
     local_operation_status: id = null,
     local_failure_status: id = null,
-    local_credential_status: id = null,
-    hugging_face_token_item: id = null,
     model_actions: [std.meta.fieldNames(ModelAction).len]id = @splat(null),
 
     last_snapshot: ?status_item.Snapshot = null,
@@ -498,21 +493,19 @@ pub const Menu = struct {
 
     fn addLocalModel(self: *Menu, menu: id) void {
         const sub = newMenu();
-        self.local_model_status = self.addDisabled(sub, "KB Whisper Small — not installed");
+        self.local_model_status = self.addDisabled(sub, "Whisper Large v3 Turbo — not installed");
         self.local_model_source = self.addDisabled(sub, "");
         self.local_model_artifact = self.addDisabled(sub, "");
         self.local_model_runtime = self.addDisabled(sub, "");
         self.local_model_installer = self.addDisabled(sub, "");
         self.local_operation_status = self.addDisabled(sub, "Model Operation — idle");
         self.local_failure_status = self.addDisabled(sub, "");
-        self.local_credential_status = self.addDisabled(sub, "Hugging Face token — not set");
         addSeparator(sub);
         for (model_action_definitions) |definition| {
             const item = self.addAction(sub, definition.title, "onModelAction:");
             msgLong(item, "setTag:", @intFromEnum(definition.action));
             self.model_actions[@intFromEnum(definition.action)] = item;
         }
-        self.hugging_face_token_item = self.addAction(sub, "Set Hugging Face token\xe2\x80\xa6", "onSetHuggingFaceToken:");
         const parent = makeItem("Local Model", null);
         msg1v(parent, "setSubmenu:", sub);
         msg1v(menu, "addItem:", parent);
@@ -581,10 +574,10 @@ pub const Menu = struct {
         msgBool(self.network_item, "setHidden:", !presentation.model_operation_uses_network);
 
         const installation_title: [*:0]const u8 = switch (snapshot.installation) {
-            .absent => "KB Whisper Small — not installed",
-            .ready => "KB Whisper Small — installed",
-            .update_available => "KB Whisper Small — update available",
-            .corrupt => "KB Whisper Small — corrupt",
+            .absent => "Whisper Large v3 Turbo — not installed",
+            .ready => "Whisper Large v3 Turbo — installed",
+            .update_available => "Whisper Large v3 Turbo — update available",
+            .corrupt => "Whisper Large v3 Turbo — corrupt",
         };
         msg1v(self.local_model_status, "setTitle:", nsstr(installation_title));
         var source_buffer: [384]u8 = undefined;
@@ -645,24 +638,6 @@ pub const Menu = struct {
         msg1v(self.local_failure_status, "setTitle:", nsstr(failure_title));
         msgBool(self.local_failure_status, "setHidden:", presentation.model_failure == .none);
 
-        const credential_title: [*:0]const u8 = if (snapshot.hugging_face_environment_override)
-            switch (snapshot.hugging_face_credential) {
-                .present => "Hugging Face credential — HF_TOKEN override; Keychain token also stored",
-                .absent => "Hugging Face credential — HF_TOKEN environment override",
-                .unavailable => "Hugging Face credential — HF_TOKEN override; Keychain unavailable",
-            }
-        else switch (snapshot.hugging_face_credential) {
-            .present => "Hugging Face token — stored in login Keychain",
-            .absent => "Hugging Face token — not set",
-            .unavailable => "Hugging Face token — Keychain unavailable",
-        };
-        msg1v(self.local_credential_status, "setTitle:", nsstr(credential_title));
-        msg1v(self.hugging_face_token_item, "setTitle:", nsstr(switch (presentation.token_action) {
-            .set => "Set Hugging Face token\xe2\x80\xa6",
-            .replace => "Replace Hugging Face token\xe2\x80\xa6",
-            .unavailable => "",
-        }));
-        msgBool(self.hugging_face_token_item, "setHidden:", presentation.token_action == .unavailable);
         for (model_action_definitions) |definition| {
             const item = self.model_actions[@intFromEnum(definition.action)];
             msgBool(item, "setHidden:", !presentation.allowsModelAction(definition.action));
@@ -774,39 +749,34 @@ const ModelActionConfirmation = struct {
 fn confirmationForModelAction(action: ModelAction) ?ModelActionConfirmation {
     return switch (action) {
         .install => .{
-            .title = "Install KB Whisper Small?",
-            .detail = "Download the official F16 ggml-model.bin artifact from KBLab/kb-whisper-small at revision 3564d61a42fc210ceaa55a22a96dd64478959c78 (487,601,984 bytes). This large Model Operation uses the network only after you choose Install; Capture audio is never uploaded.",
+            .title = "Install Whisper Large v3 Turbo?",
+            .detail = "Download the official F16 ggml-large-v3-turbo.bin artifact from ggerganov/whisper.cpp at revision 98aa99a0a9db05ae2342309f5096248665f7cba3 (1,624,555,275 bytes), credential-free. This large Model Operation uses the network only after you choose Install; Capture audio is never uploaded.",
             .button = "Install",
         },
         .update => .{
-            .title = "Update KB Whisper Small?",
-            .detail = "The replacement is downloaded and verified as staged data while the working Model Installation stays usable. An active Utterance may finish before atomic activation. Local remains selected with no OpenAI fallback, and the Hugging Face token is preserved.",
+            .title = "Update Whisper Large v3 Turbo?",
+            .detail = "The replacement is downloaded and verified as staged data while the working Model Installation stays usable. An active Utterance may finish before atomic activation. Local remains selected with no OpenAI fallback.",
             .button = "Update",
         },
         .remove => .{
             .title = "Remove the Local Model?",
-            .detail = "An active Utterance may finish before the helper unloads. Local remains selected with no OpenAI fallback. The Model Installation and staged data are removed; the Hugging Face token is preserved.",
+            .detail = "An active Utterance may finish before the helper unloads. Local remains selected with no OpenAI fallback. The Model Installation and staged data are removed.",
             .button = "Remove",
         },
         .repair => .{
             .title = "Repair the Local Model?",
-            .detail = "Valid working Model Installation data is preserved while repair data is staged. An active Utterance may finish before atomic activation. Local remains selected with no OpenAI fallback, and the Hugging Face token is preserved. If authenticated network access is needed, it is used only for this Model Operation; Capture audio is never uploaded.",
+            .detail = "Valid working Model Installation data is preserved while repair data is staged. An active Utterance may finish before atomic activation. Local remains selected with no OpenAI fallback. If network access is needed, it is used only for this Model Operation; Capture audio is never uploaded.",
             .button = "Repair",
         },
         .cancel_operation => .{
             .title = "Cancel the Model Operation?",
-            .detail = "The current cancellable stage stops cooperatively. Resumable staged data is retained, the working Model Installation stays usable, and the Hugging Face token is preserved. An active local Utterance and the no-fallback privacy boundary are unchanged.",
+            .detail = "The current cancellable stage stops cooperatively. Resumable staged data is retained and the working Model Installation stays usable. An active local Utterance and the no-fallback privacy boundary are unchanged.",
             .button = "Cancel Operation",
         },
         .discard => .{
             .title = "Discard Partial Model Data?",
-            .detail = "Only resumable staged data is discarded. The working Model Installation, active local Utterance, local selection with no OpenAI fallback, and Hugging Face token are unchanged.",
+            .detail = "Only resumable staged data is discarded. The working Model Installation, active local Utterance, and local selection with no OpenAI fallback are unchanged.",
             .button = "Discard",
-        },
-        .forget_hugging_face_token => .{
-            .title = "Forget the Hugging Face Token?",
-            .detail = "Any authenticated transfer is stopped first. Resumable staged data and the working Model Installation are preserved. Local remains selected with no OpenAI fallback, and an active local Utterance is unaffected.",
-            .button = "Forget Token",
         },
         else => null,
     };
@@ -825,9 +795,10 @@ fn confirmModelAction(action: ModelAction) bool {
 test "Install confirmation names the pinned large artifact and its privacy boundary" {
     const copy = confirmationForModelAction(.install).?;
 
-    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(copy.detail), "KBLab/kb-whisper-small") != null);
-    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(copy.detail), "ggml-model.bin") != null);
-    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(copy.detail), "487,601,984 bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(copy.detail), "ggerganov/whisper.cpp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(copy.detail), "ggml-large-v3-turbo.bin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(copy.detail), "1,624,555,275 bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(copy.detail), "credential-free") != null);
     try std.testing.expect(std.mem.indexOf(u8, std.mem.span(copy.detail), "Capture audio is never uploaded") != null);
 }
 
@@ -839,7 +810,7 @@ test "state-changing Local Model confirmations explain their containment boundar
 
     const remove = std.mem.span(confirmationForModelAction(.remove).?.detail);
     try std.testing.expect(std.mem.indexOf(u8, remove, "no OpenAI fallback") != null);
-    try std.testing.expect(std.mem.indexOf(u8, remove, "token is preserved") != null);
+    try std.testing.expect(std.mem.indexOf(u8, remove, "staged data are removed") != null);
 
     const cancel = std.mem.span(confirmationForModelAction(.cancel_operation).?.detail);
     try std.testing.expect(std.mem.indexOf(u8, cancel, "working Model Installation") != null);
@@ -848,10 +819,6 @@ test "state-changing Local Model confirmations explain their containment boundar
     const discard = std.mem.span(confirmationForModelAction(.discard).?.detail);
     try std.testing.expect(std.mem.indexOf(u8, discard, "staged data") != null);
     try std.testing.expect(std.mem.indexOf(u8, discard, "working Model Installation") != null);
-
-    const forget = std.mem.span(confirmationForModelAction(.forget_hugging_face_token).?.detail);
-    try std.testing.expect(std.mem.indexOf(u8, forget, "staged data") != null);
-    try std.testing.expect(std.mem.indexOf(u8, forget, "working Model Installation") != null);
 }
 
 fn onOpenConfig(_: id, _: SEL, _: id) callconv(.c) void {
@@ -901,35 +868,6 @@ fn onSetApiKey(_: id, _: SEL, _: id) callconv(.c) void {
     }
 }
 
-fn onSetHuggingFaceToken(_: id, _: SEL, _: id) callconv(.c) void {
-    const m = g_menu orelse return;
-    const pool = objc_autoreleasePoolPush();
-    defer objc_autoreleasePoolPop(pool);
-    msgBool(appkit.app(), "activateIgnoringOtherApps:", true);
-
-    const replacing = status_item.derive(m.host.status(m.host.ctx)).token_action == .replace;
-    const alert = msg(msg(cls("NSAlert"), "alloc"), "init");
-    msg1v(alert, "setMessageText:", nsstr(if (replacing) "Replace Hugging Face Token" else "Set Hugging Face Token"));
-    msg1v(alert, "setInformativeText:", nsstr("Stored separately in the login Keychain. Used only for an explicit Model Operation; Capture audio is never uploaded."));
-    _ = msg1(alert, "addButtonWithTitle:", nsstr(if (replacing) "Replace" else "Set"));
-    _ = msg1(alert, "addButtonWithTitle:", nsstr("Cancel"));
-    const field = secureField(.{ .x = 0, .y = 0, .w = 280, .h = 24 });
-    msg1v(alert, "setAccessoryView:", field);
-    msg1v(msg(alert, "window"), "setInitialFirstResponder:", field);
-    if (msgLongR(alert, "runModal") != NSAlertFirstButtonReturn) return;
-    const token = std.mem.trim(u8, std.mem.span(utf8(msg(field, "stringValue"))), " \t\r\n");
-    if (token.len == 0) return;
-    if (!m.host.storeHuggingFaceToken(m.host.ctx, token)) {
-        const fail = msg(msg(cls("NSAlert"), "alloc"), "init");
-        msg1v(fail, "setMessageText:", nsstr("Could not store the token"));
-        msg1v(fail, "setInformativeText:", nsstr("The Keychain write failed — see ~/Library/Logs/type-wave.log."));
-        _ = msg1(fail, "addButtonWithTitle:", nsstr("OK"));
-        _ = msgLongR(fail, "runModal");
-    }
-    m.last_snapshot = null;
-    m.refreshChrome();
-}
-
 fn onQuit(_: id, _: SEL, _: id) callconv(.c) void {
     const m = g_menu orelse return;
     feedback.log("  menu: Quit — shutting down cleanly\n", .{});
@@ -976,7 +914,6 @@ fn makeTarget() id {
     _ = class_addMethod(target_cls, sel_registerName("onPause:"), @ptrCast(&onPause), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onOpenConfig:"), @ptrCast(&onOpenConfig), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onSetApiKey:"), @ptrCast(&onSetApiKey), v_at);
-    _ = class_addMethod(target_cls, sel_registerName("onSetHuggingFaceToken:"), @ptrCast(&onSetHuggingFaceToken), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onQuit:"), @ptrCast(&onQuit), v_at);
     _ = class_addMethod(target_cls, sel_registerName("menuWillOpen:"), @ptrCast(&onMenuWillOpen), v_at);
     _ = class_addMethod(target_cls, sel_registerName("twStop:"), @ptrCast(&onStop), v_at);

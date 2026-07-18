@@ -5,7 +5,7 @@ import struct
 import sys
 import time
 
-DIGEST = bytes.fromhex("de6911330cbdc131362f7a955682b65c8a5a2394caba73e7ea821a9822efb8c6")
+DIGEST = bytes.fromhex("1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69")
 sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 1, 1, len(DIGEST)) + DIGEST)
 sys.stdout.buffer.flush()
 mode = sys.argv[1]

@@ -24,7 +24,6 @@
 //! policy (precedence, migration, log dedup) lives in config.zig.
 
 const std = @import("std");
-const credential = @import("credential.zig");
 
 // ---- CoreFoundation (hand-written externs, same style as insert.zig / hud.zig) ------
 
@@ -79,7 +78,6 @@ extern "c" fn CFDictionaryCreate(
 extern "c" fn SecItemAdd(attributes: CFDictionaryRef, result: ?*CFTypeRef) OSStatus;
 extern "c" fn SecItemCopyMatching(query: CFDictionaryRef, result: ?*CFTypeRef) OSStatus;
 extern "c" fn SecItemUpdate(query: CFDictionaryRef, attributes_to_update: CFDictionaryRef) OSStatus;
-extern "c" fn SecItemDelete(query: CFDictionaryRef) OSStatus;
 extern "c" fn SecCopyErrorMessageString(status: OSStatus, reserved: ?*anyopaque) CFStringRef;
 
 // The kSec* keys are exported CFStringRef DATA symbols, not literals — `extern var`,
@@ -106,9 +104,7 @@ pub const errSecInteractionNotAllowed: OSStatus = -25308;
 /// LaunchAgent Label, the codesign identifier) — the keychain item joins them.
 pub const service = "me.ba78.type-wave";
 pub const account = "openai-api-key";
-pub const hugging_face_account = "huggingface-token";
 const openai_label = "type-wave OpenAI API key";
-const hugging_face_label = "type-wave Hugging Face token";
 
 fn cfStr(s: [*:0]const u8) CFStringRef {
     return CFStringCreateWithCString(null, s, kCFStringEncodingUTF8);
@@ -131,29 +127,6 @@ pub const ReadResult = union(enum) {
 /// Read the key: (class, service, account, return-data, match-limit-one).
 pub fn readKey(gpa: std.mem.Allocator) ReadResult {
     return readSecret(gpa, account);
-}
-
-pub fn readHuggingFaceToken(gpa: std.mem.Allocator) ReadResult {
-    return readSecret(gpa, hugging_face_account);
-}
-
-/// Query only the item's identity, never its secret bytes. This keeps Status Item chrome
-/// refreshes non-sensitive while still distinguishing a missing item from a locked or
-/// denied Keychain that must not be presented as missing.
-pub fn huggingFaceTokenPresence() credential.Presence {
-    const svc = cfStr(service);
-    defer CFRelease(svc);
-    const acct = cfStr(hugging_face_account);
-    defer CFRelease(acct);
-    const keys = [_]CFTypeRef{ kSecClass, kSecAttrService, kSecAttrAccount, kSecMatchLimit };
-    const vals = [_]CFTypeRef{ kSecClassGenericPassword, svc, acct, kSecMatchLimitOne };
-    const query = dict(&keys, &vals);
-    defer CFRelease(query);
-    return switch (SecItemCopyMatching(query, null)) {
-        errSecSuccess => .present,
-        errSecItemNotFound => .absent,
-        else => .unavailable,
-    };
 }
 
 fn readSecret(gpa: std.mem.Allocator, item_account: [*:0]const u8) ReadResult {
@@ -184,24 +157,6 @@ fn readSecret(gpa: std.mem.Allocator, item_account: [*:0]const u8) ReadResult {
 /// item's ACL keys to the daemon's stable Designated Requirement — see the module doc.
 pub fn storeKey(key: []const u8) OSStatus {
     return storeSecret(account, openai_label, key);
-}
-
-pub fn storeHuggingFaceToken(token: []const u8) OSStatus {
-    return storeSecret(hugging_face_account, hugging_face_label, token);
-}
-
-/// Forget only the Hugging Face credential. Model data and the independent OpenAI item
-/// are outside this exact (service, account) query.
-pub fn deleteHuggingFaceToken() OSStatus {
-    const svc = cfStr(service);
-    defer CFRelease(svc);
-    const acct = cfStr(hugging_face_account);
-    defer CFRelease(acct);
-    const keys = [_]CFTypeRef{ kSecClass, kSecAttrService, kSecAttrAccount };
-    const vals = [_]CFTypeRef{ kSecClassGenericPassword, svc, acct };
-    const query = dict(&keys, &vals);
-    defer CFRelease(query);
-    return SecItemDelete(query);
 }
 
 fn storeSecret(item_account: [*:0]const u8, item_label: [*:0]const u8, secret: []const u8) OSStatus {

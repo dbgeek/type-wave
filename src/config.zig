@@ -409,7 +409,7 @@ fn serializeSettings(gpa: std.mem.Allocator, s: Settings) ?[:0]u8 {
         \\// version was generated because the file was absent or malformed.
         \\//
         \\//   .talk_key        = .right_option | .left_option | .globe
-        \\//   .transcription_backend = .openai | .local_kb_whisper
+        \\//   .transcription_backend = .openai | .local  (.local = pinned offline Whisper model)
         \\//   .model           = "<transcription model>"
         \\//   .language        = "<ISO code>"  ("" = auto-detect)
         \\//   .delay           = "minimal" | "low" | "medium" | "high" | "xhigh"
@@ -554,7 +554,7 @@ test "patchZonField does not confuse a longer field name for a prefix" {
 }
 
 test "serializeSettings round-trips through the ZON parser" {
-    const s = Settings{ .transcription_backend = .local_kb_whisper, .talk_key = .left_option, .language = "", .delay = "high", .overlay = false, .pre_paste_ms = 42 };
+    const s = Settings{ .transcription_backend = .local, .talk_key = .left_option, .language = "", .delay = "high", .overlay = false, .pre_paste_ms = 42 };
     const text = serializeSettings(talloc, s) orelse return error.SerializeFailed;
     defer talloc.free(text);
     var diag: std.zon.parse.Diagnostics = .{};
@@ -563,7 +563,7 @@ test "serializeSettings round-trips through the ZON parser" {
     // free the parsed strings (all fields present in the file, so no static defaults)
     defer std.zon.parse.free(talloc, parsed);
     try std.testing.expectEqual(Settings.NoiseReduction.near_field, parsed.noise_reduction);
-    try std.testing.expectEqual(@import("transcription_backend.zig").Backend.local_kb_whisper, parsed.transcription_backend);
+    try std.testing.expectEqual(@import("transcription_backend.zig").Backend.local, parsed.transcription_backend);
     try std.testing.expectEqual(tap.TalkKey.left_option, parsed.talk_key);
     try std.testing.expectEqualStrings("", parsed.language);
     try std.testing.expect(!parsed.overlay);
@@ -605,7 +605,7 @@ test "diffSettings flags session-shaped and overlay changes" {
     d = diffSettings(&base, &b);
     try std.testing.expect(d.any and !d.session_shaped and d.overlay);
     b = base;
-    b.transcription_backend = .local_kb_whisper;
+    b.transcription_backend = .local;
     d = diffSettings(&base, &b);
     try std.testing.expect(d.any and d.backend_selection and !d.session_shaped and !d.overlay);
     b = base;

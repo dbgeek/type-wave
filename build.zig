@@ -66,7 +66,7 @@ pub fn build(b: *std.Build) void {
     // The private local-inference helper is part of every normal build. Its build action
     // acquires and byte-verifies the exact whisper.cpp v1.9.1 source archive; an explicit
     // archive remains available for offline/reproducible builders.
-    const helper_step = b.step("whisper-helper", "Build the pinned private KB Whisper helper");
+    const helper_step = b.step("whisper-helper", "Build the pinned private local Whisper helper");
     const whisper_archive = b.option([]const u8, "whisper-archive", "Use the local pinned whisper.cpp source archive instead of acquiring it");
     const runtime_build = b.addSystemCommand(&.{"bash"});
     runtime_build.addFileArg(b.path("tools/build-whisper-runtime.sh"));

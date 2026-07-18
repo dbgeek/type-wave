@@ -122,11 +122,12 @@ exit 0
         self.assertIn("type-wave-whisper", signing)
 
         installed_data = self.home / ".local/share/type-wave"
-        self.assertIn("Apache License", (installed_data / "LICENSES/Apache-2.0.txt").read_text())
+        self.assertIn("MIT License", (installed_data / "LICENSES/OpenAI-Whisper-MIT.txt").read_text())
         provenance = (installed_data / "PROVENANCE").read_text()
-        self.assertIn("KBLab/kb-whisper-small", provenance)
-        self.assertIn("3564d61a42fc210ceaa55a22a96dd64478959c78", provenance)
-        self.assertIn("de6911330cbdc131362f7a955682b65c8a5a2394caba73e7ea821a9822efb8c6", provenance)
+        self.assertIn("ggerganov/whisper.cpp", provenance)
+        self.assertIn("ggml-large-v3-turbo.bin", provenance)
+        self.assertIn("98aa99a0a9db05ae2342309f5096248665f7cba3", provenance)
+        self.assertIn("1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69", provenance)
         self.assertIn("whisper.cpp v1.9.1", provenance)
         self.assertIn("147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447", provenance)
 
@@ -185,8 +186,9 @@ exit 0
         self.assertIn("type-wave-whisper", uninstall)
         self.assertIn("Application Support/type-wave/models", uninstall)
         self.assertIn("openai-api-key", uninstall)
-        self.assertIn("huggingface-token", uninstall)
         self.assertIn("Privacy & Security", uninstall)
+        self.assertNotIn("huggingface-token", uninstall)
+        self.assertNotIn("Hugging Face", uninstall)
 
 
 if __name__ == "__main__":

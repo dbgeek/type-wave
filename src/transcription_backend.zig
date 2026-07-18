@@ -6,7 +6,7 @@ pub const UtteranceId = u64;
 
 pub const Backend = enum {
     openai,
-    local_kb_whisper,
+    local,
 };
 
 /// Pure drain-then-switch policy. Resource owners prepare the returned ticket and may
@@ -279,38 +279,38 @@ test "selection drains an active lease before preparing the latest backend" {
     try std.testing.expect(state.finishPreparation(openai, true));
     try std.testing.expectEqual(Backend.openai, state.acquire(41).?);
 
-    state.select(.local_kb_whisper);
+    state.select(.local);
     try std.testing.expectEqual(Backend.openai, state.activeRoute().?.backend);
-    try std.testing.expect(state.beginPreparation(.local_kb_whisper) == null);
+    try std.testing.expect(state.beginPreparation(.local) == null);
     try std.testing.expect(state.acquire(42) == null);
 
     state.select(.openai);
-    state.select(.local_kb_whisper);
+    state.select(.local);
     try std.testing.expect(state.resolve(41));
-    const latest = state.beginPreparation(.local_kb_whisper).?;
-    try std.testing.expectEqual(Backend.local_kb_whisper, latest.backend);
+    const latest = state.beginPreparation(.local).?;
+    try std.testing.expectEqual(Backend.local, latest.backend);
     try std.testing.expect(state.finishPreparation(latest, true));
-    try std.testing.expectEqual(Backend.local_kb_whisper, state.acquire(42).?);
+    try std.testing.expectEqual(Backend.local, state.acquire(42).?);
 }
 
 test "obsolete preparation never becomes ready" {
     var state = Selection.init(.openai);
     const obsolete = state.beginPreparation(.openai).?;
-    state.select(.local_kb_whisper);
+    state.select(.local);
     try std.testing.expect(!state.finishPreparation(obsolete, true));
     try std.testing.expect(state.acquire(1) == null);
     try std.testing.expect(state.beginPreparation(.openai) == null);
-    try std.testing.expectEqual(Backend.local_kb_whisper, state.beginPreparation(.local_kb_whisper).?.backend);
+    try std.testing.expectEqual(Backend.local, state.beginPreparation(.local).?.backend);
 }
 
 test "invalidating a ready resource rejects leases until its replacement is prepared" {
-    var state = Selection.init(.local_kb_whisper);
-    const first = state.beginPreparation(.local_kb_whisper).?;
+    var state = Selection.init(.local);
+    const first = state.beginPreparation(.local).?;
     try std.testing.expect(state.finishPreparation(first, true));
 
-    try std.testing.expect(state.invalidate(.local_kb_whisper));
+    try std.testing.expect(state.invalidate(.local));
     try std.testing.expect(state.acquire(1) == null);
-    const replacement = state.beginPreparation(.local_kb_whisper).?;
+    const replacement = state.beginPreparation(.local).?;
     try std.testing.expect(state.finishPreparation(replacement, true));
-    try std.testing.expectEqual(Backend.local_kb_whisper, state.acquire(2).?);
+    try std.testing.expectEqual(Backend.local, state.acquire(2).?);
 }

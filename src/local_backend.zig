@@ -1,4 +1,4 @@
-//! Complete-Utterance adapter for the local KB Whisper Transcription Backend.
+//! Complete-Utterance adapter for the local Whisper Transcription Backend.
 
 const std = @import("std");
 const backend = @import("transcription_backend.zig");
@@ -55,7 +55,7 @@ pub fn Adapter(comptime Helper: type) type {
             if (!self.isReady()) return null;
             return .{
                 .id = id,
-                .backend = .local_kb_whisper,
+                .backend = .local,
                 .language = language,
                 .deadline = local_deadline,
                 .ctx = self,

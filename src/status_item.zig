@@ -5,7 +5,6 @@
 
 const std = @import("std");
 const backend = @import("transcription_backend.zig");
-const credential = @import("credential.zig");
 const installation_identity = @import("installation_identity.zig");
 const readiness = @import("readiness.zig");
 
@@ -27,13 +26,12 @@ pub const Operation = enum {
     activating,
     removing,
     discarding,
-    forgetting_credential,
     failed,
     cancelled,
 
     pub fn isActive(self: Operation) bool {
         return switch (self) {
-            .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference, .activating, .removing, .discarding, .forgetting_credential => true,
+            .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference, .activating, .removing, .discarding => true,
             .idle, .paused, .failed, .cancelled => false,
         };
     }
@@ -62,11 +60,8 @@ pub const ModelAction = enum {
     retry_runtime,
     cancel_operation,
     diagnostics,
-    forget_hugging_face_token,
 };
 
-pub const CredentialState = credential.Presence;
-pub const TokenAction = enum { set, replace, unavailable };
 pub const ModelFailure = enum {
     none,
     installation_corrupt,
@@ -84,8 +79,6 @@ pub const Snapshot = struct {
     operation: Operation = .idle,
     operation_bytes: ?ByteProgress = null,
     installation_identity: ?InstallationIdentity = null,
-    hugging_face_credential: CredentialState = .absent,
-    hugging_face_environment_override: bool = false,
     failure_detail: ?FailureDetail = null,
 };
 
@@ -138,7 +131,6 @@ pub const Presentation = struct {
     audio_stays_on_mac: bool,
     model_operation_uses_network: bool,
     model_actions: std.EnumSet(ModelAction),
-    token_action: TokenAction,
     model_failure: ModelFailure,
 
     pub fn allowsModelAction(self: Presentation, action: ModelAction) bool {
@@ -152,15 +144,10 @@ pub fn derive(s: Snapshot) Presentation {
         .headline = headline(s),
         .primary_action = primaryAction(s),
         .show_openai_controls = s.selected_backend == .openai,
-        .audio_stays_on_mac = s.selected_backend == .local_kb_whisper and
+        .audio_stays_on_mac = s.selected_backend == .local and
             s.health.status == .ready_offline,
         .model_operation_uses_network = operation_active,
         .model_actions = modelActions(s, operation_active),
-        .token_action = switch (s.hugging_face_credential) {
-            .absent => .set,
-            .present => .replace,
-            .unavailable => .unavailable,
-        },
         .model_failure = if (s.operation == .failed)
             .operation_failed
         else if (s.operation == .cancelled)
@@ -177,7 +164,6 @@ pub fn derive(s: Snapshot) Presentation {
 fn modelActions(s: Snapshot, operation_active: bool) std.EnumSet(ModelAction) {
     var actions: std.EnumSet(ModelAction) = .empty;
     actions.insert(.diagnostics);
-    if (s.hugging_face_credential == .present) actions.insert(.forget_hugging_face_token);
     switch (s.operation) {
         .paused => {
             actions.insert(.resume_operation);
@@ -228,7 +214,7 @@ fn headline(s: Snapshot) Headline {
         .no_key, .no_local_installation => return .selected_backend_prerequisite_missing,
         else => {},
     }
-    if (s.terminal_backend_failure or (s.selected_backend == .local_kb_whisper and s.installation == .corrupt)) return .backend_failure;
+    if (s.terminal_backend_failure or (s.selected_backend == .local and s.installation == .corrupt)) return .backend_failure;
     return switch (s.health.status) {
         .reconnecting, .preparing_local => .preparing,
         .ready => .ready,
@@ -251,13 +237,12 @@ fn primaryAction(s: Snapshot) PrimaryAction {
 }
 
 fn snap(fields: struct {
-    selected_backend: backend.Backend = .local_kb_whisper,
+    selected_backend: backend.Backend = .local,
     health: readiness.Health = .{ .paused = false, .status = .ready_offline },
     terminal_backend_failure: bool = false,
     local_runtime_failure: bool = false,
     installation: Installation = .ready,
     operation: Operation = .idle,
-    hugging_face_credential: CredentialState = .absent,
 }) Snapshot {
     return .{
         .selected_backend = fields.selected_backend,
@@ -266,7 +251,6 @@ fn snap(fields: struct {
         .local_runtime_failure = fields.local_runtime_failure,
         .installation = fields.installation,
         .operation = fields.operation,
-        .hugging_face_credential = fields.hugging_face_credential,
     };
 }
 
@@ -296,7 +280,7 @@ test "compact hierarchy exposes only the selected backend primary action" {
 }
 
 test "local privacy cues survive every active Model Operation stage" {
-    for ([_]Operation{ .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference, .activating, .removing, .discarding, .forgetting_credential }) |operation| {
+    for ([_]Operation{ .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference, .activating, .removing, .discarding }) |operation| {
         const p = derive(snap(.{ .operation = operation }));
         try std.testing.expect(p.audio_stays_on_mac);
         try std.testing.expect(p.model_operation_uses_network);
@@ -351,22 +335,8 @@ test "failed and cancelled Model Operations retry instead of pretending to resum
 test "Cancel is offered only while a Model Operation stage is cancellable" {
     for ([_]Operation{ .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference }) |operation|
         try std.testing.expect(derive(snap(.{ .operation = operation })).allowsModelAction(.cancel_operation));
-    for ([_]Operation{ .activating, .removing, .discarding, .forgetting_credential }) |operation|
+    for ([_]Operation{ .activating, .removing, .discarding }) |operation|
         try std.testing.expect(!derive(snap(.{ .operation = operation })).allowsModelAction(.cancel_operation));
-}
-
-test "Hugging Face token maintenance follows the observed Keychain state" {
-    const absent = derive(snap(.{ .hugging_face_credential = .absent }));
-    try std.testing.expectEqual(TokenAction.set, absent.token_action);
-    try std.testing.expect(!absent.allowsModelAction(.forget_hugging_face_token));
-
-    const present = derive(snap(.{ .hugging_face_credential = .present }));
-    try std.testing.expectEqual(TokenAction.replace, present.token_action);
-    try std.testing.expect(present.allowsModelAction(.forget_hugging_face_token));
-
-    const unavailable = derive(snap(.{ .hugging_face_credential = .unavailable }));
-    try std.testing.expectEqual(TokenAction.unavailable, unavailable.token_action);
-    try std.testing.expect(!unavailable.allowsModelAction(.forget_hugging_face_token));
 }
 
 test "Local Model failures identify the actionable recovery" {

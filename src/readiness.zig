@@ -81,7 +81,7 @@ pub const Reporter = struct {
 pub fn configured(snap: Snapshot) bool {
     const backend_prerequisite = switch (snap.selected_backend) {
         .openai => snap.key_present,
-        .local_kb_whisper => snap.local_installation_present,
+        .local => snap.local_installation_present,
     };
     return backend_prerequisite and
         snap.microphone_granted and
@@ -102,7 +102,7 @@ pub fn health(snap: Snapshot) Health {
             .{ .paused = snap.paused, .status = .no_key }
         else
             .{ .paused = snap.paused, .status = if (snap.backend_ready) .ready else .reconnecting },
-        .local_kb_whisper => if (!snap.local_installation_present)
+        .local => if (!snap.local_installation_present)
             .{ .paused = snap.paused, .status = .no_local_installation }
         else
             .{ .paused = snap.paused, .status = if (snap.backend_ready) .ready_offline else .preparing_local },
@@ -115,7 +115,7 @@ fn missingBits(snap: Snapshot) u8 {
         .openai => if (!snap.key_present) {
             missing |= missing_key;
         },
-        .local_kb_whisper => if (!snap.local_installation_present) {
+        .local => if (!snap.local_installation_present) {
             missing |= missing_local_installation;
         },
     }
@@ -132,7 +132,7 @@ fn reportFor(missing: u8) Report {
         r.count += 1;
     }
     if ((missing & missing_local_installation) != 0) {
-        r.lines[r.count] = "    - verified local KB Whisper Model Installation";
+        r.lines[r.count] = "    - verified local Model Installation";
         r.count += 1;
     }
     if ((missing & missing_microphone) != 0) {
@@ -188,12 +188,12 @@ test "configured requires setup prerequisites and a live tap" {
 
 test "Configuration Phase uses only the selected backend durable prerequisite" {
     try std.testing.expect(configured(makeSnapshot(.{
-        .selected_backend = .local_kb_whisper,
+        .selected_backend = .local,
         .key_present = false,
         .local_installation_present = true,
     })));
     try std.testing.expect(!configured(makeSnapshot(.{
-        .selected_backend = .local_kb_whisper,
+        .selected_backend = .local,
         .key_present = true,
         .local_installation_present = false,
     })));
@@ -201,14 +201,14 @@ test "Configuration Phase uses only the selected backend durable prerequisite" {
 
 test "local readiness is offline and reports a missing Model Installation distinctly" {
     const ready_local = health(makeSnapshot(.{
-        .selected_backend = .local_kb_whisper,
+        .selected_backend = .local,
         .key_present = false,
         .local_installation_present = true,
     }));
     try std.testing.expectEqual(Status.ready_offline, ready_local.status);
 
     const missing = makeSnapshot(.{
-        .selected_backend = .local_kb_whisper,
+        .selected_backend = .local,
         .key_present = false,
         .local_installation_present = false,
     });

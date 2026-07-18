@@ -97,7 +97,7 @@ cp packaging/config.example.zon ~/.config/type-wave/config.zon
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `transcription_backend` | `.openai` | `.openai` or `.local_kb_whisper`; selection is a hard audio boundary |
+| `transcription_backend` | `.openai` | `.openai` or `.local`; selection is a hard audio boundary |
 | `talk_key` | `.right_option` | `.right_option`, `.left_option`, or `.globe` |
 | `model` | `"gpt-realtime-whisper"` | String, so model experiments do not require a rebuild |
 | `language` | `"en"` | `"en"`, `"sv"`, or `""` for auto-detect |
@@ -117,17 +117,14 @@ Secrets do not live in `config.zon`. Key precedence is:
 2. The login keychain item created by the menu or `~/.local/bin/type-wave --set-key`.
 3. One-time migration from the retired `~/.config/type-wave/env` file, if present.
 
-The pinned local KB Whisper Model Installation uses a separate Hugging Face credential.
-Store it through the installed signed binary, then explicitly start the Model Operation:
+The pinned local Model Installation (Whisper Large v3 Turbo) downloads credential-free.
+Explicitly start the Model Operation:
 
 ```sh
-~/.local/bin/type-wave --set-hf-token
 ~/.local/bin/type-wave --install-model
 ```
 
-For a foreground development operation, `HF_TOKEN` overrides the Hugging Face login-
-Keychain item for that invocation and is never persisted. The operation authenticates only
-the initial `huggingface.co` request, strips authorization from cross-origin redirects, and
+The operation starts only at the exact pinned `huggingface.co` coordinates and
 checkpoints only exact validator-matched byte ranges. A cancelled or interrupted operation
 never resumes network activity on restart; inspect it with `--model-status`, then explicitly
 choose `--resume-model` or `--discard-model`. Download and hashing progress are byte-accurate,
@@ -204,8 +201,8 @@ configuration readiness in `src/configuration_phase.zig`, transcription link sta
 | `src/hud.zig` | Silent waveform/processing overlay |
 | `src/surface.zig` | HUD-vs-sound feedback arbitration |
 | `src/feedback.zig` | Sound cues and timestamped logging |
-| `src/keychain.zig` | Separate OpenAI and Hugging Face login-Keychain items |
-| `src/model_store.zig` | Explicit authenticated Model Operation and atomic Model Installation activation |
+| `src/keychain.zig` | OpenAI login-Keychain item |
+| `src/model_store.zig` | Explicit credential-free Model Operation and atomic Model Installation activation |
 | `src/local_model_recovery.zig` | Local integrity verification versus runtime-load recovery policy |
 | `src/info_plist.zig` | Embedded `Info.plist` Mach-O section |
 

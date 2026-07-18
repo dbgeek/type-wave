@@ -1,12 +1,13 @@
 # Third-party notices
 
-## KB Whisper Small
+## Whisper Large v3 Turbo
 
-type-wave supports the official F16 `ggml-model.bin` from
-[`KBLab/kb-whisper-small`](https://huggingface.co/KBLab/kb-whisper-small), published by
-KBLab at the National Library of Sweden. The exact artifact and immutable revision are
-recorded in `PROVENANCE`. The model is offered under Apache License 2.0; the complete text
-is in `LICENSES/Apache-2.0.txt`.
+type-wave supports the official F16 `ggml-large-v3-turbo.bin` from
+[`ggerganov/whisper.cpp`](https://huggingface.co/ggerganov/whisper.cpp), the GGML
+conversion published by Georgi Gerganov of OpenAI's Whisper large-v3-turbo model.
+The exact artifact and immutable revision are recorded in `PROVENANCE`. The model is
+offered under the MIT License (© 2022 OpenAI); the complete text is in
+`LICENSES/OpenAI-Whisper-MIT.txt`.
 
 ## whisper.cpp
 

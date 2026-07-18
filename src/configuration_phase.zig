@@ -44,7 +44,7 @@ pub const ConfigurationPhase = struct {
         const snap = snapshot(facts);
         var actions = Actions{
             .connect_session = facts.selected_backend == .openai and facts.key_present and !facts.backend_present,
-            .prepare_local = facts.selected_backend == .local_kb_whisper and facts.local_installation_present and !facts.backend_present,
+            .prepare_local = facts.selected_backend == .local and facts.local_installation_present and !facts.backend_present,
             .enable_tap = facts.input_monitoring_granted and !facts.tap_enabled,
         };
         const is_configured = readiness.configured(snap);
@@ -196,7 +196,7 @@ test "session construction and missing prerequisite reporting are independent" {
 test "local Configuration Phase prepares offline without an OpenAI key" {
     var phase = ConfigurationPhase{};
     const out = phase.tick(makeFacts(.{
-        .selected_backend = .local_kb_whisper,
+        .selected_backend = .local,
         .key_present = false,
         .local_installation_present = true,
         .backend_present = false,

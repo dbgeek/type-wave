@@ -1,4 +1,4 @@
-//! Explicit, authenticated Model Operations for the pinned KB Whisper installation.
+//! Explicit, credential-free Model Operations for the pinned local Whisper installation.
 
 const std = @import("std");
 const artifact_identity = @import("artifact_identity.zig");
@@ -29,21 +29,19 @@ const staging_overhead_bytes: u64 = 16 * 1024 * 1024;
 const removal_intent_name = ".removal.pending";
 const runtime_lock_name = ".runtime.lock";
 const inference_lock_name = ".inference.lock";
-const credential_lock_name = ".credential.lock";
-const credential_revocation_name = ".credential-revocation.pending";
 
 pub const pinned_manifest = Manifest{
-    .repository = "KBLab/kb-whisper-small",
-    .revision = "3564d61a42fc210ceaa55a22a96dd64478959c78",
-    .artifact = "ggml-model.bin",
-    .installation_id = "3564d61a42fc-f16",
-    .url = "https://huggingface.co/KBLab/kb-whisper-small/resolve/3564d61a42fc210ceaa55a22a96dd64478959c78/ggml-model.bin",
-    .size = 487_601_984,
+    .repository = "ggerganov/whisper.cpp",
+    .revision = "98aa99a0a9db05ae2342309f5096248665f7cba3",
+    .artifact = "ggml-large-v3-turbo.bin",
+    .installation_id = "98aa99a0a9db-f16",
+    .url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/98aa99a0a9db05ae2342309f5096248665f7cba3/ggml-large-v3-turbo.bin",
+    .size = 1_624_555_275,
     .sha256 = .{
-        0xde, 0x69, 0x11, 0x33, 0x0c, 0xbd, 0xc1, 0x31,
-        0x36, 0x2f, 0x7a, 0x95, 0x56, 0x82, 0xb6, 0x5c,
-        0x8a, 0x5a, 0x23, 0x94, 0xca, 0xba, 0x73, 0xe7,
-        0xea, 0x82, 0x1a, 0x98, 0x22, 0xef, 0xb8, 0xc6,
+        0x1f, 0xc7, 0x0f, 0x77, 0x4d, 0x38, 0xeb, 0x16,
+        0x99, 0x93, 0xac, 0x39, 0x1e, 0xea, 0x35, 0x7e,
+        0xf4, 0x7c, 0x88, 0x75, 0x7e, 0xf7, 0x2e, 0xe5,
+        0x94, 0x38, 0x79, 0xb7, 0xe8, 0xe2, 0xbc, 0x69,
     },
 };
 
@@ -123,6 +121,10 @@ pub const InstallationIntegrity = union(enum) {
 
 const ActivationPolicy = enum { preserve_existing, replace_invalid };
 
+/// Repair always verifies offline first; the caller decides separately whether the
+/// operation may fall back to re-downloading invalid artifact data.
+pub const NetworkPolicy = enum { offline_only, allow_network };
+
 pub const ValidatorKind = enum { etag, last_modified };
 
 pub const Validator = struct {
@@ -150,31 +152,13 @@ pub const Validator = struct {
 
 pub const CancelToken = struct {
     requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    observe_credential_revocation: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    io: ?std.Io = null,
-    root: ?[]const u8 = null,
-
-    fn forOperation(io: std.Io, root: []const u8) CancelToken {
-        return .{ .io = io, .root = root };
-    }
 
     pub fn request(self: *CancelToken) void {
         self.requested.store(true, .release);
     }
 
     pub fn isRequested(self: *const CancelToken) bool {
-        if (self.requested.load(.acquire)) return true;
-        if (self.observe_credential_revocation.load(.acquire))
-            if (self.io) |io| if (self.root) |root| return credentialRevocationPending(io, root);
-        return false;
-    }
-
-    fn beginCredentialUse(self: *CancelToken) void {
-        self.observe_credential_revocation.store(true, .release);
-    }
-
-    fn endCredentialUse(self: *CancelToken) void {
-        self.observe_credential_revocation.store(false, .release);
+        return self.requested.load(.acquire);
     }
 
     pub fn signalFlag(self: *const CancelToken) *const std.atomic.Value(bool) {
@@ -276,49 +260,6 @@ pub const RuntimeLease = struct {
     }
 };
 
-const CredentialUseLease = struct {
-    shared: SharedFileLease,
-
-    fn acquire(io: std.Io, root: []const u8) !CredentialUseLease {
-        return .{ .shared = try SharedFileLease.acquire(io, root, credential_lock_name, credential_revocation_name, error.ModelOperationCancelled) };
-    }
-
-    fn release(self: *CredentialUseLease) void {
-        self.shared.release();
-    }
-};
-
-pub const CredentialRevocation = struct {
-    io: std.Io,
-    root: []const u8,
-    file: ?std.Io.File,
-
-    pub fn deinit(self: *CredentialRevocation) void {
-        removeIntentFile(self.io, self.root, credential_revocation_name);
-        if (self.file) |file| file.close(self.io);
-        self.file = null;
-    }
-};
-
-/// Phase one of Forget Token: publish a cancellation request without waiting for the
-/// transfer process. Its CancelToken observes this marker between network reads.
-pub fn requestCredentialRevocation(io: std.Io, root: []const u8) !void {
-    try writeIntentFile(io, root, credential_revocation_name);
-}
-
-/// Phase two waits until every authenticated transfer has cooperatively stopped. The
-/// caller deletes only the Hugging Face keychain item while this exclusive gate is held.
-pub fn finishCredentialRevocation(io: std.Io, root: []const u8) !CredentialRevocation {
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ root, credential_lock_name });
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .lock = .exclusive });
-    return .{ .io = io, .root = root, .file = file };
-}
-
-pub fn credentialRevocationPending(io: std.Io, root: []const u8) bool {
-    return intentFilePresent(io, root, credential_revocation_name);
-}
-
 pub fn modelRemovalPending(io: std.Io, root: []const u8) bool {
     return intentFilePresent(io, root, removal_intent_name);
 }
@@ -348,13 +289,8 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
             io: std.Io,
             path: []u8,
             file: std.Io.File,
-            credential: ?CredentialUseLease = null,
-            cancel: ?*CancelToken = null,
 
-            fn deinit(locked_value: LockedOperation) void {
-                var locked = locked_value;
-                if (locked.cancel) |cancel| cancel.endCredentialUse();
-                if (locked.credential) |*credential| credential.release();
+            fn deinit(locked: LockedOperation) void {
                 locked.file.close(locked.io);
                 locked.allocator.free(locked.path);
             }
@@ -378,7 +314,7 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
             transport: *Transport,
             smoke: *Smoke,
         ) Self {
-            return .{ .allocator = allocator, .io = io, .root = root, .manifest = manifest, .transport = transport, .smoke = smoke, .cancel = CancelToken.forOperation(io, root) };
+            return .{ .allocator = allocator, .io = io, .root = root, .manifest = manifest, .transport = transport, .smoke = smoke };
         }
 
         /// Inspect durable incomplete work after restart. This is deliberately filesystem-only:
@@ -407,15 +343,11 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
             return .{ .allocator = self.allocator, .io = self.io, .path = path, .file = file };
         }
 
-        fn beginAuthenticated(self: *Self, token: []const u8) !LockedOperation {
-            if (token.len == 0) return error.MissingHuggingFaceToken;
+        /// Acquisition is credential-free, but it may still only start at the exact
+        /// trusted origin embedded in the pinned manifest.
+        fn beginAcquisition(self: *Self) !LockedOperation {
             if (!isHuggingFaceOrigin(self.manifest.url)) return error.UntrustedArtifactOrigin;
-            var locked = try self.beginLocked();
-            errdefer locked.deinit();
-            locked.credential = try CredentialUseLease.acquire(self.io, self.root);
-            self.cancel.beginCredentialUse();
-            locked.cancel = &self.cancel;
-            return locked;
+            return self.beginLocked();
         }
 
         fn stagePaths(self: *Self) !StagePaths {
@@ -427,8 +359,8 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
 
         /// One explicit Model Operation: acquire, verify, smoke-test, then publish.
         /// Nothing before the final receipt rename can replace the active installation.
-        pub fn install(self: *Self, token: []const u8) !void {
-            const locked = try self.beginAuthenticated(token);
+        pub fn install(self: *Self) !void {
+            const locked = try self.beginAcquisition();
             defer locked.deinit();
             if (try activeInstallationPresent(self.io, self.root, self.manifest)) return;
 
@@ -442,12 +374,12 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
             try std.Io.Dir.cwd().createDirPath(self.io, paths.directory);
             var file = try std.Io.Dir.cwd().createFile(self.io, paths.model, .{ .read = true, .permissions = .fromMode(0o600) });
             defer file.close(self.io);
-            try self.acquire(token, paths.directory, file, 0, null);
+            try self.acquire(paths.directory, file, 0, null);
             try self.activate(paths.model, paths.directory, .preserve_existing);
         }
 
-        pub fn resumePartial(self: *Self, token: []const u8) !void {
-            const locked = try self.beginAuthenticated(token);
+        pub fn resumePartial(self: *Self) !void {
+            const locked = try self.beginAcquisition();
             defer locked.deinit();
             const partial = (try loadPartial(self.io, self.root, self.manifest)) orelse return error.NoResumablePartial;
             try self.preflightCapacity(self.manifest.size - partial.offset);
@@ -455,7 +387,7 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
             defer paths.deinit();
             var file = try std.Io.Dir.cwd().openFile(self.io, paths.model, .{ .mode = .read_write });
             defer file.close(self.io);
-            self.acquire(token, paths.directory, file, partial.offset, partial.validator) catch |failure| {
+            self.acquire(paths.directory, file, partial.offset, partial.validator) catch |failure| {
                 if (isIncompatibleResumeFailure(failure)) try discardStage(self.io, paths.directory);
                 return failure;
             };
@@ -463,8 +395,8 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
         }
 
         /// Explicit, filesystem-only full verification of the active Model Installation.
-        /// This deliberately performs no smoke test and cannot access credentials or the
-        /// network: a verified artifact that still will not load is a runtime failure.
+        /// This deliberately performs no smoke test and cannot access the network:
+        /// a verified artifact that still will not load is a runtime failure.
         pub fn verify(self: *Self) !InstallationIntegrity {
             const locked = try self.beginLocked();
             defer locked.deinit();
@@ -472,8 +404,8 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
         }
 
         /// Repair always starts with the same full offline verification as Verify. A
-        /// usable installation is left byte-for-byte untouched and needs no credential.
-        pub fn repair(self: *Self, token: ?[]const u8) !void {
+        /// usable installation is left byte-for-byte untouched and needs no network.
+        pub fn repair(self: *Self, network: NetworkPolicy) !void {
             const locked = try self.beginLocked();
             defer locked.deinit();
             const integrity = try verifyActiveInstallationUnlocked(self.io, self.root, self.manifest, self.additional_trusted_manifests, &self.cancel, self.observer);
@@ -516,13 +448,8 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
                 };
                 if ((try verifyActiveInstallationUnlocked(self.io, self.root, self.manifest, self.additional_trusted_manifests, &self.cancel, self.observer)) == .usable) return;
             }
-            const credential = token orelse return error.MissingHuggingFaceToken;
-            if (credential.len == 0) return error.MissingHuggingFaceToken;
+            if (network == .offline_only) return error.ModelRepairRequiresNetwork;
             if (!isHuggingFaceOrigin(self.manifest.url)) return error.UntrustedArtifactOrigin;
-            var credential_lease = try CredentialUseLease.acquire(self.io, self.root);
-            defer credential_lease.release();
-            self.cancel.beginCredentialUse();
-            defer self.cancel.endCredentialUse();
             if (corruption != .invalid_receipt) {
                 var receipt_buffer: [1024]u8 = undefined;
                 const active = (try activeReceipt(self.io, self.root, &receipt_buffer)) orelse return error.NoModelInstallation;
@@ -535,7 +462,7 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
                 try self.preflightCapacity(self.manifest.size - partial.offset);
                 var file = try std.Io.Dir.cwd().openFile(self.io, paths.model, .{ .mode = .read_write });
                 defer file.close(self.io);
-                self.acquire(credential, paths.directory, file, partial.offset, partial.validator) catch |failure| {
+                self.acquire(paths.directory, file, partial.offset, partial.validator) catch |failure| {
                     if (isIncompatibleResumeFailure(failure)) try discardStage(self.io, paths.directory);
                     return failure;
                 };
@@ -545,7 +472,7 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
                 try std.Io.Dir.cwd().createDirPath(self.io, paths.directory);
                 var file = try std.Io.Dir.cwd().createFile(self.io, paths.model, .{ .read = true, .permissions = .fromMode(0o600) });
                 defer file.close(self.io);
-                try self.acquire(credential, paths.directory, file, 0, null);
+                try self.acquire(paths.directory, file, 0, null);
             }
             try self.activate(paths.model, paths.directory, .replace_invalid);
         }
@@ -593,7 +520,7 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
                 return error.InsufficientModelStorage;
         }
 
-        fn acquire(self: *Self, token: []const u8, stage_dir: []const u8, file: std.Io.File, starting_offset: u64, starting_validator: ?Validator) !void {
+        fn acquire(self: *Self, stage_dir: []const u8, file: std.Io.File, starting_offset: u64, starting_validator: ?Validator) !void {
             if (self.chunk_size == 0) return error.InvalidModelChunkSize;
             var offset = starting_offset;
             var validator = starting_validator;
@@ -613,7 +540,7 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
                     .cancel = &self.cancel,
                 };
                 const result = while (true) {
-                    break self.transport.download(self.manifest.url, token, request, &writer) catch |failure| {
+                    break self.transport.download(self.manifest.url, request, &writer) catch |failure| {
                         if (failure == error.ModelOperationCancelled) return failure;
                         if (!isTransientDownloadFailure(failure)) return failure;
                         if (retries == self.retry_budget) return error.ModelDownloadRetryBudgetExhausted;
@@ -1352,19 +1279,11 @@ fn isHuggingFaceUri(uri: std.Uri) bool {
     return std.ascii.eqlIgnoreCase(host.bytes, "huggingface.co");
 }
 
-/// Policy helper used by the HTTP adapter: credentials exist only on the exact trusted
-/// origin. The adapter resolves each redirect itself and calls this policy again.
-pub fn authorizationFor(url: []const u8, token: []const u8, buffer: []u8) ?[]const u8 {
-    if (!isHuggingFaceOrigin(url) or token.len == 0) return null;
-    return std.fmt.bufPrint(buffer, "Bearer {s}", .{token}) catch null;
-}
-
 pub const HttpTransport = struct {
     client: *std.http.Client,
 
-    pub fn download(self: *HttpTransport, url: []const u8, token: []const u8, download_request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
-        var authorization_buffer: [4096]u8 = undefined;
-        const authorization = authorizationFor(url, token, &authorization_buffer) orelse return error.UntrustedArtifactOrigin;
+    pub fn download(self: *HttpTransport, url: []const u8, download_request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+        if (!isHuggingFaceOrigin(url)) return error.UntrustedArtifactOrigin;
         var range_buffer: [128]u8 = undefined;
         const range = try std.fmt.bufPrint(&range_buffer, "bytes={d}-{d}", .{ download_request.offset, download_request.end });
         const allocator = self.client.allocator;
@@ -1376,8 +1295,6 @@ pub const HttpTransport = struct {
         while (redirect_count <= 5) : (redirect_count += 1) {
             if (download_request.cancel.isRequested()) return error.ModelOperationCancelled;
             const uri = try std.Uri.parse(current_url);
-            const privileged_storage = [_]std.http.Header{.{ .name = "Authorization", .value = authorization }};
-            const privileged: []const std.http.Header = if (isHuggingFaceUri(uri)) &privileged_storage else &.{};
             var range_headers: [2]std.http.Header = undefined;
             range_headers[0] = .{ .name = "Range", .value = range };
             var range_header_count: usize = 1;
@@ -1388,7 +1305,6 @@ pub const HttpTransport = struct {
             var request = try self.client.request(.GET, uri, .{
                 .redirect_behavior = .unhandled,
                 .headers = .{ .accept_encoding = .omit },
-                .privileged_headers = privileged,
                 .extra_headers = range_headers[0..range_header_count],
             });
             errdefer request.deinit();
@@ -1413,7 +1329,7 @@ pub const HttpTransport = struct {
             }
 
             if (response.head.status == .unauthorized or response.head.status == .forbidden)
-                return error.HuggingFaceAuthenticationFailed;
+                return error.ModelDownloadRejected;
             const response_validator = try validateRangeResponse(response.head, download_request);
             const expected_count = download_request.end - download_request.offset + 1;
             var transfer_buffer: [64 * 1024]u8 = undefined;
@@ -1502,7 +1418,7 @@ test "Model Operation verifies and smoke-tests before publishing the active rece
         &transport,
         &smoke,
     );
-    try operation.install("hf_secret");
+    try operation.install();
 
     try std.testing.expect(smoke.called);
     try std.testing.expect(try activeInstallationPresent(std.testing.io, root_buf[0..root_len], test_manifest));
@@ -1534,7 +1450,7 @@ test "explicit Verify reads every artifact byte and distinguishes usable from co
     var transport = FakeTransport{};
     var smoke = FakeSmoke{};
     var operation = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
-    try operation.install("hf_secret");
+    try operation.install();
 
     try std.testing.expect((try operation.verify()) == .usable);
     var model_path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1580,10 +1496,10 @@ test "Repair preserves a usable Model Installation without network access" {
     var transport = FakeTransport{};
     var smoke = FakeSmoke{};
     var operation = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
-    try operation.install("hf_secret");
+    try operation.install();
     transport.calls = 0;
 
-    try operation.repair(null);
+    try operation.repair(.offline_only);
 
     try std.testing.expectEqual(@as(usize, 0), transport.calls);
     try std.testing.expect((try operation.verify()) == .usable);
@@ -1598,13 +1514,13 @@ test "confirmed Repair replaces only an invalid artifact through authenticated a
     var transport = FakeTransport{};
     var smoke = FakeSmoke{};
     var operation = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
-    try operation.install("hf_secret");
+    try operation.install();
     var model_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const model_path = (try activeModelPath(std.testing.io, root, &model_path_buf)).?;
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = model_path, .data = "binned test model" });
     transport.calls = 0;
 
-    try operation.repair("hf_secret");
+    try operation.repair(.allow_network);
 
     try std.testing.expect(transport.calls > 0);
     try std.testing.expect((try operation.verify()) == .usable);
@@ -1620,7 +1536,7 @@ test "confirmed Repair replaces only an invalid artifact through authenticated a
     const repaired_manifest = try std.fmt.bufPrint(&repaired_manifest_buf, "{s}/MODEL_MANIFEST", .{repaired_directory});
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = repaired_manifest, .data = "damaged metadata\n" });
     transport.calls = 0;
-    try operation.repair(null);
+    try operation.repair(.offline_only);
     try std.testing.expectEqual(@as(usize, 0), transport.calls);
     try std.testing.expect((try operation.verify()) == .usable);
 }
@@ -1641,11 +1557,10 @@ test "Model Operation transport observes only pinned artifact coordinates" {
         &smoke,
     );
 
-    try operation.install("hf_secret");
+    try operation.install();
 
     try std.testing.expect(transport.calls > 0);
     try std.testing.expectEqualStrings(test_manifest.url, transport.last_url.?);
-    try std.testing.expectEqualStrings("hf_secret", transport.last_token.?);
     try std.testing.expect(transport.last_request != null);
     // DownloadRequest is deliberately an artifact-only type: it has byte range,
     // validator, and cancellation state, with no PCM or transcript field.
@@ -1669,7 +1584,7 @@ test "Repair preserves and resumes validator-bound valid partial data" {
     var smoke = FakeSmoke{};
     var operation = Operation(ResumingTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
 
-    try operation.repair("hf_secret");
+    try operation.repair(.allow_network);
 
     try std.testing.expectEqual(@as(?u64, 6), transport.first_offset);
     try std.testing.expect((try operation.verify()) == .usable);
@@ -1684,13 +1599,13 @@ test "Repair rebuilds invalid installation metadata without network access" {
     var transport = FakeTransport{};
     var smoke = FakeSmoke{};
     var operation = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
-    try operation.install("hf_secret");
+    try operation.install();
     var manifest_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const manifest_path = try std.fmt.bufPrint(&manifest_path_buf, "{s}/installations/{s}/MODEL_MANIFEST", .{ root, test_manifest.installation_id });
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = manifest_path, .data = "damaged metadata\n" });
     transport.calls = 0;
 
-    try operation.repair(null);
+    try operation.repair(.offline_only);
 
     try std.testing.expectEqual(@as(usize, 0), transport.calls);
     try std.testing.expect((try operation.verify()) == .usable);
@@ -1705,14 +1620,14 @@ test "Repair reconstructs an invalid receipt from verified pinned local data" {
     var transport = FakeTransport{};
     var smoke = FakeSmoke{};
     var operation = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
-    try operation.install("hf_secret");
+    try operation.install();
     var receipt_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const receipt_path = try std.fmt.bufPrint(&receipt_path_buf, "{s}/active.receipt", .{root});
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = receipt_path, .data = "invalid receipt\n" });
     transport.calls = 0;
     smoke.called = false;
 
-    try operation.repair(null);
+    try operation.repair(.offline_only);
 
     try std.testing.expectEqual(@as(usize, 0), transport.calls);
     try std.testing.expect(smoke.called);
@@ -1728,12 +1643,12 @@ test "an interrupted receipt publish is recoverable and startup rejects changed 
     var transport = FakeTransport{};
     var smoke = FakeSmoke{};
     var operation = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
-    try operation.install("hf_secret");
+    try operation.install();
 
     var receipt_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const receipt_path = try std.fmt.bufPrint(&receipt_path_buf, "{s}/active.receipt", .{root});
     try std.Io.Dir.cwd().deleteFile(std.testing.io, receipt_path);
-    try operation.install("hf_secret");
+    try operation.install();
     try std.testing.expect(try activeInstallationPresent(std.testing.io, root, test_manifest));
 
     var model_path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1755,7 +1670,7 @@ test "failed verification or smoke test cannot replace the active receipt" {
     var short_transport = ShortTransport{};
     var smoke = FakeSmoke{};
     var bad_size = Operation(ShortTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &short_transport, &smoke);
-    try std.testing.expectError(error.ModelDownloadTruncated, bad_size.install("hf_secret"));
+    try std.testing.expectError(error.ModelDownloadTruncated, bad_size.install());
     try std.testing.expect(!smoke.called);
 
     var actual_buf: [64]u8 = undefined;
@@ -1764,14 +1679,14 @@ test "failed verification or smoke test cannot replace the active receipt" {
 
     var bad_transport = BadTransport{};
     var bad_digest = Operation(BadTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &bad_transport, &smoke);
-    try std.testing.expectError(error.ModelDigestMismatch, bad_digest.install("hf_secret"));
+    try std.testing.expectError(error.ModelDigestMismatch, bad_digest.install());
     try std.testing.expect(!smoke.called);
     try std.testing.expectEqual(OperationPhase.idle, (try bad_digest.recover()).phase);
 
     var transport = FakeTransport{};
     var failing_smoke = FailingSmoke{};
     var bad_smoke = Operation(FakeTransport, FailingSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &failing_smoke);
-    try std.testing.expectError(error.HelperSmokeTestFailed, bad_smoke.install("hf_secret"));
+    try std.testing.expectError(error.HelperSmokeTestFailed, bad_smoke.install());
     const after_smoke_failure = try std.Io.Dir.cwd().readFile(std.testing.io, receipt_path, &actual_buf);
     try std.testing.expectEqualStrings("previous installation\n", after_smoke_failure);
 }
@@ -1797,7 +1712,7 @@ test "a working older Model Installation remains active when the embedded identi
     verifier.additional_trusted_manifests = &.{test_manifest};
     try std.testing.expect((try verifier.verify()) == .usable);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = active_path, .data = "binned test model" });
-    try verifier.repair("hf_secret");
+    try verifier.repair(.allow_network);
     try std.testing.expect((try verifier.verify()) == .usable);
     try std.testing.expect(try updateAvailable(std.testing.io, root, desired));
 }
@@ -1811,7 +1726,7 @@ test "a schema-one receipt remains usable and reports an embedded replacement" {
     var transport = FakeTransport{};
     var smoke = FakeSmoke{};
     var operation = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
-    try operation.install("hf_secret");
+    try operation.install();
 
     var receipt_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const receipt_path = try std.fmt.bufPrint(&receipt_path_buf, "{s}/active.receipt", .{root});
@@ -1845,7 +1760,7 @@ test "a failed replacement leaves the working Model Installation unchanged and u
     var failing_smoke = FailingSmoke{};
     var replacement = Operation(FakeTransport, FailingSmoke).init(std.testing.allocator, std.testing.io, root, desired, &replacement_transport, &failing_smoke);
 
-    try std.testing.expectError(error.HelperSmokeTestFailed, replacement.install("hf_secret"));
+    try std.testing.expectError(error.HelperSmokeTestFailed, replacement.install());
     try std.testing.expect(try updateAvailable(std.testing.io, root, desired));
     var active_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const active_path = (try activeModelPath(std.testing.io, root, &active_path_buf)).?;
@@ -1868,7 +1783,7 @@ test "replacement activation waits for the active inference lease to drain" {
     var replacement = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, desired, &replacement_transport, &replacement_smoke);
     replacement.observer = .{ .ctx = &drain, .on_event = ActivationDrainLog.record };
 
-    try replacement.install("hf_secret");
+    try replacement.install();
 
     try std.testing.expect(drain.released);
     try std.testing.expectEqual(@as(usize, 1), drain.waits);
@@ -1912,32 +1827,12 @@ test "confirmed removal rejects new local Utterances, drains the helper, and rem
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stage, .{}));
 }
 
-test "forgetting the Hugging Face token cancels transfer and retains resumable data" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
-    const root = root_buf[0..root_len];
-
-    var transport = CredentialRevokingTransport{ .io = std.testing.io, .root = root };
-    var smoke = FakeSmoke{};
-    var operation = Operation(CredentialRevokingTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
-    operation.chunk_size = 6;
-
-    try std.testing.expectError(error.ModelOperationCancelled, operation.install("hf_secret"));
-    const recovery = try operation.recover();
-    try std.testing.expectEqual(OperationPhase.paused, recovery.phase);
-    try std.testing.expectEqual(@as(u64, 6), recovery.bytes.completed);
-    var revocation = try finishCredentialRevocation(std.testing.io, root);
-    revocation.deinit();
-    try std.testing.expect(!credentialRevocationPending(std.testing.io, root));
-}
-
-test "Hugging Face authorization is never constructed for a cross-origin request" {
-    var buffer: [128]u8 = undefined;
-    try std.testing.expectEqualStrings("Bearer hf_secret", authorizationFor(test_manifest.url, "hf_secret", &buffer).?);
-    try std.testing.expect(authorizationFor("https://cdn-lfs.hf.co/signed?secret=value", "hf_secret", &buffer) == null);
-    try std.testing.expect(authorizationFor("https://huggingface.co.evil.example/model", "hf_secret", &buffer) == null);
+test "acquisition starts only at the exact trusted artifact origin" {
+    try std.testing.expect(isHuggingFaceOrigin(test_manifest.url));
+    try std.testing.expect(isHuggingFaceOrigin(pinned_manifest.url));
+    try std.testing.expect(!isHuggingFaceOrigin("https://cdn-lfs.hf.co/signed?secret=value"));
+    try std.testing.expect(!isHuggingFaceOrigin("https://huggingface.co.evil.example/model"));
+    try std.testing.expect(!isHuggingFaceOrigin("http://huggingface.co/model"));
 }
 
 test "restart exposes a validator-bound partial as paused without network activity" {
@@ -2036,7 +1931,7 @@ test "explicit resume appends only a matching validated 206 range" {
     var transport = ResumingTransport{};
     var smoke = FakeSmoke{};
     var operation = Operation(ResumingTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
-    try operation.resumePartial("hf_secret");
+    try operation.resumePartial();
 
     try std.testing.expectEqual(@as(u64, 6), transport.first_offset.?);
     try std.testing.expectEqualStrings("\"immutable-test\"", transport.if_range.?.value());
@@ -2054,7 +1949,7 @@ test "resume discards a partial when the server validator does not match" {
     var transport = MismatchedResumeTransport{};
     var smoke = FakeSmoke{};
     var operation = Operation(MismatchedResumeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
-    try std.testing.expectError(error.ResumeResponseMismatch, operation.resumePartial("hf_secret"));
+    try std.testing.expectError(error.ResumeResponseMismatch, operation.resumePartial());
     try std.testing.expectEqual(OperationPhase.idle, (try operation.recover()).phase);
     try std.testing.expect(!smoke.called);
 }
@@ -2070,7 +1965,7 @@ test "resume discards a partial when the server range is incompatible" {
     var transport = IncompatibleRangeTransport{};
     var smoke = FakeSmoke{};
     var operation = Operation(IncompatibleRangeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
-    try std.testing.expectError(error.ModelDownloadRangeMismatch, operation.resumePartial("hf_secret"));
+    try std.testing.expectError(error.ModelDownloadRangeMismatch, operation.resumePartial());
     try std.testing.expectEqual(OperationPhase.idle, (try operation.recover()).phase);
 }
 
@@ -2085,7 +1980,7 @@ test "resume discards a partial when the server validator is malformed" {
     var transport = MalformedValidatorTransport{};
     var smoke = FakeSmoke{};
     var operation = Operation(MalformedValidatorTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
-    try std.testing.expectError(error.InvalidModelValidator, operation.resumePartial("hf_secret"));
+    try std.testing.expectError(error.InvalidModelValidator, operation.resumePartial());
     try std.testing.expectEqual(OperationPhase.idle, (try operation.recover()).phase);
 }
 
@@ -2146,7 +2041,7 @@ test "transient download retries stop at a bounded visible budget" {
     operation.retry_delay_ms = 0;
     operation.observer = .{ .ctx = &events, .on_event = EventLog.record };
 
-    try std.testing.expectError(error.ModelDownloadRetryBudgetExhausted, operation.install("hf_secret"));
+    try std.testing.expectError(error.ModelDownloadRetryBudgetExhausted, operation.install());
     try std.testing.expectEqual(@as(usize, 4), transport.requests);
     try std.testing.expectEqual(@as(usize, 3), events.retries);
     try std.testing.expect(!smoke.called);
@@ -2165,7 +2060,7 @@ test "retry budget is bounded across the complete multi-chunk operation" {
     operation.retry_delay_ms = 0;
     operation.observer = .{ .ctx = &events, .on_event = EventLog.record };
 
-    try std.testing.expectError(error.ModelDownloadRetryBudgetExhausted, operation.install("hf_secret"));
+    try std.testing.expectError(error.ModelDownloadRetryBudgetExhausted, operation.install());
     try std.testing.expectEqual(@as(usize, 7), transport.requests);
     try std.testing.expectEqual(@as(usize, 3), events.retries);
 }
@@ -2182,7 +2077,7 @@ test "a truncated transfer is retried visibly before installation continues" {
     operation.retry_delay_ms = 0;
     operation.observer = .{ .ctx = &events, .on_event = EventLog.record };
 
-    try operation.install("hf_secret");
+    try operation.install();
     try std.testing.expectEqual(@as(usize, 2), transport.requests);
     try std.testing.expectEqual(@as(usize, 1), events.retries);
 }
@@ -2203,7 +2098,7 @@ test "cancellation during hashing preserves the active installation boundary" {
     cancel_on_hash.cancel = &operation.cancel;
     operation.observer = .{ .ctx = &cancel_on_hash, .on_event = CancelOnHash.record };
 
-    try std.testing.expectError(error.ModelOperationCancelled, operation.install("hf_secret"));
+    try std.testing.expectError(error.ModelOperationCancelled, operation.install());
     var receipt_buf: [64]u8 = undefined;
     const receipt_text = try std.Io.Dir.cwd().readFile(std.testing.io, receipt_path, &receipt_buf);
     try std.testing.expectEqualStrings("previous installation\n", receipt_text);
@@ -2226,7 +2121,7 @@ test "cancellation during transfer leaves the working receipt untouched" {
     var smoke = FakeSmoke{};
     var operation = Operation(CancellingTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
 
-    try std.testing.expectError(error.ModelOperationCancelled, operation.install("hf_secret"));
+    try std.testing.expectError(error.ModelOperationCancelled, operation.install());
     var receipt_buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("working\n", try std.Io.Dir.cwd().readFile(std.testing.io, receipt_path, &receipt_buf));
     try std.testing.expect(!smoke.called);
@@ -2242,7 +2137,7 @@ test "cancellation during smoke testing pauses the verified download before acti
     var smoke = CancellingSmoke{};
     var operation = Operation(FakeTransport, CancellingSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
 
-    try std.testing.expectError(error.ModelOperationCancelled, operation.install("hf_secret"));
+    try std.testing.expectError(error.ModelOperationCancelled, operation.install());
     try std.testing.expectEqual(OperationPhase.paused, (try operation.recover()).phase);
     try std.testing.expect(!try activeInstallationPresent(std.testing.io, root, test_manifest));
 }
@@ -2254,7 +2149,7 @@ fn installTestModel(root: []const u8) !void {
     var transport = FakeTransport{};
     var smoke = FakeSmoke{};
     var operation = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
-    try operation.install("hf_secret");
+    try operation.install();
 }
 
 fn replacementManifest() Manifest {
@@ -2268,13 +2163,11 @@ fn replacementManifest() Manifest {
 const FakeTransport = struct {
     calls: usize = 0,
     last_url: ?[]const u8 = null,
-    last_token: ?[]const u8 = null,
     last_request: ?DownloadRequest = null,
 
-    pub fn download(self: *FakeTransport, url: []const u8, token: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+    pub fn download(self: *FakeTransport, url: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
         self.calls += 1;
         self.last_url = url;
-        self.last_token = token;
         self.last_request = request;
         try writer.writeAll(test_bytes[@intCast(request.offset)..@intCast(request.end + 1)]);
         return DownloadResult.fromValidator(.etag, "\"immutable-test\"");
@@ -2288,7 +2181,7 @@ const CountingTransport = struct {
 const AlwaysTransientTransport = struct {
     requests: usize = 0,
 
-    pub fn download(self: *AlwaysTransientTransport, _: []const u8, _: []const u8, _: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
+    pub fn download(self: *AlwaysTransientTransport, _: []const u8,_: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
         self.requests += 1;
         return error.ModelDownloadFailed;
     }
@@ -2297,7 +2190,7 @@ const AlwaysTransientTransport = struct {
 const IntermittentTransport = struct {
     requests: usize = 0,
 
-    pub fn download(self: *IntermittentTransport, _: []const u8, _: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+    pub fn download(self: *IntermittentTransport, _: []const u8,request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
         self.requests += 1;
         if (self.requests % 2 == 1) return error.ModelDownloadFailed;
         try writer.writeAll(test_bytes[@intCast(request.offset)..@intCast(request.end + 1)]);
@@ -2308,7 +2201,7 @@ const IntermittentTransport = struct {
 const TruncatedThenSuccessTransport = struct {
     requests: usize = 0,
 
-    pub fn download(self: *TruncatedThenSuccessTransport, _: []const u8, _: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+    pub fn download(self: *TruncatedThenSuccessTransport, _: []const u8,request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
         self.requests += 1;
         if (self.requests == 1) return error.ModelDownloadTruncated;
         try writer.writeAll(test_bytes[@intCast(request.offset)..@intCast(request.end + 1)]);
@@ -2317,7 +2210,7 @@ const TruncatedThenSuccessTransport = struct {
 };
 
 const CancellingTransport = struct {
-    pub fn download(_: *CancellingTransport, _: []const u8, _: []const u8, request: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
+    pub fn download(_: *CancellingTransport, _: []const u8,request: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
         request.cancel.request();
         return error.ModelOperationCancelled;
     }
@@ -2372,22 +2265,6 @@ const RemovalDrainLog = struct {
     }
 };
 
-const CredentialRevokingTransport = struct {
-    io: std.Io,
-    root: []const u8,
-    calls: usize = 0,
-
-    pub fn download(self: *CredentialRevokingTransport, _: []const u8, _: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
-        self.calls += 1;
-        if (self.calls == 2) {
-            try requestCredentialRevocation(self.io, self.root);
-            if (request.cancel.isRequested()) return error.ModelOperationCancelled;
-        }
-        try writer.writeAll(test_bytes[@intCast(request.offset)..@intCast(request.end + 1)]);
-        return DownloadResult.fromValidator(.etag, "\"immutable-test\"");
-    }
-};
-
 const CancelOnHash = struct {
     cancel: *CancelToken = undefined,
 
@@ -2401,7 +2278,7 @@ const ResumingTransport = struct {
     first_offset: ?u64 = null,
     if_range: ?Validator = null,
 
-    pub fn download(self: *ResumingTransport, _: []const u8, _: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+    pub fn download(self: *ResumingTransport, _: []const u8,request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
         if (self.first_offset == null) {
             self.first_offset = request.offset;
             self.if_range = request.validator.?;
@@ -2412,20 +2289,20 @@ const ResumingTransport = struct {
 };
 
 const MismatchedResumeTransport = struct {
-    pub fn download(_: *MismatchedResumeTransport, _: []const u8, _: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+    pub fn download(_: *MismatchedResumeTransport, _: []const u8,request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
         try writer.writeAll(test_bytes[@intCast(request.offset)..@intCast(request.end + 1)]);
         return DownloadResult.fromValidator(.etag, "\"different\"");
     }
 };
 
 const IncompatibleRangeTransport = struct {
-    pub fn download(_: *IncompatibleRangeTransport, _: []const u8, _: []const u8, _: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
+    pub fn download(_: *IncompatibleRangeTransport, _: []const u8,_: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
         return error.ModelDownloadRangeMismatch;
     }
 };
 
 const MalformedValidatorTransport = struct {
-    pub fn download(_: *MalformedValidatorTransport, _: []const u8, _: []const u8, _: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
+    pub fn download(_: *MalformedValidatorTransport, _: []const u8,_: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
         return error.InvalidModelValidator;
     }
 };
@@ -2458,7 +2335,7 @@ const FakeSmoke = struct {
 };
 
 const BadTransport = struct {
-    pub fn download(_: *BadTransport, _: []const u8, _: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+    pub fn download(_: *BadTransport, _: []const u8,request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
         const bad_bytes = "tinned test model";
         try writer.writeAll(bad_bytes[@intCast(request.offset)..@intCast(request.end + 1)]);
         return DownloadResult.fromValidator(.etag, "\"immutable-test\"");
@@ -2466,7 +2343,7 @@ const BadTransport = struct {
 };
 
 const ShortTransport = struct {
-    pub fn download(_: *ShortTransport, _: []const u8, _: []const u8, _: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+    pub fn download(_: *ShortTransport, _: []const u8,_: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
         try writer.writeAll("wrong");
         return DownloadResult.fromValidator(.etag, "\"immutable-test\"");
     }

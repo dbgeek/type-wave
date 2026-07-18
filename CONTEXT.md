@@ -34,11 +34,11 @@ The live connection to the transcription service over which an Utterance's audio
 _Avoid_: websocket (mechanism)
 
 **Transcription Backend**:
-The selected source of a Final Transcript for an Utterance; it may also emit Partial Transcripts. OpenAI is the default backend; a local KB Whisper backend is an offline alternative.
+The selected source of a Final Transcript for an Utterance; it may also emit Partial Transcripts. OpenAI is the default backend; the local Whisper backend is an offline alternative.
 _Avoid_: transcription provider, engine
 
 **Model Installation**:
-A verified local copy of the pinned KB Whisper artifact that the local Transcription Backend can use offline. It exists independently of both Hugging Face credentials and any Model Operation in progress.
+A verified local copy of the pinned model artifact (currently ggml-large-v3-turbo; see `packaging/share/type-wave/PROVENANCE`) that the local Transcription Backend can use offline. Downloaded credential-free; it exists independently of any Model Operation in progress.
 _Avoid_: downloaded model, model cache
 
 **Model Operation**:

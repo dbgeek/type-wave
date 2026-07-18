@@ -118,13 +118,10 @@ prompts (and the entries in **System Settings → Privacy & Security**) are attr
 > into the keychain the first time the daemon looks for it (the log says when the file can
 > be deleted). A missing key is not fatal: the self-heal supervisor polls until one appears.
 
-The Hugging Face token for an explicit local-model operation is a second generic-password
-item under the same service, account `huggingface-token`, label
-`type-wave Hugging Face token`. Store it separately with
-`~/.local/bin/type-wave --set-hf-token`; `HF_TOKEN` is a foreground-only override for
-`--install-model` or `--resume-model` and is never written to Keychain or the LaunchAgent
-plist. Interrupted work stays paused without automatic network access; use `--model-status`,
-then explicitly run `--resume-model` or `--discard-model`.
+The pinned local model artifact is downloaded credential-free from its exact pinned
+Hugging Face coordinates; no second Keychain item exists for it. Interrupted work stays
+paused without automatic network access; use `--model-status`, then explicitly run
+`--resume-model` or `--discard-model`.
 
 ## Verify grant persistence across a rebuild (the point of #15)
 
@@ -170,8 +167,8 @@ rm -rf ~/.local/share/type-wave
 ```
 
 Removing the libexec directory removes the `type-wave-whisper` fixed path and the immutable
-daemon/helper pair directories behind it. This leaves Model Installations, both
-login-Keychain items, and TCC grants intact.
+daemon/helper pair directories behind it. This leaves Model Installations, the
+login-Keychain item, and TCC grants intact.
 
 ### 2. Model Installation data
 
@@ -180,13 +177,11 @@ active local Utterance may finish and the helper unloads first. After removing t
 package, the user may separately remove
 `~/Library/Application Support/type-wave/models/`. Neither path removes credentials.
 
-### 3. Login-Keychain items
+### 3. Login-Keychain item
 
-The two credentials are separate generic-password items and neither is removed with binaries
-or model data. Forget the Hugging Face item with
-`~/.local/bin/type-wave --forget-hf-token` before removing the binary, or delete the account
-`huggingface-token` manually in Keychain Access. Delete the distinct `openai-api-key` account
-only through a separate Keychain Access action (service `me.ba78.type-wave`).
+The OpenAI credential is a generic-password item and is not removed with binaries or model
+data. Delete the `openai-api-key` account only through a separate Keychain Access action
+(service `me.ba78.type-wave`).
 
 ### 4. TCC grants and signing identity
 

@@ -211,12 +211,12 @@ const FailureObservation = struct {
 test "Model Operation observation retains the actionable terminal failure" {
     var observation = ModelOperationObservation{};
     observation.begin(42, .installing, .install);
-    observation.observeFailure("--install-model: HuggingFaceAuthenticationFailed");
+    observation.observeFailure("--install-model: ModelDownloadRejected");
     observation.finish(false);
 
     const current = observation.current().?;
     try std.testing.expectEqual(status_item.Operation.failed, current.phase);
-    try std.testing.expectEqualStrings("--install-model: HuggingFaceAuthenticationFailed", current.failure_detail.?.value());
+    try std.testing.expectEqualStrings("--install-model: ModelDownloadRejected", current.failure_detail.?.value());
 }
 
 // ---- tuning ----------------------------------------------------------------
@@ -354,7 +354,7 @@ const TranscriptionAdapter = struct {
         if (!self.selection.isReady()) return false;
         return switch (self.selection.selected) {
             .openai => if (self.current()) |session| session.isReady() else false,
-            .local_kb_whisper => if (self.currentLocal()) |local| local.isReady() else false,
+            .local => if (self.currentLocal()) |local| local.isReady() else false,
         };
     }
     pub fn acquire(self: *TranscriptionAdapter, id: backend.UtteranceId) ?backend.Lease {
@@ -364,7 +364,7 @@ const TranscriptionAdapter = struct {
             return null;
         };
         self.selection_mu.unlock(self.io);
-        if (acquired_backend == .local_kb_whisper) {
+        if (acquired_backend == .local) {
             const local = self.currentLocal() orelse {
                 self.resolve(id);
                 return null;
@@ -413,7 +413,7 @@ const TranscriptionAdapter = struct {
         const route = self.activeRoute() orelse return error.NoActiveUtterance;
         switch (route.backend) {
             .openai => try commands.append_audio(self, route.id, pcm),
-            .local_kb_whisper => try (self.currentLocal() orelse return error.NoLocalBackend).appendAudio(route.id, pcm),
+            .local => try (self.currentLocal() orelse return error.NoLocalBackend).appendAudio(route.id, pcm),
         }
         return route.id;
     }
@@ -636,10 +636,10 @@ const Daemon = struct {
         }) catch |failure| retry: {
             if (self.local_model_recovery.loadFailed() != .verify) {
                 self.local_failure.setError("Local runtime load failed", failure);
-                feedback.log("  local KB Whisper runtime failure after verified installation: {s}; send SIGHUP to Retry\n", .{@errorName(failure)});
+                feedback.log("  local Whisper runtime failure after verified installation: {s}; send SIGHUP to Retry\n", .{@errorName(failure)});
                 return null;
             }
-            feedback.log("  local KB Whisper load failed: {s}; verifying the Model Installation offline\n", .{@errorName(failure)});
+            feedback.log("  local Whisper load failed: {s}; verifying the Model Installation offline\n", .{@errorName(failure)});
             const usable = self.verifyLocalInstallation(root) orelse return null;
             if (self.local_model_recovery.verificationFinished(usable) != .load) return null;
             break :retry local_backend.ProcessHelper.start(self.alloc, self.io, helper_path, model_path, .{
@@ -656,7 +656,7 @@ const Daemon = struct {
         self.local_failure.clear();
         const local = self.alloc.create(LocalAdapter) catch {
             helper.shutdown();
-            feedback.log("  local KB Whisper unavailable: adapter allocation failed\n", .{});
+            feedback.log("  local Whisper unavailable: adapter allocation failed\n", .{});
             return null;
         };
         local.* = LocalAdapter.init(self.alloc, self.io, helper, .{
@@ -700,12 +700,12 @@ const Daemon = struct {
 
     fn localRetryLoop(self: *Daemon) void {
         while (!g_quit.load(.acquire)) {
-            if (g_retry_local.swap(false, .acq_rel) and self.transcription.selected() == .local_kb_whisper) {
+            if (g_retry_local.swap(false, .acq_rel) and self.transcription.selected() == .local) {
                 if (self.transcription.currentLocal()) |local| {
                     local.retry();
-                    feedback.log("  local KB Whisper Retry requested\n", .{});
+                    feedback.log("  local Whisper Retry requested\n", .{});
                 } else if (self.local_model_recovery.retry() != .none) {
-                    feedback.log("  local KB Whisper load Retry requested\n", .{});
+                    feedback.log("  local Whisper load Retry requested\n", .{});
                 }
             }
             _ = usleep(50_000);
@@ -774,10 +774,10 @@ const Daemon = struct {
 
             const selected = self.store.current().transcription_backend;
             self.transcription.select(selected);
-            if (selected == .local_kb_whisper and self.transcription.activeRoute() == null) {
+            if (selected == .local and self.transcription.activeRoute() == null) {
                 if (self.transcription.currentLocal()) |local| {
                     if (!local.usesActiveInstallation()) {
-                        _ = self.transcription.invalidate(.local_kb_whisper);
+                        _ = self.transcription.invalidate(.local);
                         feedback.log("  local Model Installation changed — draining old helper and warming the activated replacement\n", .{});
                     }
                 }
@@ -785,7 +785,7 @@ const Daemon = struct {
             if (self.transcription.activeRoute() == null and !self.transcription.selectionReady()) {
                 switch (selected) {
                     .openai => if (self.transcription.takeSession()) |session| session.shutdown(),
-                    .local_kb_whisper => if (self.transcription.takeLocal()) |local| {
+                    .local => if (self.transcription.takeLocal()) |local| {
                         local.shutdown();
                         self.removeInactiveModelInstallations();
                     },
@@ -824,16 +824,16 @@ const Daemon = struct {
                             }
                         };
                     },
-                    .local_kb_whisper => {
+                    .local => {
                         if (self.transcription.takeSession()) |session| session.shutdown();
-                        if (outcome.actions.prepare_local) if (self.transcription.beginPreparation(.local_kb_whisper)) |ticket| {
+                        if (outcome.actions.prepare_local) if (self.transcription.beginPreparation(.local)) |ticket| {
                             if (self.prepareLocalHelper()) |local| {
                                 if (!self.transcription.setLocal(local)) {
                                     local.shutdown();
                                     _ = self.transcription.finishPreparation(ticket, false);
                                 } else if (self.transcription.finishPreparation(ticket, true)) {
                                     changed_facts = true;
-                                    feedback.log("  local KB Whisper helper warm — Capture stays on this Mac\n", .{});
+                                    feedback.log("  local Whisper helper warm — Capture stays on this Mac\n", .{});
                                 } else if (self.transcription.takeLocal()) |obsolete| obsolete.shutdown();
                             } else _ = self.transcription.finishPreparation(ticket, false);
                         };
@@ -898,7 +898,7 @@ const Daemon = struct {
         const selected = self.transcription.selected();
         const resource_present = switch (selected) {
             .openai => self.transcription.current() != null,
-            .local_kb_whisper => self.transcription.currentLocal() != null,
+            .local => self.transcription.currentLocal() != null,
         };
         return .{
             .selected_backend = selected,
@@ -977,14 +977,12 @@ const Daemon = struct {
         return .{
             .selected_backend = self.store.current().transcription_backend,
             .health = h,
-            .terminal_backend_failure = self.store.current().transcription_backend == .local_kb_whisper and recovery_state == .runtime_failure,
+            .terminal_backend_failure = self.store.current().transcription_backend == .local and recovery_state == .runtime_failure,
             .local_runtime_failure = recovery_state == .runtime_failure,
             .installation = installation,
             .operation = operation,
             .operation_bytes = operation_bytes,
             .installation_identity = installation_identity,
-            .hugging_face_credential = keychain.huggingFaceTokenPresence(),
-            .hugging_face_environment_override = std.c.getenv("HF_TOKEN") != null,
             .failure_detail = failure_detail,
         };
     }
@@ -1032,18 +1030,6 @@ const Daemon = struct {
         return false;
     }
 
-    fn menuStoreHuggingFaceToken(ctx: *anyopaque, token: []const u8) bool {
-        _ = ctx;
-        const st = keychain.storeHuggingFaceToken(token);
-        if (st == keychain.errSecSuccess) {
-            feedback.log("  menu: Hugging Face token stored separately in the login Keychain\n", .{});
-            return true;
-        }
-        var buf: [256]u8 = undefined;
-        feedback.log("  menu: Hugging Face token Keychain write failed: {s}\n", .{keychain.describe(st, &buf)});
-        return false;
-    }
-
     fn menuModelAction(ctx: *anyopaque, action: menu_mod.ModelAction) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
         switch (action) {
@@ -1082,7 +1068,6 @@ const Daemon = struct {
             .verify => "--verify-model",
             .repair => "--repair-model",
             .remove => "--remove-model",
-            .forget_hugging_face_token => "--forget-hf-token",
             .retry_runtime, .retry_operation, .cancel_operation, .diagnostics => unreachable,
         };
         var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -1118,7 +1103,6 @@ const Daemon = struct {
             .verify => .verifying,
             .remove => .removing,
             .discard => .discarding,
-            .forget_hugging_face_token => .forgetting_credential,
             else => .installing,
         }, effective_action);
         const waiter = std.Thread.spawn(.{}, waitForModelAction, .{ self.io, child, effective_action }) catch {
@@ -1284,7 +1268,6 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
         .setOverlay = Daemon.menuSetOverlay,
         .setPaused = Daemon.menuSetPaused,
         .storeApiKey = Daemon.menuStoreApiKey,
-        .storeHuggingFaceToken = Daemon.menuStoreHuggingFaceToken,
         .modelAction = Daemon.menuModelAction,
         .quit = Daemon.menuQuit,
     });
