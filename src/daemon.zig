@@ -66,10 +66,16 @@ const insertion_adapter = @import("insertion_adapter.zig");
 const readiness = @import("readiness.zig");
 const configuration_phase = @import("configuration_phase.zig");
 const backend = @import("transcription_backend.zig");
+const backend_router = @import("backend_router.zig");
+const operation_channel = @import("operation_channel.zig");
+const model_operation = @import("model_operation.zig");
 const local_backend = @import("local_backend.zig");
 const model_store = @import("model_store.zig");
 const local_model_recovery = @import("local_model_recovery.zig");
 const status_item = @import("status_item.zig");
+const failure_observation = @import("failure_observation.zig");
+
+const FailureObservation = failure_observation.FailureObservation;
 
 const Session = session_mod.Session;
 const LocalAdapter = local_backend.Adapter(local_backend.ProcessHelper);
@@ -85,138 +91,103 @@ extern "c" fn signal(sig: c_int, handler: *const fn (c_int) callconv(.c) void) c
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
 const SIGHUP: c_int = 1;
-const ObservationMutex = struct {
-    value: std.atomic.Mutex = .unlocked,
 
-    fn lock(self: *ObservationMutex) void {
-        while (!self.value.tryLock()) std.atomic.spinLoopHint();
-    }
+/// Alias for the libc `kill` extern, so the Model Operation Runner's `Deps.kill` method can
+/// call it without its own name shadowing the extern inside its body.
+const posixKill = kill;
 
-    fn unlock(self: *ObservationMutex) void {
-        self.value.unlock();
-    }
-};
+/// model_operation.zig's `Deps` seam, made real (wayfinder #95). The Model Operation Runner
+/// owns the operation policy and its cross-thread observation; this adapter is the effects
+/// it drives: resolve the daemon's own executable, spawn the Model Operation child with the
+/// built argv + environment, write any confirmation to its stdin, run the two drain threads
+/// that re-enter the Runner via trampolines (stdout → decoded operation-channel events;
+/// stderr → prose / failure fallback, then the terminal outcome), and kill on cancel.
+const ModelOperationRunnerDeps = struct {
+    daemon: *Daemon,
 
-const ModelOperationObservation = struct {
-    pid: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(0),
-    phase: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(status_item.Operation.idle)),
-    completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    retry_action: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(menu_mod.ModelAction.install)),
-    cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    failure: FailureObservation = .{},
-
-    const Current = struct { phase: status_item.Operation, bytes: ?status_item.ByteProgress, active: bool, failure_detail: ?status_item.FailureDetail };
-
-    fn current(self: *ModelOperationObservation) ?Current {
-        const active = self.pid.load(.acquire) != 0;
-        const phase = std.enums.fromInt(status_item.Operation, self.phase.load(.acquire)) orelse .installing;
-        if (!active and phase != .failed and phase != .cancelled) return null;
-        const total = self.total.load(.acquire);
-        return .{
-            .phase = phase,
-            .bytes = if (!phase.reportsByteProgress() or total == 0) null else .{ .completed = self.completed.load(.acquire), .total = total },
-            .active = active,
-            .failure_detail = self.failure.current(),
+    /// Resolve the executable, spawn the child (writing any confirmation to its stdin), and
+    /// hand the child to the waiter drain thread. Returns the child's pid, or null when any
+    /// step fails — the Runner then begins nothing (no phantom operation). `begin` runs the
+    /// instant this returns, before the child can emit; the pipes buffer anything that races
+    /// ahead of it.
+    pub fn launch(self: *ModelOperationRunnerDeps, request: model_operation.LaunchRequest) ?c_int {
+        const d = self.daemon;
+        var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        var executable_size: u32 = executable_buffer.len;
+        if (_NSGetExecutablePath(&executable_buffer, &executable_size) != 0) return null;
+        const executable = std.mem.sliceTo(executable_buffer[0..executable_size], 0);
+        var child = std.process.spawn(d.io, .{
+            .argv = &.{ executable, request.argument },
+            .environ_map = d.process_environ,
+            .stdin = if (request.confirmation != null) .pipe else .ignore,
+            .stdout = .pipe, // the typed Model Operation channel (operation_channel.zig)
+            .stderr = .pipe, // human prose: daemon log + failure fallback
+        }) catch |failure| {
+            feedback.log("  menu: could not start Model Operation: {s}\n", .{@errorName(failure)});
+            return null;
         };
-    }
-
-    fn begin(self: *ModelOperationObservation, pid: c_int, phase: status_item.Operation, action: menu_mod.ModelAction) void {
-        self.phase.store(@intFromEnum(phase), .release);
-        self.retry_action.store(@intFromEnum(action), .release);
-        self.cancel_requested.store(false, .release);
-        self.completed.store(0, .release);
-        self.total.store(0, .release);
-        self.failure.clear();
-        self.pid.store(pid, .release);
-    }
-
-    fn observeFailure(self: *ModelOperationObservation, line: []const u8) void {
-        if (std.mem.indexOf(u8, line, "Model Operation:") != null) return;
-        self.failure.set(line);
-    }
-
-    fn finish(self: *ModelOperationObservation, succeeded: bool) void {
-        self.phase.store(@intFromEnum(if (succeeded)
-            status_item.Operation.idle
-        else if (self.cancel_requested.load(.acquire))
-            status_item.Operation.cancelled
-        else
-            status_item.Operation.failed), .release);
-        self.completed.store(0, .release);
-        self.total.store(0, .release);
-        self.pid.store(0, .release);
-    }
-
-    fn setPhase(self: *ModelOperationObservation, phase: status_item.Operation) void {
-        self.phase.store(@intFromEnum(phase), .release);
-        if (phase != .installing and phase != .updating and phase != .verifying) {
-            self.completed.store(0, .release);
-            self.total.store(0, .release);
+        if (request.confirmation) |answer| {
+            child.stdin.?.writeStreamingAll(d.io, answer) catch {
+                child.kill(d.io);
+                return null;
+            };
+            child.stdin.?.close(d.io);
+            child.stdin = null;
         }
-    }
-
-    fn setProgress(self: *ModelOperationObservation, completed: u64, total: u64) void {
-        self.completed.store(completed, .release);
-        self.total.store(total, .release);
-    }
-
-    fn requestCancel(self: *ModelOperationObservation) ?c_int {
-        const phase = std.enums.fromInt(status_item.Operation, self.phase.load(.acquire)) orelse return null;
-        if (!phase.isCancellable()) return null;
-        const pid = self.pid.load(.acquire);
-        if (pid == 0) return null;
-        self.cancel_requested.store(true, .release);
+        const pid: c_int = @intCast(child.id.?);
+        const waiter = std.Thread.spawn(.{}, drainModelOperation, .{ d.io, child, &d.model_operation_runner }) catch {
+            child.kill(d.io);
+            return null;
+        };
+        waiter.detach();
         return pid;
     }
 
-    fn retryAction(self: *const ModelOperationObservation) ?menu_mod.ModelAction {
-        const phase = std.enums.fromInt(status_item.Operation, self.phase.load(.acquire)) orelse return null;
-        if (phase != .failed and phase != .cancelled) return null;
-        return std.enums.fromInt(menu_mod.ModelAction, self.retry_action.load(.acquire));
+    /// Cancel routing's effect: deliver SIGTERM to the live child the Runner named.
+    pub fn kill(_: *ModelOperationRunnerDeps, pid: c_int) void {
+        _ = posixKill(pid, SIGTERM);
+    }
+
+    /// Narration for the daemon log: the child's stderr prose, and the terminal line.
+    pub fn log(_: *ModelOperationRunnerDeps, note: model_operation.Note) void {
+        switch (note) {
+            .stderr => |line| feedback.log("  model: {s}\n", .{line}),
+            .finished => |finished| feedback.log("  menu: Model Operation {s} {s}\n", .{
+                @tagName(finished.action),
+                if (finished.succeeded) "finished" else "failed",
+            }),
+        }
     }
 };
-var g_model_operation: ModelOperationObservation = .{};
+const ModelOperationRunner = model_operation.Runner(ModelOperationRunnerDeps);
 
-const FailureObservation = struct {
-    mutex: ObservationMutex = .{},
-    detail: ?status_item.FailureDetail = null,
+/// The waiter drain thread the Deps runs per launch (one of the two): it spawns the stdout
+/// channel drain, streams the child's stderr prose into the Runner (failure fallback + log),
+/// then joins the channel drain and reports the terminal outcome. Re-enters the Runner via
+/// the pointer it is handed — the Runner must not move (model_operation.zig).
+fn drainModelOperation(io: std.Io, child_value: std.process.Child, runner: *ModelOperationRunner) void {
+    var child = child_value;
+    const channel_thread: ?std.Thread = std.Thread.spawn(.{}, drainOperationChannel, .{ io, child.stdout.?, runner }) catch null;
+    if (channel_thread == null)
+        feedback.log("  menu: Model Operation channel reader unavailable — progress will not update\n", .{});
+    var read_buffer: [2048]u8 = undefined;
+    var stderr_reader = child.stderr.?.readerStreaming(io, &read_buffer);
+    while (stderr_reader.interface.takeDelimiter('\n') catch null) |line| runner.onStderr(line);
+    if (channel_thread) |thread| thread.join(); // both pipes hit EOF at child exit
+    const term = child.wait(io) catch return runner.onTerminal(false);
+    runner.onTerminal(term.success());
+}
 
-    fn set(self: *FailureObservation, value: []const u8) void {
-        const detail = status_item.FailureDetail.init(value) catch return;
-        self.mutex.lock();
-        self.detail = detail;
-        self.mutex.unlock();
+/// The stdout channel drain thread (the other of the two): decoded operation-channel events
+/// drive the Runner's observation — phase and byte progress; anything undecodable on this
+/// stream is silently skipped.
+fn drainOperationChannel(io: std.Io, stdout_value: std.Io.File, runner: *ModelOperationRunner) void {
+    var stdout = stdout_value;
+    var read_buffer: [2048]u8 = undefined;
+    var reader = stdout.readerStreaming(io, &read_buffer);
+    while (reader.interface.takeDelimiter('\n') catch null) |line| {
+        if (operation_channel.decode(line)) |event| runner.onChannelEvent(event);
     }
-
-    fn setError(self: *FailureObservation, prefix: []const u8, failure: anyerror) void {
-        var buffer: [256]u8 = undefined;
-        const detail = std.fmt.bufPrint(&buffer, "{s}: {s}", .{ prefix, @errorName(failure) }) catch return;
-        self.set(detail);
-    }
-
-    fn clear(self: *FailureObservation) void {
-        self.mutex.lock();
-        self.detail = null;
-        self.mutex.unlock();
-    }
-
-    fn current(self: *FailureObservation) ?status_item.FailureDetail {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.detail;
-    }
-};
-
-test "Model Operation observation retains the actionable terminal failure" {
-    var observation = ModelOperationObservation{};
-    observation.begin(42, .installing, .install);
-    observation.observeFailure("--install-model: ModelDownloadRejected");
-    observation.finish(false);
-
-    const current = observation.current().?;
-    try std.testing.expectEqual(status_item.Operation.failed, current.phase);
-    try std.testing.expectEqualStrings("--install-model: ModelDownloadRejected", current.failure_detail.?.value());
 }
 
 // ---- tuning ----------------------------------------------------------------
@@ -271,161 +242,60 @@ fn keyName(k: tapmod.TalkKey) []const u8 {
 // (Audio is Capture itself — it already fits the seam, so it needs no wrapper.)
 // ============================================================================
 
-/// Transcription seam: owns the selected-backend policy plus atomic pointers to the warm
-/// OpenAI and local resources. Selection policy pins the active route; the supervisor may
-/// take and shut down only obsolete resources after that route drains.
-const TranscriptionAdapter = struct {
-    io: std.Io = undefined,
-    selection_mu: std.Io.Mutex = .init,
-    selection: backend.Selection = backend.Selection.init(.openai),
-    ptr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    local_ptr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    store: *config.Store = undefined,
+/// Transcription seam: the Backend Router's daemon-side dependencies (backend_router.zig
+/// owns the drain-then-switch policy). This supplies the effectful provisioning, the
+/// Settings Snapshot language, the Configuration Phase bridge, and the narration.
+const DaemonDeps = struct {
+    pub const SessionResource = Session;
+    pub const LocalResource = LocalAdapter;
 
-    const commands = backend.Commands{
-        .begin = begin,
-        .append_audio = appendAudio,
-        .release = release,
-        .request_cancel = cancel,
-        .cancel = cancel,
-    };
+    daemon: *Daemon,
+    /// Freshly loaded by gatherOutcome for this tick's potential connect; the Session
+    /// retains the slice (a process-lifetime allocation, like snapshots).
+    pending_key: ?[]const u8 = null,
+    /// The Configuration Phase outcome gathered mid-tick by `wants`; the supervisor
+    /// loop executes its non-router actions (tap enable, READY, reporting) afterwards.
+    outcome: configuration_phase.Outcome = undefined,
 
-    fn set(self: *TranscriptionAdapter, sess: *Session) void {
-        self.ptr.store(@intFromPtr(sess), .release);
+    pub fn connectOpenai(self: *DaemonDeps) !*Session {
+        const d = self.daemon;
+        const key = self.pending_key orelse return error.MissingApiKey;
+        return Session.connect(d.io, d.alloc, key, .{ .ctx = d, .get = Daemon.getParams }, d.observer());
     }
-    fn current(self: *TranscriptionAdapter) ?*Session {
-        const p = self.ptr.load(.acquire);
-        return if (p == 0) null else @ptrFromInt(p);
+
+    pub fn prepareLocal(self: *DaemonDeps) ?*LocalAdapter {
+        return self.daemon.prepareLocalHelper();
     }
-    fn takeSession(self: *TranscriptionAdapter) ?*Session {
-        const p = self.ptr.swap(0, .acq_rel);
-        return if (p == 0) null else @ptrFromInt(p);
-    }
-    fn setLocal(self: *TranscriptionAdapter, local: *LocalAdapter) bool {
-        return self.local_ptr.cmpxchgStrong(0, @intFromPtr(local), .release, .acquire) == null;
-    }
-    fn currentLocal(self: *TranscriptionAdapter) ?*LocalAdapter {
-        const p = self.local_ptr.load(.acquire);
-        return if (p == 0) null else @ptrFromInt(p);
-    }
-    fn takeLocal(self: *TranscriptionAdapter) ?*LocalAdapter {
-        const p = self.local_ptr.swap(0, .acq_rel);
-        return if (p == 0) null else @ptrFromInt(p);
-    }
-    fn select(self: *TranscriptionAdapter, requested: backend.Backend) void {
-        self.selection_mu.lockUncancelable(self.io);
-        defer self.selection_mu.unlock(self.io);
-        self.selection.select(requested);
-    }
-    fn selected(self: *TranscriptionAdapter) backend.Backend {
-        self.selection_mu.lockUncancelable(self.io);
-        defer self.selection_mu.unlock(self.io);
-        return self.selection.selected;
-    }
-    fn beginPreparation(self: *TranscriptionAdapter, expected: backend.Backend) ?backend.Selection.Ticket {
-        self.selection_mu.lockUncancelable(self.io);
-        defer self.selection_mu.unlock(self.io);
-        return self.selection.beginPreparation(expected);
-    }
-    fn finishPreparation(self: *TranscriptionAdapter, ticket: backend.Selection.Ticket, ready: bool) bool {
-        self.selection_mu.lockUncancelable(self.io);
-        defer self.selection_mu.unlock(self.io);
-        return self.selection.finishPreparation(ticket, ready);
-    }
-    fn invalidate(self: *TranscriptionAdapter, expected: backend.Backend) bool {
-        self.selection_mu.lockUncancelable(self.io);
-        defer self.selection_mu.unlock(self.io);
-        return self.selection.invalidate(expected);
-    }
-    fn activeRoute(self: *TranscriptionAdapter) ?backend.Selection.Route {
-        self.selection_mu.lockUncancelable(self.io);
-        defer self.selection_mu.unlock(self.io);
-        return self.selection.activeRoute();
-    }
-    fn selectionReady(self: *TranscriptionAdapter) bool {
-        self.selection_mu.lockUncancelable(self.io);
-        defer self.selection_mu.unlock(self.io);
-        return self.selection.isReady();
-    }
-    // ---- the Coordinator's backend-neutral lease seam -----------------------------
-    pub fn available(self: *TranscriptionAdapter) bool {
-        self.selection_mu.lockUncancelable(self.io);
-        defer self.selection_mu.unlock(self.io);
-        if (!self.selection.isReady()) return false;
-        return switch (self.selection.selected) {
-            .openai => if (self.current()) |session| session.isReady() else false,
-            .local => if (self.currentLocal()) |local| local.isReady() else false,
-        };
-    }
-    pub fn acquire(self: *TranscriptionAdapter, id: backend.UtteranceId) ?backend.Lease {
-        self.selection_mu.lockUncancelable(self.io);
-        const acquired_backend = self.selection.acquire(id) orelse {
-            self.selection_mu.unlock(self.io);
-            return null;
-        };
-        self.selection_mu.unlock(self.io);
-        if (acquired_backend == .local) {
-            const local = self.currentLocal() orelse {
-                self.resolve(id);
-                return null;
-            };
-            return local.acquire(id, self.store.current().language) orelse {
-                self.resolve(id);
-                return null;
-            };
-        }
-        const session = self.current() orelse {
-            self.resolve(id);
-            return null;
-        };
+
+    /// The Backend Router asks between reconciliation and preparation, exactly once
+    /// per tick, so the Configuration Phase sees post-teardown facts.
+    pub fn wants(self: *DaemonDeps) backend_router.Wants {
+        self.outcome = self.daemon.gatherOutcome();
         return .{
-            .id = id,
-            .backend = .openai,
-            .language = session.leaseLanguage(),
-            .deadline = backend.openai_deadline,
-            .ctx = self,
-            .commands = &commands,
+            .connect_openai = self.outcome.actions.connect_session and self.pending_key != null,
+            .prepare_local = self.outcome.actions.prepare_local,
         };
     }
-    fn from(ctx: *anyopaque) *TranscriptionAdapter {
-        return @ptrCast(@alignCast(ctx));
+
+    pub fn language(self: *DaemonDeps) backend.Language {
+        return self.daemon.store.current().language;
     }
-    fn begin(ctx: *anyopaque, id: backend.UtteranceId, language: backend.Language) !void {
-        const self = from(ctx);
-        const session = self.current() orelse return error.NoTranscriptionSession;
-        try session.beginUtterance(id, language);
-    }
-    fn appendAudio(ctx: *anyopaque, id: backend.UtteranceId, pcm: []const u8) !void {
-        const self = from(ctx);
-        const session = self.current() orelse return error.NoTranscriptionSession;
-        try session.appendAudio(id, pcm);
-    }
-    fn release(ctx: *anyopaque, id: backend.UtteranceId) !void {
-        const self = from(ctx);
-        const session = self.current() orelse return error.NoTranscriptionSession;
-        try session.releaseUtterance(id);
-    }
-    fn cancel(ctx: *anyopaque, id: backend.UtteranceId) void {
-        const self = from(ctx);
-        if (self.current()) |s| s.cancelUtterance(id);
-    }
-    fn appendCurrent(self: *TranscriptionAdapter, pcm: []const u8) !backend.UtteranceId {
-        const route = self.activeRoute() orelse return error.NoActiveUtterance;
-        switch (route.backend) {
-            .openai => try commands.append_audio(self, route.id, pcm),
-            .local => try (self.currentLocal() orelse return error.NoLocalBackend).appendAudio(route.id, pcm),
+
+    pub fn note(self: *DaemonDeps, event: backend_router.Event) void {
+        _ = self;
+        switch (event) {
+            .stale => feedback.log("  local Model Installation changed — draining old helper and warming the activated replacement\n", .{}),
+            .ready => |which| switch (which) {
+                .openai => feedback.log("  supervisor: API key found — Transcription Session connecting…\n", .{}),
+                .local => feedback.log("  local Whisper helper warm — Capture stays on this Mac\n", .{}),
+            },
+            .prepare_failed => |failure| if (failure.which == .openai)
+                feedback.log("  supervisor: session connect failed: {s} — will retry\n", .{@errorName(failure.err orelse error.Unknown)}),
+            .tore_down => {}, // teardown of drained resources is routine, not news
         }
-        return route.id;
-    }
-    fn activeId(self: *TranscriptionAdapter) backend.UtteranceId {
-        return if (self.activeRoute()) |route| route.id else 0;
-    }
-    pub fn resolve(self: *TranscriptionAdapter, id: backend.UtteranceId) void {
-        self.selection_mu.lockUncancelable(self.io);
-        defer self.selection_mu.unlock(self.io);
-        _ = self.selection.resolve(id);
     }
 };
+const BackendRouter = backend_router.Router(DaemonDeps);
 
 /// Real dependencies for insertion_adapter.zig. The adapter owns the asynchronous
 /// Insertion policy; daemon.zig supplies the concrete macOS mechanism, Settings Snapshot,
@@ -498,7 +368,7 @@ const DeadlineAdapter = struct {
 // The Coordinator's dependency set, wired to the real adapters above.
 const RealDeps = struct {
     audio: *cap.Capture,
-    backends: *TranscriptionAdapter,
+    backends: *BackendRouter,
     insertion: *InsertionAdapter,
     deadline: *DeadlineAdapter,
     feedback: *surface.Surface,
@@ -547,11 +417,20 @@ const Daemon = struct {
     tap: tapmod.Tap = undefined, // built in run()
 
     // ---- the Coordinator's real adapters + the Coordinator itself (wired in run()) ----
-    transcription: TranscriptionAdapter = .{},
+    router_deps: DaemonDeps = undefined,
+    transcription: BackendRouter = undefined,
     insertion: InsertionAdapter = undefined,
     deadline: DeadlineAdapter = .{},
     feedback_surface: surface.Surface = undefined,
     coordinator: Coord = undefined,
+
+    /// The Model Operation Runner (model_operation.zig, wayfinder #94) + its real Deps: the
+    /// daemon's one route from a Status Item action to a Model Operation child, and the owner
+    /// of that operation's observation. Wired in run(); driven by menuModelAction, read by
+    /// menuStatus. Handed out by pointer and must not move (its observation atomics are
+    /// addressed in place).
+    model_operation_runner_deps: ModelOperationRunnerDeps = undefined,
+    model_operation_runner: ModelOperationRunner = undefined,
 
     /// Supervisor-thread-only: owns Configuration Phase memory, including READY
     /// announcements and distinct not-configured reports.
@@ -701,8 +580,7 @@ const Daemon = struct {
     fn localRetryLoop(self: *Daemon) void {
         while (!g_quit.load(.acquire)) {
             if (g_retry_local.swap(false, .acq_rel) and self.transcription.selected() == .local) {
-                if (self.transcription.currentLocal()) |local| {
-                    local.retry();
+                if (self.transcription.retryLocal()) {
                     feedback.log("  local Whisper Retry requested\n", .{});
                 } else if (self.local_model_recovery.retry() != .none) {
                     feedback.log("  local Whisper load Retry requested\n", .{});
@@ -765,6 +643,22 @@ const Daemon = struct {
 
     // ---- supervisor thread: the self-heal / not-configured → configured engine ----
 
+    /// One facts pass: probe grants/key/installation, tick the Configuration Phase, and
+    /// park the freshly loaded key (if any) for DaemonDeps.connectOpenai. Called by the
+    /// Backend Router mid-tick (DaemonDeps.wants) and again after self-heal effects.
+    fn gatherOutcome(self: *Daemon) configuration_phase.Outcome {
+        const selected = self.transcription.selected();
+        const local_installation = self.localInstallationPresent();
+        const key = if (selected == .openai and !self.transcription.resourcePresent(.openai))
+            config.loadApiKeyOnly(self.io, self.alloc)
+        else
+            null;
+        self.router_deps.pending_key = key;
+        const im = tapmod.Tap.listenGranted();
+        const pe = insertmod.postEventGranted();
+        return self.configuration.tick(self.configurationFacts(im, pe, key != null, local_installation));
+    }
+
     fn supervisorLoop(self: *Daemon) void {
         var first = true;
         while (!g_quit.load(.acquire)) {
@@ -772,78 +666,14 @@ const Daemon = struct {
             first = false;
             if (g_quit.load(.acquire)) return;
 
-            const selected = self.store.current().transcription_backend;
-            self.transcription.select(selected);
-            if (selected == .local and self.transcription.activeRoute() == null) {
-                if (self.transcription.currentLocal()) |local| {
-                    if (!local.usesActiveInstallation()) {
-                        _ = self.transcription.invalidate(.local);
-                        feedback.log("  local Model Installation changed — draining old helper and warming the activated replacement\n", .{});
-                    }
-                }
-            }
-            if (self.transcription.activeRoute() == null and !self.transcription.selectionReady()) {
-                switch (selected) {
-                    .openai => if (self.transcription.takeSession()) |session| session.shutdown(),
-                    .local => if (self.transcription.takeLocal()) |local| {
-                        local.shutdown();
-                        self.removeInactiveModelInstallations();
-                    },
-                }
-            }
-            const local_installation = self.localInstallationPresent();
-            const key = if (selected == .openai and self.transcription.current() == null)
-                config.loadApiKeyOnly(self.io, self.alloc)
-            else
-                null;
-            const im = tapmod.Tap.listenGranted();
-            const pe = insertmod.postEventGranted();
-            var facts = self.configurationFacts(im, pe, key != null, local_installation);
-            var outcome = self.configuration.tick(facts);
-
-            // An accepted lease blocks teardown and preparation through its complete
-            // Coordinator lifecycle. Once drained, remove the obsolete warm resource and
-            // prepare a generation-tagged latest selection.
-            var changed_facts = false;
-            if (self.transcription.activeRoute() == null) {
-                switch (selected) {
-                    .openai => {
-                        if (self.transcription.takeLocal()) |local| local.shutdown();
-                        if (outcome.actions.connect_session) if (key) |k| {
-                            if (self.transcription.beginPreparation(.openai)) |ticket| {
-                                if (Session.connect(self.io, self.alloc, k, .{ .ctx = self, .get = getParams }, self.observer())) |sess| {
-                                    self.transcription.set(sess);
-                                    if (self.transcription.finishPreparation(ticket, true)) {
-                                        changed_facts = true;
-                                        feedback.log("  supervisor: API key found — Transcription Session connecting…\n", .{});
-                                    } else if (self.transcription.takeSession()) |obsolete| obsolete.shutdown();
-                                } else |e| {
-                                    _ = self.transcription.finishPreparation(ticket, false);
-                                    feedback.log("  supervisor: session connect failed: {s} — will retry\n", .{@errorName(e)});
-                                }
-                            }
-                        };
-                    },
-                    .local => {
-                        if (self.transcription.takeSession()) |session| session.shutdown();
-                        if (outcome.actions.prepare_local) if (self.transcription.beginPreparation(.local)) |ticket| {
-                            if (self.prepareLocalHelper()) |local| {
-                                if (!self.transcription.setLocal(local)) {
-                                    local.shutdown();
-                                    _ = self.transcription.finishPreparation(ticket, false);
-                                } else if (self.transcription.finishPreparation(ticket, true)) {
-                                    changed_facts = true;
-                                    feedback.log("  local Whisper helper warm — Capture stays on this Mac\n", .{});
-                                } else if (self.transcription.takeLocal()) |obsolete| obsolete.shutdown();
-                            } else _ = self.transcription.finishPreparation(ticket, false);
-                        };
-                    },
-                }
-            }
+            // The Backend Router reconciles (selection, staleness, drain-gated teardown),
+            // gathers the Configuration Phase outcome via DaemonDeps.wants at the right
+            // moment, then prepares. True = a resource became authoritative this tick.
+            var changed_facts = self.transcription.tick(self.store.current().transcription_backend);
+            var outcome = self.router_deps.outcome;
 
             if (outcome.actions.enable_tap) {
                 if (self.tap.enable()) {
-                    facts.tap_enabled = true;
                     changed_facts = true;
                     feedback.log("  supervisor: Input Monitoring granted — Talk Key tap is live\n", .{});
                 } else {
@@ -851,12 +681,9 @@ const Daemon = struct {
                 }
             }
 
-            // 3. Re-evaluate after successful self-heal effects so READY/reporting reflects
+            // Re-evaluate after successful self-heal effects so READY/reporting reflects
             // the state users see at the end of this poll tick.
-            if (changed_facts) {
-                facts = self.configurationFacts(im, pe, key != null, local_installation);
-                outcome = self.configuration.tick(facts);
-            }
+            if (changed_facts) outcome = self.gatherOutcome();
 
             if (outcome.actions.announce_ready)
                 feedback.log("  READY — hold {s}, speak, release; the transcript lands at the cursor.\n", .{keyName(self.store.current().talk_key)});
@@ -864,9 +691,9 @@ const Daemon = struct {
             // Cheap nonblocking reconciliation also catches updates activated while OpenAI
             // is selected and no local helper exists. Busy operation/inference locks defer
             // cleanup to the next supervisor tick without disturbing dictation.
-            if (self.transcription.activeRoute() == null)
+            if (self.transcription.activeId() == 0)
                 self.removeInactiveModelInstallations();
-            self.capture_enabled.store(outcome.configured and self.transcription.available() and !facts.paused, .release);
+            self.capture_enabled.store(outcome.configured and self.transcription.available() and !self.paused.load(.acquire), .release);
         }
     }
 
@@ -896,13 +723,10 @@ const Daemon = struct {
 
     fn configurationFacts(self: *Daemon, im: bool, pe: bool, key_present_now: bool, local_installation: bool) configuration_phase.Facts {
         const selected = self.transcription.selected();
-        const resource_present = switch (selected) {
-            .openai => self.transcription.current() != null,
-            .local => self.transcription.currentLocal() != null,
-        };
+        const resource_present = self.transcription.resourcePresent(selected);
         return .{
             .selected_backend = selected,
-            .key_present = key_present_now or self.transcription.current() != null,
+            .key_present = key_present_now or self.transcription.resourcePresent(.openai),
             .local_installation_present = local_installation,
             .microphone_granted = cap.microphoneGranted(),
             .backend_present = resource_present,
@@ -967,7 +791,7 @@ const Daemon = struct {
         }
         const recovery_state = self.local_model_recovery.current();
         if (recovery_state == .corrupt) installation = .corrupt;
-        if (g_model_operation.current()) |observed| {
+        if (self.model_operation_runner.current()) |observed| {
             if (observed.active or operation != .paused) {
                 operation = observed.phase;
                 operation_bytes = observed.bytes;
@@ -991,7 +815,7 @@ const Daemon = struct {
     /// the first connect there is nothing to mark — that connect reads the snapshot.
     fn menuMarkSessionDirty(ctx: *anyopaque) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
-        if (self.transcription.current()) |s| s.markParamsDirty();
+        self.transcription.settingsChanged();
     }
 
     /// The Overlay toggle (#32 decision 3): lazy-build on first enable — menu actions
@@ -1030,17 +854,16 @@ const Daemon = struct {
         return false;
     }
 
+    /// Every Status Item Model Operation action, routed through the Runner. `retry_runtime`,
+    /// `cancel_operation`, and `diagnostics` are handled here (they spawn no operation child);
+    /// every launchable / retryable action goes to `startAction`, which resolves a retry to
+    /// its original action, applies the one-at-a-time busy guard, and launches through the
+    /// Deps seam.
     fn menuModelAction(ctx: *anyopaque, action: menu_mod.ModelAction) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
         switch (action) {
-            .retry_runtime => {
-                g_retry_local.store(true, .release);
-                return;
-            },
-            .cancel_operation => {
-                if (g_model_operation.requestCancel()) |pid| _ = kill(pid, SIGTERM);
-                return;
-            },
+            .retry_runtime => g_retry_local.store(true, .release),
+            .cancel_operation => _ = self.model_operation_runner.requestCancel(),
             .diagnostics => {
                 const raw_home = std.c.getenv("HOME") orelse return;
                 var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -1051,101 +874,9 @@ const Daemon = struct {
                     return;
                 };
                 waiter.detach();
-                return;
             },
-            else => {},
+            else => self.model_operation_runner.startAction(action),
         }
-        const effective_action = if (action == .retry_operation)
-            g_model_operation.retryAction() orelse return
-        else
-            action;
-        if (g_model_operation.pid.load(.acquire) != 0) return;
-        const argument: []const u8 = switch (effective_action) {
-            .install => "--install-model",
-            .update => "--update-model",
-            .resume_operation => "--resume-model",
-            .discard => "--discard-model",
-            .verify => "--verify-model",
-            .repair => "--repair-model",
-            .remove => "--remove-model",
-            .retry_runtime, .retry_operation, .cancel_operation, .diagnostics => unreachable,
-        };
-        var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        var executable_size: u32 = executable_buffer.len;
-        if (_NSGetExecutablePath(&executable_buffer, &executable_size) != 0) return;
-        const executable = std.mem.sliceTo(executable_buffer[0..executable_size], 0);
-        const confirmation: ?[]const u8 = switch (effective_action) {
-            .repair => "yes\n",
-            .remove => "remove\n",
-            else => null,
-        };
-        var child = std.process.spawn(self.io, .{
-            .argv = &.{ executable, argument },
-            .environ_map = self.process_environ,
-            .stdin = if (confirmation != null) .pipe else .ignore,
-            .stdout = .inherit,
-            .stderr = .pipe,
-        }) catch |failure| {
-            feedback.log("  menu: could not start Model Operation: {s}\n", .{@errorName(failure)});
-            return;
-        };
-        if (confirmation) |answer| {
-            child.stdin.?.writeStreamingAll(self.io, answer) catch {
-                child.kill(self.io);
-                return;
-            };
-            child.stdin.?.close(self.io);
-            child.stdin = null;
-        }
-        const pid: c_int = @intCast(child.id.?);
-        g_model_operation.begin(pid, switch (effective_action) {
-            .update => status_item.Operation.updating,
-            .verify => .verifying,
-            .remove => .removing,
-            .discard => .discarding,
-            else => .installing,
-        }, effective_action);
-        const waiter = std.Thread.spawn(.{}, waitForModelAction, .{ self.io, child, effective_action }) catch {
-            child.kill(self.io);
-            g_model_operation.finish(false);
-            return;
-        };
-        waiter.detach();
-    }
-
-    fn waitForModelAction(io: std.Io, child_value: std.process.Child, action: menu_mod.ModelAction) void {
-        var child = child_value;
-        var read_buffer: [2048]u8 = undefined;
-        var stderr_reader = child.stderr.?.readerStreaming(io, &read_buffer);
-        while (stderr_reader.interface.takeDelimiter('\n') catch null) |line| {
-            observeModelProgress(line);
-            g_model_operation.observeFailure(line);
-            feedback.log("  model: {s}\n", .{line});
-        }
-        const term = child.wait(io) catch {
-            g_model_operation.finish(false);
-            return;
-        };
-        g_model_operation.finish(term.success());
-        feedback.log("  menu: Model Operation {s} {s}\n", .{ @tagName(action), if (term.success()) "finished" else "failed" });
-    }
-
-    fn observeModelProgress(line: []const u8) void {
-        const prefix = "Model Operation: ";
-        const detail = if (std.mem.indexOf(u8, line, prefix)) |at| line[at + prefix.len ..] else return;
-        if (std.mem.startsWith(u8, detail, "verifying ")) g_model_operation.setPhase(.verifying);
-        if (std.mem.startsWith(u8, detail, "smoke testing")) g_model_operation.setPhase(.smoke_testing);
-        if (std.mem.startsWith(u8, detail, "waiting for active local inference")) g_model_operation.setPhase(.waiting_for_inference);
-        if (std.mem.startsWith(u8, detail, "activating")) g_model_operation.setPhase(.activating);
-        if (std.mem.startsWith(u8, detail, "removing")) g_model_operation.setPhase(.removing);
-        const slash = std.mem.indexOfScalar(u8, detail, '/') orelse return;
-        var begin = slash;
-        while (begin > 0 and std.ascii.isDigit(detail[begin - 1])) begin -= 1;
-        var end = slash + 1;
-        while (end < detail.len and std.ascii.isDigit(detail[end])) end += 1;
-        const completed = std.fmt.parseInt(u64, detail[begin..slash], 10) catch return;
-        const total = std.fmt.parseInt(u64, detail[slash + 1 .. end], 10) catch return;
-        g_model_operation.setProgress(completed, total);
     }
 
     fn waitForDetached(io: std.Io, child_value: std.process.Child) void {
@@ -1186,9 +917,10 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
         .process_environ = process_environ,
         .store = config.Store.init(first_snapshot),
     };
-    daemon.transcription.store = &daemon.store;
-    daemon.transcription.io = io;
-    daemon.transcription.selection = backend.Selection.init(selected_backend);
+    daemon.router_deps = .{ .daemon = &daemon };
+    daemon.transcription = BackendRouter.init(io, &daemon.router_deps, selected_backend);
+    daemon.model_operation_runner_deps = .{ .daemon = &daemon };
+    daemon.model_operation_runner = ModelOperationRunner.init(&daemon.model_operation_runner_deps);
 
     // ---- modules that need neither a grant nor the key to construct ----
     try daemon.capture.init();
@@ -1309,9 +1041,6 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     feedback.log("shutting down…\n", .{});
     supervisor.join();
     local_retry.join();
-    if (daemon.transcription.currentLocal()) |local|
-        local.shutdown()
-    else if (daemon.transcription.current()) |sess|
-        sess.shutdown();
+    daemon.transcription.shutdown();
     feedback.log("bye.\n", .{});
 }

@@ -26,6 +26,16 @@ const StatFs = extern struct {
 
 extern "c" fn statfs(path: [*:0]const u8, stats: *StatFs) c_int;
 const staging_overhead_bytes: u64 = 16 * 1024 * 1024;
+
+/// Bytes fetched per HTTP Range request during a Model Installation download, and the
+/// resume checkpoint granularity. Each chunk is one request that re-resolves the
+/// HuggingFace→CDN redirect, then fsyncs the file and rewrites `partial.meta` — so a
+/// small chunk turns one download into thousands of serialized round-trips (the former
+/// 1 MiB default made the ~1.6 GB pinned model ~1550 requests, ~10 min vs. under 1 min
+/// for a single streamed GET). Larger coarsens resume: an interrupted download re-fetches
+/// at most one chunk. 32 MiB keeps the pinned model near ~50 requests while re-downloading
+/// at most 32 MiB on resume.
+const default_chunk_size: u64 = 32 * 1024 * 1024;
 const removal_intent_name = ".removal.pending";
 const runtime_lock_name = ".runtime.lock";
 const inference_lock_name = ".inference.lock";
@@ -277,7 +287,7 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
         additional_trusted_manifests: ?[]const Manifest = null,
         retry_budget: u8 = 3,
         retry_delay_ms: u32 = 1000,
-        chunk_size: u64 = 1024 * 1024,
+        chunk_size: u64 = default_chunk_size,
 
         const Self = @This();
         const PreparedInstallation = struct {
@@ -1394,6 +1404,18 @@ fn headerValue(head: std.http.Client.Response.Head, name: []const u8) ?[]const u
         if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
     }
     return null;
+}
+
+test "the default chunk size keeps the pinned model download to a modest request count" {
+    // Guards the regression this default was raised to fix: a 1 MiB chunk fetched the
+    // ~1.6 GB pinned model as ~1550 serialized Range requests. Each chunk is one HTTP
+    // round-trip (plus a redirect re-resolve, an fsync, and a checkpoint rewrite), so the
+    // request count must stay small.
+    const chunks = std.math.divCeil(u64, pinned_manifest.size, default_chunk_size) catch unreachable;
+    try std.testing.expect(chunks <= 64);
+    // …without coarsening resume so far that an interrupted download re-fetches a large
+    // amount: a resume repeats at most one chunk.
+    try std.testing.expect(default_chunk_size <= 64 * 1024 * 1024);
 }
 
 test "capacity preflight retains the working installation plus staging overhead" {

@@ -17,8 +17,34 @@ Provisional text emitted while an Utterance is still being spoken. Logged, may b
 _Avoid_: delta, interim result
 
 **Final Transcript**:
-The committed text for a completed Utterance; the only text that is ever inserted.
+The committed text for a completed Utterance; the only text that is ever inserted. For a
+multi-Segment Utterance it is the ordered concatenation of that Utterance's Segment
+Transcripts; a short single-Segment Utterance yields it directly.
 _Avoid_: result, output
+
+**Segment**:
+A contiguous span of one Utterance's Capture, transcribed on its own. The local Backend
+cuts a long Utterance into Segments at silences — a 15 s soft floor, then the next
+≥400 ms pause, with a 25 s hard-max force-cut — so it can transcribe them in the
+background while the Utterance is still being spoken. A short Utterance is a single
+Segment, identical to pre-segmentation behaviour. OpenAI never segments; it streams. See
+ADR-0003.
+_Avoid_: chunk (that names the 50 ms Capture buffer), clip
+
+**Segment Transcript**:
+The committed text of one Segment. Segment Transcripts concatenate in spoken order into
+their Utterance's Final Transcript. Unlike a Partial Transcript it is not revisable, and —
+as part of the Final Transcript — it is inserted.
+_Avoid_: partial (a Partial Transcript is the revisable OpenAI delta)
+
+**Segmenter**:
+The pure state machine that owns the silence-cut policy (ADR-0003): it accumulates one
+Utterance's Capture and decides where each Segment ends — the 15 s soft floor, the next
+≥400 ms pause, the 25 s hard-max force-cut. A Capture buffer and its RMS level go in; an
+owned Segment's PCM comes out at each cut. It holds no queue, lease, or IPC — the local
+Transcription Backend's adapter drives it under its own lock and owns everything past the
+cut. Lives in `src/segmenter.zig`, exercised by fed (rms, pcm) pairs, not real audio.
+_Avoid_: chunker, splitter, VAD (it is not a general voice-activity detector)
 
 **Insertion**:
 Placing a Final Transcript at the cursor of the Focused Target. Every Insertion ends with
@@ -37,6 +63,15 @@ _Avoid_: websocket (mechanism)
 The selected source of a Final Transcript for an Utterance; it may also emit Partial Transcripts. OpenAI is the default backend; the local Whisper backend is an offline alternative.
 _Avoid_: transcription provider, engine
 
+**Backend Router**:
+The daemon's one route from an accepted Utterance to the selected Transcription Backend,
+and the owner of the drain-then-switch policy: an accepted Utterance pins its backend
+through Insertion or abandonment; a backend switch — or a Model Installation activating
+under the warm helper — drains first, then tears down the obsolete resource and warms a
+generation-tagged replacement. It reaches every effect (connect, warm, narrate) through
+a dependency seam it is handed, so it is exercised by scripted events, not hardware.
+_Avoid_: transcription adapter, backend manager
+
 **Model Installation**:
 A verified local copy of the pinned model artifact (currently ggml-large-v3-turbo; see `packaging/share/type-wave/PROVENANCE`) that the local Transcription Backend can use offline. Downloaded credential-free; it exists independently of any Model Operation in progress.
 _Avoid_: downloaded model, model cache
@@ -44,6 +79,16 @@ _Avoid_: downloaded model, model cache
 **Model Operation**:
 A user-authorized acquisition, verification, activation, repair, or removal acting on a Model Installation. An operation may be in progress while the current Model Installation remains usable.
 _Avoid_: download state, model task
+
+**Model Operation Runner**:
+The daemon's one route from a Status Item action to a Model Operation child process, and
+the owner of that operation's observation — the phase and byte progress the Status Item
+reflects. It drives one operation from launch to a terminal outcome (success / cancelled /
+failed), reaching every effect (spawn, cancel-kill, log) through a dependency seam it is
+handed, so it is exercised by fed operation-channel events, not real subprocesses. It
+consumes the operation-channel wire; it does not warm the local helper — that is the
+Backend Router's path. Lives in `src/model_operation.zig`.
+_Avoid_: model manager, operation orchestrator, download manager
 
 **Capture**:
 The microphone audio stream feeding a Transcription Session.

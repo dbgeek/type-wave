@@ -149,7 +149,7 @@ pub fn Coordinator(comptime Deps: type) type {
             // server-side, so committing the buffered tail would insert a truncated Final
             // Transcript. Abandon cleanly rather than commit a fragment.
             if (self.poisoned) {
-                feedback.log("  Transcription Backend failed mid-Utterance — discarded; hold the Talk Key and say it again\n", .{});
+                feedback.log("  part of that was lost — the whole Utterance was discarded; hold the Talk Key and say it again\n", .{});
                 self.abandon();
                 return;
             }
@@ -192,7 +192,9 @@ pub fn Coordinator(comptime Deps: type) type {
 
         fn onDeadline(self: *Self, id: UtteranceId) void {
             if (!self.matches(id, .awaiting_final)) return;
-            feedback.log("  no Final Transcript within the deadline — nothing inserted\n", .{});
+            // For local Segments this is a drain overrun: part of that was lost. The loud error
+            // cue fires via abandon; the retry advice makes the signal specific (#92).
+            feedback.log("  no Final Transcript within the deadline — nothing inserted; hold the Talk Key and say it again\n", .{});
             self.active.?.cancel();
             self.abandon();
         }
@@ -213,7 +215,9 @@ pub fn Coordinator(comptime Deps: type) type {
                 .awaiting_final => {
                     self.deps.deadline.cancel(id);
                     self.active.?.cancel();
-                    feedback.log("  Transcription Backend failed before a Final Transcript arrived — nothing inserted\n", .{});
+                    // A local Segment failing during the post-release drain lands here: part of
+                    // that was lost, discard whole (all-or-nothing) with the retry cue (#92).
+                    feedback.log("  part of that was lost — the whole Utterance was discarded; hold the Talk Key and say it again\n", .{});
                     self.abandon();
                 },
                 .idle, .inserting => {},

@@ -51,7 +51,7 @@ The names below fix ownership and public seams, not private helper functions.
 | Utterance lifecycle | `src/coordinator.zig` | Utterance identity, phase, poison/abandon policy, deadline, terminal-event arbitration |
 | Backend contract and selection | new `src/transcription_backend.zig` | Backend lease, neutral command/event vocabulary, selected adapter routing |
 | OpenAI adapter | new `src/openai_backend.zig`, using `src/session.zig` | Map the neutral seam to the existing streaming Transcription Session |
-| Local adapter | new `src/local_backend.zig` | Complete-Utterance PCM buffer, helper supervision, IPC request mapping |
+| Local adapter | new `src/local_backend.zig` | Capture buffering + silence-cut Segmentation (ADR-0003), helper supervision, IPC request mapping |
 | Helper executable | new `src/whisper_helper.zig` plus narrow runtime bindings | Model load/warm, 24 kHz-to-16 kHz conversion, whisper.cpp inference, cooperative cancellation |
 | IPC codec | new `src/whisper_ipc.zig` | Framing, validation, limits, structured failures |
 | Model lifecycle | new `src/model_store.zig` | Model Installation, Model Operation, receipt, staging, verification, activation, removal |
@@ -98,8 +98,11 @@ const BackendEvent = union(enum) {
   start and the Utterance must be abandoned from `idle`.
 - **LIFE-3:** `appendAudio` must consume or copy its borrowed PCM before returning. Capture
   must stop synchronously before `release`, so all tail audio precedes release.
-- **LIFE-4:** The Coordinator must not retain PCM. OpenAI must stream each chunk; local must
-  buffer the complete Utterance behind its adapter and submit it only on `release`.
+- **LIFE-4:** The Coordinator must not retain PCM. OpenAI must stream each chunk; local
+  buffers behind its adapter and inserts one Final Transcript on `release`. _(Superseded in
+  part by ADR-0003: a long local Utterance is now cut into background **Segments** submitted
+  mid-Utterance, still assembled into one Insertion on release; a short Utterance is one
+  Segment submitted on release, as before.)_
 - **LIFE-5:** Backends must emit only ID-tagged `final` or `failed` lifecycle events to the
   Coordinator. OpenAI Partial Transcripts remain optional backend diagnostics and local
   must not synthesize them.

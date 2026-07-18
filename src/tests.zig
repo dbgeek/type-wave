@@ -7,6 +7,8 @@
 test {
     _ = @import("coordinator.zig");
     _ = @import("transcription_backend.zig");
+    _ = @import("backend_router.zig");
+    _ = @import("segmenter.zig");
     _ = @import("local_backend.zig");
     _ = @import("whisper_ipc.zig");
     _ = @import("whisper_helper_core.zig");
@@ -21,5 +23,9 @@ test {
     _ = @import("model_store.zig");
     _ = @import("local_model_recovery.zig");
     _ = @import("status_item.zig");
+    _ = @import("failure_observation.zig");
     _ = @import("menu.zig");
+    _ = @import("operation_channel.zig");
+    _ = @import("model_operation.zig"); // the Model Operation Runner (observation + orchestration)
+    _ = @import("daemon.zig"); // the capstone: compiled here for coverage (its Model Operation observation tests moved to model_operation.zig)
 }

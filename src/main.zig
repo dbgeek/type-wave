@@ -16,6 +16,25 @@ const daemon = @import("daemon.zig");
 const keychain = @import("keychain.zig");
 const model_store = @import("model_store.zig");
 const local_backend = @import("local_backend.zig");
+const operation_channel = @import("operation_channel.zig");
+
+/// True only when the daemon spawned this process as a Model Operation child
+/// (operation_channel.env_var in the environment): typed events then mirror the
+/// stderr prose onto stdout. A terminal run keeps stdout silent.
+var g_operation_channel = false;
+
+fn emitOperationEvent(event: operation_channel.Event) void {
+    if (!g_operation_channel) return;
+    var buffer: [256]u8 = undefined;
+    const line = operation_channel.encode(&buffer, event) catch return;
+    buffer[line.len] = '\n';
+    var written: usize = 0;
+    while (written < line.len + 1) {
+        const n = std.c.write(1, buffer[written..].ptr, line.len + 1 - written);
+        if (n <= 0) return;
+        written += @intCast(n);
+    }
+}
 
 extern "c" fn signal(sig: c_int, handler: *const fn (c_int) callconv(.c) void) callconv(.c) usize;
 const SIGINT: c_int = 2;
@@ -36,8 +55,20 @@ comptime {
     _ = &@import("info_plist.zig").info_plist;
 }
 
+/// Model-action exit shared by every daemon-spawnable subcommand: prose to stderr as
+/// before, plus the typed terminal `failed` event so the Status Item's failure detail
+/// is the stable error name, not a log line.
+fn finishModelAction(arg: []const u8, result: anyerror!void) void {
+    result catch |failure| {
+        std.debug.print("{s}: {s}\n", .{ arg, @errorName(failure) });
+        emitOperationEvent(.{ .failed = @errorName(failure) });
+        std.process.exit(1);
+    };
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     const alloc = std.heap.c_allocator;
+    g_operation_channel = init.environ.getPosix(operation_channel.env_var) != null;
 
     const argv = init.args.vector;
     if (argv.len > 1) {
@@ -46,17 +77,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (argv.len == 2 and (std.mem.eql(u8, arg, "--install-model") or std.mem.eql(u8, arg, "--update-model") or std.mem.eql(u8, arg, "--resume-model"))) {
             const resume_partial = std.mem.eql(u8, arg, "--resume-model");
             const update_only = std.mem.eql(u8, arg, "--update-model");
-            installModel(init.environ, resume_partial, update_only) catch |failure| {
-                std.debug.print("{s}: {s}\n", .{ arg, @errorName(failure) });
-                std.process.exit(1);
-            };
-            return;
+            return finishModelAction(arg, installModel(init.environ, resume_partial, update_only));
         }
-        if (argv.len == 2 and std.mem.eql(u8, arg, "--discard-model")) return discardModel(init.environ);
-        if (argv.len == 2 and std.mem.eql(u8, arg, "--remove-model")) return removeModel(init.environ);
+        if (argv.len == 2 and std.mem.eql(u8, arg, "--discard-model")) return finishModelAction(arg, discardModel(init.environ));
+        if (argv.len == 2 and std.mem.eql(u8, arg, "--remove-model")) return finishModelAction(arg, removeModel(init.environ));
         if (argv.len == 2 and std.mem.eql(u8, arg, "--model-status")) return modelStatus(init.environ);
-        if (argv.len == 2 and std.mem.eql(u8, arg, "--verify-model")) return verifyModel(init.environ);
-        if (argv.len == 2 and std.mem.eql(u8, arg, "--repair-model")) return repairModel(init.environ);
+        if (argv.len == 2 and std.mem.eql(u8, arg, "--verify-model")) return finishModelAction(arg, verifyModel(init.environ));
+        if (argv.len == 2 and std.mem.eql(u8, arg, "--repair-model")) return finishModelAction(arg, repairModel(init.environ));
         std.debug.print(
             \\usage: type-wave [--set-key | --install-model | --update-model | --resume-model | --discard-model | --remove-model | --model-status | --verify-model | --repair-model]
             \\
@@ -101,6 +128,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     std.debug.print("type-wave — headless dictation daemon (wayfinder #19)\n\n", .{});
     var environ_map = try init.environ.createMap(alloc);
     defer environ_map.deinit();
+    // Every child the daemon spawns is a Model Operation of its own executable; the
+    // marker turns on their typed stdout channel (operation_channel.zig).
+    try environ_map.put(operation_channel.env_var, "1");
     try daemon.run(io, alloc, &environ_map);
 }
 
@@ -232,6 +262,7 @@ fn installModel(environ: std.process.Environ, resume_partial: bool, update_only:
 }
 
 fn printModelEvent(_: *anyopaque, event: model_store.OperationEvent) void {
+    emitOperationEvent(.{ .operation = event });
     switch (event) {
         .downloading => |bytes| std.debug.print("Model Operation: downloading {d}/{d} bytes\n", .{ bytes.completed, bytes.total }),
         .retrying => |retry| std.debug.print(

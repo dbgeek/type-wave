@@ -9,7 +9,12 @@ pub const pinned_model_sha256: [32]u8 = .{
     0xf4, 0x7c, 0x88, 0x75, 0x7e, 0xf7, 0x2e, 0xe5,
     0x94, 0x38, 0x79, 0xb7, 0xe8, 0xe2, 0xbc, 0x69,
 };
-pub const max_pcm_len: usize = 24_000 * 2 * 15;
+/// Per-**Segment** ceiling on 24 kHz s16 Capture bytes handed to one inference (ADR-0003).
+/// A long local Utterance is cut into Segments; the local Adapter force-cuts at a 25 s hard
+/// max, so this bound only has to clear that plus one 50 ms buffer of slop — 26 s here. It
+/// is no longer a per-Utterance cap (that ceiling is gone). Stays well under the 2 MiB IPC
+/// frame payload cap: 26 s · 48 kB/s = 1.25 MiB.
+pub const max_pcm_len: usize = 24_000 * 2 * 26;
 
 pub const Artifact = artifact_identity.Identity;
 
