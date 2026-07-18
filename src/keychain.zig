@@ -136,6 +136,27 @@ pub fn readHuggingFaceToken(gpa: std.mem.Allocator) ReadResult {
     return readSecret(gpa, hugging_face_account);
 }
 
+pub const Presence = enum { absent, present, unavailable };
+
+/// Query only the item's identity, never its secret bytes. This keeps Status Item chrome
+/// refreshes non-sensitive while still distinguishing a missing item from a locked or
+/// denied Keychain that must not be presented as missing.
+pub fn huggingFaceTokenPresence() Presence {
+    const svc = cfStr(service);
+    defer CFRelease(svc);
+    const acct = cfStr(hugging_face_account);
+    defer CFRelease(acct);
+    const keys = [_]CFTypeRef{ kSecClass, kSecAttrService, kSecAttrAccount, kSecMatchLimit };
+    const vals = [_]CFTypeRef{ kSecClassGenericPassword, svc, acct, kSecMatchLimitOne };
+    const query = dict(&keys, &vals);
+    defer CFRelease(query);
+    return switch (SecItemCopyMatching(query, null)) {
+        errSecSuccess => .present,
+        errSecItemNotFound => .absent,
+        else => .unavailable,
+    };
+}
+
 fn readSecret(gpa: std.mem.Allocator, item_account: [*:0]const u8) ReadResult {
     const svc = cfStr(service);
     defer CFRelease(svc);

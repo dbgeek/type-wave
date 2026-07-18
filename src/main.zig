@@ -108,7 +108,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("Model Operation recovery check: {s}\n", .{@errorName(failure)});
 
     std.debug.print("type-wave — headless dictation daemon (wayfinder #19)\n\n", .{});
-    try daemon.run(io, alloc);
+    var environ_map = try init.environ.createMap(alloc);
+    defer environ_map.deinit();
+    try daemon.run(io, alloc, &environ_map);
 }
 
 /// `--set-key`: one line from stdin → keychain. Echo is suppressed on a terminal so the

@@ -465,6 +465,7 @@ fn cooperativeCancelTramp(ctx: *anyopaque, id: backend.UtteranceId) void {
 const Daemon = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
+    process_environ: *const std.process.Environ.Map,
 
     // ---- live settings (#16, made mutable by #32/#34): the immutable-snapshot store.
     //      The menu is the sole writer; every reader acquire-loads a coherent snapshot
@@ -909,6 +910,12 @@ const Daemon = struct {
             .operation = operation,
             .operation_bytes = operation_bytes,
             .installation_identity = installation_identity,
+            .hugging_face_credential = switch (keychain.huggingFaceTokenPresence()) {
+                .absent => .absent,
+                .present => .present,
+                .unavailable => .unavailable,
+            },
+            .hugging_face_environment_override = std.c.getenv("HF_TOKEN") != null,
         };
     }
 
@@ -1019,6 +1026,7 @@ const Daemon = struct {
         };
         var child = std.process.spawn(self.io, .{
             .argv = &.{ executable, argument },
+            .environ_map = self.process_environ,
             .stdin = if (confirmation != null) .pipe else .ignore,
             .stdout = .inherit,
             .stderr = .pipe,
@@ -1105,7 +1113,7 @@ const Daemon = struct {
 /// tap's run loop until a quit signal. Never exits non-zero for a *recoverable* condition
 /// (missing key/grants) — those are the supervisor's job — so the LaunchAgent never
 /// crash-loops on them.
-pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
+pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.process.Environ.Map) !void {
     // Settings load always (defaults if absent); the secret is NOT required up front — the
     // supervisor waits for it (self-heal). The parsed Settings become the first immutable
     // snapshot in the Store (#32); every later change swaps in a fresh heap copy.
@@ -1120,6 +1128,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator) !void {
     var daemon = Daemon{
         .io = io,
         .alloc = alloc,
+        .process_environ = process_environ,
         .store = config.Store.init(first_snapshot),
     };
     daemon.transcription.store = &daemon.store;

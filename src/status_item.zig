@@ -63,6 +63,16 @@ pub const ModelAction = enum {
     forget_hugging_face_token,
 };
 
+pub const CredentialState = enum { absent, present, unavailable };
+pub const TokenAction = enum { set, replace, unavailable };
+pub const ModelFailure = enum {
+    none,
+    installation_corrupt,
+    runtime_unavailable,
+    operation_failed,
+    operation_cancelled,
+};
+
 pub const Snapshot = struct {
     selected_backend: backend.Backend,
     health: readiness.Health,
@@ -72,6 +82,8 @@ pub const Snapshot = struct {
     operation: Operation = .idle,
     operation_bytes: ?ByteProgress = null,
     installation_identity: ?InstallationIdentity = null,
+    hugging_face_credential: CredentialState = .absent,
+    hugging_face_environment_override: bool = false,
 };
 
 pub const ByteProgress = struct { completed: u64, total: u64 };
@@ -108,6 +120,8 @@ pub const Presentation = struct {
     audio_stays_on_mac: bool,
     model_operation_uses_network: bool,
     model_actions: std.EnumSet(ModelAction),
+    token_action: TokenAction,
+    model_failure: ModelFailure,
 
     pub fn allowsModelAction(self: Presentation, action: ModelAction) bool {
         return self.model_actions.contains(action);
@@ -124,13 +138,28 @@ pub fn derive(s: Snapshot) Presentation {
             s.health.status == .ready_offline,
         .model_operation_uses_network = operation_active,
         .model_actions = modelActions(s, operation_active),
+        .token_action = switch (s.hugging_face_credential) {
+            .absent => .set,
+            .present => .replace,
+            .unavailable => .unavailable,
+        },
+        .model_failure = if (s.operation == .failed)
+            .operation_failed
+        else if (s.operation == .cancelled)
+            .operation_cancelled
+        else if (s.installation == .corrupt)
+            .installation_corrupt
+        else if (s.local_runtime_failure)
+            .runtime_unavailable
+        else
+            .none,
     };
 }
 
 fn modelActions(s: Snapshot, operation_active: bool) std.EnumSet(ModelAction) {
     var actions: std.EnumSet(ModelAction) = .empty;
     actions.insert(.diagnostics);
-    actions.insert(.forget_hugging_face_token);
+    if (s.hugging_face_credential == .present) actions.insert(.forget_hugging_face_token);
     switch (s.operation) {
         .paused => {
             actions.insert(.resume_operation);
@@ -210,6 +239,7 @@ fn snap(fields: struct {
     local_runtime_failure: bool = false,
     installation: Installation = .ready,
     operation: Operation = .idle,
+    hugging_face_credential: CredentialState = .absent,
 }) Snapshot {
     return .{
         .selected_backend = fields.selected_backend,
@@ -218,6 +248,7 @@ fn snap(fields: struct {
         .local_runtime_failure = fields.local_runtime_failure,
         .installation = fields.installation,
         .operation = fields.operation,
+        .hugging_face_credential = fields.hugging_face_credential,
     };
 }
 
@@ -304,4 +335,26 @@ test "Cancel is offered only while a Model Operation stage is cancellable" {
         try std.testing.expect(derive(snap(.{ .operation = operation })).allowsModelAction(.cancel_operation));
     for ([_]Operation{ .activating, .removing, .discarding, .forgetting_credential }) |operation|
         try std.testing.expect(!derive(snap(.{ .operation = operation })).allowsModelAction(.cancel_operation));
+}
+
+test "Hugging Face token maintenance follows the observed Keychain state" {
+    const absent = derive(snap(.{ .hugging_face_credential = .absent }));
+    try std.testing.expectEqual(TokenAction.set, absent.token_action);
+    try std.testing.expect(!absent.allowsModelAction(.forget_hugging_face_token));
+
+    const present = derive(snap(.{ .hugging_face_credential = .present }));
+    try std.testing.expectEqual(TokenAction.replace, present.token_action);
+    try std.testing.expect(present.allowsModelAction(.forget_hugging_face_token));
+
+    const unavailable = derive(snap(.{ .hugging_face_credential = .unavailable }));
+    try std.testing.expectEqual(TokenAction.unavailable, unavailable.token_action);
+    try std.testing.expect(!unavailable.allowsModelAction(.forget_hugging_face_token));
+}
+
+test "Local Model failures identify the actionable recovery" {
+    try std.testing.expectEqual(ModelFailure.installation_corrupt, derive(snap(.{ .installation = .corrupt })).model_failure);
+    try std.testing.expectEqual(ModelFailure.runtime_unavailable, derive(snap(.{ .local_runtime_failure = true })).model_failure);
+    try std.testing.expectEqual(ModelFailure.operation_failed, derive(snap(.{ .operation = .failed })).model_failure);
+    try std.testing.expectEqual(ModelFailure.operation_cancelled, derive(snap(.{ .operation = .cancelled })).model_failure);
+    try std.testing.expectEqual(ModelFailure.none, derive(snap(.{})).model_failure);
 }

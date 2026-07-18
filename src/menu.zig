@@ -382,6 +382,9 @@ pub const Menu = struct {
     local_model_parent: id = null,
     local_model_status: id = null,
     local_operation_status: id = null,
+    local_failure_status: id = null,
+    local_credential_status: id = null,
+    hugging_face_token_item: id = null,
     model_actions: [std.meta.fieldNames(ModelAction).len]id = @splat(null),
 
     last_snapshot: ?status_item.Snapshot = null,
@@ -493,13 +496,15 @@ pub const Menu = struct {
         const sub = newMenu();
         self.local_model_status = self.addDisabled(sub, "KB Whisper Small — not installed");
         self.local_operation_status = self.addDisabled(sub, "Model Operation — idle");
+        self.local_failure_status = self.addDisabled(sub, "");
+        self.local_credential_status = self.addDisabled(sub, "Hugging Face token — not set");
         addSeparator(sub);
         for (model_action_definitions) |definition| {
             const item = self.addAction(sub, definition.title, "onModelAction:");
             msgLong(item, "setTag:", @intFromEnum(definition.action));
             self.model_actions[@intFromEnum(definition.action)] = item;
         }
-        _ = self.addAction(sub, "Set or Replace Hugging Face token\xe2\x80\xa6", "onSetHuggingFaceToken:");
+        self.hugging_face_token_item = self.addAction(sub, "Set Hugging Face token\xe2\x80\xa6", "onSetHuggingFaceToken:");
         const parent = makeItem("Local Model", null);
         msg1v(parent, "setSubmenu:", sub);
         msg1v(menu, "addItem:", parent);
@@ -591,6 +596,35 @@ pub const Menu = struct {
             break :title printed.ptr;
         };
         msg1v(self.local_operation_status, "setTitle:", nsstr(operation_title));
+
+        const failure_title: [*:0]const u8 = switch (presentation.model_failure) {
+            .none => "",
+            .installation_corrupt => "Failure — Model Installation corrupt; Repair or Remove",
+            .runtime_unavailable => "Failure — Local runtime unavailable; Retry or Open diagnostics",
+            .operation_failed => "Failure — Model Operation failed; Retry or Open diagnostics",
+            .operation_cancelled => "Model Operation cancelled; Retry if still needed",
+        };
+        msg1v(self.local_failure_status, "setTitle:", nsstr(failure_title));
+        msgBool(self.local_failure_status, "setHidden:", presentation.model_failure == .none);
+
+        const credential_title: [*:0]const u8 = if (snapshot.hugging_face_environment_override)
+            switch (snapshot.hugging_face_credential) {
+                .present => "Hugging Face credential — HF_TOKEN override; Keychain token also stored",
+                .absent => "Hugging Face credential — HF_TOKEN environment override",
+                .unavailable => "Hugging Face credential — HF_TOKEN override; Keychain unavailable",
+            }
+        else switch (snapshot.hugging_face_credential) {
+            .present => "Hugging Face token — stored in login Keychain",
+            .absent => "Hugging Face token — not set",
+            .unavailable => "Hugging Face token — Keychain unavailable",
+        };
+        msg1v(self.local_credential_status, "setTitle:", nsstr(credential_title));
+        msg1v(self.hugging_face_token_item, "setTitle:", nsstr(switch (presentation.token_action) {
+            .set => "Set Hugging Face token\xe2\x80\xa6",
+            .replace => "Replace Hugging Face token\xe2\x80\xa6",
+            .unavailable => "",
+        }));
+        msgBool(self.hugging_face_token_item, "setHidden:", presentation.token_action == .unavailable);
         for (model_action_definitions) |definition| {
             const item = self.model_actions[@intFromEnum(definition.action)];
             msgBool(item, "setHidden:", !presentation.allowsModelAction(definition.action));
@@ -673,7 +707,7 @@ fn onPrimary(sender_self: id, command: SEL, sender: id) callconv(.c) void {
         .none, .operation_progress => {},
         .set_openai_api_key => onSetApiKey(sender_self, command, sender),
         .install_local_model => if (confirmModelAction(.install)) m.host.modelAction(m.host.ctx, .install),
-        .update_local_model => m.host.modelAction(m.host.ctx, .update),
+        .update_local_model => if (confirmModelAction(.update)) m.host.modelAction(m.host.ctx, .update),
         .resume_model_operation => m.host.modelAction(m.host.ctx, .resume_operation),
         .retry_model_operation => m.host.modelAction(m.host.ctx, .retry_operation),
         .repair_local_model => if (confirmModelAction(.repair)) m.host.modelAction(m.host.ctx, .repair),
@@ -706,6 +740,11 @@ fn confirmationForModelAction(action: ModelAction) ?ModelActionConfirmation {
             .detail = "Download the official F16 ggml-model.bin artifact from KBLab/kb-whisper-small at revision 3564d61a42fc210ceaa55a22a96dd64478959c78 (487,601,984 bytes). This large Model Operation uses the network only after you choose Install; Capture audio is never uploaded.",
             .button = "Install",
         },
+        .update => .{
+            .title = "Update KB Whisper Small?",
+            .detail = "The replacement is downloaded and verified as staged data while the working Model Installation stays usable. An active Utterance may finish before atomic activation. Local remains selected with no OpenAI fallback, and the Hugging Face token is preserved.",
+            .button = "Update",
+        },
         .remove => .{
             .title = "Remove the Local Model?",
             .detail = "An active Utterance may finish before the helper unloads. Local remains selected with no OpenAI fallback. The Model Installation and staged data are removed; the Hugging Face token is preserved.",
@@ -713,17 +752,22 @@ fn confirmationForModelAction(action: ModelAction) ?ModelActionConfirmation {
         },
         .repair => .{
             .title = "Repair the Local Model?",
-            .detail = "Valid local data is preserved. If authenticated network access is needed, it is used only for this Model Operation; Capture audio is never uploaded.",
+            .detail = "Valid working Model Installation data is preserved while repair data is staged. An active Utterance may finish before atomic activation. Local remains selected with no OpenAI fallback, and the Hugging Face token is preserved. If authenticated network access is needed, it is used only for this Model Operation; Capture audio is never uploaded.",
             .button = "Repair",
+        },
+        .cancel_operation => .{
+            .title = "Cancel the Model Operation?",
+            .detail = "The current cancellable stage stops cooperatively. Resumable staged data is retained, the working Model Installation stays usable, and the Hugging Face token is preserved. An active local Utterance and the no-fallback privacy boundary are unchanged.",
+            .button = "Cancel Operation",
         },
         .discard => .{
             .title = "Discard Partial Model Data?",
-            .detail = "Only resumable staged data is discarded. A working Model Installation remains unchanged.",
+            .detail = "Only resumable staged data is discarded. The working Model Installation, active local Utterance, local selection with no OpenAI fallback, and Hugging Face token are unchanged.",
             .button = "Discard",
         },
         .forget_hugging_face_token => .{
             .title = "Forget the Hugging Face Token?",
-            .detail = "Any authenticated transfer is stopped first. Resumable staged data and the working Model Installation are preserved.",
+            .detail = "Any authenticated transfer is stopped first. Resumable staged data and the working Model Installation are preserved. Local remains selected with no OpenAI fallback, and an active local Utterance is unaffected.",
             .button = "Forget Token",
         },
         else => null,
@@ -747,6 +791,29 @@ test "Install confirmation names the pinned large artifact and its privacy bound
     try std.testing.expect(std.mem.indexOf(u8, std.mem.span(copy.detail), "ggml-model.bin") != null);
     try std.testing.expect(std.mem.indexOf(u8, std.mem.span(copy.detail), "487,601,984 bytes") != null);
     try std.testing.expect(std.mem.indexOf(u8, std.mem.span(copy.detail), "Capture audio is never uploaded") != null);
+}
+
+test "state-changing Local Model confirmations explain their containment boundary" {
+    const update = std.mem.span(confirmationForModelAction(.update).?.detail);
+    try std.testing.expect(std.mem.indexOf(u8, update, "active Utterance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, update, "staged") != null);
+    try std.testing.expect(std.mem.indexOf(u8, update, "working Model Installation") != null);
+
+    const remove = std.mem.span(confirmationForModelAction(.remove).?.detail);
+    try std.testing.expect(std.mem.indexOf(u8, remove, "no OpenAI fallback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, remove, "token is preserved") != null);
+
+    const cancel = std.mem.span(confirmationForModelAction(.cancel_operation).?.detail);
+    try std.testing.expect(std.mem.indexOf(u8, cancel, "working Model Installation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cancel, "staged data") != null);
+
+    const discard = std.mem.span(confirmationForModelAction(.discard).?.detail);
+    try std.testing.expect(std.mem.indexOf(u8, discard, "staged data") != null);
+    try std.testing.expect(std.mem.indexOf(u8, discard, "working Model Installation") != null);
+
+    const forget = std.mem.span(confirmationForModelAction(.forget_hugging_face_token).?.detail);
+    try std.testing.expect(std.mem.indexOf(u8, forget, "staged data") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forget, "working Model Installation") != null);
 }
 
 fn onOpenConfig(_: id, _: SEL, _: id) callconv(.c) void {
@@ -802,10 +869,11 @@ fn onSetHuggingFaceToken(_: id, _: SEL, _: id) callconv(.c) void {
     defer objc_autoreleasePoolPop(pool);
     msgBool(appkit.app(), "activateIgnoringOtherApps:", true);
 
+    const replacing = status_item.derive(m.host.status(m.host.ctx)).token_action == .replace;
     const alert = msg(msg(cls("NSAlert"), "alloc"), "init");
-    msg1v(alert, "setMessageText:", nsstr("Set Hugging Face Token"));
+    msg1v(alert, "setMessageText:", nsstr(if (replacing) "Replace Hugging Face Token" else "Set Hugging Face Token"));
     msg1v(alert, "setInformativeText:", nsstr("Stored separately in the login Keychain. Used only for an explicit Model Operation; Capture audio is never uploaded."));
-    _ = msg1(alert, "addButtonWithTitle:", nsstr("Set"));
+    _ = msg1(alert, "addButtonWithTitle:", nsstr(if (replacing) "Replace" else "Set"));
     _ = msg1(alert, "addButtonWithTitle:", nsstr("Cancel"));
     const field = secureField(.{ .x = 0, .y = 0, .w = 280, .h = 24 });
     msg1v(alert, "setAccessoryView:", field);
@@ -820,6 +888,8 @@ fn onSetHuggingFaceToken(_: id, _: SEL, _: id) callconv(.c) void {
         _ = msg1(fail, "addButtonWithTitle:", nsstr("OK"));
         _ = msgLongR(fail, "runModal");
     }
+    m.last_snapshot = null;
+    m.refreshChrome();
 }
 
 fn onQuit(_: id, _: SEL, _: id) callconv(.c) void {
