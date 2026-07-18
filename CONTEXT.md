@@ -17,8 +17,25 @@ Provisional text emitted while an Utterance is still being spoken. Logged, may b
 _Avoid_: delta, interim result
 
 **Final Transcript**:
-The committed text for a completed Utterance; the only text that is ever inserted.
+The committed text for a completed Utterance; the only text that is ever inserted. For a
+multi-Segment Utterance it is the ordered concatenation of that Utterance's Segment
+Transcripts; a short single-Segment Utterance yields it directly.
 _Avoid_: result, output
+
+**Segment**:
+A contiguous span of one Utterance's Capture, transcribed on its own. The local Backend
+cuts a long Utterance into Segments at silences — a 15 s soft floor, then the next
+≥400 ms pause, with a 25 s hard-max force-cut — so it can transcribe them in the
+background while the Utterance is still being spoken. A short Utterance is a single
+Segment, identical to pre-segmentation behaviour. OpenAI never segments; it streams. See
+ADR-0003.
+_Avoid_: chunk (that names the 50 ms Capture buffer), clip
+
+**Segment Transcript**:
+The committed text of one Segment. Segment Transcripts concatenate in spoken order into
+their Utterance's Final Transcript. Unlike a Partial Transcript it is not revisable, and —
+as part of the Final Transcript — it is inserted.
+_Avoid_: partial (a Partial Transcript is the revisable OpenAI delta)
 
 **Insertion**:
 Placing a Final Transcript at the cursor of the Focused Target. Every Insertion ends with
