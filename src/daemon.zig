@@ -68,6 +68,7 @@ const configuration_phase = @import("configuration_phase.zig");
 const backend = @import("transcription_backend.zig");
 const backend_router = @import("backend_router.zig");
 const operation_channel = @import("operation_channel.zig");
+const model_operation = @import("model_operation.zig");
 const local_backend = @import("local_backend.zig");
 const model_store = @import("model_store.zig");
 const local_model_recovery = @import("local_model_recovery.zig");
@@ -91,121 +92,103 @@ const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
 const SIGHUP: c_int = 1;
 
-const ModelOperationObservation = struct {
-    pid: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(0),
-    phase: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(status_item.Operation.idle)),
-    completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    retry_action: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(menu_mod.ModelAction.install)),
-    cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    typed_failure: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    failure: FailureObservation = .{},
+/// Alias for the libc `kill` extern, so the Model Operation Runner's `Deps.kill` method can
+/// call it without its own name shadowing the extern inside its body.
+const posixKill = kill;
 
-    const Current = struct { phase: status_item.Operation, bytes: ?status_item.ByteProgress, active: bool, failure_detail: ?status_item.FailureDetail };
+/// model_operation.zig's `Deps` seam, made real (wayfinder #95). The Model Operation Runner
+/// owns the operation policy and its cross-thread observation; this adapter is the effects
+/// it drives: resolve the daemon's own executable, spawn the Model Operation child with the
+/// built argv + environment, write any confirmation to its stdin, run the two drain threads
+/// that re-enter the Runner via trampolines (stdout → decoded operation-channel events;
+/// stderr → prose / failure fallback, then the terminal outcome), and kill on cancel.
+const ModelOperationRunnerDeps = struct {
+    daemon: *Daemon,
 
-    fn current(self: *ModelOperationObservation) ?Current {
-        const active = self.pid.load(.acquire) != 0;
-        const phase = std.enums.fromInt(status_item.Operation, self.phase.load(.acquire)) orelse .installing;
-        if (!active and phase != .failed and phase != .cancelled) return null;
-        const total = self.total.load(.acquire);
-        return .{
-            .phase = phase,
-            .bytes = if (!phase.reportsByteProgress() or total == 0) null else .{ .completed = self.completed.load(.acquire), .total = total },
-            .active = active,
-            .failure_detail = self.failure.current(),
+    /// Resolve the executable, spawn the child (writing any confirmation to its stdin), and
+    /// hand the child to the waiter drain thread. Returns the child's pid, or null when any
+    /// step fails — the Runner then begins nothing (no phantom operation). `begin` runs the
+    /// instant this returns, before the child can emit; the pipes buffer anything that races
+    /// ahead of it.
+    pub fn launch(self: *ModelOperationRunnerDeps, request: model_operation.LaunchRequest) ?c_int {
+        const d = self.daemon;
+        var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        var executable_size: u32 = executable_buffer.len;
+        if (_NSGetExecutablePath(&executable_buffer, &executable_size) != 0) return null;
+        const executable = std.mem.sliceTo(executable_buffer[0..executable_size], 0);
+        var child = std.process.spawn(d.io, .{
+            .argv = &.{ executable, request.argument },
+            .environ_map = d.process_environ,
+            .stdin = if (request.confirmation != null) .pipe else .ignore,
+            .stdout = .pipe, // the typed Model Operation channel (operation_channel.zig)
+            .stderr = .pipe, // human prose: daemon log + failure fallback
+        }) catch |failure| {
+            feedback.log("  menu: could not start Model Operation: {s}\n", .{@errorName(failure)});
+            return null;
         };
-    }
-
-    fn begin(self: *ModelOperationObservation, pid: c_int, phase: status_item.Operation, action: menu_mod.ModelAction) void {
-        self.phase.store(@intFromEnum(phase), .release);
-        self.retry_action.store(@intFromEnum(action), .release);
-        self.cancel_requested.store(false, .release);
-        self.completed.store(0, .release);
-        self.total.store(0, .release);
-        self.typed_failure.store(false, .release);
-        self.failure.clear();
-        self.pid.store(pid, .release);
-    }
-
-    /// A decoded typed event from the child's stdout channel — the only source of
-    /// phase and byte progress. Stderr prose is log and failure fallback, never
-    /// mined for numbers.
-    fn apply(self: *ModelOperationObservation, event: operation_channel.Event) void {
-        switch (event) {
-            .operation => |op| switch (op) {
-                .downloading => |bytes| self.setProgress(bytes.completed, bytes.total),
-                // A retry carries its own byte position — attempt/budget never
-                // masquerades as progress (the old prose mining's latent bug).
-                .retrying => |retry| self.setProgress(retry.bytes.completed, retry.bytes.total),
-                .verifying => |bytes| {
-                    self.setPhase(.verifying);
-                    self.setProgress(bytes.completed, bytes.total);
-                },
-                .smoke_testing => self.setPhase(.smoke_testing),
-                .waiting_for_inference => self.setPhase(.waiting_for_inference),
-                .activating => self.setPhase(.activating),
-                .removing => self.setPhase(.removing),
-            },
-            .failed => |name| {
-                self.typed_failure.store(true, .release);
-                self.failure.set(name);
-            },
+        if (request.confirmation) |answer| {
+            child.stdin.?.writeStreamingAll(d.io, answer) catch {
+                child.kill(d.io);
+                return null;
+            };
+            child.stdin.?.close(d.io);
+            child.stdin = null;
         }
-    }
-
-    /// Stderr fallback for deaths that never emit a typed `failed` event (a panic,
-    /// OOM): retain the last non-progress line. A typed failure is authoritative.
-    fn observeFailure(self: *ModelOperationObservation, line: []const u8) void {
-        if (std.mem.indexOf(u8, line, "Model Operation:") != null) return;
-        if (self.typed_failure.load(.acquire)) return;
-        self.failure.set(line);
-    }
-
-    fn finish(self: *ModelOperationObservation, succeeded: bool) void {
-        self.phase.store(@intFromEnum(if (succeeded)
-            status_item.Operation.idle
-        else if (self.cancel_requested.load(.acquire))
-            status_item.Operation.cancelled
-        else
-            status_item.Operation.failed), .release);
-        self.completed.store(0, .release);
-        self.total.store(0, .release);
-        self.pid.store(0, .release);
-    }
-
-    fn setPhase(self: *ModelOperationObservation, phase: status_item.Operation) void {
-        self.phase.store(@intFromEnum(phase), .release);
-        if (phase != .installing and phase != .updating and phase != .verifying) {
-            self.completed.store(0, .release);
-            self.total.store(0, .release);
-        }
-    }
-
-    fn setProgress(self: *ModelOperationObservation, completed: u64, total: u64) void {
-        self.completed.store(completed, .release);
-        self.total.store(total, .release);
-    }
-
-    fn requestCancel(self: *ModelOperationObservation) ?c_int {
-        const phase = std.enums.fromInt(status_item.Operation, self.phase.load(.acquire)) orelse return null;
-        if (!phase.isCancellable()) return null;
-        const pid = self.pid.load(.acquire);
-        if (pid == 0) return null;
-        self.cancel_requested.store(true, .release);
+        const pid: c_int = @intCast(child.id.?);
+        const waiter = std.Thread.spawn(.{}, drainModelOperation, .{ d.io, child, &d.model_operation_runner }) catch {
+            child.kill(d.io);
+            return null;
+        };
+        waiter.detach();
         return pid;
     }
 
-    fn retryAction(self: *const ModelOperationObservation) ?menu_mod.ModelAction {
-        const phase = std.enums.fromInt(status_item.Operation, self.phase.load(.acquire)) orelse return null;
-        if (phase != .failed and phase != .cancelled) return null;
-        return std.enums.fromInt(menu_mod.ModelAction, self.retry_action.load(.acquire));
+    /// Cancel routing's effect: deliver SIGTERM to the live child the Runner named.
+    pub fn kill(_: *ModelOperationRunnerDeps, pid: c_int) void {
+        _ = posixKill(pid, SIGTERM);
+    }
+
+    /// Narration for the daemon log: the child's stderr prose, and the terminal line.
+    pub fn log(_: *ModelOperationRunnerDeps, note: model_operation.Note) void {
+        switch (note) {
+            .stderr => |line| feedback.log("  model: {s}\n", .{line}),
+            .finished => |finished| feedback.log("  menu: Model Operation {s} {s}\n", .{
+                @tagName(finished.action),
+                if (finished.succeeded) "finished" else "failed",
+            }),
+        }
     }
 };
-var g_model_operation: ModelOperationObservation = .{};
-// This observation's behaviour is now exercised through the Model Operation Runner
-// (model_operation.zig, wayfinder #94), which owns the standalone lift of it; the three
-// tests that lived here moved there. This copy stays until the daemon is wired to the
-// Runner.
+const ModelOperationRunner = model_operation.Runner(ModelOperationRunnerDeps);
+
+/// The waiter drain thread the Deps runs per launch (one of the two): it spawns the stdout
+/// channel drain, streams the child's stderr prose into the Runner (failure fallback + log),
+/// then joins the channel drain and reports the terminal outcome. Re-enters the Runner via
+/// the pointer it is handed — the Runner must not move (model_operation.zig).
+fn drainModelOperation(io: std.Io, child_value: std.process.Child, runner: *ModelOperationRunner) void {
+    var child = child_value;
+    const channel_thread: ?std.Thread = std.Thread.spawn(.{}, drainOperationChannel, .{ io, child.stdout.?, runner }) catch null;
+    if (channel_thread == null)
+        feedback.log("  menu: Model Operation channel reader unavailable — progress will not update\n", .{});
+    var read_buffer: [2048]u8 = undefined;
+    var stderr_reader = child.stderr.?.readerStreaming(io, &read_buffer);
+    while (stderr_reader.interface.takeDelimiter('\n') catch null) |line| runner.onStderr(line);
+    if (channel_thread) |thread| thread.join(); // both pipes hit EOF at child exit
+    const term = child.wait(io) catch return runner.onTerminal(false);
+    runner.onTerminal(term.success());
+}
+
+/// The stdout channel drain thread (the other of the two): decoded operation-channel events
+/// drive the Runner's observation — phase and byte progress; anything undecodable on this
+/// stream is silently skipped.
+fn drainOperationChannel(io: std.Io, stdout_value: std.Io.File, runner: *ModelOperationRunner) void {
+    var stdout = stdout_value;
+    var read_buffer: [2048]u8 = undefined;
+    var reader = stdout.readerStreaming(io, &read_buffer);
+    while (reader.interface.takeDelimiter('\n') catch null) |line| {
+        if (operation_channel.decode(line)) |event| runner.onChannelEvent(event);
+    }
+}
 
 // ---- tuning ----------------------------------------------------------------
 /// Self-heal poll cadence. Fast enough that granting a permission / dropping in the key
@@ -440,6 +423,14 @@ const Daemon = struct {
     deadline: DeadlineAdapter = .{},
     feedback_surface: surface.Surface = undefined,
     coordinator: Coord = undefined,
+
+    /// The Model Operation Runner (model_operation.zig, wayfinder #94) + its real Deps: the
+    /// daemon's one route from a Status Item action to a Model Operation child, and the owner
+    /// of that operation's observation. Wired in run(); driven by menuModelAction, read by
+    /// menuStatus. Handed out by pointer and must not move (its observation atomics are
+    /// addressed in place).
+    model_operation_runner_deps: ModelOperationRunnerDeps = undefined,
+    model_operation_runner: ModelOperationRunner = undefined,
 
     /// Supervisor-thread-only: owns Configuration Phase memory, including READY
     /// announcements and distinct not-configured reports.
@@ -800,7 +791,7 @@ const Daemon = struct {
         }
         const recovery_state = self.local_model_recovery.current();
         if (recovery_state == .corrupt) installation = .corrupt;
-        if (g_model_operation.current()) |observed| {
+        if (self.model_operation_runner.current()) |observed| {
             if (observed.active or operation != .paused) {
                 operation = observed.phase;
                 operation_bytes = observed.bytes;
@@ -863,17 +854,16 @@ const Daemon = struct {
         return false;
     }
 
+    /// Every Status Item Model Operation action, routed through the Runner. `retry_runtime`,
+    /// `cancel_operation`, and `diagnostics` are handled here (they spawn no operation child);
+    /// every launchable / retryable action goes to `startAction`, which resolves a retry to
+    /// its original action, applies the one-at-a-time busy guard, and launches through the
+    /// Deps seam.
     fn menuModelAction(ctx: *anyopaque, action: menu_mod.ModelAction) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
         switch (action) {
-            .retry_runtime => {
-                g_retry_local.store(true, .release);
-                return;
-            },
-            .cancel_operation => {
-                if (g_model_operation.requestCancel()) |pid| _ = kill(pid, SIGTERM);
-                return;
-            },
+            .retry_runtime => g_retry_local.store(true, .release),
+            .cancel_operation => _ = self.model_operation_runner.requestCancel(),
             .diagnostics => {
                 const raw_home = std.c.getenv("HOME") orelse return;
                 var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -884,96 +874,8 @@ const Daemon = struct {
                     return;
                 };
                 waiter.detach();
-                return;
             },
-            else => {},
-        }
-        const effective_action = if (action == .retry_operation)
-            g_model_operation.retryAction() orelse return
-        else
-            action;
-        if (g_model_operation.pid.load(.acquire) != 0) return;
-        const argument: []const u8 = switch (effective_action) {
-            .install => "--install-model",
-            .update => "--update-model",
-            .resume_operation => "--resume-model",
-            .discard => "--discard-model",
-            .verify => "--verify-model",
-            .repair => "--repair-model",
-            .remove => "--remove-model",
-            .retry_runtime, .retry_operation, .cancel_operation, .diagnostics => unreachable,
-        };
-        var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        var executable_size: u32 = executable_buffer.len;
-        if (_NSGetExecutablePath(&executable_buffer, &executable_size) != 0) return;
-        const executable = std.mem.sliceTo(executable_buffer[0..executable_size], 0);
-        const confirmation: ?[]const u8 = switch (effective_action) {
-            .repair => "yes\n",
-            .remove => "remove\n",
-            else => null,
-        };
-        var child = std.process.spawn(self.io, .{
-            .argv = &.{ executable, argument },
-            .environ_map = self.process_environ,
-            .stdin = if (confirmation != null) .pipe else .ignore,
-            .stdout = .pipe, // the typed Model Operation channel (operation_channel.zig)
-            .stderr = .pipe, // human prose: daemon log + failure fallback
-        }) catch |failure| {
-            feedback.log("  menu: could not start Model Operation: {s}\n", .{@errorName(failure)});
-            return;
-        };
-        if (confirmation) |answer| {
-            child.stdin.?.writeStreamingAll(self.io, answer) catch {
-                child.kill(self.io);
-                return;
-            };
-            child.stdin.?.close(self.io);
-            child.stdin = null;
-        }
-        const pid: c_int = @intCast(child.id.?);
-        g_model_operation.begin(pid, switch (effective_action) {
-            .update => status_item.Operation.updating,
-            .verify => .verifying,
-            .remove => .removing,
-            .discard => .discarding,
-            else => .installing,
-        }, effective_action);
-        const waiter = std.Thread.spawn(.{}, waitForModelAction, .{ self.io, child, effective_action }) catch {
-            child.kill(self.io);
-            g_model_operation.finish(false);
-            return;
-        };
-        waiter.detach();
-    }
-
-    fn waitForModelAction(io: std.Io, child_value: std.process.Child, action: menu_mod.ModelAction) void {
-        var child = child_value;
-        const channel_thread: ?std.Thread = std.Thread.spawn(.{}, observeOperationChannel, .{ io, child.stdout.? }) catch null;
-        if (channel_thread == null)
-            feedback.log("  menu: Model Operation channel reader unavailable — progress will not update\n", .{});
-        var read_buffer: [2048]u8 = undefined;
-        var stderr_reader = child.stderr.?.readerStreaming(io, &read_buffer);
-        while (stderr_reader.interface.takeDelimiter('\n') catch null) |line| {
-            g_model_operation.observeFailure(line);
-            feedback.log("  model: {s}\n", .{line});
-        }
-        if (channel_thread) |thread| thread.join(); // both pipes hit EOF at child exit
-        const term = child.wait(io) catch {
-            g_model_operation.finish(false);
-            return;
-        };
-        g_model_operation.finish(term.success());
-        feedback.log("  menu: Model Operation {s} {s}\n", .{ @tagName(action), if (term.success()) "finished" else "failed" });
-    }
-
-    /// Drain the child's stdout channel: decoded events drive the observation;
-    /// anything undecodable on this stream is silently skipped.
-    fn observeOperationChannel(io: std.Io, stdout_value: std.Io.File) void {
-        var stdout = stdout_value;
-        var read_buffer: [2048]u8 = undefined;
-        var reader = stdout.readerStreaming(io, &read_buffer);
-        while (reader.interface.takeDelimiter('\n') catch null) |line| {
-            if (operation_channel.decode(line)) |event| g_model_operation.apply(event);
+            else => self.model_operation_runner.startAction(action),
         }
     }
 
@@ -1017,6 +919,8 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     };
     daemon.router_deps = .{ .daemon = &daemon };
     daemon.transcription = BackendRouter.init(io, &daemon.router_deps, selected_backend);
+    daemon.model_operation_runner_deps = .{ .daemon = &daemon };
+    daemon.model_operation_runner = ModelOperationRunner.init(&daemon.model_operation_runner_deps);
 
     // ---- modules that need neither a grant nor the key to construct ----
     try daemon.capture.init();
