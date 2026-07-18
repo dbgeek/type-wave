@@ -26,5 +26,6 @@ test {
     _ = @import("failure_observation.zig");
     _ = @import("menu.zig");
     _ = @import("operation_channel.zig");
-    _ = @import("daemon.zig"); // the Model Operation observation tests
+    _ = @import("model_operation.zig"); // the Model Operation Runner (observation + orchestration)
+    _ = @import("daemon.zig"); // the capstone: compiled here for coverage (its Model Operation observation tests moved to model_operation.zig)
 }

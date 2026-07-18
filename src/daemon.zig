@@ -202,47 +202,10 @@ const ModelOperationObservation = struct {
     }
 };
 var g_model_operation: ModelOperationObservation = .{};
-
-test "Model Operation observation retains the actionable terminal failure" {
-    var observation = ModelOperationObservation{};
-    observation.begin(42, .installing, .install);
-    observation.observeFailure("--install-model: ModelDownloadRejected");
-    observation.finish(false);
-
-    const current = observation.current().?;
-    try std.testing.expectEqual(status_item.Operation.failed, current.phase);
-    try std.testing.expectEqualStrings("--install-model: ModelDownloadRejected", current.failure_detail.?.value());
-}
-
-test "typed channel events drive phase and bytes; a retry never corrupts progress" {
-    var observation = ModelOperationObservation{};
-    observation.begin(42, .installing, .install);
-
-    observation.apply(.{ .operation = .{ .downloading = .{ .completed = 100, .total = 1_000 } } });
-    var current = observation.current().?;
-    try std.testing.expectEqual(status_item.Operation.installing, current.phase);
-    try std.testing.expectEqualDeep(status_item.ByteProgress{ .completed = 100, .total = 1_000 }, current.bytes.?);
-
-    // The prose mining this replaced read "retry 2/5" as 2/5 bytes.
-    observation.apply(.{ .operation = .{ .retrying = .{ .attempt = 2, .budget = 5, .delay_ms = 4_000, .bytes = .{ .completed = 100, .total = 1_000 } } } });
-    current = observation.current().?;
-    try std.testing.expectEqualDeep(status_item.ByteProgress{ .completed = 100, .total = 1_000 }, current.bytes.?);
-
-    observation.apply(.{ .operation = .{ .verifying = .{ .completed = 1_000, .total = 1_000 } } });
-    try std.testing.expectEqual(status_item.Operation.verifying, observation.current().?.phase);
-}
-
-test "a typed failure is authoritative over trailing stderr prose" {
-    var observation = ModelOperationObservation{};
-    observation.begin(42, .installing, .install);
-    observation.apply(.{ .failed = "ModelDownloadRejected" });
-    observation.observeFailure("--install-model: ModelDownloadRejected"); // prose may still trail in
-    observation.finish(false);
-
-    const current = observation.current().?;
-    try std.testing.expectEqual(status_item.Operation.failed, current.phase);
-    try std.testing.expectEqualStrings("ModelDownloadRejected", current.failure_detail.?.value());
-}
+// This observation's behaviour is now exercised through the Model Operation Runner
+// (model_operation.zig, wayfinder #94), which owns the standalone lift of it; the three
+// tests that lived here moved there. This copy stays until the daemon is wired to the
+// Runner.
 
 // ---- tuning ----------------------------------------------------------------
 /// Self-heal poll cadence. Fast enough that granting a permission / dropping in the key
