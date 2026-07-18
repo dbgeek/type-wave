@@ -123,7 +123,8 @@ replace_link() {
   next="$path.next.$$"
   rm -f "$next"
   ln -s "$target" "$next"
-  mv -f -h "$next" "$path"
+  # BSD-only -h flag; bypass PATH so a GNU coreutils mv (no -h) can't be picked up
+  /bin/mv -f -h "$next" "$path"
 }
 
 restore_path() {
