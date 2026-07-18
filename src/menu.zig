@@ -165,24 +165,13 @@ const NSAlertFirstButtonReturn: c_long = 1000;
 /// of them (a paused daemon reads needs-attention even when otherwise healthy).
 pub const Status = readiness.Status;
 pub const Health = readiness.Health;
-pub const ModelAction = enum {
-    install,
-    update,
-    resume_operation,
-    discard,
-    verify,
-    repair,
-    remove,
-    retry_runtime,
-    cancel_operation,
-    diagnostics,
-    forget_hugging_face_token,
-};
+pub const ModelAction = status_item.ModelAction;
 const ModelActionDefinition = struct { title: [*:0]const u8, action: ModelAction };
 const model_action_definitions = [_]ModelActionDefinition{
     .{ .title = "Install\xe2\x80\xa6", .action = .install },
     .{ .title = "Update\xe2\x80\xa6", .action = .update },
     .{ .title = "Resume Model Operation", .action = .resume_operation },
+    .{ .title = "Retry Model Operation", .action = .retry_operation },
     .{ .title = "Discard partial data\xe2\x80\xa6", .action = .discard },
     .{ .title = "Verify", .action = .verify },
     .{ .title = "Repair\xe2\x80\xa6", .action = .repair },
@@ -358,19 +347,6 @@ fn primaryText(action: status_item.PrimaryAction, operation: status_item.Operati
             .forgetting_credential => "Forgetting Hugging Face token\xe2\x80\xa6",
             else => "Model Operation in progress\xe2\x80\xa6",
         },
-    };
-}
-
-fn modelActionVisible(action: ModelAction, snapshot: status_item.Snapshot, operation_active: bool) bool {
-    return switch (action) {
-        .install => snapshot.installation == .absent and !operation_active,
-        .update => snapshot.installation == .update_available and !operation_active,
-        .resume_operation, .discard => snapshot.operation == .paused,
-        .verify, .remove => snapshot.installation != .absent and !operation_active,
-        .repair => snapshot.installation == .corrupt and !operation_active,
-        .retry_runtime => snapshot.local_runtime_failure and !operation_active,
-        .cancel_operation => operation_active,
-        .diagnostics, .forget_hugging_face_token => true,
     };
 }
 
@@ -615,13 +591,9 @@ pub const Menu = struct {
             break :title printed.ptr;
         };
         msg1v(self.local_operation_status, "setTitle:", nsstr(operation_title));
-        const operation_active = switch (snapshot.operation) {
-            .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference, .activating, .removing, .discarding, .forgetting_credential => true,
-            else => false,
-        };
         for (model_action_definitions) |definition| {
             const item = self.model_actions[@intFromEnum(definition.action)];
-            msgBool(item, "setHidden:", !modelActionVisible(definition.action, snapshot, operation_active));
+            msgBool(item, "setHidden:", !presentation.allowsModelAction(definition.action));
         }
     }
 
@@ -700,10 +672,10 @@ fn onPrimary(sender_self: id, command: SEL, sender: id) callconv(.c) void {
     switch (status_item.derive(snapshot).primary_action) {
         .none, .operation_progress => {},
         .set_openai_api_key => onSetApiKey(sender_self, command, sender),
-        .install_local_model => m.host.modelAction(m.host.ctx, .install),
+        .install_local_model => if (confirmModelAction(.install)) m.host.modelAction(m.host.ctx, .install),
         .update_local_model => m.host.modelAction(m.host.ctx, .update),
         .resume_model_operation => m.host.modelAction(m.host.ctx, .resume_operation),
-        .retry_model_operation => m.host.modelAction(m.host.ctx, .resume_operation),
+        .retry_model_operation => m.host.modelAction(m.host.ctx, .retry_operation),
         .repair_local_model => if (confirmModelAction(.repair)) m.host.modelAction(m.host.ctx, .repair),
         .retry_local_runtime => m.host.modelAction(m.host.ctx, .retry_runtime),
     }
@@ -721,8 +693,19 @@ fn onModelAction(_: id, _: SEL, sender: id) callconv(.c) void {
     m.refreshChrome();
 }
 
-fn confirmModelAction(action: ModelAction) bool {
-    const copy: ?struct { title: [*:0]const u8, detail: [*:0]const u8, button: [*:0]const u8 } = switch (action) {
+const ModelActionConfirmation = struct {
+    title: [*:0]const u8,
+    detail: [*:0]const u8,
+    button: [*:0]const u8,
+};
+
+fn confirmationForModelAction(action: ModelAction) ?ModelActionConfirmation {
+    return switch (action) {
+        .install => .{
+            .title = "Install KB Whisper Small?",
+            .detail = "Download the official F16 ggml-model.bin artifact from KBLab/kb-whisper-small at revision 3564d61a42fc210ceaa55a22a96dd64478959c78 (487,601,984 bytes). This large Model Operation uses the network only after you choose Install; Capture audio is never uploaded.",
+            .button = "Install",
+        },
         .remove => .{
             .title = "Remove the Local Model?",
             .detail = "An active Utterance may finish before the helper unloads. Local remains selected with no OpenAI fallback. The Model Installation and staged data are removed; the Hugging Face token is preserved.",
@@ -745,13 +728,25 @@ fn confirmModelAction(action: ModelAction) bool {
         },
         else => null,
     };
-    const content = copy orelse return true;
+}
+
+fn confirmModelAction(action: ModelAction) bool {
+    const content = confirmationForModelAction(action) orelse return true;
     const alert = msg(msg(cls("NSAlert"), "alloc"), "init");
     msg1v(alert, "setMessageText:", nsstr(content.title));
     msg1v(alert, "setInformativeText:", nsstr(content.detail));
     _ = msg1(alert, "addButtonWithTitle:", nsstr(content.button));
     _ = msg1(alert, "addButtonWithTitle:", nsstr("Cancel"));
     return msgLongR(alert, "runModal") == NSAlertFirstButtonReturn;
+}
+
+test "Install confirmation names the pinned large artifact and its privacy boundary" {
+    const copy = confirmationForModelAction(.install).?;
+
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(copy.detail), "KBLab/kb-whisper-small") != null);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(copy.detail), "ggml-model.bin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(copy.detail), "487,601,984 bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(copy.detail), "Capture audio is never uploaded") != null);
 }
 
 fn onOpenConfig(_: id, _: SEL, _: id) callconv(.c) void {

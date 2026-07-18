@@ -27,6 +27,40 @@ pub const Operation = enum {
     discarding,
     forgetting_credential,
     failed,
+    cancelled,
+
+    pub fn isActive(self: Operation) bool {
+        return switch (self) {
+            .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference, .activating, .removing, .discarding, .forgetting_credential => true,
+            .idle, .paused, .failed, .cancelled => false,
+        };
+    }
+
+    pub fn isCancellable(self: Operation) bool {
+        return switch (self) {
+            .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference => true,
+            else => false,
+        };
+    }
+
+    pub fn reportsByteProgress(self: Operation) bool {
+        return self == .installing or self == .updating or self == .verifying;
+    }
+};
+
+pub const ModelAction = enum {
+    install,
+    update,
+    resume_operation,
+    retry_operation,
+    discard,
+    verify,
+    repair,
+    remove,
+    retry_runtime,
+    cancel_operation,
+    diagnostics,
+    forget_hugging_face_token,
 };
 
 pub const Snapshot = struct {
@@ -73,24 +107,66 @@ pub const Presentation = struct {
     show_openai_controls: bool,
     audio_stays_on_mac: bool,
     model_operation_uses_network: bool,
+    model_actions: std.EnumSet(ModelAction),
+
+    pub fn allowsModelAction(self: Presentation, action: ModelAction) bool {
+        return self.model_actions.contains(action);
+    }
 };
 
 pub fn derive(s: Snapshot) Presentation {
-    const operation_active = switch (s.operation) {
-        .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference, .activating, .removing, .discarding, .forgetting_credential => true,
-        .idle, .paused, .failed => false,
-    };
+    const operation_active = s.operation.isActive();
     return .{
         .headline = headline(s),
         .primary_action = primaryAction(s),
         .show_openai_controls = s.selected_backend == .openai,
         .audio_stays_on_mac = s.selected_backend == .local_kb_whisper and
             s.health.status == .ready_offline,
-        .model_operation_uses_network = operation_active and switch (s.operation) {
-            .installing, .updating => true,
-            else => false,
-        },
+        .model_operation_uses_network = operation_active,
+        .model_actions = modelActions(s, operation_active),
     };
+}
+
+fn modelActions(s: Snapshot, operation_active: bool) std.EnumSet(ModelAction) {
+    var actions: std.EnumSet(ModelAction) = .empty;
+    actions.insert(.diagnostics);
+    actions.insert(.forget_hugging_face_token);
+    switch (s.operation) {
+        .paused => {
+            actions.insert(.resume_operation);
+            actions.insert(.discard);
+            return actions;
+        },
+        .failed, .cancelled => {
+            actions.insert(.retry_operation);
+            return actions;
+        },
+        .idle => {},
+        else => {
+            if (s.operation.isCancellable()) actions.insert(.cancel_operation);
+            return actions;
+        },
+    }
+    std.debug.assert(!operation_active);
+    switch (s.installation) {
+        .absent => actions.insert(.install),
+        .ready => {
+            actions.insert(.verify);
+            actions.insert(.remove);
+        },
+        .update_available => {
+            actions.insert(.update);
+            actions.insert(.verify);
+            actions.insert(.remove);
+        },
+        .corrupt => {
+            actions.insert(.verify);
+            actions.insert(.repair);
+            actions.insert(.remove);
+        },
+    }
+    if (s.local_runtime_failure) actions.insert(.retry_runtime);
+    return actions;
 }
 
 fn headline(s: Snapshot) Headline {
@@ -118,11 +194,8 @@ fn primaryAction(s: Snapshot) PrimaryAction {
     if (s.selected_backend == .openai)
         return if (s.health.status == .no_key) .set_openai_api_key else .none;
     if (s.operation == .paused) return .resume_model_operation;
-    if (s.operation == .failed) return .retry_model_operation;
-    switch (s.operation) {
-        .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference, .activating, .removing, .discarding, .forgetting_credential => return .operation_progress,
-        .idle, .paused, .failed => {},
-    }
+    if (s.operation == .failed or s.operation == .cancelled) return .retry_model_operation;
+    if (s.operation.isActive()) return .operation_progress;
     if (s.installation == .absent) return .install_local_model;
     if (s.installation == .corrupt) return .repair_local_model;
     if (s.terminal_backend_failure) return .retry_local_runtime;
@@ -173,12 +246,14 @@ test "compact hierarchy exposes only the selected backend primary action" {
     try std.testing.expectEqual(PrimaryAction.retry_local_runtime, derive(snap(.{ .terminal_backend_failure = true })).primary_action);
 }
 
-test "local privacy cue survives a network-using Model Operation" {
-    const p = derive(snap(.{ .operation = .updating }));
-    try std.testing.expect(p.audio_stays_on_mac);
-    try std.testing.expect(p.model_operation_uses_network);
-    try std.testing.expectEqual(PrimaryAction.operation_progress, p.primary_action);
-    try std.testing.expect(!p.show_openai_controls);
+test "local privacy cues survive every active Model Operation stage" {
+    for ([_]Operation{ .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference, .activating, .removing, .discarding, .forgetting_credential }) |operation| {
+        const p = derive(snap(.{ .operation = operation }));
+        try std.testing.expect(p.audio_stays_on_mac);
+        try std.testing.expect(p.model_operation_uses_network);
+        try std.testing.expectEqual(PrimaryAction.operation_progress, p.primary_action);
+        try std.testing.expect(!p.show_openai_controls);
+    }
 }
 
 test "local Model Operation recovery stays in its submenu under OpenAI selection" {
@@ -201,4 +276,32 @@ test "unselected local corruption and runtime failure do not change OpenAI headl
     }));
     try std.testing.expectEqual(Headline.ready, p.headline);
     try std.testing.expectEqual(PrimaryAction.none, p.primary_action);
+}
+
+test "restart-paused Model Operation exposes only Resume and Discard recovery" {
+    const p = derive(snap(.{ .operation = .paused }));
+
+    try std.testing.expectEqual(PrimaryAction.resume_model_operation, p.primary_action);
+    try std.testing.expect(p.allowsModelAction(.resume_operation));
+    try std.testing.expect(p.allowsModelAction(.discard));
+    try std.testing.expect(!p.allowsModelAction(.install));
+    try std.testing.expect(!p.allowsModelAction(.cancel_operation));
+}
+
+test "failed and cancelled Model Operations retry instead of pretending to resume partial data" {
+    for ([_]Operation{ .failed, .cancelled }) |operation| {
+        const p = derive(snap(.{ .operation = operation }));
+
+        try std.testing.expectEqual(PrimaryAction.retry_model_operation, p.primary_action);
+        try std.testing.expect(p.allowsModelAction(.retry_operation));
+        try std.testing.expect(!p.allowsModelAction(.resume_operation));
+        try std.testing.expect(!p.allowsModelAction(.discard));
+    }
+}
+
+test "Cancel is offered only while a Model Operation stage is cancellable" {
+    for ([_]Operation{ .installing, .updating, .verifying, .smoke_testing, .waiting_for_inference }) |operation|
+        try std.testing.expect(derive(snap(.{ .operation = operation })).allowsModelAction(.cancel_operation));
+    for ([_]Operation{ .activating, .removing, .discarding, .forgetting_credential }) |operation|
+        try std.testing.expect(!derive(snap(.{ .operation = operation })).allowsModelAction(.cancel_operation));
 }

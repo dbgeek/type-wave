@@ -90,36 +90,70 @@ const ModelOperationObservation = struct {
     phase: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(status_item.Operation.idle)),
     completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    retry_action: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(menu_mod.ModelAction.install)),
+    cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    const Current = struct { phase: status_item.Operation, bytes: ?status_item.ByteProgress };
+    const Current = struct { phase: status_item.Operation, bytes: ?status_item.ByteProgress, active: bool };
 
     fn current(self: *const ModelOperationObservation) ?Current {
-        if (self.pid.load(.acquire) == 0) return null;
+        const active = self.pid.load(.acquire) != 0;
+        const phase = std.enums.fromInt(status_item.Operation, self.phase.load(.acquire)) orelse .installing;
+        if (!active and phase != .failed and phase != .cancelled) return null;
         const total = self.total.load(.acquire);
         return .{
-            .phase = std.enums.fromInt(status_item.Operation, self.phase.load(.acquire)) orelse .installing,
-            .bytes = if (total == 0) null else .{ .completed = self.completed.load(.acquire), .total = total },
+            .phase = phase,
+            .bytes = if (!phase.reportsByteProgress() or total == 0) null else .{ .completed = self.completed.load(.acquire), .total = total },
+            .active = active,
         };
     }
 
-    fn begin(self: *ModelOperationObservation, pid: c_int, phase: status_item.Operation) void {
+    fn begin(self: *ModelOperationObservation, pid: c_int, phase: status_item.Operation, action: menu_mod.ModelAction) void {
         self.phase.store(@intFromEnum(phase), .release);
+        self.retry_action.store(@intFromEnum(action), .release);
+        self.cancel_requested.store(false, .release);
         self.completed.store(0, .release);
         self.total.store(0, .release);
         self.pid.store(pid, .release);
     }
 
-    fn finish(self: *ModelOperationObservation) void {
+    fn finish(self: *ModelOperationObservation, succeeded: bool) void {
+        self.phase.store(@intFromEnum(if (succeeded)
+            status_item.Operation.idle
+        else if (self.cancel_requested.load(.acquire))
+            status_item.Operation.cancelled
+        else
+            status_item.Operation.failed), .release);
+        self.completed.store(0, .release);
+        self.total.store(0, .release);
         self.pid.store(0, .release);
     }
 
     fn setPhase(self: *ModelOperationObservation, phase: status_item.Operation) void {
         self.phase.store(@intFromEnum(phase), .release);
+        if (phase != .installing and phase != .updating and phase != .verifying) {
+            self.completed.store(0, .release);
+            self.total.store(0, .release);
+        }
     }
 
     fn setProgress(self: *ModelOperationObservation, completed: u64, total: u64) void {
         self.completed.store(completed, .release);
         self.total.store(total, .release);
+    }
+
+    fn requestCancel(self: *ModelOperationObservation) ?c_int {
+        const phase = std.enums.fromInt(status_item.Operation, self.phase.load(.acquire)) orelse return null;
+        if (!phase.isCancellable()) return null;
+        const pid = self.pid.load(.acquire);
+        if (pid == 0) return null;
+        self.cancel_requested.store(true, .release);
+        return pid;
+    }
+
+    fn retryAction(self: *const ModelOperationObservation) ?menu_mod.ModelAction {
+        const phase = std.enums.fromInt(status_item.Operation, self.phase.load(.acquire)) orelse return null;
+        if (phase != .failed and phase != .cancelled) return null;
+        return std.enums.fromInt(menu_mod.ModelAction, self.retry_action.load(.acquire));
     }
 };
 var g_model_operation: ModelOperationObservation = .{};
@@ -861,8 +895,10 @@ const Daemon = struct {
         const recovery_state = self.local_model_recovery.current();
         if (recovery_state == .corrupt) installation = .corrupt;
         if (g_model_operation.current()) |observed| {
-            operation = observed.phase;
-            operation_bytes = observed.bytes;
+            if (observed.active or operation != .paused) {
+                operation = observed.phase;
+                operation_bytes = observed.bytes;
+            }
         }
         return .{
             .selected_backend = self.store.current().transcription_backend,
@@ -939,8 +975,7 @@ const Daemon = struct {
                 return;
             },
             .cancel_operation => {
-                const pid = g_model_operation.pid.load(.acquire);
-                if (pid != 0) _ = kill(pid, SIGTERM);
+                if (g_model_operation.requestCancel()) |pid| _ = kill(pid, SIGTERM);
                 return;
             },
             .diagnostics => {
@@ -957,8 +992,12 @@ const Daemon = struct {
             },
             else => {},
         }
+        const effective_action = if (action == .retry_operation)
+            g_model_operation.retryAction() orelse return
+        else
+            action;
         if (g_model_operation.pid.load(.acquire) != 0) return;
-        const argument: []const u8 = switch (action) {
+        const argument: []const u8 = switch (effective_action) {
             .install => "--install-model",
             .update => "--update-model",
             .resume_operation => "--resume-model",
@@ -967,13 +1006,13 @@ const Daemon = struct {
             .repair => "--repair-model",
             .remove => "--remove-model",
             .forget_hugging_face_token => "--forget-hf-token",
-            .retry_runtime, .cancel_operation, .diagnostics => unreachable,
+            .retry_runtime, .retry_operation, .cancel_operation, .diagnostics => unreachable,
         };
         var executable_buffer: [std.fs.max_path_bytes]u8 = undefined;
         var executable_size: u32 = executable_buffer.len;
         if (_NSGetExecutablePath(&executable_buffer, &executable_size) != 0) return;
         const executable = std.mem.sliceTo(executable_buffer[0..executable_size], 0);
-        const confirmation: ?[]const u8 = switch (action) {
+        const confirmation: ?[]const u8 = switch (effective_action) {
             .repair => "yes\n",
             .remove => "remove\n",
             else => null,
@@ -996,17 +1035,17 @@ const Daemon = struct {
             child.stdin = null;
         }
         const pid: c_int = @intCast(child.id.?);
-        g_model_operation.begin(pid, switch (action) {
+        g_model_operation.begin(pid, switch (effective_action) {
             .update => status_item.Operation.updating,
             .verify => .verifying,
             .remove => .removing,
             .discard => .discarding,
             .forget_hugging_face_token => .forgetting_credential,
             else => .installing,
-        });
-        const waiter = std.Thread.spawn(.{}, waitForModelAction, .{ self.io, child, action }) catch {
+        }, effective_action);
+        const waiter = std.Thread.spawn(.{}, waitForModelAction, .{ self.io, child, effective_action }) catch {
             child.kill(self.io);
-            g_model_operation.finish();
+            g_model_operation.finish(false);
             return;
         };
         waiter.detach();
@@ -1021,10 +1060,10 @@ const Daemon = struct {
             feedback.log("  model: {s}\n", .{line});
         }
         const term = child.wait(io) catch {
-            g_model_operation.finish();
+            g_model_operation.finish(false);
             return;
         };
-        g_model_operation.finish();
+        g_model_operation.finish(term.success());
         feedback.log("  menu: Model Operation {s} {s}\n", .{ @tagName(action), if (term.success()) "finished" else "failed" });
     }
 

@@ -21,4 +21,5 @@ test {
     _ = @import("model_store.zig");
     _ = @import("local_model_recovery.zig");
     _ = @import("status_item.zig");
+    _ = @import("menu.zig");
 }
