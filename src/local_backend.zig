@@ -9,6 +9,7 @@ const helper_core = @import("whisper_helper_core.zig");
 const helper_supervisor = @import("whisper_supervisor.zig");
 const coordinator = @import("coordinator.zig");
 const model_store = @import("model_store.zig");
+const segmentation = @import("segmenter.zig");
 
 extern "c" fn usleep(usec: c_uint) c_int;
 
@@ -27,18 +28,9 @@ pub const Events = struct {
 
 const HelperEvents = Events;
 
-/// Silence-cut tuning (ADR-0003). Bytes are 24 kHz · 2 B mono, i.e. 48 kB per second of
-/// Capture. Defaults are the grilled values; tests override them to exercise cuts cheaply.
-pub const SegmentPolicy = struct {
-    /// Never cut before this much Capture has accumulated — a short Utterance is one Segment.
-    soft_floor_bytes: usize = 24_000 * 2 * 15, // 15 s
-    /// Force a cut here even mid-word when no pause has come. Kept under `max_pcm_len`.
-    hard_max_bytes: usize = 24_000 * 2 * 25, // 25 s
-    /// A pause is this many consecutive quiet bytes (RMS below `silence_rms`).
-    pause_bytes: usize = 24_000 * 2 * 400 / 1_000, // 400 ms
-    /// A 50 ms buffer whose RMS (0..1 of full scale) is under this counts as quiet.
-    silence_rms: f32 = 0.015,
-};
+/// The silence-cut policy and its accumulation state live in the pure Segmenter (ADR-0003);
+/// re-exported here so callers and tests that reach for `local_backend.SegmentPolicy` still do.
+pub const SegmentPolicy = segmentation.SegmentPolicy;
 
 /// One cut-but-not-yet-submitted Segment: its spoken-order index and owned Capture bytes.
 const Segment = struct { index: u16, pcm: []u8 };
@@ -53,6 +45,9 @@ fn segmentId(utterance: backend.UtteranceId, index: u16) backend.UtteranceId {
 }
 fn utteranceOf(seg_id: backend.UtteranceId) backend.UtteranceId {
     return seg_id >> segment_index_bits;
+}
+fn segmentIndex(seg_id: backend.UtteranceId) usize {
+    return @truncate(seg_id & ((1 << segment_index_bits) - 1));
 }
 
 /// RMS (0..1 of full scale) of one Capture buffer — the silence signal, computed the same
@@ -78,7 +73,6 @@ pub fn Adapter(comptime Helper: type) type {
         io: std.Io,
         helper: *Helper,
         events: Events,
-        policy: SegmentPolicy = .{},
         mu: std.Io.Mutex = .init,
         active_id: ?backend.UtteranceId = null,
         language: ipc.Language = .english,
@@ -88,13 +82,9 @@ pub fn Adapter(comptime Helper: type) type {
         failed: bool = false,
 
         // ---- segmentation state (all guarded by `mu`) ----------------------------
-        /// The Segment currently being accumulated from Capture (not yet cut).
-        segment: std.ArrayList(u8) = .empty,
-        /// Trailing run of quiet Capture bytes in `segment`, for the ≥400 ms pause test.
-        quiet_run_bytes: usize = 0,
-        /// Whether `segment` has held any above-threshold audio — a silence-cut needs speech
-        /// to close off, so leading silence never spawns a spurious Segment.
-        segment_has_speech: bool = false,
+        /// The silence-cut policy and the Segment being accumulated from Capture. Pure: the
+        /// Adapter feeds it Capture (with the per-buffer RMS) and enqueues the Segments it cuts.
+        segmenter: segmentation.Segmenter = .{},
         /// Cut-but-not-yet-submitted Segments, FIFO in spoken order (stays shallow: inference
         /// outpaces speech). Each `.pcm` is owned until submitted (the helper copies it).
         pending: std.ArrayList(Segment) = .empty,
@@ -220,24 +210,15 @@ pub fn Adapter(comptime Helper: type) type {
                 self.mu.unlock(self.io);
                 return error.SegmentSubmitFailed;
             }
-            self.segment.appendSlice(self.allocator, pcm) catch |failure| {
+            // The Segmenter accumulates and decides where a Segment ends (ADR-0003); a returned
+            // cut is enqueued and submitted here. Below the soft floor a short Utterance stays whole.
+            const cut = self.segmenter.push(self.allocator, bufferRms(pcm), pcm) catch |failure| {
                 self.mu.unlock(self.io);
                 return failure;
             };
-            if (bufferRms(pcm) < self.policy.silence_rms) {
-                self.quiet_run_bytes += pcm.len;
-            } else {
-                self.quiet_run_bytes = 0;
-                self.segment_has_speech = true;
-            }
-            // Past the soft floor, cut at the next pause; force a cut at the hard max (the
-            // one case that may split a word). Below the floor a short Utterance stays whole.
-            const at_hard_max = self.segment.items.len >= self.policy.hard_max_bytes;
-            const at_pause = self.segment.items.len >= self.policy.soft_floor_bytes and
-                self.segment_has_speech and self.quiet_run_bytes >= self.policy.pause_bytes;
             var submit_failed = false;
-            if (at_hard_max or at_pause) {
-                submit_failed = self.cutLocked() catch |failure| {
+            if (cut) |pcm_out| {
+                submit_failed = self.enqueueCutLocked(pcm_out) catch |failure| {
                     self.mu.unlock(self.io);
                     return failure;
                 };
@@ -257,10 +238,17 @@ pub fn Adapter(comptime Helper: type) type {
                 return error.SegmentSubmitFailed;
             }
             // Flush the trailing partial Segment, then drain: nothing was inserted mid-Utterance.
-            const flush_failed = self.cutLocked() catch |failure| {
+            const trailing = self.segmenter.flush(self.allocator) catch |failure| {
                 self.mu.unlock(self.io);
                 return failure;
             };
+            var flush_failed = false;
+            if (trailing) |pcm_out| {
+                flush_failed = self.enqueueCutLocked(pcm_out) catch |failure| {
+                    self.mu.unlock(self.io);
+                    return failure;
+                };
+            }
             if (self.segments_cut == 0) {
                 self.mu.unlock(self.io);
                 return error.EmptyCapture;
@@ -305,6 +293,10 @@ pub fn Adapter(comptime Helper: type) type {
             }
             const id = self.active_id.?;
             self.in_flight_id = null;
+            // Reassembly order rests on the single-slot invariant: this Segment's final must be
+            // the next one in spoken order. A dev tripwire — the `in_flight_id` guard above
+            // already prevents misattribution in release builds, where this compiles out.
+            std.debug.assert(segmentIndex(seg_id) == self.segments_done);
             self.segments_done += 1;
             self.appendAssembledLocked(text) catch {
                 self.failed = true;
@@ -346,16 +338,12 @@ pub fn Adapter(comptime Helper: type) type {
             return self.in_flight_id == null and self.pending.items.len == 0 and self.segments_done == self.segments_cut;
         }
 
-        /// Cut the accumulating Segment, enqueue it in spoken order, and try to submit.
+        /// Enqueue a freshly cut Segment (owned `pcm`) in spoken order and try to submit it.
         /// Returns whether submitting a Segment failed (the caller fails the Utterance).
-        fn cutLocked(self: *Self) !bool {
-            if (self.segment.items.len == 0) return false;
-            const pcm = try self.segment.toOwnedSlice(self.allocator);
+        fn enqueueCutLocked(self: *Self, pcm: []u8) !bool {
             errdefer self.allocator.free(pcm);
             try self.pending.append(self.allocator, .{ .index = @intCast(self.segments_cut), .pcm = pcm });
             self.segments_cut += 1;
-            self.quiet_run_bytes = 0;
-            self.segment_has_speech = false;
             return self.pumpLocked();
         }
 
@@ -439,12 +427,10 @@ pub fn Adapter(comptime Helper: type) type {
         }
 
         fn resetUtteranceStateLocked(self: *Self) void {
-            for (self.pending.items) |seg| self.allocator.free(seg.pcm);
+            for (self.pending.items) |queued| self.allocator.free(queued.pcm);
             self.pending.clearRetainingCapacity();
-            self.segment.clearRetainingCapacity();
+            self.segmenter.reset();
             self.assembled.clearRetainingCapacity();
-            self.quiet_run_bytes = 0;
-            self.segment_has_speech = false;
             self.in_flight_id = null;
             self.segments_cut = 0;
             self.segments_done = 0;
@@ -454,9 +440,9 @@ pub fn Adapter(comptime Helper: type) type {
         /// Free the Adapter's owned buffers. For tests — the daemon's Adapter lives for the
         /// process lifetime.
         pub fn deinit(self: *Self) void {
-            for (self.pending.items) |seg| self.allocator.free(seg.pcm);
+            for (self.pending.items) |queued| self.allocator.free(queued.pcm);
             self.pending.deinit(self.allocator);
-            self.segment.deinit(self.allocator);
+            self.segmenter.deinit(self.allocator);
             self.assembled.deinit(self.allocator);
         }
 
@@ -1255,7 +1241,7 @@ test "a long Utterance is cut at a pause into ordered Segments assembled into on
     var helper = FakeHelper{};
     var events = EventRecorder{};
     var adapter = Adapter(FakeHelper).init(std.testing.allocator, std.testing.io, &helper, events.events());
-    adapter.policy = tiny_policy;
+    adapter.segmenter.policy = tiny_policy;
     defer adapter.deinit();
 
     try adapter.begin(3, "en");
@@ -1286,7 +1272,7 @@ test "no pause forces a cut at the hard max" {
     var helper = FakeHelper{};
     var events = EventRecorder{};
     var adapter = Adapter(FakeHelper).init(std.testing.allocator, std.testing.io, &helper, events.events());
-    adapter.policy = .{ .soft_floor_bytes = 4, .hard_max_bytes = 8, .pause_bytes = 4, .silence_rms = 0.5 };
+    adapter.segmenter.policy = .{ .soft_floor_bytes = 4, .hard_max_bytes = 8, .pause_bytes = 4, .silence_rms = 0.5 };
     defer adapter.deinit();
 
     try adapter.begin(5, "en");
@@ -1303,7 +1289,7 @@ test "any Segment failing discards the whole Utterance, even an already-transcri
     var helper = FakeHelper{};
     var events = EventRecorder{};
     var adapter = Adapter(FakeHelper).init(std.testing.allocator, std.testing.io, &helper, events.events());
-    adapter.policy = tiny_policy;
+    adapter.segmenter.policy = tiny_policy;
     defer adapter.deinit();
 
     try adapter.begin(6, "en");

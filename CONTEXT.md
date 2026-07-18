@@ -37,6 +37,15 @@ their Utterance's Final Transcript. Unlike a Partial Transcript it is not revisa
 as part of the Final Transcript — it is inserted.
 _Avoid_: partial (a Partial Transcript is the revisable OpenAI delta)
 
+**Segmenter**:
+The pure state machine that owns the silence-cut policy (ADR-0003): it accumulates one
+Utterance's Capture and decides where each Segment ends — the 15 s soft floor, the next
+≥400 ms pause, the 25 s hard-max force-cut. A Capture buffer and its RMS level go in; an
+owned Segment's PCM comes out at each cut. It holds no queue, lease, or IPC — the local
+Transcription Backend's adapter drives it under its own lock and owns everything past the
+cut. Lives in `src/segmenter.zig`, exercised by fed (rms, pcm) pairs, not real audio.
+_Avoid_: chunker, splitter, VAD (it is not a general voice-activity detector)
+
 **Insertion**:
 Placing a Final Transcript at the cursor of the Focused Target. Every Insertion ends with
 a single trailing space, so consecutive Insertions don't run their words together.
