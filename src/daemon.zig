@@ -86,18 +86,16 @@ const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
 const SIGHUP: c_int = 1;
 const ObservationMutex = struct {
-    value: extern struct { _opaque: u32 = 0 } = .{},
+    value: std.atomic.Mutex = .unlocked,
 
     fn lock(self: *ObservationMutex) void {
-        os_unfair_lock_lock(&self.value);
+        while (!self.value.tryLock()) std.atomic.spinLoopHint();
     }
 
     fn unlock(self: *ObservationMutex) void {
-        os_unfair_lock_unlock(&self.value);
+        self.value.unlock();
     }
 };
-extern "c" fn os_unfair_lock_lock(lock: *anyopaque) void;
-extern "c" fn os_unfair_lock_unlock(lock: *anyopaque) void;
 
 const ModelOperationObservation = struct {
     pid: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(0),
@@ -106,8 +104,7 @@ const ModelOperationObservation = struct {
     total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     retry_action: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(menu_mod.ModelAction.install)),
     cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    failure_mutex: ObservationMutex = .{},
-    failure_detail: ?status_item.FailureDetail = null,
+    failure: FailureObservation = .{},
 
     const Current = struct { phase: status_item.Operation, bytes: ?status_item.ByteProgress, active: bool, failure_detail: ?status_item.FailureDetail };
 
@@ -116,13 +113,11 @@ const ModelOperationObservation = struct {
         const phase = std.enums.fromInt(status_item.Operation, self.phase.load(.acquire)) orelse .installing;
         if (!active and phase != .failed and phase != .cancelled) return null;
         const total = self.total.load(.acquire);
-        self.failure_mutex.lock();
-        defer self.failure_mutex.unlock();
         return .{
             .phase = phase,
             .bytes = if (!phase.reportsByteProgress() or total == 0) null else .{ .completed = self.completed.load(.acquire), .total = total },
             .active = active,
-            .failure_detail = self.failure_detail,
+            .failure_detail = self.failure.current(),
         };
     }
 
@@ -132,18 +127,13 @@ const ModelOperationObservation = struct {
         self.cancel_requested.store(false, .release);
         self.completed.store(0, .release);
         self.total.store(0, .release);
-        self.failure_mutex.lock();
-        self.failure_detail = null;
-        self.failure_mutex.unlock();
+        self.failure.clear();
         self.pid.store(pid, .release);
     }
 
     fn observeFailure(self: *ModelOperationObservation, line: []const u8) void {
         if (std.mem.indexOf(u8, line, "Model Operation:") != null) return;
-        const detail = status_item.FailureDetail.init(line) catch return;
-        self.failure_mutex.lock();
-        self.failure_detail = detail;
-        self.failure_mutex.unlock();
+        self.failure.set(line);
     }
 
     fn finish(self: *ModelOperationObservation, succeeded: bool) void {
