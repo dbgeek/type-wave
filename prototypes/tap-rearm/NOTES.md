@@ -33,8 +33,7 @@ same "portable spike, frozen snapshot" posture as `prototypes/insertion-spike`. 
   run loop services the tap (the same constraint `tap.zig`'s own doc comments state); keeping the
   synthetic post there too avoids a cross-thread confound.
 - **Director thread** drives the interactive protocol (prompts, timing, stdin) and hands the main
-  thread one of four `Action`s (`try_a`, `try_b`, `post_test`, `quit`) via atomics, blocking for the
-  result.
+  thread one of three `Action`s (`try_a`, `try_b`, `quit`) via atomics, blocking for the result.
 
 **Self-detection trick for PostEvent:** the tap's mask includes `keyDown`/`keyUp` (not just
 `flagsChanged`), and every synthetic post is tagged via `CGEventSourceSetUserData` (matching
@@ -42,6 +41,15 @@ same "portable spike, frozen snapshot" posture as `prototypes/insertion-spike`. 
 **objective, in-process signal** that the post reached the HID event stream at all — independent of
 whether it visibly landed in a focused text field, which still needs a human to eyeball. Both
 signals are recorded per attempt.
+
+**Phase 2's trigger is a real key press, not Enter-in-Terminal.** The first version of this spike
+prompted "press Enter in Terminal to fire the post" — which is wrong: pressing Enter in Terminal
+re-focuses Terminal, so the synthetic keystroke lands there instead of wherever the human actually
+wanted to watch. Fixed: the director *arms* the attempt, then the human presses+releases
+**Right-Option** (the real Talk Key) while their target app stays focused; the tap's own callback —
+already running on the correct thread — fires `postSyntheticKeystroke()` directly on that release
+edge. This also doubles as a second, more forgiving liveness check on the tap itself (a 20s window
+per attempt, vs. Phase 1's tighter confirmation).
 
 **Headless-bug comparison:** `--accessory` sets `NSApplicationActivationPolicyAccessory` (same call
 `appkit.zig`'s `app()` makes) before the first grant probe; without the flag, the binary behaves like
@@ -54,10 +62,16 @@ cd prototypes/tap-rearm
 zig build
 ```
 
-Confirmed building clean (2026-07-19): `zig build` produces `zig-out/bin/tap-rearm`, a valid
-arm64 Mach-O executable. (An earlier attempt in a sandboxed shell hit a transient `xcrun
---show-sdk-path -> unable to find sdk: 'macosx'` configure failure — unrelated to this code, it
-cleared on retry.)
+Confirmed building clean once (2026-07-19) in this sandboxed session: `zig build` produced
+`zig-out/bin/tap-rearm`, a valid arm64 Mach-O executable. Every other attempt in this same
+session's shell hit `xcrun --show-sdk-path -> error: unable to find sdk: 'macosx'` at the
+**configure** step — even though the SDKs exist on disk under
+`/Library/Developer/CommandLineTools/SDKs/`, and the same failure reproduces on the sibling
+`prototypes/insertion-spike`. That looks like an `xcrun` SDK-cache quirk specific to this
+background job's shell, not the code — semantic correctness of every change here was cross-checked
+with `zig build-obj src/main.zig -target aarch64-macos` (full type-check + codegen, no
+linking/SDK lookup needed), which has compiled clean on every revision. **Run `zig build` in your
+own interactive terminal**, where it has built and run successfully already.
 
 **Compat note for whoever touches this next:** this Zig nightly (`0.17.0-dev.1267+300116b02`)
 has dropped `std.process.args()`/`ArgIterator` entirely — there's no argv-reading API left in
@@ -66,24 +80,33 @@ has dropped `std.process.args()`/`ArgIterator` entirely — there's no argv-read
 
 ## Run protocol
 
-**Protocol 1 — Input Monitoring re-arm (path A vs B).** Before running, make sure Input Monitoring
-is **denied** for this binary (first run will prompt/register it; deny, or pre-deny via System
-Settings > Privacy & Security > Input Monitoring). Then:
+**Grants persist across runs of the same binary.** If you've run `tap-rearm` before (e.g. while
+debugging the build), Input Monitoring and/or Accessibility may already be granted to it — the
+preflight lines at startup will read `true` from the very first tick. That's not a bug, but it
+means Phase 1 won't exercise the interesting path-A-vs-path-B question, and Phase 2's "baseline"
+won't be a clean pre-grant case. **Revoke both** in System Settings > Privacy & Security >
+Input Monitoring / Accessibility before a run if you want a clean test of either.
+
+**Protocol 1 — Input Monitoring re-arm (path A vs B).** With Input Monitoring **denied**:
 
 ```sh
 ./zig-out/bin/tap-rearm
 ```
 
 Follow Phase 1's prompts: grant Input Monitoring while the loop polls, then press an Option key
-within the 5s confirmation window when asked. Record which path (A or B) reported
-`CGEventTapIsEnabled==true`, and whether the real-event confirmation succeeded.
+within the 15s confirmation window when asked (it retries once more if you miss it). Record which
+path (A or B) reported `CGEventTapIsEnabled==true`, and whether the real-event confirmation
+succeeded (`[LIVE]` vs `[WARN]`).
 
-**Protocol 2 — PostEvent live landing.** Continues automatically into Phase 2 in the same run.
-Before granting Accessibility, revoke it for this binary if it's already granted from a prior run
-(System Settings > Privacy & Security > Accessibility), so the baseline attempt is a clean "denied"
-case. Click into a scratch text field (TextEdit/Notes), run the baseline post, then grant
-Accessibility and run the post-grant attempt(s). Record, per attempt: `self-tap-saw` (objective) and
-`human-confirmed-landed` (eyeballed), plus the preflight value before/after.
+**Protocol 2 — PostEvent live landing.** Continues automatically into Phase 2 in the same run, with
+Accessibility **denied** for a clean baseline. Each attempt is triggered by a real key press, not by
+switching back to Terminal: click into a scratch text field (TextEdit/Notes) and leave it focused,
+press Enter in Terminal only to *arm* the attempt, then go press+release **Right-Option** (the real
+Talk Key) without touching Terminal again — that's what fires the synthetic post, so your target
+app never loses focus at the moment it matters. Run the baseline attempt, then grant Accessibility
+and run the post-grant attempt(s). Record, per attempt: `self-tap-saw` (objective, from the spike's
+own tap) and `human-confirmed-landed` (what you actually saw in the text field), plus the preflight
+value before/after.
 
 **Protocol 3 — Headless Sequoia+ trap.** Run the binary twice, comparing the printed
 `PostEvent preflight` line and Phase 2's post-grant `self-tap-saw` outcome:

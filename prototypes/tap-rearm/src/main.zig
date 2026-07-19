@@ -130,8 +130,23 @@ var press_seen = std.atomic.Value(bool).init(false);
 var self_post_seen = std.atomic.Value(bool).init(false);
 var last_press_keycode = std.atomic.Value(i64).init(0);
 
+/// Phase 2's trigger: the director arms this, then the human presses+releases
+/// Right-Option (like the real Talk Key) to fire the post — while whatever app
+/// they're focused on STAYS focused, unlike the old "press Enter in Terminal"
+/// design, which stole focus back to Terminal at the exact moment of the post.
+var post_armed = std.atomic.Value(bool).init(false);
+var post_fired = std.atomic.Value(bool).init(false);
+
+// Edge-tracked physical key state — read/written only by callback() on the
+// run-loop thread, so plain (non-atomic) globals are fine (tap.zig's own `edge()`
+// helper uses the same flags-based edge-detection pattern).
+var right_down_state = false;
+var left_down_state = false;
+
 /// Runs on the run-loop thread. Kept fast per tap.zig's own doc comment — a slow
-/// callback makes the OS disable the tap.
+/// callback makes the OS disable the tap. postSyntheticKeystroke()'s ~5ms is a
+/// deliberate exception (still far under the OS's timeout-disable threshold) so
+/// the post fires while the human's target app is still focused.
 fn callback(_: CGEventTapProxy, etype: u32, event: CGEventRef, _: ?*anyopaque) callconv(.c) CGEventRef {
     if (etype == kCGEventTapDisabledByTimeout or etype == kCGEventTapDisabledByUserInput) {
         return event;
@@ -144,14 +159,25 @@ fn callback(_: CGEventTapProxy, etype: u32, event: CGEventRef, _: ?*anyopaque) c
     if (etype != kCGEventFlagsChanged) return event;
     if (tagged) return event;
 
-    const keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
     const flags = CGEventGetFlags(event);
-    const down = (keycode == kVK_RightOption and (flags & NX_DEVICERALTKEYMASK) != 0) or
-        (keycode == kVK_Option and (flags & NX_DEVICELALTKEYMASK) != 0);
-    if (down) {
-        last_press_keycode.store(keycode, .monotonic);
+    const right_now = (flags & NX_DEVICERALTKEYMASK) != 0;
+    const left_now = (flags & NX_DEVICELALTKEYMASK) != 0;
+
+    if (right_now and !right_down_state) {
+        last_press_keycode.store(kVK_RightOption, .monotonic);
         press_seen.store(true, .release);
     }
+    if (!right_now and right_down_state and post_armed.load(.acquire)) {
+        post_armed.store(false, .release);
+        postSyntheticKeystroke();
+        post_fired.store(true, .release);
+    }
+    if (left_now and !left_down_state) {
+        last_press_keycode.store(kVK_Option, .monotonic);
+        press_seen.store(true, .release);
+    }
+    right_down_state = right_now;
+    left_down_state = left_now;
     return event;
 }
 
@@ -233,7 +259,7 @@ fn postSyntheticKeystroke() void {
 
 // ---- director: runs on a background thread; drives the interactive protocol ----
 
-const Action = enum(u8) { none, try_a, try_b, post_test, quit };
+const Action = enum(u8) { none, try_a, try_b, quit };
 var requested = std.atomic.Value(u8).init(@intFromEnum(Action.none));
 var action_done = std.atomic.Value(bool).init(false);
 var action_result = std.atomic.Value(bool).init(false);
@@ -293,22 +319,33 @@ fn director() void {
         }
     }
     std.debug.print("\n  CGEventTapIsEnabled==true via path {s}.\n", .{winning_path});
-    std.debug.print("  Confirming with a REAL event: press either Option key now (5s window)...\n", .{});
-    press_seen.store(false, .release);
-    var waited: u32 = 0;
-    while (waited < 5000 and !press_seen.load(.acquire)) {
-        sleepMs(100);
-        waited += 100;
+    var confirm_try: u32 = 0;
+    var confirmed = false;
+    while (confirm_try < 2 and !confirmed) {
+        std.debug.print("  Confirming with a REAL event: press either Option key now (15s window)...\n", .{});
+        press_seen.store(false, .release);
+        var waited: u32 = 0;
+        while (waited < 15000 and !press_seen.load(.acquire)) {
+            sleepMs(100);
+            waited += 100;
+        }
+        confirmed = press_seen.load(.acquire);
+        confirm_try += 1;
     }
-    if (press_seen.load(.acquire)) {
+    if (confirmed) {
         std.debug.print("  [LIVE] flagsChanged observed (keycode 0x{X}) — Input Monitoring re-arm CONFIRMED via path {s}.\n\n", .{ last_press_keycode.load(.monotonic), winning_path });
     } else {
-        std.debug.print("  [WARN] IsEnabled==true but no real event arrived in 5s — re-run and press Option promptly.\n\n", .{});
+        std.debug.print("  [WARN] IsEnabled==true but no real event arrived in two 15s windows — the tap\n", .{});
+        std.debug.print("  may not really be delivering events; treat Phase 2's results with that in mind.\n\n", .{});
     }
 
     std.debug.print("---- Phase 2: PostEvent / Accessibility live pickup ----\n", .{});
-    std.debug.print("Click into a scratch text field (TextEdit/Notes) so you can see what lands.\n", .{});
-    std.debug.print("Press Enter for a BASELINE post (expected to fail/be denied pre-grant): ", .{});
+    std.debug.print("Each attempt below is triggered by pressing+releasing Right-Option (the real\n", .{});
+    std.debug.print("Talk Key) — NOT Enter in Terminal, so your target app's focus is never stolen\n", .{});
+    std.debug.print("back to this terminal at the moment of the post.\n\n", .{});
+    std.debug.print("Click into a scratch text field (TextEdit/Notes) and leave it focused, then\n", .{});
+    std.debug.print("press Enter here to arm the BASELINE attempt (expected to fail/be denied\n", .{});
+    std.debug.print("pre-grant): ", .{});
     _ = readLine(&line);
     runPostAttempt("baseline (pre-grant)");
 
@@ -317,7 +354,7 @@ fn director() void {
     std.debug.print("from, or this binary itself, depending on how it was invoked).\n", .{});
     var retry = true;
     while (retry) {
-        std.debug.print("Press Enter once granted, to attempt the post-grant post: ", .{});
+        std.debug.print("Press Enter once granted, to arm the post-grant attempt: ", .{});
         _ = readLine(&line);
         runPostAttempt("post-grant");
         std.debug.print("Retry the post-grant attempt? [y/N]: ", .{});
@@ -333,7 +370,24 @@ fn director() void {
 
 fn runPostAttempt(label: []const u8) void {
     const preflight_before = CGPreflightPostEventAccess();
-    const seen = doAction(.post_test, 500);
+
+    std.debug.print("  [{s}] armed — press+release Right-Option now (your target app must be\n", .{label});
+    std.debug.print("  [{s}] focused, NOT this terminal) — 20s window...\n", .{label});
+    post_fired.store(false, .release);
+    post_armed.store(true, .release);
+    var waited: u32 = 0;
+    while (!post_fired.load(.acquire) and waited < 20000) {
+        sleepMs(100);
+        waited += 100;
+    }
+    post_armed.store(false, .release);
+    if (!post_fired.load(.acquire)) {
+        std.debug.print("  [{s}] no Right-Option press seen in 20s — skipping this attempt (re-run and\n", .{label});
+        std.debug.print("  [{s}] press it promptly, from your target app).\n", .{label});
+        return;
+    }
+    sleepMs(150); // let the run loop deliver the just-posted keyDown back to our tap
+    const seen = self_post_seen.load(.acquire);
     const preflight_after = CGPreflightPostEventAccess();
     std.debug.print("  [{s}] preflight before={} after={}  self-tap saw the synthetic keyDown={}\n", .{ label, preflight_before, preflight_after, seen });
     std.debug.print("  [{s}] Did \"TYPEWAVE-TEST\" actually appear in the focused field? [y/N]: ", .{label});
@@ -382,12 +436,6 @@ pub fn main() !void {
             },
             .try_b => {
                 action_result.store(pathBRecreate(), .release);
-                action_done.store(true, .release);
-            },
-            .post_test => {
-                postSyntheticKeystroke();
-                sleepMs(150); // let the tap callback observe it before we report
-                action_result.store(self_post_seen.load(.acquire), .release);
                 action_done.store(true, .release);
             },
             .quit => {
