@@ -344,12 +344,9 @@ fn runPostAttempt(label: []const u8) void {
 }
 
 pub fn main() !void {
-    var argv = std.process.args();
-    _ = argv.next();
-    var accessory = false;
-    while (argv.next()) |a| {
-        if (std.mem.eql(u8, a, "--accessory")) accessory = true;
-    }
+    // This nightly dropped std.process's argv iteration entirely (no ArgIterator left
+    // in std) — an env var sidesteps it, same as cli-dictation's OPENAI_API_KEY lookup.
+    const accessory = std.c.getenv("ACCESSORY") != null;
 
     if (accessory) {
         setAccessoryActivationPolicy();
