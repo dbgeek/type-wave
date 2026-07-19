@@ -9,11 +9,6 @@ backends: **OpenAI's Realtime API** over WebSocket/TLS (streaming, the default),
 **offline local Whisper** model (audio never leaves your Mac). It can run in the
 foreground while developing, or as a signed per-user LaunchAgent for daily use.
 
-<!--
-  Demo GIF: record a ~5-10s clip of hold Talk Key -> speak -> release -> text landing
-  at the cursor, with the HUD visible. Export it as assets/type-wave-demo.gif and drop
-  the file into the repo; the embed below renders once the file exists on this branch.
--->
 <p align="center">
   <img src="assets/type-wave-demo.gif"
        alt="type-wave demo: hold a key, speak, release, and the text lands at your cursor"
