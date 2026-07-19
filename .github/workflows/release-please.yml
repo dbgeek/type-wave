@@ -31,8 +31,8 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
-      # --- ticket #117 plugs in here ---
-      # When steps.release.outputs.releases_created == 'true', an AI-authored
-      # "Highlights" summary is generated in-job and PATCHed onto the release
-      # body via `gh release edit --notes` (no PAT cascade needed — same job).
-      # Left unwired until #117 chooses the provider.
+      # Release notes = the Conventional-Commits changelog only. Ticket #117
+      # weighed layering an AI-authored "Highlights" summary on top; the owner
+      # chose NOT to (the free GitHub Models path retires 2026-07-30, and a paid
+      # provider key wasn't worth it for this repo). There is deliberately no
+      # summariser step here — see map #109 / #117 before adding one.
