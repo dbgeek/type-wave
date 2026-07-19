@@ -20,6 +20,7 @@ test {
     _ = @import("insertion_adapter.zig");
     _ = @import("readiness.zig");
     _ = @import("configuration_phase.zig");
+    _ = @import("grant_sequence.zig"); // the serialized cold-start TCC request sequence (#130)
     _ = @import("model_store.zig");
     _ = @import("local_model_recovery.zig");
     _ = @import("status_item.zig");

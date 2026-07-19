@@ -25,7 +25,6 @@ pub const Facts = struct {
 pub const Actions = struct {
     connect_session: bool = false,
     prepare_local: bool = false,
-    enable_tap: bool = false,
     announce_ready: bool = false,
     report_missing: ?readiness.Report = null,
 };
@@ -42,10 +41,12 @@ pub const ConfigurationPhase = struct {
 
     pub fn tick(self: *ConfigurationPhase, facts: Facts) Outcome {
         const snap = snapshot(facts);
+        // No tap action here: re-arming a dead tap is the supervisor's unconditional
+        // fresh-create attempt (#127/#129) — the Input Monitoring preflight this policy
+        // sees can stay stale in-process, so it must not gate the re-arm.
         var actions = Actions{
             .connect_session = facts.selected_backend == .openai and facts.key_present and !facts.backend_present,
             .prepare_local = facts.selected_backend == .local and facts.local_installation_present and !facts.backend_present,
-            .enable_tap = facts.input_monitoring_granted and !facts.tap_enabled,
         };
         const is_configured = readiness.configured(snap);
 
@@ -170,12 +171,11 @@ test "commands Session construction and announces only after backend readiness" 
     try std.testing.expect(after_connect.actions.announce_ready);
 }
 
-test "commands tap enable and reports the current missing set" {
+test "a dead tap alone keeps the phase not-configured and reported" {
     var phase = ConfigurationPhase{};
 
     const out = phase.tick(makeFacts(.{ .tap_enabled = false }));
     try std.testing.expect(!out.configured);
-    try std.testing.expect(out.actions.enable_tap);
     try std.testing.expect(out.actions.report_missing != null);
 }
 
