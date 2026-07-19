@@ -3,50 +3,74 @@
 **Hold-to-talk dictation for macOS.** Hold a key, speak, release, and the
 transcribed text is inserted at the cursor of the app you are already using.
 
-type-wave is a Zig daemon for Apple Silicon macOS. It uses CoreAudio for capture,
-OpenAI's Realtime transcription API over WebSocket/TLS, and macOS event/pasteboard
-APIs for insertion. It can run in the foreground while developing, or as a signed
-per-user LaunchAgent for daily use.
+type-wave is a Zig daemon for Apple Silicon macOS. It captures with CoreAudio and
+inserts through macOS event/pasteboard APIs, and transcribes with either of two
+backends: **OpenAI's Realtime API** over WebSocket/TLS (streaming, the default), or an
+**offline local Whisper** model (audio never leaves your Mac). It can run in the
+foreground while developing, or as a signed per-user LaunchAgent for daily use.
 
-> Status: research repo, `v0.0.0`, macOS-only. The mic -> transcribe -> insert
-> pipeline is implemented end-to-end. Distribution work such as hardened runtime,
-> entitlements, and notarization is still out of scope.
+<p align="center">
+  <img src="assets/type-wave-demo.gif"
+       alt="type-wave demo: hold a key, speak, release, and the text lands at your cursor"
+       width="640">
+</p>
+
+> **Status:** experimental research project, `v0.0.0`, Apple Silicon macOS only.
+> Single-maintainer, no support or SLA — small fixes welcome, larger changes worth
+> discussing first. The hold-to-talk -> transcribe -> insert pipeline works end-to-end
+> on either backend. Distribution hardening (hardened runtime, entitlements,
+> notarization) is out of scope for now, so you build from source.
 
 ## How It Works
 
-```text
-hold Talk Key
-    -> CoreAudio Capture (24 kHz mono PCM)
-    -> warm OpenAI Realtime Transcription Session
-release Talk Key
-    -> manual commit
-    -> Final Transcript
-    -> insertion at the Focused Target cursor
+```mermaid
+flowchart TD
+    TK([Hold Talk Key, speak, release]) --> CAP[CoreAudio Capture]
+    CAP --> ROUTER{Backend Router}
+    ROUTER -->|OpenAI, default| OA[OpenAI Realtime<br/>Transcription Session]
+    ROUTER -->|Local, offline| LW[Local Whisper Backend<br/>Segmenter cuts at silences]
+    OA --> FT[Final Transcript]
+    LW --> FT
+    FT --> INS([Insertion at Focused Target cursor])
 ```
 
-The default **Talk Key** is Right Option. While it is held, type-wave streams mic
-audio to a warm transcription session. On release, it commits the utterance, waits
-for the **Final Transcript**, then inserts that text through either a clipboard-swap
-paste or synthetic keystrokes.
+The default **Talk Key** is Right Option. Holding it opens one **Utterance**; while it
+is held, type-wave captures mic audio and routes it through the **Backend Router** to
+the selected **Transcription Backend**. On release it commits the Utterance and waits
+for the **Final Transcript** — the only text ever inserted — then places it at the
+**Focused Target** cursor through either a clipboard-swap paste or synthetic keystrokes.
 
-The floating HUD is visual feedback only: a red waveform while recording, then green
-processing dots until the utterance resolves. It never shows transcript text. Partial
-transcripts are logged and may be revised; only Final Transcripts are inserted.
+The two backends reach that same Final Transcript by different routes. **OpenAI**
+streams: it emits revisable **Partial Transcripts** live, then commits the Final
+Transcript on release. **Local Whisper** runs offline: its **Segmenter** cuts a long
+Utterance into **Segments** at silences and transcribes them in the background, and the
+ordered **Segment Transcripts** concatenate into the Final Transcript. In local mode the
+audio never leaves the Mac.
 
-A menu-bar Status Item derives readiness for the selected Transcription Backend and exposes
-the persisted OpenAI/local chooser. Its compact menu shows one relevant primary action,
-keeps OpenAI controls in OpenAI context, and leaves full Model Installation management reachable
-under either selection. Ready local mode says that audio stays on this Mac; an explicit
-network-using Model Operation gets its own separate cue.
+Across the whole lifecycle the **Utterance Coordinator** owns the state machine from
+Talk Key press to a resolved Insertion. The floating **HUD** is silent visual feedback
+only — a red waveform while recording, then green processing dots until the Utterance
+resolves; it never shows transcript text. A menu-bar **Status Item** derives readiness
+for the selected backend, exposes the OpenAI/local chooser, and keeps full **Model
+Installation** management reachable under either selection.
 
 The project vocabulary is kept in [CONTEXT.md](./CONTEXT.md).
 
 ## Requirements
 
+Common to both backends:
+
 - Apple Silicon macOS.
 - Nix with flakes, or a matching bare Zig nightly. See [docs/toolchain.md](./docs/toolchain.md).
-- An OpenAI API key with access to Realtime transcription.
 - macOS grants for Input Monitoring, Accessibility, and Microphone.
+
+Then pick a Transcription Backend:
+
+- **OpenAI (default):** an OpenAI API key with access to Realtime transcription. Audio
+  streams to OpenAI during dictation.
+- **Local Whisper (offline):** no API key and no network at dictation time — only a
+  one-time, credential-free download of the pinned model (Whisper Large v3 Turbo). Audio
+  stays on your Mac.
 
 ## Quick Start
 
