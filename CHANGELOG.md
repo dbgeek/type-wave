@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/dbgeek/type-wave/compare/v0.1.0...v0.1.1) (2026-07-19)
+
+
+### Features
+
+* **daemon:** zero-restart TCC cold start — tap recreate, Insertion probe, serialized grant requests ([#133](https://github.com/dbgeek/type-wave/issues/133)) ([8807f9f](https://github.com/dbgeek/type-wave/commit/8807f9ffc40620e5cc4657ca9a62d2dfb2034fe9))
+
 ## 0.1.0 (2026-07-19)
 
 
