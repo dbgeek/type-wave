@@ -54,13 +54,34 @@ extern "c" fn CGEventTapIsEnabled(tap: CFMachPortRef) bool;
 extern "c" fn CGEventGetIntegerValueField(ev: CGEventRef, field: u32) i64;
 extern "c" fn CGEventGetFlags(ev: CGEventRef) u64;
 extern "c" fn CFMachPortCreateRunLoopSource(alloc: CFAllocatorRef, port: CFMachPortRef, order: c_long) CFRunLoopSourceRef;
+extern "c" fn CFMachPortInvalidate(port: CFMachPortRef) void;
 extern "c" fn CFRunLoopGetCurrent() CFRunLoopRef;
 extern "c" fn CFRunLoopAddSource(rl: CFRunLoopRef, src: CFRunLoopSourceRef, mode: CFStringRef) void;
+extern "c" fn CFRunLoopRemoveSource(rl: CFRunLoopRef, src: CFRunLoopSourceRef, mode: CFStringRef) void;
+extern "c" fn CFRunLoopPerformBlock(rl: CFRunLoopRef, mode: CFStringRef, block: *anyopaque) void;
+extern "c" fn CFRunLoopWakeUp(rl: CFRunLoopRef) void;
 extern "c" fn CFRunLoopRun() void;
+extern "c" fn CFRelease(cf: ?*anyopaque) void;
 extern var kCFRunLoopCommonModes: CFStringRef;
+extern var _NSConcreteStackBlock: anyopaque;
 
 extern "c" fn CGPreflightListenEventAccess() bool;
 extern "c" fn CGRequestListenEventAccess() bool;
+
+// scheduleRecreate hands the run loop a manual stack block (same layout as capture.zig's
+// PermissionBlock). CFRunLoopPerformBlock copies it, so the stack literal may die at
+// return; flags=0 means the copy is a plain memcpy, which is exactly right for the one
+// captured raw pointer.
+const BlockDescriptor = extern struct { reserved: usize = 0, size: usize };
+const RecreateBlock = extern struct {
+    isa: *anyopaque,
+    flags: c_int = 0,
+    reserved: c_int = 0,
+    invoke: *const fn (*RecreateBlock) callconv(.c) void,
+    descriptor: *const BlockDescriptor,
+    tap: *Tap,
+};
+const recreate_block_descriptor = BlockDescriptor{ .size = @sizeOf(RecreateBlock) };
 
 /// `globe` is the Fn / 🌐 key. Named `globe` (not `fn`) because `fn` is a Zig keyword;
 /// it is the "fn" option in the config vocabulary (wayfinder #16). Its observation is
@@ -77,11 +98,28 @@ pub const Callbacks = struct {
     /// tap is dead (Input Monitoring likely revoked) and the daemon should surface it
     /// (wayfinder #18). Optional; runs on the run-loop thread, so keep it fast.
     on_disabled: ?*const fn (ctx: ?*anyopaque, by_timeout: bool, reenabled: bool) void = null,
+    /// A self-tagged synthetic event (insert.zig's Insertion probe) round-tripped the
+    /// event stream back into this tap — objective, in-process proof the PostEvent grant
+    /// is live, where `CGPreflightPostEventAccess` can stay stale-`false` for the process
+    /// lifetime (#129). Optional; runs on the run-loop thread, so keep it fast.
+    on_self_event: ?*const fn (ctx: ?*anyopaque) void = null,
 };
 
 pub const Tap = struct {
     cbs: Callbacks,
+    /// Run-loop-thread only after `install` — `recreate` frees and replaces it, so no
+    /// other thread may dereference it (cross-thread liveness reads go through `live`).
     port: CFMachPortRef = null,
+    source: CFRunLoopSourceRef = null,
+    /// The run loop that services the tap, captured at `install`; `scheduleRecreate`
+    /// targets it from any thread (CFRunLoop is documented thread-safe).
+    run_loop: CFRunLoopRef = null,
+    /// Cross-thread mirror of CGEventTapIsEnabled, maintained at every mutation point on
+    /// the run-loop thread (create/recreate, and the callback's disabled-by re-enable).
+    /// The supervisor polls this instead of the port because `recreate` frees the port.
+    live: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Coalesces scheduleRecreate: at most one recreate block in flight.
+    recreate_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     right_down: bool = false,
     left_down: bool = false,
     fn_down: bool = false,
@@ -110,14 +148,20 @@ pub const Tap = struct {
         // sound the failure and recover once the grant returns (wayfinder #18).
         if (etype == kCGEventTapDisabledByTimeout or etype == kCGEventTapDisabledByUserInput) {
             CGEventTapEnable(self.port, true);
+            const took = CGEventTapIsEnabled(self.port);
+            self.live.store(took, .release);
             if (self.cbs.on_disabled) |cb|
-                cb(self.cbs.ctx, etype == kCGEventTapDisabledByTimeout, CGEventTapIsEnabled(self.port));
+                cb(self.cbs.ctx, etype == kCGEventTapDisabledByTimeout, took);
             return event;
         }
         if (etype != kCGEventFlagsChanged) return event;
 
-        // Ignore our own synthetic events (never matches the Option filter anyway).
-        if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) == self_event_tag) return event;
+        // Our own synthetic events: report the round-trip (the #129 PostEvent probe),
+        // then skip them (they never match the Option filter anyway).
+        if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) == self_event_tag) {
+            if (self.cbs.on_self_event) |cb| cb(self.cbs.ctx);
+            return event;
+        }
 
         const keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
         const flags = CGEventGetFlags(event);
@@ -146,36 +190,83 @@ pub const Tap = struct {
     /// Create the tap, add it to the current run loop, and enable it. Returns whether the
     /// tap is actually **live** — `false` means it was created but stays disabled because
     /// Input Monitoring isn't granted yet (the header's "returns NULL when denied" is
-    /// stale; crib sheet §3/§5). The daemon (wayfinder #19) keeps a created-but-disabled
-    /// tap and brings it live via `enable()` once the grant appears — so only a genuine
-    /// creation failure (null port) is an error here. Must run on the thread whose run
-    /// loop will service the tap (the daemon calls it on the main thread before its run
-    /// loop starts).
+    /// stale; crib sheet §3/§5). A created-while-denied port can NEVER be brought live by
+    /// CGEventTapEnable (#127, confirmed live by #129) — the daemon's supervisor re-arms
+    /// it via `scheduleRecreate` instead — so only a genuine creation failure (null port)
+    /// is an error here. Must run on the thread whose run loop will service the tap (the
+    /// daemon calls it on the main thread before its run loop starts).
     pub fn install(self: *Tap) error{TapCreateFailed}!bool {
+        self.run_loop = CFRunLoopGetCurrent();
+        return self.create();
+    }
+
+    /// The shared create body: fresh CGEventTapCreate + run-loop source + enable, with
+    /// the `live` mirror updated. Run-loop thread only (install, and recreate's block).
+    fn create(self: *Tap) error{TapCreateFailed}!bool {
         const mask: CGEventMask = 1 << 12; // CGEventMaskBit(kCGEventFlagsChanged)
         const port = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly, mask, callback, self);
-        if (port == null) return error.TapCreateFailed;
+        if (port == null) {
+            self.live.store(false, .release);
+            return error.TapCreateFailed;
+        }
         self.port = port;
-        const source = CFMachPortCreateRunLoopSource(null, port, 0);
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
+        self.source = CFMachPortCreateRunLoopSource(null, port, 0);
+        CFRunLoopAddSource(self.run_loop, self.source, kCFRunLoopCommonModes);
         CGEventTapEnable(port, true);
-        return CGEventTapIsEnabled(port);
+        const is_live = CGEventTapIsEnabled(port);
+        self.live.store(is_live, .release);
+        return is_live;
     }
 
-    /// Re-enable the tap and report whether it took. The daemon's self-heal supervisor
-    /// calls this once Input Monitoring is granted after a created-but-disabled start
-    /// (wayfinder #19). Thread-safe: CGEventTapEnable just messages the event server, and
-    /// the run-loop source was already added by `install`. A `false` return means the
-    /// grant still isn't effective.
-    pub fn enable(self: *Tap) bool {
-        if (self.port == null) return false;
-        CGEventTapEnable(self.port, true);
-        return CGEventTapIsEnabled(self.port);
+    /// Tear the port + run-loop source down and create the tap fresh. This is the #127
+    /// re-arm, confirmed live by #129: a fresh CGEventTapCreate re-consults tccd, so the
+    /// create attempt itself is the grant detector — where CGPreflightListenEventAccess
+    /// stays stale in-process and CGEventTapEnable on the created-while-denied port is
+    /// permanently inert. Run-loop thread only (the spike kept every tap mutation there);
+    /// other threads use `scheduleRecreate`. Returns whether the new tap is live; a hard
+    /// create failure leaves no tap and reads as not-live until a later attempt succeeds.
+    pub fn recreate(self: *Tap) bool {
+        if (self.source != null) {
+            CFRunLoopRemoveSource(self.run_loop, self.source, kCFRunLoopCommonModes);
+            CFRelease(@ptrCast(self.source));
+            self.source = null;
+        }
+        if (self.port != null) {
+            CFMachPortInvalidate(self.port);
+            CFRelease(@ptrCast(self.port));
+            self.port = null;
+        }
+        return self.create() catch false;
     }
 
-    /// Whether the tap currently exists and is delivering events.
+    /// Fire-and-forget re-arm from any thread: hand `recreate` to the run loop captured
+    /// at `install`, coalesced to one attempt in flight. The outcome is read as
+    /// `isEnabled` on a later supervisor tick (the spike saw the tap live on the very
+    /// next poll after granting).
+    pub fn scheduleRecreate(self: *Tap) void {
+        if (self.run_loop == null) return;
+        if (self.recreate_pending.swap(true, .acq_rel)) return;
+        var block = RecreateBlock{
+            .isa = &_NSConcreteStackBlock,
+            .invoke = recreateOnRunLoop,
+            .descriptor = &recreate_block_descriptor,
+            .tap = self,
+        };
+        CFRunLoopPerformBlock(self.run_loop, kCFRunLoopCommonModes, @ptrCast(&block));
+        CFRunLoopWakeUp(self.run_loop);
+    }
+
+    fn recreateOnRunLoop(block: *RecreateBlock) callconv(.c) void {
+        const self = block.tap;
+        // Re-check on the owning thread: the OS-timeout re-enable may have raced us live.
+        if (!self.live.load(.acquire)) _ = self.recreate();
+        self.recreate_pending.store(false, .release);
+    }
+
+    /// Whether the tap currently exists and is delivering events. Safe from any thread —
+    /// reads the run-loop thread's mirror, never the port itself.
     pub fn isEnabled(self: *Tap) bool {
-        return self.port != null and CGEventTapIsEnabled(self.port);
+        return self.live.load(.acquire);
     }
 
     /// Block on the current run loop, servicing the tap. Never returns.

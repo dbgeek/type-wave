@@ -12,7 +12,11 @@ const tap = @import("tap.zig");
 const feedback = @import("feedback.zig");
 
 pub const InsertError = error{
-    /// No kTCCServicePostEvent grant — CGEventPost is silently dropped. §7.
+    /// No kTCCServicePostEvent grant — CGEventPost is silently dropped. §7. The
+    /// mechanisms below no longer raise this themselves: post-grant the preflight can
+    /// stay stale-`false` for the process lifetime (#129), so gating on it would refuse
+    /// Insertion forever after a live grant. The error stays in the seam's contract (and
+    /// the InsertionAdapter's failure path) for mechanism-level failures.
     PostEventDenied,
 };
 
@@ -47,10 +51,14 @@ const kVK_ANSI_V: u16 = 0x09; // layout note: Dvorak-QWERTY-⌘ would need a key
 extern "c" fn CGEventSourceCreate(state: i32) CGEventSourceRef;
 extern "c" fn CGEventSourceSetUserData(src: CGEventSourceRef, data: i64) void;
 extern "c" fn CGEventCreateKeyboardEvent(src: CGEventSourceRef, vk: u16, key_down: bool) CGEventRef;
+extern "c" fn CGEventCreate(src: CGEventSourceRef) CGEventRef;
+extern "c" fn CGEventSetType(ev: CGEventRef, etype: u32) void;
 extern "c" fn CGEventSetFlags(ev: CGEventRef, flags: CGEventFlags) void;
 extern "c" fn CGEventKeyboardSetUnicodeString(ev: CGEventRef, len: c_ulong, s: [*]const UniChar) void;
 extern "c" fn CGEventPost(where: u32, ev: CGEventRef) void;
 extern "c" fn CFRelease(cf: ?*anyopaque) void;
+
+const kCGEventFlagsChanged: u32 = 12;
 
 extern "c" fn CGPreflightPostEventAccess() bool;
 extern "c" fn CGRequestPostEventAccess() bool;
@@ -130,10 +138,30 @@ pub fn requestPostEventAccess() bool {
     return CGRequestPostEventAccess();
 }
 
-/// Silent preflight only — never prompts. The daemon's self-heal supervisor (#19) polls
-/// this so it re-checks the grant without re-triggering a TCC dialog every tick.
+/// Silent preflight only — never prompts. Trustworthy when `true`; a `false` can be a
+/// lie for the rest of the process lifetime after a live grant (#129), so the daemon
+/// ORs this with its attempt-then-observe latch (a `postTaggedProbe` seen back through
+/// its own tap) instead of trusting it alone.
 pub fn postEventGranted() bool {
     return CGPreflightPostEventAccess();
+}
+
+/// Post a tagged, invisible probe for the attempt-then-observe PostEvent detection
+/// (#129): a flagsChanged event whose flags mirror the current session state (so apps
+/// see no modifier change), tagged with tap.self_event_tag so the daemon's listen-only
+/// tap — whose mask already passes flagsChanged — reports the round-trip via
+/// `on_self_event`. Denied, the OS silently drops it; landed, it proves the grant live
+/// where the preflight stays stale-`false`. Own throwaway source per post (the spike's
+/// pattern), so it never races the Inserter's source across threads.
+pub fn postTaggedProbe() void {
+    const src = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
+    defer if (src != null) CFRelease(@ptrCast(src));
+    if (src != null) CGEventSourceSetUserData(src, tap.self_event_tag);
+    const ev = CGEventCreate(src);
+    if (ev == null) return;
+    CGEventSetType(ev, kCGEventFlagsChanged);
+    CGEventPost(kCGSessionEventTap, ev);
+    CFRelease(@ptrCast(ev));
 }
 
 pub fn secureInputActive() bool {
@@ -226,7 +254,9 @@ pub const Inserter = struct {
         // worker's serialization makes this a no-op in practice; this keeps the
         // mechanism correct on its own.
         self.drainDeferredRestore();
-        if (!CGPreflightPostEventAccess()) return error.PostEventDenied;
+        // No preflight gate: post-grant it stays stale-`false` for the process lifetime
+        // (#129), so the post is attempted unconditionally — the daemon only reaches
+        // `configured` (and so ever schedules an insert) once a probe proved the grant.
         const t_paste = feedback.nowMs();
 
         const pool = objc_autoreleasePoolPush();
@@ -298,8 +328,7 @@ pub const Inserter = struct {
     /// splitting a surrogate pair, key-down+key-up per chunk with ~1 ms pacing
     /// (espanso's rules, §1–§2). Posts to the HID tap like the real injectors do.
     pub fn keystroke(self: *Inserter, utf16: []const UniChar) InsertError!void {
-        if (!CGPreflightPostEventAccess()) return error.PostEventDenied;
-
+        // No preflight gate — same attempt-then-observe stance as `paste` (#129).
         var i: usize = 0;
         while (i < utf16.len) {
             var n: usize = @min(20, utf16.len - i);

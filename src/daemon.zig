@@ -27,7 +27,10 @@
 //!    (Input Monitoring granted) AND (PostEvent granted) AND (tap enabled). Missing
 //!    prerequisites do NOT crash the daemon (the LaunchAgent's KeepAlive would crash-loop);
 //!    the supervisor polls (~3 s), executes the phase module's actions, and reserves
-//!    `exit(0)` for a clean SIGTERM/bootout.
+//!    `exit(0)` for a clean SIGTERM/bootout. On a cold start the supervisor also runs
+//!    #130's serialized TCC request sequence (grant_sequence.zig) and the two live
+//!    pickup mechanisms #127/#129 confirmed: fresh-create tap re-arm for Input
+//!    Monitoring, tagged-probe attempt-then-observe for PostEvent — zero restarts.
 //! 2. **Link state** (owned by session.zig): connecting / ready / reconnecting / closed.
 //!
 //! # Threads
@@ -65,6 +68,7 @@ const keychain = @import("keychain.zig");
 const insertion_adapter = @import("insertion_adapter.zig");
 const readiness = @import("readiness.zig");
 const configuration_phase = @import("configuration_phase.zig");
+const grant_sequence = @import("grant_sequence.zig");
 const backend = @import("transcription_backend.zig");
 const backend_router = @import("backend_router.zig");
 const operation_channel = @import("operation_channel.zig");
@@ -254,7 +258,7 @@ const DaemonDeps = struct {
     /// retains the slice (a process-lifetime allocation, like snapshots).
     pending_key: ?[]const u8 = null,
     /// The Configuration Phase outcome gathered mid-tick by `wants`; the supervisor
-    /// loop executes its non-router actions (tap enable, READY, reporting) afterwards.
+    /// loop executes its non-router actions (READY, reporting) afterwards.
     outcome: configuration_phase.Outcome = undefined,
 
     pub fn connectOpenai(self: *DaemonDeps) !*Session {
@@ -435,6 +439,18 @@ const Daemon = struct {
     /// Supervisor-thread-only: owns Configuration Phase memory, including READY
     /// announcements and distinct not-configured reports.
     configuration: configuration_phase.ConfigurationPhase = .{},
+    /// Supervisor-thread-only: #130's serialized cold-start TCC request sequence —
+    /// Microphone → Input Monitoring → PostEvent, one request in flight at a time,
+    /// advancing on grant or a 60 s per-grant timeout. Never restarts anything.
+    grants: grant_sequence.Sequence = .{},
+    /// Supervisor-thread-only: prints the sequence header once, right before its
+    /// first `[N/3]` line, so the block stays contiguous in the log.
+    grants_header_printed: bool = false,
+    /// Attempt-then-observe latch for the PostEvent grant (#129): set by the tap
+    /// callback when a self-tagged Insertion probe round-trips the event stream.
+    /// `CGPreflightPostEventAccess` can stay stale-`false` for the process lifetime
+    /// after a live grant, so this latch is the only trustworthy in-process signal.
+    post_event_observed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     local_model_recovery: local_model_recovery.Recovery = .{},
     local_failure: FailureObservation = .{},
 
@@ -641,7 +657,27 @@ const Daemon = struct {
         }
     }
 
+    /// A self-tagged synthetic event round-tripped the event stream into our tap: the
+    /// PostEvent grant is provably live (#129). Runs on the run-loop thread; one store.
+    fn onSelfEvent(ctx: ?*anyopaque) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx.?));
+        self.post_event_observed.store(true, .release);
+    }
+
     // ---- supervisor thread: the self-heal / not-configured → configured engine ----
+
+    /// Input Monitoring fact. The preflight is stale in-process after a live grant
+    /// (#127), so the live tap — brought up by the fresh-create re-arm — is the truth;
+    /// the preflight only adds the created-but-momentarily-disabled window at startup.
+    fn inputMonitoringFact(self: *Daemon) bool {
+        return self.tap.isEnabled() or tapmod.Tap.listenGranted();
+    }
+
+    /// PostEvent fact: the observe latch (#129) ORed with the preflight, which is
+    /// trustworthy when `true` but can lie `false` for the process lifetime.
+    fn postEventFact(self: *Daemon) bool {
+        return self.post_event_observed.load(.acquire) or insertmod.postEventGranted();
+    }
 
     /// One facts pass: probe grants/key/installation, tick the Configuration Phase, and
     /// park the freshly loaded key (if any) for DaemonDeps.connectOpenai. Called by the
@@ -654,8 +690,8 @@ const Daemon = struct {
         else
             null;
         self.router_deps.pending_key = key;
-        const im = tapmod.Tap.listenGranted();
-        const pe = insertmod.postEventGranted();
+        const im = self.inputMonitoringFact();
+        const pe = self.postEventFact();
         return self.configuration.tick(self.configurationFacts(im, pe, key != null, local_installation));
     }
 
@@ -666,20 +702,29 @@ const Daemon = struct {
             first = false;
             if (g_quit.load(.acquire)) return;
 
+            // Input Monitoring re-arm (#127/#129): CGEventTapEnable on a created-while-
+            // denied port is permanently inert, and the preflight is stale in-process —
+            // only a fresh CGEventTapCreate re-consults tccd, so the create attempt IS
+            // the grant detector. It must run on the tap's run-loop thread; schedule it
+            // there and read the outcome as isEnabled on the next tick (the #129 spike
+            // saw the tap live on the very next poll after granting).
+            if (!self.tap.isEnabled()) self.tap.scheduleRecreate();
+
+            // PostEvent attempt-then-observe (#129): once its prompt has had its chance
+            // to surface, post an invisible tagged probe each tick until one round-trips
+            // our own live tap (onSelfEvent latches it). Denied posts are silently
+            // dropped, so an ungranted state just keeps probing at supervisor cadence.
+            if (self.grants.reached(.post_event) and self.tap.isEnabled() and !self.postEventFact())
+                insertmod.postTaggedProbe();
+
+            // #130's serialized cold-start requests + all [N/3] narration.
+            self.tickGrantSequence();
+
             // The Backend Router reconciles (selection, staleness, drain-gated teardown),
             // gathers the Configuration Phase outcome via DaemonDeps.wants at the right
             // moment, then prepares. True = a resource became authoritative this tick.
-            var changed_facts = self.transcription.tick(self.store.current().transcription_backend);
+            const changed_facts = self.transcription.tick(self.store.current().transcription_backend);
             var outcome = self.router_deps.outcome;
-
-            if (outcome.actions.enable_tap) {
-                if (self.tap.enable()) {
-                    changed_facts = true;
-                    feedback.log("  supervisor: Input Monitoring granted — Talk Key tap is live\n", .{});
-                } else {
-                    feedback.log("  supervisor: Input Monitoring looks granted but the tap won't enable — a daemon restart may be needed\n", .{});
-                }
-            }
 
             // Re-evaluate after successful self-heal effects so READY/reporting reflects
             // the state users see at the end of this poll tick.
@@ -695,6 +740,63 @@ const Daemon = struct {
                 self.removeInactiveModelInstallations();
             self.capture_enabled.store(outcome.configured and self.transcription.available() and !self.paused.load(.acquire), .release);
         }
+    }
+
+    /// One tick of #130's serialized TCC request sequence: gather the three grant facts,
+    /// let the pure policy decide, then fire the requests and print the [N/3] lines. The
+    /// grant facts keep being polled here forever — a grant landing minutes after its
+    /// step timed out still gets its granted line and its live pickup.
+    fn tickGrantSequence(self: *Daemon) void {
+        const facts = grant_sequence.Facts{
+            cap.microphoneGranted(),
+            self.inputMonitoringFact(),
+            self.postEventFact(),
+        };
+        const actions = self.grants.tick(feedback.nowMs(), facts);
+        if (actions.count > 0 and !self.grants_header_printed) {
+            self.grants_header_printed = true;
+            feedback.log("TCC grants for the type-wave daemon (requesting one at a time):\n", .{});
+        }
+        for (actions.slice()) |action| switch (action) {
+            .request => |grant| {
+                switch (grant) {
+                    .microphone => cap.requestMicrophoneAccess(),
+                    .input_monitoring => _ = tapmod.Tap.requestListenAccess(),
+                    .post_event => _ = insertmod.requestPostEventAccess(),
+                }
+                feedback.log("  [{d}/3] {s}: requesting{s}\n", .{ stepNo(grant), grantName(grant), requestHint(grant) });
+            },
+            .granted => |grant| feedback.log("  [{d}/3] {s}: granted — {s}\n", .{ stepNo(grant), grantName(grant), grantedNote(grant) }),
+            .timed_out => |grant| feedback.log("  [{d}/3] {s}: still waiting after 60s — moving on to the next grant; will keep polling in the background\n", .{ stepNo(grant), grantName(grant) }),
+        };
+    }
+
+    fn stepNo(grant: grant_sequence.Grant) usize {
+        return @intFromEnum(grant) + 1;
+    }
+
+    fn grantName(grant: grant_sequence.Grant) []const u8 {
+        return switch (grant) {
+            .microphone => "Microphone",
+            .input_monitoring => "Input Monitoring",
+            .post_event => "PostEvent (Accessibility)",
+        };
+    }
+
+    fn requestHint(grant: grant_sequence.Grant) []const u8 {
+        return switch (grant) {
+            .microphone => "…",
+            .input_monitoring => " — check System Settings > Privacy & Security > Input Monitoring",
+            .post_event => " — check System Settings > Privacy & Security > Accessibility",
+        };
+    }
+
+    fn grantedNote(grant: grant_sequence.Grant) []const u8 {
+        return switch (grant) {
+            .microphone => "Capture is live",
+            .input_monitoring => "Talk Key tap is live",
+            .post_event => "Insertion is live",
+        };
     }
 
     /// Log the missing prerequisites once per distinct set (not every tick), with one error
@@ -751,8 +853,8 @@ const Daemon = struct {
     fn menuStatus(ctx: *anyopaque) status_item.Snapshot {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
         const h = configuration_phase.health(self.configurationFacts(
-            tapmod.Tap.listenGranted(),
-            insertmod.postEventGranted(),
+            self.inputMonitoringFact(),
+            self.postEventFact(),
             false,
             self.localInstallationPresent(),
         ));
@@ -964,23 +1066,23 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     daemon.deadline.on_cooperative_cancel = cooperativeCancelTramp;
     daemon.deadline.on_fire = deadlineFireTramp;
 
-    // ---- Talk Key tap: prompt for the two event grants once, then create the tap on THIS
-    //      (main) run loop. A created-but-disabled tap is fine — the supervisor enables it
-    //      once Input Monitoring appears. Only a null port is a genuine hard failure. ----
-    const listen_ok = tapmod.Tap.requestListenAccess();
-    const post_ok = insertmod.requestPostEventAccess();
-    cap.requestMicrophoneAccess();
-    const microphone_ok = cap.microphoneGranted();
-    feedback.log("TCC grants for the type-wave daemon:\n", .{});
-    feedback.log("  Input Monitoring (Talk Key tap): {s}\n", .{if (listen_ok) "granted" else "NOT granted — waiting"});
-    feedback.log("  PostEvent        (Insertion):    {s}\n", .{if (post_ok) "granted" else "NOT granted — waiting"});
-    feedback.log("  Microphone       (Capture):      {s}\n", .{if (microphone_ok) "granted" else "NOT granted — enable in System Settings"});
+    // ---- Accessory activation policy, BEFORE any TCC preflight: Sequoia+ answers
+    //      CGPreflightPostEventAccess()==false for a background-only process (#127).
+    //      menu.init would set it as a side effect, but the ordering is load-bearing —
+    //      make it explicit here so the headless path is covered by design (#129). ----
+    _ = appkit.app();
 
+    // ---- Talk Key tap: created on THIS (main) run loop. No TCC request fires here —
+    //      the supervisor serializes them, one grant in flight at a time (#130). A
+    //      created-while-denied tap stays disabled until the supervisor's fresh-create
+    //      re-arm picks the grant up live (#127/#129); CGEventTapEnable can never revive
+    //      it. Only a null port is a genuine hard failure. ----
     daemon.tap = .{ .cbs = .{
         .ctx = &daemon,
         .on_press = Daemon.tapPress,
         .on_release = Daemon.tapRelease,
         .on_disabled = Daemon.onTapDisabled,
+        .on_self_event = Daemon.onSelfEvent,
     } };
     const tap_live = daemon.tap.install() catch |e| switch (e) {
         error.TapCreateFailed => {
@@ -988,7 +1090,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
             return e;
         },
     };
-    feedback.log("  Talk Key tap: {s}\n", .{if (tap_live) "live" else "created, waiting for Input Monitoring"});
+    feedback.log("Talk Key tap: {s}\n", .{if (tap_live) "live" else "created, waiting for Input Monitoring (the supervisor re-arms it once granted)"});
 
     // ---- menu-bar status item (#34): built on the main thread before the run loop.
     //      Headless (no display) skips it and the daemon behaves exactly as before. ----
