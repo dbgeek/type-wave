@@ -54,14 +54,15 @@ cd prototypes/tap-rearm
 zig build
 ```
 
-Note (2026-07-19): in this session's sandboxed shell, `zig build` failed at the **configure** step
-because `xcrun --show-sdk-path` returned `error: unable to find sdk: 'macosx'` even though the SDKs
-are present under `/Library/Developer/CommandLineTools/SDKs/` — the same failure reproduces on the
-sibling `prototypes/insertion-spike`, so it's an environment quirk of that shell, not this code.
-**Semantic correctness was verified instead** via `zig build-obj src/main.zig -target
-aarch64-macos` from inside `src/` (full type-check + codegen, no linking, so no SDK/framework
-lookup needed) — it compiled with zero errors. Confirm `zig build` itself succeeds in a normal
-interactive terminal before running the live test below.
+Confirmed building clean (2026-07-19): `zig build` produces `zig-out/bin/tap-rearm`, a valid
+arm64 Mach-O executable. (An earlier attempt in a sandboxed shell hit a transient `xcrun
+--show-sdk-path -> unable to find sdk: 'macosx'` configure failure — unrelated to this code, it
+cleared on retry.)
+
+**Compat note for whoever touches this next:** this Zig nightly (`0.17.0-dev.1267+300116b02`)
+has dropped `std.process.args()`/`ArgIterator` entirely — there's no argv-reading API left in
+`std` at all. `--accessory` was originally a CLI flag; it's now the `ACCESSORY` env var instead
+(`std.c.getenv`, same pattern `cli-dictation`'s `OPENAI_API_KEY` lookup already uses).
 
 ## Run protocol
 
@@ -88,12 +89,12 @@ Accessibility and run the post-grant attempt(s). Record, per attempt: `self-tap-
 `PostEvent preflight` line and Phase 2's post-grant `self-tap-saw` outcome:
 
 ```sh
-./zig-out/bin/tap-rearm             # headless default — reproduces the bug if present
-./zig-out/bin/tap-rearm --accessory # sets Accessory policy before the first probe — the proposed fix
+./zig-out/bin/tap-rearm          # headless default — reproduces the bug if present
+ACCESSORY=1 ./zig-out/bin/tap-rearm # sets Accessory policy before the first probe — the proposed fix
 ```
 
-If the un-flagged run shows `preflight after=false` (or `self-tap-saw=false`) post-grant while the
-`--accessory` run shows `true`/`true`, that confirms §5 of the research doc and the fix daemon.zig's
+If the unset run shows `preflight after=false` (or `self-tap-saw=false`) post-grant while the
+`ACCESSORY=1` run shows `true`/`true`, that confirms §5 of the research doc and the fix daemon.zig's
 headless path needs.
 
 ## Answer
