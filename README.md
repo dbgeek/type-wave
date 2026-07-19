@@ -224,4 +224,14 @@ flake.nix            development shell pinning the Zig nightly
 - Architecture decisions live in [docs/adr](./docs/adr).
 - Research crib sheets live in [docs/research](./docs/research).
 - Work tracking conventions are in [docs/agents/issue-tracker.md](./docs/agents/issue-tracker.md).
-- `vendor/websocket.zig` is MIT-licensed; see its `LICENSE`.
+
+## License
+
+type-wave is released under the [MIT License](./LICENSE), Copyright (c) 2026
+Björn Ahl.
+
+It builds on MIT-licensed third-party components (vendored `websocket.zig`,
+whisper.cpp, and the Whisper large-v3-turbo model). Their attributions and
+license-text locations are listed in
+[THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md); pinned revisions and hashes
+are in [packaging/share/type-wave/PROVENANCE](./packaging/share/type-wave/PROVENANCE).
