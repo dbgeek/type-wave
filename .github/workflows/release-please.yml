@@ -1,0 +1,38 @@
+name: release-please
+
+# Source-only release pipeline (map #109).
+# On every push to main, release-please maintains a running "release PR" that
+# accumulates Conventional-Commit changes. Merging that release PR bumps the
+# SemVer version (syncing build.zig.zon via the // x-release-please-version
+# marker), pushes the vX.Y.Z tag, and cuts a source-only GitHub Release.
+#
+# Token: a fine-grained PAT in secret RELEASE_PLEASE_TOKEN (scope: this repo,
+# Contents + Pull requests: write). Using a PAT instead of the default
+# GITHUB_TOKEN means the release PR is authored by a real identity, so it
+# TRIGGERS the required `test` and `Validate PR title` checks on main
+# (GITHUB_TOKEN-authored PRs trigger neither — see map #109 / ticket #116).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # --- ticket #117 plugs in here ---
+      # When steps.release.outputs.releases_created == 'true', an AI-authored
+      # "Highlights" summary is generated in-job and PATCHed onto the release
+      # body via `gh release edit --notes` (no PAT cascade needed — same job).
+      # Left unwired until #117 chooses the provider.
