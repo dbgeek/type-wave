@@ -1,0 +1,65 @@
+# Release CI gate — the "green build + full headless test suite before release"
+# precondition for map #109 (automate GitHub releases).
+#
+# Decisions (ticket #115, grounded in research #110 → docs/research/ci-macos-arm64.md):
+#   • Runner:        macos-15 (arm64 / M1), pinned — free & unlimited on this public repo.
+#   • Toolchain:     nightly Zig + cmake/ninja/python3/mypy, reproduced from the Nix flake
+#                    (flake.lock is the real lock) via DeterminateSystems/nix-installer-action
+#                    + `nix develop` — NOT setup-zig (which pins only Zig and drifts).
+#   • Gate scope:    `zig build test` — the whole headless suite: Zig unit tests
+#                    (Coordinator lifecycle + pure fns) + acceptance/local_backend unittests
+#                    + `mypy --strict` + packaging/test_packaging.py. Source-only releases
+#                    attach no binary, so the ~4–8 min Metal whisper-helper compile is NOT
+#                    part of this gate.
+#   • Cache:         magic-nix-cache (free, revived 2025) for the Nix store, plus ~/.cache/zig
+#                    (the single biggest wall-clock lever — memoizes Zig + the whisper build).
+#
+# The `test` job name is the required status-check context on `main` (branch protection).
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One in-flight run per ref; new pushes cancel superseded runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: the gate only reads the tree.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Reproduce the exact pinned dev shell (Zig + cmake/ninja/python3/mypy) from flake.lock.
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      # Free, ephemeral Nix-store speed cache (GitHub Actions cache backed).
+      - name: Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      # Zig global cache — memoizes compilation and the whisper Metal build output.
+      # Keyed on the toolchain/build inputs; falls back to the newest partial match.
+      - name: Cache ~/.cache/zig
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-cache-${{ runner.os }}-${{ hashFiles('flake.lock', 'build.zig.zon', 'build.zig', 'tools/build-whisper-runtime.sh') }}-${{ github.sha }}
+          restore-keys: |
+            zig-cache-${{ runner.os }}-${{ hashFiles('flake.lock', 'build.zig.zon', 'build.zig', 'tools/build-whisper-runtime.sh') }}-
+            zig-cache-${{ runner.os }}-
+
+      # The release gate: the full headless test suite, run inside the pinned dev shell.
+      - name: zig build test
+        run: nix develop --command zig build test
