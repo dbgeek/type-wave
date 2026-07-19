@@ -21,6 +21,25 @@ excerpt from `~/Library/Logs/type-wave.log`.
   not be merged, and it is kinder to learn that before you invest the time.
 - Keep each PR to a single concern.
 
+## Commit and PR conventions
+
+Releases are automated from commit history, so the **PR title matters**.
+
+- **We merge squash-only.** Each PR lands on `main` as exactly one commit whose
+  subject is the **PR title** — so your branch commits can be as messy as you
+  like, but the title must be right. (Merge-commit and rebase merges are off.)
+- **The PR title must be a [Conventional Commit](https://www.conventionalcommits.org/):**
+  `<type>[optional scope]: <description>` — e.g. `feat: add local backend picker`
+  or `fix(hud): stop capsule flicker on handover`. A CI check (`PR title lint`)
+  blocks the merge if it isn't.
+- **Types:** `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`,
+  `build`, `ci`, `chore`, `revert`. Only `feat` and `fix` produce a release;
+  `feat` → new features, `fix` → bug fixes. **Scope is optional** — add one when
+  it helps (`feat(backends): …`), skip it otherwise.
+- **Breaking changes:** put a `!` after the type — `feat!:` or `refactor!:`.
+  While we are pre-1.0 a breaking change bumps the **minor** version (`0.3.x →
+  0.4.0`); ordinary `feat`/`fix` bump the **patch**.
+
 ## Working on the code
 
 type-wave is a Zig daemon for Apple Silicon macOS. See the
