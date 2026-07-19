@@ -1,0 +1,51 @@
+# Enforces Conventional Commits on the PR *title* (see CONTRIBUTING.md).
+#
+# type-wave merges are squash-only, so the PR title becomes the sole commit
+# subject on `main` — which is exactly what release-please reads to derive the
+# version bump and changelog. A malformed title would silently corrupt both, so
+# this check is intended to be a *required* status check (wired into branch
+# protection separately; see issue #115).
+name: PR title lint
+
+# pull_request_target (not pull_request) so the auto-comment on failure has a
+# write token even for fork PRs. Safe here: this action only reads the PR title
+# via the API — it never checks out or executes the PR's code.
+on:
+  pull_request_target:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize # keep the check present on the head SHA as commits land
+
+permissions:
+  pull-requests: write # post/update the failure comment
+
+jobs:
+  validate-pr-title:
+    name: Validate PR title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Default Conventional type set. `feat` and `fix` drive version bumps;
+          # the rest are categorized (or hidden) in the changelog.
+          types: |
+            feat
+            fix
+            docs
+            style
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+            revert
+          # Scope is optional and unrestricted — no requireScope, no scopes enum.
+          requireScope: false
+          # Breaking changes: the `!` marker in the title (e.g. `feat!:`) is the
+          # authoritative signal (it survives squash cleanly). A BREAKING CHANGE
+          # footer is honored by release-please but not required here.
