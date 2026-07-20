@@ -63,6 +63,11 @@ pub const Settings = struct {
     /// set `.overlay = false` for sound-only feedback. A headless run (no display) also
     /// degrades to sound-only on its own, so this never blocks startup.
     overlay: bool = true,
+    /// Backtrack (docs/backtrack-spec.md): opt-in rewrite pass between the Final
+    /// Transcript and its Insertion — spoken self-corrections applied, fillers removed,
+    /// one OpenAI call. Transcript text leaves the Mac, so it applies only when the
+    /// pinned backend is OpenAI; read at Talk Key press and pinned with the Lease.
+    backtrack: bool = false,
 
     /// OpenAI input-audio noise reduction. `.off` sends JSON `null` (feature disabled).
     pub const NoiseReduction = enum { near_field, far_field, off };
@@ -274,6 +279,7 @@ pub fn diffSettings(a: *const Settings, b: *const Settings) Diff {
     if (!std.mem.eql(u8, a.delay, b.delay)) d.session_shaped = true;
     if (a.noise_reduction != b.noise_reduction) d.session_shaped = true;
     if (a.overlay != b.overlay) d.overlay = true;
+    if (a.backtrack != b.backtrack) d.any = true; // pinned at press with the Lease — read-at-use
     if (d.backend_selection or d.session_shaped or d.overlay) d.any = true;
     return d;
 }
@@ -417,6 +423,7 @@ fn serializeSettings(gpa: std.mem.Allocator, s: Settings) ?[:0]u8 {
         \\//   .insertion       = .paste | .keystroke
         \\//   .pre_paste_ms    = <ms between the pasteboard write and Cmd-V; raise for a slow target>
         \\//   .overlay         = true | false
+        \\//   .backtrack       = true | false  (rewrite self-corrections via OpenAI — transcript text leaves your Mac)
         \\.{{
         \\    .transcription_backend = .{s},
         \\    .talk_key = .{s},
@@ -427,11 +434,13 @@ fn serializeSettings(gpa: std.mem.Allocator, s: Settings) ?[:0]u8 {
         \\    .insertion = .{s},
         \\    .pre_paste_ms = {d},
         \\    .overlay = {},
+        \\    .backtrack = {},
         \\}}
         \\
     , .{
         @tagName(s.transcription_backend), @tagName(s.talk_key),  s.model,        s.language, s.delay,
         @tagName(s.noise_reduction),       @tagName(s.insertion), s.pre_paste_ms, s.overlay,
+        s.backtrack,
     }) catch return null;
     return gpa.dupeSentinel(u8, text, 0) catch null;
 }
@@ -554,7 +563,7 @@ test "patchZonField does not confuse a longer field name for a prefix" {
 }
 
 test "serializeSettings round-trips through the ZON parser" {
-    const s = Settings{ .transcription_backend = .local, .talk_key = .left_option, .language = "", .delay = "high", .overlay = false, .pre_paste_ms = 42 };
+    const s = Settings{ .transcription_backend = .local, .talk_key = .left_option, .language = "", .delay = "high", .overlay = false, .pre_paste_ms = 42, .backtrack = true };
     const text = serializeSettings(talloc, s) orelse return error.SerializeFailed;
     defer talloc.free(text);
     var diag: std.zon.parse.Diagnostics = .{};
@@ -568,6 +577,23 @@ test "serializeSettings round-trips through the ZON parser" {
     try std.testing.expectEqualStrings("", parsed.language);
     try std.testing.expect(!parsed.overlay);
     try std.testing.expectEqual(@as(u32, 42), parsed.pre_paste_ms);
+    try std.testing.expect(parsed.backtrack);
+}
+
+test "backtrack parses from config.zon and defaults off when absent" {
+    var diag: std.zon.parse.Diagnostics = .{};
+    defer diag.deinit(talloc);
+    const parsed = try std.zon.parse.fromSliceAlloc(Settings, talloc, ".{ .backtrack = true }", &diag, .{});
+    try std.testing.expect(parsed.backtrack);
+    try std.testing.expect(!(Settings{}).backtrack);
+}
+
+test "diffSettings flags a backtrack change as plain (pinned at press with the Lease)" {
+    const base = Settings{};
+    var b = base;
+    b.backtrack = true;
+    const d = diffSettings(&base, &b);
+    try std.testing.expect(d.any and !d.session_shaped and !d.overlay and !d.backend_selection);
 }
 
 test "OpenAI is the default Transcription Backend when config omits selection" {

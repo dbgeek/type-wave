@@ -324,6 +324,16 @@ fn statusText(p: status_item.Presentation, selected: backend.Backend) [*:0]const
     };
 }
 
+/// Disclosure line 2 beneath the Backtrack toggle. On the Local backend with Backtrack
+/// on it sharpens to the "enabled but not applying" status — the toggle stays checked so
+/// it can be pre-enabled for the switch to OpenAI (docs/backtrack-spec.md §Settings & UX);
+/// otherwise it states the cloud/network reality, shown identically whether on or off.
+fn backtrackLine2(s: *const config.Settings) [*:0]const u8 {
+    if (s.transcription_backend == .local and s.backtrack)
+        return "Not applying \xe2\x80\x94 needs the OpenAI backend";
+    return "Needs internet; unavailable on the Local backend";
+}
+
 fn primaryText(action: status_item.PrimaryAction, operation: status_item.Operation) [*:0]const u8 {
     return switch (action) {
         .none => "",
@@ -375,6 +385,9 @@ pub const Menu = struct {
     set_api_key_item: id = null,
     pause_item: id = null, // title flips Pause/Resume
     overlay_item: id = null, // checkbox mirror of settings.overlay
+    backtrack_item: id = null, // checkbox mirror of settings.backtrack
+    backtrack_cloud_item: id = null, // disclosure line 1 (static; on and off)
+    backtrack_backend_item: id = null, // disclosure line 2 (swaps on Local + on)
     submenu: [groups.len]id = @splat(null),
     group_parent: [groups.len]id = @splat(null),
     local_model_parent: id = null,
@@ -420,6 +433,14 @@ pub const Menu = struct {
         addSeparator(menu);
         const snap = self.store.current();
         self.addRadioGroup(menu, 0, snap);
+        // Backtrack sits directly beneath the Backend radio group it depends on, with two
+        // always-visible disclosure lines (docs/backtrack-spec.md §Settings & UX). Unlike
+        // the openai_only groups it is never hidden — hiding would erase an opted-in
+        // preference — so on the Local backend it stays checked/enabled and line 2 sharpens.
+        self.backtrack_item = self.addAction(menu, "Backtrack (rewrite self-corrections)", "onBacktrack:");
+        self.backtrack_cloud_item = self.addDisabled(menu, "Uses OpenAI cloud \xe2\x80\x94 transcript text leaves your Mac");
+        self.backtrack_backend_item = self.addDisabled(menu, ""); // wording filled by syncBacktrack
+        self.syncBacktrack(); // set the toggle state + line-2 wording from the snapshot
         self.primary_item = self.addAction(menu, "", "onPrimary:");
         self.privacy_item = self.addDisabled(menu, "Audio stays on this Mac");
         self.network_item = self.addDisabled(menu, "Network used only for this model operation");
@@ -526,6 +547,15 @@ pub const Menu = struct {
             const on = cur != null and i == @as(c_long, @intCast(cur.?));
             msgLong(it, "setState:", if (on) NSControlStateOn else NSControlStateOff);
         }
+    }
+
+    /// Re-checkmark the Backtrack toggle and set disclosure line 2 from the current
+    /// snapshot. Called on menu open, on toggle, and when the backend selection changes
+    /// (line 2 tracks the backend). The toggle is never disabled or hidden.
+    fn syncBacktrack(self: *Menu) void {
+        const snap = self.store.current();
+        msgLong(self.backtrack_item, "setState:", if (snap.backtrack) NSControlStateOn else NSControlStateOff);
+        msg1v(self.backtrack_backend_item, "setTitle:", nsstr(backtrackLine2(snap)));
     }
 
     /// Push the independent state axes into the compact hierarchy. Cheap when nothing
@@ -690,6 +720,7 @@ fn onRadio(_: id, _: SEL, sender: id) callconv(.c) void {
     applyOption(&next, gi, oi);
     m.commitSettings(next, g.field, g.opts[oi].zon, g.session_shaped);
     m.syncGroup(gi);
+    if (gi == 0) m.syncBacktrack(); // backend switch re-words Backtrack disclosure line 2
     feedback.log("  menu: {s} → {s}{s}\n", .{
         g.title,                                                                 g.opts[oi].label,
         if (g.session_shaped) " (binds at the next idle session cycle)" else "",
@@ -704,6 +735,16 @@ fn onOverlay(_: id, _: SEL, _: id) callconv(.c) void {
     msgLong(m.overlay_item, "setState:", if (next.overlay) NSControlStateOn else NSControlStateOff);
     m.host.setOverlay(m.host.ctx, next.overlay);
     feedback.log("  menu: Overlay HUD → {s}\n", .{if (next.overlay) "on" else "off"});
+}
+
+fn onBacktrack(_: id, _: SEL, _: id) callconv(.c) void {
+    const m = g_menu orelse return;
+    var next = m.store.current().*;
+    next.backtrack = !next.backtrack;
+    // Read-at-use / pinned at Talk Key press — no Host callback, no session cycle.
+    m.commitSettings(next, "backtrack", if (next.backtrack) "true" else "false", false);
+    m.syncBacktrack(); // toggle checkmark + line-2 wording (sharpens on Local + on)
+    feedback.log("  menu: Backtrack → {s}\n", .{if (next.backtrack) "on" else "off"});
 }
 
 fn onPause(_: id, _: SEL, _: id) callconv(.c) void {
@@ -838,6 +879,25 @@ test "state-changing Local Model confirmations explain their containment boundar
     try std.testing.expect(std.mem.indexOf(u8, discard, "working Model Installation") != null);
 }
 
+test "backtrackLine2 sharpens to not-applying only on Local with Backtrack on" {
+    const cloud = "unavailable on the Local backend";
+    const sharpened = "Not applying";
+
+    // The three non-sharpened cases all show the plain cloud/network line.
+    inline for (.{
+        config.Settings{ .transcription_backend = .openai, .backtrack = true },
+        config.Settings{ .transcription_backend = .openai, .backtrack = false },
+        config.Settings{ .transcription_backend = .local, .backtrack = false },
+    }) |s| {
+        var settings = s;
+        try std.testing.expect(std.mem.indexOf(u8, std.mem.span(backtrackLine2(&settings)), cloud) != null);
+    }
+
+    // Only Local + on sharpens — the opted-in preference is kept, not erased.
+    var on_local = config.Settings{ .transcription_backend = .local, .backtrack = true };
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(backtrackLine2(&on_local)), sharpened) != null);
+}
+
 fn onOpenConfig(_: id, _: SEL, _: id) callconv(.c) void {
     const m = g_menu orelse return;
     var buf: [4096]u8 = undefined;
@@ -910,6 +970,7 @@ fn onMenuWillOpen(_: id, _: SEL, _: id) callconv(.c) void {
     }
     for (0..groups.len) |gi| m.syncGroup(gi);
     msgLong(m.overlay_item, "setState:", if (m.store.current().overlay) NSControlStateOn else NSControlStateOff);
+    m.syncBacktrack(); // pick up a hand-edited .backtrack and re-word line 2 for the backend
     m.last_snapshot = null; // force refresh after settings or external model-state changes
     m.refreshChrome();
 }
@@ -928,6 +989,7 @@ fn makeTarget() id {
     _ = class_addMethod(target_cls, sel_registerName("onPrimary:"), @ptrCast(&onPrimary), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onModelAction:"), @ptrCast(&onModelAction), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onOverlay:"), @ptrCast(&onOverlay), v_at);
+    _ = class_addMethod(target_cls, sel_registerName("onBacktrack:"), @ptrCast(&onBacktrack), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onPause:"), @ptrCast(&onPause), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onOpenConfig:"), @ptrCast(&onOpenConfig), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onSetApiKey:"), @ptrCast(&onSetApiKey), v_at);

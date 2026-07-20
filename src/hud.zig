@@ -113,6 +113,11 @@ inline fn msgRect(self: id, op: [*:0]const u8, r: NSRect) void {
     const f: *const fn (id, SEL, NSRect) callconv(.c) void = @ptrCast(&objc_msgSend);
     f(self, sel_registerName(op), r);
 }
+// [self op:x ofColor:a]  (CGFloat, id) -> id — NSColor blendedColorWithFraction:ofColor:.
+inline fn msgDoubleId(self: id, op: [*:0]const u8, x: f64, a: id) id {
+    const f: *const fn (id, SEL, f64, id) callconv(.c) id = @ptrCast(&objc_msgSend);
+    return f(self, sel_registerName(op), x, a);
+}
 
 // ---- Cocoa geometry ---------------------------------------------------------
 /// NSRect == {origin{x,y}, size{w,h}}; flat here, identical layout. Four f64 = an HFA,
@@ -259,6 +264,21 @@ const show_dur: f64 = 0.20 * motion_speed;
 const hide_dur: f64 = 0.16 * motion_speed;
 const cross_dur: f64 = 0.22 * motion_speed;
 
+/// The degraded-insertion amber pulse (docs/backtrack-spec.md §UX 4, ADR-0004): the
+/// processing dots flash systemOrangeColor once over ~300 ms, then the normal hide fade
+/// carries it out. Deliberately NOT scaled by motion_speed — the spec fixes the
+/// wall-clock duration so a rare, soundless downgrade reliably registers.
+const pulse_dur: f64 = 0.30;
+
+/// Amber intensity (0..1) of the degraded pulse `elapsed` seconds in: an easeOut ramp
+/// to full systemOrangeColor, which the following hide fade then removes, so the whole
+/// event reads as one amber bloom. Pure — the one place pulse-time becomes color weight,
+/// unit-tested below.
+fn pulseEnvelope(elapsed: f64) f32 {
+    const f = std.math.clamp(elapsed / pulse_dur, 0.0, 1.0);
+    return @floatCast(1.0 - (1.0 - f) * (1.0 - f));
+}
+
 /// The PURE decision half of the pill's motion (the #47 prototype shape,
 /// graduated): fed (published state, now) once per pump tick, it decides which
 /// transition starts this tick; the AppKit executor in `render` performs it.
@@ -272,6 +292,10 @@ pub const Sequencer = struct {
     shown: bool = false,
     /// Hide-fade deadline; the pump orders out once now >= deadline.
     hide_at: ?f64 = null,
+    /// Degraded-insertion pulse deadline (ADR-0004): the amber tint plays until here, set
+    /// by `startPulse` and stepped by `pulseStep`. Orthogonal to the window lifecycle —
+    /// the pump resolves the pill to `.hidden` when it elapses and the normal fade takes over.
+    pulse_at: ?f64 = null,
 
     /// What happens to the panel window this tick.
     pub const WindowFx = enum {
@@ -329,6 +353,31 @@ pub const Sequencer = struct {
         };
         return .{ .window = window, .marks = marks };
     }
+
+    /// One tick of the degraded-insertion pulse (ADR-0004). Independent of `step`: the
+    /// pulse tints the dots while the pill is still `.processing`; when it elapses the
+    /// pump resolves the pill to `.hidden` and `step` plays the ordinary fade around the
+    /// frozen amber dots.
+    pub const Pulse = struct {
+        /// Weight (0 none .. 1 full systemOrangeColor) to blend into the dots this tick.
+        amber: f32 = 0,
+        /// True on the single tick the pulse elapses — the caller resolves to the hide fade.
+        ended: bool = false,
+    };
+
+    /// Arm the one-shot amber pulse: it plays for `pulse_dur` from `now`.
+    pub fn startPulse(self: *Sequencer, now: f64) void {
+        self.pulse_at = now + pulse_dur;
+    }
+
+    /// The amber weight for `now`, and whether the pulse just elapsed. Idle (`.{}`) when
+    /// no pulse is armed. Clears the deadline on the ending tick so it fires exactly once.
+    pub fn pulseStep(self: *Sequencer, now: f64) Pulse {
+        const until = self.pulse_at orelse return .{};
+        if (now < until) return .{ .amber = pulseEnvelope(now - (until - pulse_dur)) };
+        self.pulse_at = null;
+        return .{ .amber = 1.0, .ended = true };
+    }
 };
 
 // ---- level → bar mapping (the seam carries raw linear RMS; mapping is render-side) ----
@@ -371,6 +420,10 @@ pub const Hud = struct {
     /// by `mu` like the state it gates.
     enabled: bool = true,
     pending_state: State = .hidden,
+    /// One-shot degraded-insertion pulse request (ADR-0004). Set by `pulseDegraded` from
+    /// the resolution thread, consumed by the render pump (which arms the Sequencer's
+    /// pulse and drives the amber envelope + self-hide). Guarded by `mu` like `pending_state`.
+    pulse_pending: bool = false,
     q: [level_queue_cap]f32 = @splat(0), // raw linear RMS, one sample per Capture buffer
     qlen: usize = 0,
 
@@ -539,6 +592,24 @@ pub const Hud = struct {
         self.publish(.hidden);
     }
 
+    /// Fire the one-shot degraded-insertion pulse (docs/backtrack-spec.md §UX 4,
+    /// ADR-0004): the processing dots flash systemOrangeColor once (~300 ms), then the
+    /// pill fades out. Called on the degraded path *instead of* `hide` — the render pump
+    /// does the amber envelope and the self-hide. Thread-safe, no AppKit. If there is no
+    /// processing pill to pulse (overlay off, or nothing in flight) it degrades to a plain
+    /// hide so the pill never stays up. No-op while inactive (headless).
+    pub fn pulseDegraded(self: *Hud) void {
+        if (!self.active) return;
+        os_unfair_lock_lock(&self.mu);
+        defer os_unfair_lock_unlock(&self.mu);
+        if (!self.enabled or self.pending_state != .processing) {
+            self.pending_state = .hidden; // nothing to pulse — just take the pill down
+            self.qlen = 0;
+            return;
+        }
+        self.pulse_pending = true;
+    }
+
     /// Queue one raw linear RMS sample (0..1 of full scale) — one Capture buffer's
     /// loudness, i.e. one new bar. Called from the audio queue's thread; no AppKit.
     /// Dropped unless the published state is `.recording`, so a straggler buffer
@@ -561,14 +632,31 @@ pub const Hud = struct {
         // message ObjC while holding the spinlock (it would stall the audio producer).
         var drained: [level_queue_cap]f32 = undefined;
         os_unfair_lock_lock(&self.mu);
-        const st = self.pending_state;
+        var st = self.pending_state;
+        const pulse_req = self.pulse_pending;
+        self.pulse_pending = false;
         const n = self.qlen;
         @memcpy(drained[0..n], self.q[0..n]);
         self.qlen = 0;
         os_unfair_lock_unlock(&self.mu);
 
+        const now = CFAbsoluteTimeGetCurrent();
+
+        // Degraded-insertion pulse (ADR-0004): arm on request while a processing pill is
+        // up, tint the dots amber over ~300 ms, then resolve to `.hidden` so the ordinary
+        // hide fade carries the frozen amber dots out. `pulse.amber` feeds the dot color;
+        // `pulse.ended` hands off to the standard fade below.
+        if (pulse_req and st == .processing) self.seq.startPulse(now);
+        const pulse = self.seq.pulseStep(now);
+        if (pulse.ended and st == .processing) {
+            os_unfair_lock_lock(&self.mu);
+            if (self.pending_state == .processing) self.pending_state = .hidden;
+            os_unfair_lock_unlock(&self.mu);
+            st = .hidden;
+        }
+
         // What moves this tick — the sequencer decides, the code below executes.
-        const decision = self.seq.step(st, CFAbsoluteTimeGetCurrent());
+        const decision = self.seq.step(st, now);
 
         if (st == .hidden) {
             // Only window motion happens while hidden; the marks are never touched,
@@ -612,7 +700,10 @@ pub const Hud = struct {
             msgDouble(self.panel, "setAlphaValue:", 1.0);
         }
 
-        self.applyMarkColors();
+        // Amber only tints the dots, and only while the pulse is playing over a processing
+        // pill (ADR-0004); every other tick resolves the plain semantic marks.
+        const amber: f32 = if (st == .processing) pulse.amber else 0.0;
+        self.applyMarkColors(amber);
         self.applyMarks(decision.marks);
 
         const row_w = @as(f64, @floatFromInt(n_bars)) * (bar_w + bar_gap) - bar_gap;
@@ -663,9 +754,16 @@ pub const Hud = struct {
     /// lands within one tick even mid-recording or during a long processing hold,
     /// with no notification wiring. Cheap: two color resolutions and 29 autoreleased
     /// setBackgroundColor: pokes inside the tick's already-batched transaction.
-    fn applyMarkColors(self: *Hud) void {
+    fn applyMarkColors(self: *Hud, amber: f32) void {
         const bar_color = cgColor(systemColor("labelColor"));
-        const dot_color = cgColor(systemColor("secondaryLabelColor"));
+        var dot_ns = systemColor("secondaryLabelColor");
+        if (amber > 0.0) {
+            // Degraded pulse (ADR-0004): blend `amber` of systemOrangeColor into the dots.
+            // Both colors resolve HERE, at paint time, so the pulse tracks light/dark like
+            // every other mark — no accent-refresh machinery (the property ADR-0002 keeps).
+            dot_ns = msgDoubleId(dot_ns, "blendedColorWithFraction:ofColor:", @as(f64, amber), systemColor("systemOrangeColor"));
+        }
+        const dot_color = cgColor(dot_ns);
         for (self.bars) |bar| msg1v(bar, "setBackgroundColor:", bar_color);
         for (self.dots) |dot| msg1v(dot, "setBackgroundColor:", dot_color);
     }
@@ -847,4 +945,61 @@ test "motion 5: a press during the hide fade cancels it and records normally" {
         Sequencer.Decision{ .window = .order_out, .marks = .keep },
         seq.step(.hidden, 100.40 + hide_dur),
     );
+}
+
+// ---- the degraded-insertion amber pulse (ADR-0004) --------------------------
+
+test "pulseEnvelope: ramps from 0 to full amber and clamps at both ends" {
+    try std.testing.expectEqual(@as(f32, 0.0), pulseEnvelope(0.0));
+    try std.testing.expectEqual(@as(f32, 1.0), pulseEnvelope(pulse_dur));
+    try std.testing.expectEqual(@as(f32, 1.0), pulseEnvelope(pulse_dur * 2.0)); // clamped
+    try std.testing.expectEqual(@as(f32, 0.0), pulseEnvelope(-1.0)); // clamped
+    // Monotonic non-decreasing across the ramp (easeOut is front-loaded, never dips).
+    var prev: f32 = -1.0;
+    var i: usize = 0;
+    while (i <= 10) : (i += 1) {
+        const v = pulseEnvelope(pulse_dur * @as(f64, @floatFromInt(i)) / 10.0);
+        try std.testing.expect(v >= prev);
+        prev = v;
+    }
+}
+
+test "pulse 1: an armed pulse tints, then ends exactly once, then goes idle" {
+    var seq = Sequencer{};
+    // No pulse armed → idle.
+    try std.testing.expectEqual(Sequencer.Pulse{}, seq.pulseStep(50.0));
+
+    seq.startPulse(100.0);
+    // Mid-pulse ticks carry a rising amber weight and never end.
+    const a = seq.pulseStep(100.0);
+    try std.testing.expect(!a.ended and a.amber == 0.0); // envelope(0) == 0
+    const b = seq.pulseStep(100.15);
+    try std.testing.expect(!b.ended and b.amber > a.amber); // ramping up
+    // The first tick at/after the deadline ends the pulse at full amber…
+    const end = seq.pulseStep(100.0 + pulse_dur);
+    try std.testing.expect(end.ended and end.amber == 1.0);
+    // …and only once: the deadline is cleared, so subsequent ticks are idle again.
+    try std.testing.expectEqual(Sequencer.Pulse{}, seq.pulseStep(100.0 + pulse_dur + 0.05));
+}
+
+test "pulse 2: the pump's pulse→hide composition freezes amber and fades out" {
+    // Mirrors the render pump: pulseStep runs alongside step; when the pulse ends the pump
+    // resolves the pill to .hidden and step plays the ordinary fade around the frozen dots.
+    var seq = Sequencer{};
+    _ = seq.step(.recording, 100.0);
+    _ = seq.step(.processing, 100.05); // dots up, pill shown
+    seq.startPulse(100.05);
+
+    // While the pulse plays the published state stays .processing — step decides nothing.
+    try std.testing.expect(!seq.pulseStep(100.10).ended);
+    try std.testing.expectEqual(Sequencer.Decision{}, seq.step(.processing, 100.10));
+
+    // The pulse elapses: the pump sees `ended`, resolves to .hidden, and step starts the
+    // hide fade — marks untouched, so the amber dots freeze and fade out (motion 3).
+    try std.testing.expect(seq.pulseStep(100.05 + pulse_dur).ended);
+    try std.testing.expectEqual(
+        Sequencer.Decision{ .window = .hide_fade, .marks = .keep },
+        seq.step(.hidden, 100.05 + pulse_dur),
+    );
+    try std.testing.expectEqual(@as(?f64, 100.05 + pulse_dur + hide_dur), seq.hide_at);
 }

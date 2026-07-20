@@ -30,6 +30,8 @@
 //!     caller's Configuration Phase sees post-teardown facts — preserving the
 //!     prepare-in-the-same-tick behavior on a Model Installation swap.
 //!   deps.language() backend.Language — the Settings Snapshot language for new Leases.
+//!   deps.backtrack() bool — the Settings Snapshot Backtrack enablement, stamped onto
+//!     every new Lease so it is pinned at Talk Key press (docs/backtrack-spec.md).
 //!   deps.note(Event) — narration for the caller's log. Invoked outside the router
 //!     mutex; it must not call back into the Router.
 
@@ -163,11 +165,17 @@ pub fn Router(comptime Deps: type) type {
             const session = self.session;
             const local = self.local;
             self.unlock();
-            const lease: ?backend.Lease = switch (which) {
+            var lease: ?backend.Lease = switch (which) {
                 .openai => if (session) |s| s.acquire(id, self.deps.language()) else null,
                 .local => if (local) |l| l.acquire(id, self.deps.language()) else null,
             };
-            if (lease == null) self.resolve(id);
+            if (lease == null) {
+                self.resolve(id);
+                return null;
+            }
+            // Pin Backtrack enablement at press, alongside the backend and language the
+            // Lease already carries — a mid-Utterance settings flip cannot half-apply.
+            lease.?.backtrack = self.deps.backtrack();
             return lease;
         }
 
@@ -522,6 +530,7 @@ const FakeDeps = struct {
     prepare_ok: bool = true,
     pending_wants: Wants = .{},
     lang: backend.Language = "en",
+    backtrack_enabled: bool = false,
     events: [16]Event = undefined,
     event_count: usize = 0,
     /// Reentry hook simulating a menu selection landing while a connect is in flight
@@ -547,6 +556,9 @@ const FakeDeps = struct {
     }
     pub fn language(self: *FakeDeps) backend.Language {
         return self.lang;
+    }
+    pub fn backtrack(self: *FakeDeps) bool {
+        return self.backtrack_enabled;
     }
     pub fn note(self: *FakeDeps, event: Event) void {
         self.events[self.event_count] = event;
@@ -584,6 +596,22 @@ test "switching backends tears down the drained resource and warms the replaceme
     try std.testing.expect(router.available());
     const lease = router.acquire(7).?;
     try std.testing.expectEqual(backend.Backend.local, lease.backend);
+}
+
+test "a new Lease pins the Settings Snapshot Backtrack enablement at acquire" {
+    var deps = FakeDeps{ .backtrack_enabled = true };
+    var router = testRouter(&deps, .openai);
+    deps.pending_wants = .{ .connect_openai = true };
+    try std.testing.expect(router.tick(.openai));
+
+    const lease = router.acquire(7).?;
+    try std.testing.expect(lease.backtrack);
+    deps.backtrack_enabled = false; // mid-Utterance flip — the pinned Lease keeps true
+    try std.testing.expect(lease.backtrack);
+    router.resolve(7);
+
+    const next = router.acquire(8).?;
+    try std.testing.expect(!next.backtrack);
 }
 
 test "a switch lands only after the active Utterance drains" {

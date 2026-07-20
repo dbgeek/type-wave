@@ -52,4 +52,11 @@
     // error chime. Set false for sound-only feedback (all three chimes). A headless run
     // with no display degrades to sound-only automatically.
     .overlay = true,
+
+    // Backtrack (docs/backtrack-spec.md): opt-in rewrite pass between transcription and
+    // Insertion — spoken self-corrections applied ("at 20:00 no 18:00" → "at 18:00") and
+    // fillers ("um", "öh") removed, in one OpenAI call. Uses OpenAI cloud: the transcript
+    // TEXT leaves your Mac (audio handling is unchanged), it needs internet, and it does
+    // not apply on the Local backend — there the raw transcript inserts unchanged.
+    .backtrack = false,
 }

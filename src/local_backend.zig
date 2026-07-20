@@ -1158,16 +1158,26 @@ const IntegrationInsertion = struct {
     id: backend.UtteranceId = 0,
     text: [64]u8 = undefined,
     text_len: usize = 0,
-    pub fn submit(self: *IntegrationInsertion, id: backend.UtteranceId, value: []const u8) void {
+    pub fn submit(self: *IntegrationInsertion, id: backend.UtteranceId, value: []const u8, kind: coordinator.InsertKind) void {
         self.submits += 1;
         self.id = id;
         @memcpy(self.text[0..value.len], value);
         self.text_len = value.len;
+        // A local Lease never routes through the rewrite, so it only ever inserts normally.
+        std.debug.assert(kind == .normal);
+    }
+};
+
+/// Backtrack never applies on the local Transcription Backend (docs/backtrack-spec.md),
+/// so the local integration Coordinator must never reach this seam.
+const IntegrationRewrite = struct {
+    pub fn submit(_: *IntegrationRewrite, _: backend.UtteranceId, _: []const u8) void {
+        unreachable; // a local Lease can never route a Final Transcript to the rewrite
     }
 };
 
 const IntegrationDeadline = struct {
-    pub fn arm(_: *IntegrationDeadline, _: backend.UtteranceId, _: backend.DeadlinePolicy) void {}
+    pub fn arm(_: *IntegrationDeadline, _: backend.UtteranceId, _: backend.DeadlineKind, _: backend.DeadlinePolicy) void {}
     pub fn cancel(_: *IntegrationDeadline, _: backend.UtteranceId) void {}
 };
 
@@ -1176,6 +1186,7 @@ const IntegrationFeedback = struct {
     pub fn listening(_: *IntegrationFeedback) void {}
     pub fn released(_: *IntegrationFeedback) void {}
     pub fn inserted(_: *IntegrationFeedback) void {}
+    pub fn degraded(_: *IntegrationFeedback) void {} // local never degrades (no rewrite)
     pub fn abandoned(self: *IntegrationFeedback) void {
         self.abandoned_count += 1;
     }
@@ -1184,6 +1195,7 @@ const IntegrationFeedback = struct {
 const IntegrationDeps = struct {
     audio: *IntegrationAudio,
     backends: *IntegrationBackends,
+    rewrite: *IntegrationRewrite,
     insertion: *IntegrationInsertion,
     deadline: *IntegrationDeadline,
     feedback: *IntegrationFeedback,
@@ -1373,11 +1385,13 @@ test "local Transcription Backend drives one Insertion and abandons empty or fai
     var audio = IntegrationAudio{};
     var backends = IntegrationBackends{ .adapter = &adapter };
     var insertion = IntegrationInsertion{};
+    var rewrite = IntegrationRewrite{};
     var deadline = IntegrationDeadline{};
     var surface = IntegrationFeedback{};
     var co = IntegrationCoordinator.init(.{
         .audio = &audio,
         .backends = &backends,
+        .rewrite = &rewrite,
         .insertion = &insertion,
         .deadline = &deadline,
         .feedback = &surface,

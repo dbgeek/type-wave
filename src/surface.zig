@@ -43,6 +43,15 @@ pub const Surface = struct {
         self.hud.hide();
     }
 
+    /// Insertion succeeded, but with the *raw* Final Transcript because the Backtrack
+    /// rewrite timed out or errored (docs/backtrack-spec.md §UX 4, ADR-0004). The text
+    /// still landed, so — unlike `abandoned` — the error cue is deliberately silent; the
+    /// only signal is a one-shot ~300 ms amber pulse on the processing dots, which then
+    /// fades out. `pulseDegraded` self-hides, so this replaces the `inserted` silent hide.
+    pub fn degraded(self: *Surface) void {
+        self.hud.pulseDegraded();
+    }
+
     /// This Utterance produced no Insertion (no session, no audio, poison, empty/failed
     /// transcript, deadline, or a failed insert). Take the pill down and sound the error
     /// cue — always audible, even under the pill.

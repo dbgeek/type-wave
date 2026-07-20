@@ -51,6 +51,23 @@ Placing a Final Transcript at the cursor of the Focused Target. Every Insertion 
 a single trailing space, so consecutive Insertions don't run their words together.
 _Avoid_: typing, pasting (those name mechanisms, not the act)
 
+**Backtrack**:
+The opt-in rewrite pass between an Utterance's Final Transcript and its Insertion
+(docs/backtrack-spec.md): one OpenAI call applies spoken self-corrections ("at 20:00 no
+18:00" → "at 18:00") and removes disfluencies. Enablement is read from the Settings
+Snapshot at Talk Key press and pinned with the backend Lease; it applies only when the
+pinned backend is OpenAI, and whenever it cannot run the raw Final Transcript inserts
+unchanged — dictation never breaks.
+_Avoid_: cleanup, post-processing (both name only half the pass), correction mode
+
+**Rewrite**:
+Backtrack's one transformation of a Final Transcript, driven by the Utterance
+Coordinator's `.rewriting` phase through the Rewrite seam: a worker thread makes the
+OpenAI Responses call off-mutex (`rewrite_adapter.zig`, `openai_rewrite.zig`) and the
+`.rewritten` reverse edge hands the text to Insertion. A failed Rewrite falls back to
+the raw Final Transcript.
+_Avoid_: edit, fixup, transformation (vague), LLM call (mechanism)
+
 **Focused Target**:
 The app and text field that own the cursor at the moment of Insertion.
 _Avoid_: active window
