@@ -32,7 +32,12 @@ pub fn buildRequestBody(w: *std.Io.Writer, utterance: []const u8) !void {
     try std.json.Stringify.encodeJsonString(prompt, .{}, w);
     try w.writeAll(",\"input\":");
     try std.json.Stringify.encodeJsonString(utterance, .{}, w);
-    try w.writeAll(",\"reasoning\":{\"effort\":\"none\"},\"temperature\":0,\"max_output_tokens\":8192}");
+    // "service_tier":"default" pins the spec's standard tier explicitly (OpenAI's
+    // "auto" would resolve there today, but the locked config should not be implicit;
+    // "priority" is the spec's named 2× tail-latency escape hatch if ever needed).
+    // max_output_tokens matches the 8 KiB transcript bound — a cost cap, never hit by
+    // a sane rewrite since the output is about as long as the input.
+    try w.writeAll(",\"reasoning\":{\"effort\":\"none\"},\"temperature\":0,\"service_tier\":\"default\",\"max_output_tokens\":8192}");
 }
 
 /// Pull the message text out of a Responses API body: the concatenated `output_text`
@@ -136,6 +141,7 @@ test "buildRequestBody emits the locked call config with the utterance JSON-esca
     try std.testing.expectEqualStrings("säg \"hej\"\nno wait", root.object.get("input").?.string);
     try std.testing.expectEqualStrings("none", root.object.get("reasoning").?.object.get("effort").?.string);
     try std.testing.expectEqual(@as(i64, 0), root.object.get("temperature").?.integer);
+    try std.testing.expectEqualStrings("default", root.object.get("service_tier").?.string);
 }
 
 test "the embedded prompt is v6: corrections and filler removal in one pass" {

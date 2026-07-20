@@ -1,6 +1,6 @@
 # ADR 0001 — Fully serialize the Utterance lifecycle
 
-- Status: accepted (2026-07-08); amended (2026-07-09, issue #38 — see Amendment)
+- Status: accepted (2026-07-08); amended (2026-07-09, issue #38; 2026-07-20, issue #144 — see Amendments)
 - Supersedes: the press-during-paste overlap grilled for wayfinder #19
 
 ## Context
@@ -68,3 +68,18 @@ overlap this ADR traded away:
 
 What moved is only *where the Insertion is considered complete*: at the text landing,
 not at the end of the mechanism's private cleanup.
+
+## Amendment (2026-07-20, issue #144 — Backtrack)
+
+The phase machine gains an optional `.rewriting` phase between `awaiting_final` and
+`inserting`: `idle → capturing → awaiting_final → [rewriting →] inserting → idle`.
+It is entered only when the Lease pinned Backtrack on with the OpenAI backend at press
+(docs/backtrack-spec.md), and it changes nothing this ADR decided:
+
+- `.rewriting` is exactly as blocking as `.inserting` — Talk Key presses are rejected
+  (the same `phase != .idle` overlap guard, zero new mechanism), and the phase ends at
+  exactly one event (`.rewritten`), delivered once per Utterance.
+- One Utterance still resolves fully before the next begins; the rewrite worker is one
+  more single-job thread reporting back through a reverse edge, like the insert worker.
+- Unlike `.inserting`, the rewrite *does* cross the network; its ~3 s deadline is part
+  of the Backtrack spec and lands with the follow-on failure-policy ticket.

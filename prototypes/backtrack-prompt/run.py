@@ -77,12 +77,14 @@ def api_key():
 
 
 def rewrite(conn, key, utterance):
+    # Mirror src/openai_rewrite.zig buildRequestBody — keep the two in lockstep.
     req = {
         "model": MODEL,
         "instructions": PROMPT,
         "input": utterance,
         "reasoning": {"effort": "none"},
-        "max_output_tokens": 1000,
+        "service_tier": "default",
+        "max_output_tokens": 8192,
     }
     # temperature 0 is part of the locked config (byte-identical determinism);
     # override via TEMPERATURE only to probe.
