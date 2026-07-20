@@ -1158,11 +1158,13 @@ const IntegrationInsertion = struct {
     id: backend.UtteranceId = 0,
     text: [64]u8 = undefined,
     text_len: usize = 0,
-    pub fn submit(self: *IntegrationInsertion, id: backend.UtteranceId, value: []const u8) void {
+    pub fn submit(self: *IntegrationInsertion, id: backend.UtteranceId, value: []const u8, kind: coordinator.InsertKind) void {
         self.submits += 1;
         self.id = id;
         @memcpy(self.text[0..value.len], value);
         self.text_len = value.len;
+        // A local Lease never routes through the rewrite, so it only ever inserts normally.
+        std.debug.assert(kind == .normal);
     }
 };
 
@@ -1184,6 +1186,7 @@ const IntegrationFeedback = struct {
     pub fn listening(_: *IntegrationFeedback) void {}
     pub fn released(_: *IntegrationFeedback) void {}
     pub fn inserted(_: *IntegrationFeedback) void {}
+    pub fn degraded(_: *IntegrationFeedback) void {} // local never degrades (no rewrite)
     pub fn abandoned(self: *IntegrationFeedback) void {
         self.abandoned_count += 1;
     }

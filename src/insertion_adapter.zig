@@ -32,6 +32,11 @@ pub fn InsertionAdapter(comptime Deps: type) type {
         /// `submit` before the `pending` release-store; read by the worker after acquire.
         job: [8193]u8 = undefined,
         job_id: coord.UtteranceId = 0,
+        /// Which text this job carries (docs/backtrack-spec.md §UX 4): a `.raw_fallback`
+        /// job that inserts cleanly reports `.degraded` instead of `.ok`, so the HUD pulses
+        /// amber (ADR-0004). Set by `submit`, read by the worker — ordered across threads by
+        /// `pending` like `job`.
+        job_kind: coord.InsertKind = .normal,
         /// When `submit` handed the job over (≈ the Final Transcript's arrival) — anchors
         /// the final→inserted split in the timing logs (issues #36–#38). Ordered across
         /// threads by the `pending` release-store / acquire-swap, like `job`.
@@ -45,8 +50,9 @@ pub fn InsertionAdapter(comptime Deps: type) type {
         /// Coordinator seam. Runs under the Coordinator's mutex; must not block. The
         /// adapter owns the Insertion invariant that every non-empty Final Transcript
         /// lands with exactly one trailing separator.
-        pub fn submit(self: *Self, id: coord.UtteranceId, text: []const u8) void {
+        pub fn submit(self: *Self, id: coord.UtteranceId, text: []const u8, kind: coord.InsertKind) void {
             self.job_id = id;
+            self.job_kind = kind;
             _ = insertmod.ensureTrailingSpace(&self.job, text);
             self.submitted_at_ms = feedback.nowMs();
             self.pending.store(true, .release);
@@ -60,15 +66,19 @@ pub fn InsertionAdapter(comptime Deps: type) type {
 
             const z: [*:0]const u8 = @ptrCast(&self.job);
             const plan = self.deps.insertionPlan();
+            // A successful insert of a rewrite-fallback job is `.degraded`, not `.ok`: the
+            // raw text landed, but the downgrade earns the amber HUD pulse (ADR-0004). An
+            // insert that *fails* is `.failed` regardless — nothing landed at the cursor.
             const result: coord.InsertResult = if (self.deps.insert(plan, z)) |_|
-                .ok
+                (if (self.job_kind == .raw_fallback) .degraded else .ok)
             else |e| blk: {
                 feedback.log("  insertion failed: {s}\n", .{explainInsert(e)});
                 break :blk .failed;
             };
-            if (result == .ok) {
+            if (result != .failed) {
                 const now = feedback.nowMs();
-                feedback.log("  inserted at the cursor (+{d}ms after the Final Transcript; mechanism {d}ms)\n", .{ now - self.submitted_at_ms, now - t_pick });
+                const note = if (result == .degraded) " [raw fallback]" else "";
+                feedback.log("  inserted at the cursor (+{d}ms after the Final Transcript; mechanism {d}ms){s}\n", .{ now - self.submitted_at_ms, now - t_pick, note });
             }
             // Report completion *before* the deferred clipboard restore (issue #38): the
             // Coordinator leaves `.inserting` at the Cmd-V settle, so the ~300 ms restore
@@ -146,7 +156,7 @@ const FakeDeps = struct {
 test "submit copies a Final Transcript and applies the Insertion separator" {
     var adapter = InsertionAdapter(FakeDeps).init(.{});
 
-    adapter.submit(7, "hello");
+    adapter.submit(7, "hello", .normal);
     try std.testing.expect(adapter.runOnce());
     try std.testing.expectEqualStrings("hello ", adapter.deps.lastText());
     try std.testing.expectEqual(@as(usize, 1), adapter.deps.completions);
@@ -154,10 +164,42 @@ test "submit copies a Final Transcript and applies the Insertion separator" {
     try std.testing.expectEqual(coord.InsertResult.ok, adapter.deps.last_completion);
 }
 
+test "a degraded submit that inserts cleanly reports .degraded (ADR-0004)" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{});
+
+    // The raw-transcript fallback: the text still lands, but flagged degraded.
+    adapter.submit(7, "um the raw one", .raw_fallback);
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqualStrings("um the raw one ", adapter.deps.lastText());
+    try std.testing.expectEqual(coord.InsertResult.degraded, adapter.deps.last_completion);
+}
+
+test "a degraded submit whose insert fails is still .failed" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{ .result = error.PostEventDenied });
+
+    // Nothing landed at the cursor — a hard failure outranks the degraded flag.
+    adapter.submit(7, "um the raw one", .raw_fallback);
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(coord.InsertResult.failed, adapter.deps.last_completion);
+}
+
+test "a fresh submit clears the degraded flag of a prior job" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{});
+
+    adapter.submit(7, "raw", .raw_fallback);
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(coord.InsertResult.degraded, adapter.deps.last_completion);
+
+    // The next, normal insertion must not inherit the previous job's degraded flag.
+    adapter.submit(8, "clean", .normal);
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(coord.InsertResult.ok, adapter.deps.last_completion);
+}
+
 test "worker reads the Settings Snapshot at job execution time" {
     var adapter = InsertionAdapter(FakeDeps).init(.{ .plan = .{ .method = .paste } });
 
-    adapter.submit(7, "hello");
+    adapter.submit(7, "hello", .normal);
     adapter.deps.plan = .{ .method = .keystroke, .pre_paste_ms = 40 };
 
     try std.testing.expect(adapter.runOnce());
@@ -168,7 +210,7 @@ test "worker reads the Settings Snapshot at job execution time" {
 test "insert failure reports a failed completion" {
     var adapter = InsertionAdapter(FakeDeps).init(.{ .result = error.PostEventDenied });
 
-    adapter.submit(7, "hello");
+    adapter.submit(7, "hello", .normal);
     try std.testing.expect(adapter.runOnce());
 
     try std.testing.expectEqual(@as(usize, 1), adapter.deps.calls);
@@ -181,7 +223,7 @@ test "insert failure reports a failed completion" {
 test "completion is reported before the deferred clipboard restore (issue #38)" {
     var adapter = InsertionAdapter(FakeDeps).init(.{});
 
-    adapter.submit(7, "hello");
+    adapter.submit(7, "hello", .normal);
     try std.testing.expect(adapter.runOnce());
 
     // The Coordinator must leave `.inserting` before the ~300 ms restore runs, so the

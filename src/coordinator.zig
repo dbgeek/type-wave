@@ -42,8 +42,18 @@ const backend = @import("transcription_backend.zig");
 
 pub const UtteranceId = backend.UtteranceId;
 
-/// Outcome the insert worker reports back as the `.inserted` event.
-pub const InsertResult = enum { ok, failed };
+/// Which text the Insertion seam is placing. `.normal` is a successful rewrite or any
+/// non-Backtrack insert; `.raw_fallback` is the raw Final Transcript inserted because the
+/// Backtrack rewrite timed out or errored (docs/backtrack-spec.md §UX 4, ADR-0004). The
+/// kind rides `submit` so a clean `.raw_fallback` insert reports `.degraded` — the seam
+/// alone can't tell the raw fallback from a normal insert.
+pub const InsertKind = enum { normal, raw_fallback };
+
+/// Outcome the insert worker reports back as the `.inserted` event. `.degraded` is a
+/// successful `.raw_fallback` insertion (docs/backtrack-spec.md §UX 4, ADR-0004): the text
+/// still landed — no error cue — but the downgrade earns the amber HUD pulse. The insertion
+/// mechanism failing outright is still `.failed`, whatever the submitted kind.
+pub const InsertResult = enum { ok, degraded, failed };
 
 /// Outcome the Rewrite worker reports back as the `.rewritten` event
 /// (docs/backtrack-spec.md). `.failed` means the OpenAI call did not yield a usable
@@ -235,7 +245,7 @@ pub fn Coordinator(comptime Deps: type) type {
                 self.phase = .rewriting; // blocking, exactly like .inserting (ADR-0001)
                 return;
             }
-            self.deps.insertion.submit(id, text); // copies text; worker inserts, then .inserted
+            self.deps.insertion.submit(id, text, .normal); // copies text; worker inserts, then .inserted
             self.phase = .inserting; // blocking: next hold waits (ADR-0001)
         }
 
@@ -243,10 +253,10 @@ pub fn Coordinator(comptime Deps: type) type {
             if (!self.matches(id, .rewriting)) return;
             self.deps.deadline.cancel(id); // the rewrite resolved within its ~3 s budget
             // `.failed` already carries the raw Final Transcript (the worker's fallback):
-            // dictation never breaks; the worker logged the downgrade. The degraded
-            // surface cue is the follow-on ticket (spec §UX 4).
-            _ = r;
-            self.deps.insertion.submit(id, text); // copies text; worker inserts, then .inserted
+            // dictation never breaks; the worker logged the downgrade. The `.raw_fallback`
+            // kind rides the insert so `.inserted` earns the amber pulse (spec §UX 4, ADR-0004).
+            const kind: InsertKind = if (r == .failed) .raw_fallback else .normal;
+            self.deps.insertion.submit(id, text, kind); // copies text; worker inserts, then .inserted
             self.phase = .inserting;
         }
 
@@ -258,7 +268,7 @@ pub fn Coordinator(comptime Deps: type) type {
                 // error cue — text still lands. The abandoned call's late `.rewritten`
                 // is stale-rejected by the phase guard.
                 feedback.log("  Backtrack rewrite exceeded {d} ms — inserting the raw Final Transcript\n", .{rewrite_deadline.final_ms});
-                self.deps.insertion.submit(id, self.raw[0..self.raw_len]);
+                self.deps.insertion.submit(id, self.raw[0..self.raw_len], .raw_fallback); // earns the amber pulse
                 self.phase = .inserting;
                 return;
             }
@@ -301,6 +311,9 @@ pub fn Coordinator(comptime Deps: type) type {
             if (!self.matches(id, .inserting)) return;
             switch (r) {
                 .ok => self.deps.feedback.inserted(),
+                // Raw-transcript fallback landed: dictation held (no error cue), but the
+                // downgrade earns the amber HUD pulse instead of the silent hide (ADR-0004).
+                .degraded => self.deps.feedback.degraded(),
                 .failed => {
                     feedback.log("  insertion failed — nothing landed at the cursor\n", .{});
                     self.deps.feedback.abandoned();
@@ -427,11 +440,13 @@ const FakeInsertion = struct {
     last_id: UtteranceId = 0,
     last: [256]u8 = undefined,
     last_len: usize = 0,
-    fn submit(self: *FakeInsertion, id: UtteranceId, text: []const u8) void {
+    last_kind: InsertKind = .normal,
+    fn submit(self: *FakeInsertion, id: UtteranceId, text: []const u8, kind: InsertKind) void {
         self.submits += 1;
         self.last_id = id;
         @memcpy(self.last[0..text.len], text);
         self.last_len = text.len;
+        self.last_kind = kind;
     }
     fn lastText(self: *FakeInsertion) []const u8 {
         return self.last[0..self.last_len];
@@ -476,6 +491,7 @@ const FakeFeedback = struct {
     listenings: usize = 0,
     releaseds: usize = 0,
     inserteds: usize = 0,
+    degradeds: usize = 0,
     abandoneds: usize = 0,
     fn listening(self: *FakeFeedback) void {
         self.listenings += 1;
@@ -485,6 +501,9 @@ const FakeFeedback = struct {
     }
     fn inserted(self: *FakeFeedback) void {
         self.inserteds += 1;
+    }
+    fn degraded(self: *FakeFeedback) void {
+        self.degradeds += 1;
     }
     fn abandoned(self: *FakeFeedback) void {
         self.abandoneds += 1;
@@ -915,12 +934,31 @@ test "21 failed rewrite inserts the carried raw Final Transcript" {
     co.handle(.press);
     co.handle(.release);
     co.handle(.{ .final = .{ .id = 1, .text = "um the raw one" } });
-    // The worker's fallback: .failed carries the raw text back for insertion.
+    // The worker's fallback: .failed carries the raw text back for insertion, flagged
+    // degraded so the adapter reports `.degraded` and the HUD pulses amber (ADR-0004).
     co.handle(.{ .rewritten = .{ .id = 1, .text = "um the raw one", .result = .failed } });
     try expectEqual(@as(usize, 1), h.insertion.submits);
     try expectEqualStrings("um the raw one", h.insertion.lastText());
+    try expectEqual(InsertKind.raw_fallback, h.insertion.last_kind);
+    co.handle(.{ .inserted = .{ .id = 1, .result = .degraded } });
+    try expect(h.feedback.degradeds == 1); // amber pulse, not the silent hide
+    try expect(h.feedback.inserteds == 0);
+    try expect(h.feedback.abandoneds == 0); // no error cue — the raw text landed
+}
+
+test "21b a successful rewrite inserts un-flagged and hides silently" {
+    var h = Harness{};
+    h.backends.backtrack = true;
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "um at 20:00 no 18:00" } });
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "At 18:00", .result = .ok } });
+    try expectEqualStrings("At 18:00", h.insertion.lastText());
+    try expectEqual(InsertKind.normal, h.insertion.last_kind); // the happy path never flags a fallback
     co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
-    try expect(h.feedback.inserteds == 1);
+    try expect(h.feedback.inserteds == 1); // silent success hide, no amber
+    try expect(h.feedback.degradeds == 0);
 }
 
 test "22 stale mismatched or phase-invalid rewritten events cannot advance an Utterance" {
@@ -979,6 +1017,7 @@ test "24 rewrite timeout: the ~3 s budget fires during .rewriting and the raw Fi
     co.handle(.{ .deadline = .{ .id = 1, .kind = .rewrite } }); // budget exceeded
     try expectEqual(@as(usize, 1), h.insertion.submits);
     try expectEqualStrings("um at 20:00 no 18:00", h.insertion.lastText());
+    try expectEqual(InsertKind.raw_fallback, h.insertion.last_kind); // the timeout fallback earns the amber pulse
     try expectEqual(@as(usize, 0), h.feedback.abandoneds); // no error cue — text still lands
 
     // The abandoned call resolves late: stale, must not double-insert.
