@@ -7,8 +7,14 @@
 //! slice is only valid during the Coordinator's `handle` call), run the slow OpenAI call
 //! off the Coordinator mutex on a worker thread, and report the result back through the
 //! reverse edge. On any failure — HTTP error, unusable response, empty rewrite — it
-//! completes with the **raw** transcript and `.failed`, so dictation never breaks; the
-//! ~3 s timeout that bounds a hung call is the follow-on ticket (spec §Pipeline).
+//! completes with the **raw** transcript and `.failed`, so dictation never breaks.
+//!
+//! A hung call is bounded by the Coordinator's ~3 s rewrite budget (spec §Pipeline): the
+//! Coordinator inserts the raw transcript itself and stale-rejects this worker's late
+//! completion. That means the *next* Utterance can submit a new job while the old call is
+//! still in flight — so the job hand-off below copies under a lock: `submit` stages the
+//! job, `takeJob` claims it into worker-local storage, and the slow call runs only on
+//! that claimed copy.
 //!
 //! `openai_rewrite.zig` is the OpenAI Responses API mechanism module. This module is the
 //! policy adapter between the Utterance lifecycle and that mechanism.
@@ -17,67 +23,110 @@ const std = @import("std");
 const coord = @import("coordinator.zig");
 const feedback = @import("feedback.zig");
 
+/// Serializes the job hand-off between the Coordinator (`submit`) and the worker
+/// (`takeJob`). Same os_unfair_lock choice as coordinator.zig: std.Thread.Mutex is gone
+/// on this Zig nightly, and std.Io.Mutex needs an Io this adapter shouldn't carry.
+const Mutex = struct {
+    lock_: OsUnfairLock = .{},
+    fn lock(self: *Mutex) void {
+        os_unfair_lock_lock(&self.lock_);
+    }
+    fn unlock(self: *Mutex) void {
+        os_unfair_lock_unlock(&self.lock_);
+    }
+};
+const OsUnfairLock = extern struct { _opaque: u32 = 0 };
+extern "c" fn os_unfair_lock_lock(lock: *OsUnfairLock) void;
+extern "c" fn os_unfair_lock_unlock(lock: *OsUnfairLock) void;
+
 pub fn RewriteAdapter(comptime Deps: type) type {
     return struct {
         const Self = @This();
 
         deps: Deps,
 
-        /// The single rewrite job — sized to the Transcription Session's Final
+        /// The staged rewrite job — sized to the Transcription Session's Final
         /// Transcript accumulator (session.zig), so the whole transcript always fits
-        /// (the spec sets no per-utterance cap of its own). Written by `submit` before
-        /// the `pending` release-store; read by the worker after acquire.
+        /// (the spec sets no per-utterance cap of its own). All fields below through
+        /// `pending` are guarded by `mu`: written by `submit`, claimed by `takeJob`.
         job: [8192]u8 = undefined,
         job_len: usize = 0,
         job_id: coord.UtteranceId = 0,
         /// When `submit` handed the job over (≈ the Final Transcript's arrival) —
-        /// anchors the final→rewritten split in the timing logs. Ordered across threads
-        /// by the `pending` release-store / acquire-swap, like `job`.
+        /// anchors the final→rewritten split in the timing logs.
         submitted_at_ms: i64 = 0,
-        /// The rewritten text; the `.rewritten` reverse edge borrows it only for the
-        /// duration of `complete` (the insertion seam copies synchronously).
+        pending: bool = false,
+        mu: Mutex = .{},
+
+        // Worker-local (only the single worker thread touches these): the claimed job
+        // the slow call runs on, immune to an overlapped `submit`, and the rewritten
+        // text — the `.rewritten` reverse edge borrows `out` only for the duration of
+        // `complete` (the insertion seam copies synchronously).
+        work: [8192]u8 = undefined,
+        work_len: usize = 0,
+        work_id: coord.UtteranceId = 0,
+        work_submitted_at_ms: i64 = 0,
         out: [8192]u8 = undefined,
-        pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
         pub fn init(deps: Deps) Self {
             return .{ .deps = deps };
         }
 
-        /// Coordinator seam. Runs under the Coordinator's mutex; must not block.
+        /// Coordinator seam. Runs under the Coordinator's mutex; must not block (the
+        /// hand-off lock is only ever held for a memcpy).
         pub fn submit(self: *Self, id: coord.UtteranceId, text: []const u8) void {
+            self.mu.lock();
+            defer self.mu.unlock();
             self.job_id = id;
             const n = @min(text.len, self.job.len);
             @memcpy(self.job[0..n], text[0..n]);
             self.job_len = n;
             self.submitted_at_ms = feedback.nowMs();
-            self.pending.store(true, .release);
+            self.pending = true;
         }
 
-        /// One worker tick. Exposed so tests can drive the adapter without spawning a
-        /// thread or sleeping. Returns whether a job was drained.
-        pub fn runOnce(self: *Self) bool {
-            if (!self.pending.swap(false, .acquire)) return false;
-            const t_pick = feedback.nowMs();
+        /// Claim the staged job into worker-local storage. Returns whether there was one.
+        fn takeJob(self: *Self) bool {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (!self.pending) return false;
+            self.pending = false;
+            self.work_id = self.job_id;
+            self.work_len = self.job_len;
+            @memcpy(self.work[0..self.job_len], self.job[0..self.job_len]);
+            self.work_submitted_at_ms = self.submitted_at_ms;
+            return true;
+        }
 
-            const raw = self.job[0..self.job_len];
+        /// Run the slow OpenAI call on the claimed job and report the completion.
+        fn processJob(self: *Self) void {
+            const t_pick = feedback.nowMs();
+            const raw = self.work[0..self.work_len];
             if (self.deps.rewrite(raw, &self.out)) |rewritten| {
                 if (rewritten.len == 0) {
                     // A rewrite that erased the whole Utterance is a failure, not a
                     // cleanup — the raw transcript inserts instead (spec: never lose
                     // dictation). The mechanism already rejects this; belt-and-braces.
                     feedback.log("  Backtrack rewrite came back empty — inserting the raw Final Transcript\n", .{});
-                    self.deps.complete(self.job_id, raw, .failed);
-                    return true;
+                    self.deps.complete(self.work_id, raw, .failed);
+                    return;
                 }
                 const now = feedback.nowMs();
-                feedback.log("  Backtrack rewrote the Final Transcript (+{d}ms after the Final Transcript; call {d}ms)\n", .{ now - self.submitted_at_ms, now - t_pick });
-                self.deps.complete(self.job_id, rewritten, .ok);
+                feedback.log("  Backtrack rewrote the Final Transcript (+{d}ms after the Final Transcript; call {d}ms)\n", .{ now - self.work_submitted_at_ms, now - t_pick });
+                self.deps.complete(self.work_id, rewritten, .ok);
             } else |e| {
                 // Never lose dictation: the raw Final Transcript rides the same reverse
                 // edge. No error cue — text IS inserted (spec §failure policy).
                 feedback.log("  Backtrack rewrite failed: {s} — inserting the raw Final Transcript\n", .{@errorName(e)});
-                self.deps.complete(self.job_id, raw, .failed);
+                self.deps.complete(self.work_id, raw, .failed);
             }
+        }
+
+        /// One worker tick. Exposed so tests can drive the adapter without spawning a
+        /// thread or sleeping. Returns whether a job was drained.
+        pub fn runOnce(self: *Self) bool {
+            if (!self.takeJob()) return false;
+            self.processJob();
             return true;
         }
 
@@ -170,6 +219,21 @@ test "an empty rewrite is a failure: the raw Final Transcript inserts instead" {
 
     try std.testing.expectEqual(coord.RewriteResult.failed, adapter.deps.last_completion);
     try std.testing.expectEqualStrings("the raw one", adapter.deps.completedText());
+}
+
+test "a submit overlapping a hung in-flight call cannot corrupt that call's job" {
+    // The Coordinator's ~3 s timeout means it can move on while the worker is still
+    // blocked in the OpenAI call — and the next Utterance then submits a new job.
+    var adapter = RewriteAdapter(FakeDeps).init(.{ .failure = error.RewriteHttpFailure });
+    adapter.submit(1, "first raw");
+    try std.testing.expect(adapter.takeJob()); // worker claims the job — call now "in flight"
+    adapter.submit(2, "second raw"); // Coordinator timed out; the next Utterance overlaps
+    adapter.processJob(); // the hung call resolves — must complete job 1 with its own text
+    try std.testing.expectEqual(@as(coord.UtteranceId, 1), adapter.deps.last_completion_id);
+    try std.testing.expectEqualStrings("first raw", adapter.deps.completedText());
+    try std.testing.expect(adapter.runOnce()); // the overlapped job then drains intact
+    try std.testing.expectEqual(@as(coord.UtteranceId, 2), adapter.deps.last_completion_id);
+    try std.testing.expectEqualStrings("second raw", adapter.deps.completedText());
 }
 
 test "runOnce reports idle without touching dependencies" {

@@ -33,6 +33,8 @@
 //!   and is entered only when the Lease pinned Backtrack on AND the OpenAI backend at
 //!   press. It is just as blocking as `.inserting` — Talk Key presses are rejected — and
 //!   the green processing HUD spans it unchanged (released → resolution, no new state).
+//!   The `rewrite_deadline` budget (~3 s) bounds the extra wait: past it the raw Final
+//!   Transcript inserts instead, so a slow rewrite degrades rather than stalls.
 
 const std = @import("std");
 const feedback = @import("feedback.zig");
@@ -48,6 +50,13 @@ pub const InsertResult = enum { ok, failed };
 /// rewrite — the event then carries the raw Final Transcript so dictation never
 /// breaks; the distinction feeds the degraded-insertion surface (spec §UX 4).
 pub const RewriteResult = enum { ok, failed };
+
+/// The Backtrack rewrite budget (docs/backtrack-spec.md §failure policy): a ~3 s hard
+/// timeout armed at rewrite-submit, independent of the release-anchored deadline (which
+/// the Final Transcript already cancelled). ~10% of warm calls exceed the original
+/// 2.5 s, with rare 9.8 s / 14.7 s outliers — past this budget the raw Final Transcript
+/// inserts instead, so the degraded path is expected on roughly 1 in 10–20 utterances.
+pub const rewrite_deadline = backend.DeadlinePolicy{ .final_ms = 3_000 };
 
 /// Everything that can happen *to* an Utterance, from whichever thread observed it.
 /// The `final` slice borrows the Transcription Session's accumulator and is valid only
@@ -97,6 +106,12 @@ pub fn Coordinator(comptime Deps: type) type {
         next_id: UtteranceId = 1,
         active: ?backend.Lease = null,
         poisoned: bool = false,
+        /// The raw Final Transcript, copied when the Utterance detours into `.rewriting`
+        /// (the `final` slice is only valid during that `handle` call). This is what the
+        /// rewrite-budget fallback inserts — sized like the Rewrite adapter's job buffer
+        /// to the Transcription Session's accumulator, so the whole transcript fits.
+        raw: [8192]u8 = undefined,
+        raw_len: usize = 0,
 
         pub fn init(deps: Deps) Self {
             return .{ .deps = deps };
@@ -208,7 +223,12 @@ pub fn Coordinator(comptime Deps: type) type {
             // seam; the `.rewritten` reverse edge then reaches the insertion seam. The
             // processing dots span the extra wait unchanged.
             if (self.active.?.backend == .openai and self.active.?.backtrack) {
+                // Keep a copy for the rewrite-budget fallback: if the ~3 s budget fires,
+                // the raw Final Transcript inserts from here.
+                self.raw_len = @min(text.len, self.raw.len);
+                @memcpy(self.raw[0..self.raw_len], text[0..self.raw_len]);
                 self.deps.rewrite.submit(id, text); // copies text; worker rewrites, then .rewritten
+                self.deps.deadline.arm(id, rewrite_deadline); // the ~3 s rewrite budget
                 self.phase = .rewriting; // blocking, exactly like .inserting (ADR-0001)
                 return;
             }
@@ -218,6 +238,7 @@ pub fn Coordinator(comptime Deps: type) type {
 
         fn onRewritten(self: *Self, id: UtteranceId, text: []const u8, r: RewriteResult) void {
             if (!self.matches(id, .rewriting)) return;
+            self.deps.deadline.cancel(id); // the rewrite resolved within its ~3 s budget
             // `.failed` already carries the raw Final Transcript (the worker's fallback):
             // dictation never breaks; the worker logged the downgrade. The degraded
             // surface cue is the follow-on ticket (spec §UX 4).
@@ -227,6 +248,16 @@ pub fn Coordinator(comptime Deps: type) type {
         }
 
         fn onDeadline(self: *Self, id: UtteranceId) void {
+            if (self.matches(id, .rewriting)) {
+                // The ~3 s rewrite budget fired (docs/backtrack-spec.md §failure policy):
+                // stop waiting and insert the raw Final Transcript copied at submit. No
+                // error cue — text still lands. The abandoned call's late `.rewritten`
+                // is stale-rejected by the phase guard.
+                feedback.log("  Backtrack rewrite exceeded {d} ms — inserting the raw Final Transcript\n", .{rewrite_deadline.final_ms});
+                self.deps.insertion.submit(id, self.raw[0..self.raw_len]);
+                self.phase = .inserting;
+                return;
+            }
             if (!self.matches(id, .awaiting_final)) return;
             // For local Segments this is a drain overrun: part of that was lost. The loud error
             // cue fires via abandon; the retry advice makes the signal specific (#92).
@@ -908,6 +939,69 @@ test "22 stale mismatched or phase-invalid rewritten events cannot advance an Ut
     co.handle(.{ .rewritten = .{ .id = 1, .text = "duplicate", .result = .ok } }); // now .inserting
     try expectEqual(@as(usize, 1), h.insertion.submits);
     try expectEqualStrings("right", h.insertion.lastText());
+}
+
+test "24 rewrite timeout: the ~3 s budget fires during .rewriting and the raw Final Transcript inserts" {
+    var h = Harness{};
+    h.backends.backtrack = true;
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    try expectEqual(@as(usize, 1), h.deadline.arms); // release-anchored deadline
+    co.handle(.{ .final = .{ .id = 1, .text = "um at 20:00 no 18:00" } }); // → rewriting
+    try expectEqual(@as(usize, 1), h.deadline.cancels); // release deadline resolved by the final
+    try expectEqual(@as(usize, 2), h.deadline.arms); // rewrite budget armed at submit
+    try expectEqual(rewrite_deadline.final_ms, h.deadline.last_policy.final_ms);
+    try expectEqual(@as(?u32, null), h.deadline.last_policy.cooperative_cancel_ms);
+
+    co.handle(.{ .deadline = 1 }); // budget exceeded
+    try expectEqual(@as(usize, 1), h.insertion.submits);
+    try expectEqualStrings("um at 20:00 no 18:00", h.insertion.lastText());
+    try expectEqual(@as(usize, 0), h.feedback.abandoneds); // no error cue — text still lands
+
+    // The abandoned call resolves late: stale, must not double-insert.
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "At 18:00", .result = .ok } });
+    try expectEqual(@as(usize, 1), h.insertion.submits);
+    try expectEqualStrings("um at 20:00 no 18:00", h.insertion.lastText());
+
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
+    try expect(h.feedback.inserteds == 1);
+    co.handle(.press); // fully resolved — next hold accepted
+    try expect(h.backends.began == 2);
+}
+
+test "25 a rewrite completing within budget disarms the rewrite deadline" {
+    var h = Harness{};
+    h.backends.backtrack = true;
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "raw" } });
+    try expectEqual(@as(usize, 2), h.deadline.arms);
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "rewritten", .result = .ok } });
+    try expectEqual(@as(usize, 2), h.deadline.cancels); // rewrite budget disarmed
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
+
+    // A failed completion (raw carried back) disarms it just the same.
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 2, .text = "raw two" } });
+    co.handle(.{ .rewritten = .{ .id = 2, .text = "raw two", .result = .failed } });
+    try expectEqual(@as(usize, 4), h.deadline.cancels);
+}
+
+test "26 a mismatched deadline during .rewriting cannot force the fallback" {
+    var h = Harness{};
+    h.backends.backtrack = true;
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "raw" } });
+    co.handle(.{ .deadline = 99 });
+    try expectEqual(@as(usize, 0), h.insertion.submits);
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "rewritten", .result = .ok } });
+    try expectEqual(@as(usize, 1), h.insertion.submits);
+    try expectEqualStrings("rewritten", h.insertion.lastText());
 }
 
 test "23 backend failure during .rewriting is ignored (final already delivered)" {
