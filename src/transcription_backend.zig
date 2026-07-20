@@ -20,20 +20,30 @@ pub const DeadlinePolicy = struct {
 
 pub const openai_deadline = DeadlinePolicy{ .final_ms = 15_000 };
 
+/// Which wait a deadline bounds. An Utterance arms two in sequence — the
+/// release-anchored `.release` deadline (awaiting the Final Transcript) and, under
+/// Backtrack, the `.rewrite` budget (docs/backtrack-spec.md §failure policy). The kind
+/// rides the fired action so a stale claim of one can never be mistaken for the other:
+/// the claim and the Coordinator's phase change race on different locks, and the
+/// Utterance id alone does not tell them apart.
+pub const DeadlineKind = enum { release, rewrite };
+
 /// Mutable timer state. The real adapter protects this value with one mutex so the
-/// fire time and identity are armed, cancelled, and claimed as one generation.
+/// fire time, identity, and kind are armed, cancelled, and claimed as one generation.
 pub const DeadlineState = struct {
     cooperative_at_ms: i64 = 0,
     fire_at_ms: i64 = 0,
     id: UtteranceId = 0,
+    kind: DeadlineKind = .release,
 
     pub const Action = union(enum) {
         cooperative_cancel: UtteranceId,
-        final: UtteranceId,
+        final: struct { id: UtteranceId, kind: DeadlineKind },
     };
 
-    pub fn arm(self: *DeadlineState, id: UtteranceId, now_ms: i64, policy: DeadlinePolicy) void {
+    pub fn arm(self: *DeadlineState, id: UtteranceId, kind: DeadlineKind, now_ms: i64, policy: DeadlinePolicy) void {
         self.id = id;
+        self.kind = kind;
         self.cooperative_at_ms = if (policy.cooperative_cancel_ms) |delay| now_ms + delay else 0;
         self.fire_at_ms = now_ms + policy.final_ms;
     }
@@ -45,9 +55,9 @@ pub const DeadlineState = struct {
     pub fn claim(self: *DeadlineState, now_ms: i64) ?Action {
         if (self.fire_at_ms == 0) return null;
         if (now_ms >= self.fire_at_ms) {
-            const id = self.id;
+            const fired = Action{ .final = .{ .id = self.id, .kind = self.kind } };
             self.* = .{};
-            return .{ .final = id };
+            return fired;
         }
         if (self.cooperative_at_ms != 0 and now_ms >= self.cooperative_at_ms) {
             self.cooperative_at_ms = 0;
@@ -176,31 +186,30 @@ test "lease pins metadata and forwards identity-tagged backend commands" {
     try std.testing.expectEqual(@as(u32, 15_000), lease.deadline.final_ms);
 }
 
-test "deadline claim cannot borrow the identity of a later arm" {
+test "deadline claim cannot borrow the identity or kind of a later arm" {
     var state = DeadlineState{};
-    state.arm(1, 1_000, .{ .final_ms = 100 });
-    try std.testing.expectEqualDeep(DeadlineState.Action{ .final = 1 }, state.claim(1_100).?);
+    state.arm(1, .release, 1_000, .{ .final_ms = 100 });
+    try std.testing.expectEqualDeep(DeadlineState.Action{ .final = .{ .id = 1, .kind = .release } }, state.claim(1_100).?);
 
-    state.arm(2, 1_100, .{ .final_ms = 100 });
+    state.arm(1, .rewrite, 1_100, .{ .final_ms = 100 });
     try std.testing.expect(state.claim(1_100) == null);
-    try std.testing.expectEqualDeep(DeadlineState.Action{ .final = 2 }, state.claim(1_200).?);
+    try std.testing.expectEqualDeep(DeadlineState.Action{ .final = .{ .id = 1, .kind = .rewrite } }, state.claim(1_200).?);
 }
 
 test "deadline cancellation is identity matched" {
     var state = DeadlineState{};
-    state.arm(8, 1_000, .{ .final_ms = 100 });
+    state.arm(8, .release, 1_000, .{ .final_ms = 100 });
     state.cancel(7);
-    try std.testing.expectEqualDeep(DeadlineState.Action{ .final = 8 }, state.claim(1_100).?);
+    try std.testing.expectEqualDeep(DeadlineState.Action{ .final = .{ .id = 8, .kind = .release } }, state.claim(1_100).?);
 }
 
 test "local deadline requests cancellation at 9.5 seconds and claims the hard deadline at 10 seconds" {
     var state = DeadlineState{};
-    state.arm(73, 1_000, .{ .cooperative_cancel_ms = 9_500, .final_ms = 10_000 });
+    state.arm(73, .release, 1_000, .{ .cooperative_cancel_ms = 9_500, .final_ms = 10_000 });
 
     try std.testing.expect(state.claim(10_499) == null);
     try std.testing.expectEqualDeep(DeadlineState.Action{ .cooperative_cancel = 73 }, state.claim(10_500).?);
     try std.testing.expect(state.claim(10_999) == null);
-    try std.testing.expectEqualDeep(DeadlineState.Action{ .final = 73 }, state.claim(11_000).?);
+    try std.testing.expectEqualDeep(DeadlineState.Action{ .final = .{ .id = 73, .kind = .release } }, state.claim(11_000).?);
     try std.testing.expect(state.claim(11_001) == null);
 }
-

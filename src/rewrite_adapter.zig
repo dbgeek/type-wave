@@ -107,7 +107,7 @@ pub fn RewriteAdapter(comptime Deps: type) type {
                     // A rewrite that erased the whole Utterance is a failure, not a
                     // cleanup — the raw transcript inserts instead (spec: never lose
                     // dictation). The mechanism already rejects this; belt-and-braces.
-                    feedback.log("  Backtrack rewrite came back empty — inserting the raw Final Transcript\n", .{});
+                    feedback.log("  Backtrack rewrite came back empty — completing with the raw Final Transcript\n", .{});
                     self.deps.complete(self.work_id, raw, .failed);
                     return;
                 }
@@ -116,8 +116,10 @@ pub fn RewriteAdapter(comptime Deps: type) type {
                 self.deps.complete(self.work_id, rewritten, .ok);
             } else |e| {
                 // Never lose dictation: the raw Final Transcript rides the same reverse
-                // edge. No error cue — text IS inserted (spec §failure policy).
-                feedback.log("  Backtrack rewrite failed: {s} — inserting the raw Final Transcript\n", .{@errorName(e)});
+                // edge. No error cue — text lands via the Coordinator (spec §failure
+                // policy). "Completing", not "inserting": if the ~3 s budget already
+                // fired, this completion is stale-rejected and nothing more inserts.
+                feedback.log("  Backtrack rewrite failed: {s} — completing with the raw Final Transcript\n", .{@errorName(e)});
                 self.deps.complete(self.work_id, raw, .failed);
             }
         }

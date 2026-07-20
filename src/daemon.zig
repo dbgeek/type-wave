@@ -509,12 +509,12 @@ const DeadlineAdapter = struct {
 
     co_ctx: *anyopaque = undefined,
     on_cooperative_cancel: *const fn (*anyopaque, backend.UtteranceId) void = undefined,
-    on_fire: *const fn (*anyopaque, backend.UtteranceId) void = undefined,
+    on_fire: *const fn (*anyopaque, backend.UtteranceId, backend.DeadlineKind) void = undefined,
 
-    pub fn arm(self: *DeadlineAdapter, id: backend.UtteranceId, policy: backend.DeadlinePolicy) void {
+    pub fn arm(self: *DeadlineAdapter, id: backend.UtteranceId, kind: backend.DeadlineKind, policy: backend.DeadlinePolicy) void {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        self.state.arm(id, session_mod.nowMs(), policy);
+        self.state.arm(id, kind, session_mod.nowMs(), policy);
     }
     pub fn cancel(self: *DeadlineAdapter, id: backend.UtteranceId) void {
         self.mu.lockUncancelable(self.io);
@@ -528,7 +528,7 @@ const DeadlineAdapter = struct {
             self.mu.unlock(self.io);
             if (claimed) |action| switch (action) {
                 .cooperative_cancel => |id| self.on_cooperative_cancel(self.co_ctx, id),
-                .final => |id| self.on_fire(self.co_ctx, id),
+                .final => |fired| self.on_fire(self.co_ctx, fired.id, fired.kind),
             };
             _ = usleep(1_000);
         }
@@ -556,9 +556,9 @@ fn rewriteDoneTramp(ctx: *anyopaque, id: coord.UtteranceId, text: []const u8, re
     const co: *Coord = @ptrCast(@alignCast(ctx));
     co.handle(.{ .rewritten = .{ .id = id, .text = text, .result = result } });
 }
-fn deadlineFireTramp(ctx: *anyopaque, id: backend.UtteranceId) void {
+fn deadlineFireTramp(ctx: *anyopaque, id: backend.UtteranceId, kind: backend.DeadlineKind) void {
     const co: *Coord = @ptrCast(@alignCast(ctx));
-    co.handle(.{ .deadline = id });
+    co.handle(.{ .deadline = .{ .id = id, .kind = kind } });
 }
 fn cooperativeCancelTramp(ctx: *anyopaque, id: backend.UtteranceId) void {
     const co: *Coord = @ptrCast(@alignCast(ctx));

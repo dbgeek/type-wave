@@ -70,7 +70,10 @@ pub const Event = union(enum) {
     final: struct { id: UtteranceId, text: []const u8 },
     backend_failed: UtteranceId,
     cooperative_cancel: UtteranceId,
-    deadline: UtteranceId,
+    /// A claimed deadline fire. The kind names which wait it bounded — the claim and a
+    /// phase-advancing event race on different locks, so id + phase alone cannot tell
+    /// a stale release-anchored fire from the rewrite budget (they share the id).
+    deadline: struct { id: UtteranceId, kind: backend.DeadlineKind },
     /// Reverse edge from the Rewrite worker (docs/backtrack-spec.md). Like `final`,
     /// the `text` slice borrows the worker's buffer and is valid only for the
     /// duration of the `handle` call — the insertion seam copies synchronously.
@@ -127,7 +130,7 @@ pub fn Coordinator(comptime Deps: type) type {
                 .final => |e| self.onFinal(e.id, e.text),
                 .backend_failed => |id| self.onBackendFailed(id),
                 .cooperative_cancel => |id| self.onCooperativeCancel(id),
-                .deadline => |id| self.onDeadline(id),
+                .deadline => |e| self.onDeadline(e.id, e.kind),
                 .rewritten => |e| self.onRewritten(e.id, e.text, e.result),
                 .inserted => |e| self.onInserted(e.id, e.result),
             }
@@ -194,7 +197,7 @@ pub fn Coordinator(comptime Deps: type) type {
             if (!self.deps.audio.heardSound())
                 feedback.log("  microphone captured only silence — is Microphone permission granted to this process?\n", .{});
 
-            self.deps.deadline.arm(lease.id, lease.deadline); // release-anchored; final cancels it
+            self.deps.deadline.arm(lease.id, .release, lease.deadline); // release-anchored; final cancels it
             lease.release() catch |e| {
                 self.deps.deadline.cancel(lease.id);
                 feedback.log("  backend release failed: {s}\n", .{@errorName(e)});
@@ -228,7 +231,7 @@ pub fn Coordinator(comptime Deps: type) type {
                 self.raw_len = @min(text.len, self.raw.len);
                 @memcpy(self.raw[0..self.raw_len], text[0..self.raw_len]);
                 self.deps.rewrite.submit(id, text); // copies text; worker rewrites, then .rewritten
-                self.deps.deadline.arm(id, rewrite_deadline); // the ~3 s rewrite budget
+                self.deps.deadline.arm(id, .rewrite, rewrite_deadline); // the ~3 s rewrite budget
                 self.phase = .rewriting; // blocking, exactly like .inserting (ADR-0001)
                 return;
             }
@@ -247,8 +250,9 @@ pub fn Coordinator(comptime Deps: type) type {
             self.phase = .inserting;
         }
 
-        fn onDeadline(self: *Self, id: UtteranceId) void {
-            if (self.matches(id, .rewriting)) {
+        fn onDeadline(self: *Self, id: UtteranceId, kind: backend.DeadlineKind) void {
+            if (kind == .rewrite) {
+                if (!self.matches(id, .rewriting)) return;
                 // The ~3 s rewrite budget fired (docs/backtrack-spec.md §failure policy):
                 // stop waiting and insert the raw Final Transcript copied at submit. No
                 // error cue — text still lands. The abandoned call's late `.rewritten`
@@ -454,10 +458,12 @@ const FakeDeadline = struct {
     arms: usize = 0,
     cancels: usize = 0,
     last_id: UtteranceId = 0,
+    last_kind: backend.DeadlineKind = .release,
     last_policy: backend.DeadlinePolicy = .{ .final_ms = 0 },
-    fn arm(self: *FakeDeadline, id: UtteranceId, policy: backend.DeadlinePolicy) void {
+    fn arm(self: *FakeDeadline, id: UtteranceId, kind: backend.DeadlineKind, policy: backend.DeadlinePolicy) void {
         self.arms += 1;
         self.last_id = id;
+        self.last_kind = kind;
         self.last_policy = policy;
     }
     fn cancel(self: *FakeDeadline, id: UtteranceId) void {
@@ -646,7 +652,7 @@ test "9 deadline before final abandons" {
     const co = h.wire();
     co.handle(.press);
     co.handle(.release); // → awaiting_final
-    co.handle(.{ .deadline = 1 });
+    co.handle(.{ .deadline = .{ .id = 1, .kind = .release } });
     try expect(h.feedback.abandoneds == 1);
     try expect(h.insertion.submits == 0);
     // a stale final afterwards is ignored
@@ -666,7 +672,7 @@ test "9a cooperative deadline requests cancellation without resolving the Uttera
     try expectEqual(@as(usize, 0), h.backends.cancelled);
     try expectEqual(@as(usize, 0), h.feedback.abandoneds);
 
-    co.handle(.{ .deadline = 1 });
+    co.handle(.{ .deadline = .{ .id = 1, .kind = .release } });
     try expectEqual(@as(usize, 1), h.backends.cancelled);
     try expectEqual(@as(usize, 1), h.feedback.abandoneds);
 }
@@ -758,7 +764,7 @@ test "14 accepted Utterance pins unique identity backend language and deadline p
     try expectEqualStrings("sv", co.active.?.language);
     try expectEqual(@as(UtteranceId, 1), h.deadline.last_id);
     try expectEqual(@as(u32, 12_345), h.deadline.last_policy.final_ms);
-    co.handle(.{ .deadline = 1 });
+    co.handle(.{ .deadline = .{ .id = 1, .kind = .release } });
     co.handle(.press);
     try expectEqual(@as(UtteranceId, 2), h.backends.last_id);
 }
@@ -770,21 +776,21 @@ test "15 mismatched duplicate late and phase-invalid events cannot advance an Ut
     co.handle(.press); // id 1, capturing
     co.handle(.{ .final = .{ .id = 1, .text = "too early" } });
     co.handle(.{ .backend_failed = 99 });
-    co.handle(.{ .deadline = 1 });
+    co.handle(.{ .deadline = .{ .id = 1, .kind = .release } });
     co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
     try expectEqual(@as(usize, 0), h.insertion.submits);
     try expectEqual(@as(usize, 0), h.feedback.abandoneds);
 
     co.handle(.release); // id 1, awaiting_final
     co.handle(.{ .final = .{ .id = 99, .text = "wrong Utterance" } });
-    co.handle(.{ .deadline = 99 });
+    co.handle(.{ .deadline = .{ .id = 99, .kind = .release } });
     try expectEqual(@as(usize, 0), h.insertion.submits);
     co.handle(.{ .final = .{ .id = 1, .text = "right Utterance" } });
     try expectEqual(@as(usize, 1), h.insertion.submits);
     try expectEqual(@as(UtteranceId, 1), h.insertion.last_id);
 
     co.handle(.{ .final = .{ .id = 1, .text = "duplicate" } });
-    co.handle(.{ .deadline = 1 });
+    co.handle(.{ .deadline = .{ .id = 1, .kind = .release } });
     co.handle(.{ .inserted = .{ .id = 99, .result = .ok } });
     try expectEqual(@as(usize, 1), h.insertion.submits);
     try expectEqual(@as(usize, 0), h.feedback.inserteds);
@@ -941,6 +947,20 @@ test "22 stale mismatched or phase-invalid rewritten events cannot advance an Ut
     try expectEqualStrings("right", h.insertion.lastText());
 }
 
+test "23 backend failure during .rewriting is ignored (final already delivered)" {
+    var h = Harness{};
+    h.backends.backtrack = true;
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "text" } }); // → rewriting
+    co.handle(.{ .backend_failed = 1 });
+    try expectEqual(@as(usize, 0), h.backends.cancelled);
+    try expectEqual(@as(usize, 0), h.feedback.abandoneds);
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "text", .result = .ok } });
+    try expectEqual(@as(usize, 1), h.insertion.submits);
+}
+
 test "24 rewrite timeout: the ~3 s budget fires during .rewriting and the raw Final Transcript inserts" {
     var h = Harness{};
     h.backends.backtrack = true;
@@ -948,13 +968,15 @@ test "24 rewrite timeout: the ~3 s budget fires during .rewriting and the raw Fi
     co.handle(.press);
     co.handle(.release);
     try expectEqual(@as(usize, 1), h.deadline.arms); // release-anchored deadline
+    try expectEqual(backend.DeadlineKind.release, h.deadline.last_kind);
     co.handle(.{ .final = .{ .id = 1, .text = "um at 20:00 no 18:00" } }); // → rewriting
     try expectEqual(@as(usize, 1), h.deadline.cancels); // release deadline resolved by the final
     try expectEqual(@as(usize, 2), h.deadline.arms); // rewrite budget armed at submit
+    try expectEqual(backend.DeadlineKind.rewrite, h.deadline.last_kind);
     try expectEqual(rewrite_deadline.final_ms, h.deadline.last_policy.final_ms);
     try expectEqual(@as(?u32, null), h.deadline.last_policy.cooperative_cancel_ms);
 
-    co.handle(.{ .deadline = 1 }); // budget exceeded
+    co.handle(.{ .deadline = .{ .id = 1, .kind = .rewrite } }); // budget exceeded
     try expectEqual(@as(usize, 1), h.insertion.submits);
     try expectEqualStrings("um at 20:00 no 18:00", h.insertion.lastText());
     try expectEqual(@as(usize, 0), h.feedback.abandoneds); // no error cue — text still lands
@@ -990,30 +1012,34 @@ test "25 a rewrite completing within budget disarms the rewrite deadline" {
     try expectEqual(@as(usize, 4), h.deadline.cancels);
 }
 
-test "26 a mismatched deadline during .rewriting cannot force the fallback" {
+test "26 a mismatched rewrite deadline during .rewriting cannot force the fallback" {
     var h = Harness{};
     h.backends.backtrack = true;
     const co = h.wire();
     co.handle(.press);
     co.handle(.release);
     co.handle(.{ .final = .{ .id = 1, .text = "raw" } });
-    co.handle(.{ .deadline = 99 });
+    co.handle(.{ .deadline = .{ .id = 99, .kind = .rewrite } });
     try expectEqual(@as(usize, 0), h.insertion.submits);
     co.handle(.{ .rewritten = .{ .id = 1, .text = "rewritten", .result = .ok } });
     try expectEqual(@as(usize, 1), h.insertion.submits);
     try expectEqualStrings("rewritten", h.insertion.lastText());
 }
 
-test "23 backend failure during .rewriting is ignored (final already delivered)" {
+test "27 a stale release-anchored deadline cannot fire the rewrite fallback early" {
     var h = Harness{};
     h.backends.backtrack = true;
     const co = h.wire();
     co.handle(.press);
     co.handle(.release);
-    co.handle(.{ .final = .{ .id = 1, .text = "text" } }); // → rewriting
-    co.handle(.{ .backend_failed = 1 });
-    try expectEqual(@as(usize, 0), h.backends.cancelled);
+    co.handle(.{ .final = .{ .id = 1, .text = "raw" } }); // → rewriting; budget armed
+    // The 15 s release deadline was claimed just before the final won the Coordinator
+    // mutex: its cancel was a no-op and the stale fire arrives now, same id, tagged
+    // `.release`. It bounded a wait that is over — it must not cut the budget short.
+    co.handle(.{ .deadline = .{ .id = 1, .kind = .release } });
+    try expectEqual(@as(usize, 0), h.insertion.submits);
     try expectEqual(@as(usize, 0), h.feedback.abandoneds);
-    co.handle(.{ .rewritten = .{ .id = 1, .text = "text", .result = .ok } });
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "rewritten", .result = .ok } });
     try expectEqual(@as(usize, 1), h.insertion.submits);
+    try expectEqualStrings("rewritten", h.insertion.lastText());
 }

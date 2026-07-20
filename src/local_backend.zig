@@ -1175,7 +1175,7 @@ const IntegrationRewrite = struct {
 };
 
 const IntegrationDeadline = struct {
-    pub fn arm(_: *IntegrationDeadline, _: backend.UtteranceId, _: backend.DeadlinePolicy) void {}
+    pub fn arm(_: *IntegrationDeadline, _: backend.UtteranceId, _: backend.DeadlineKind, _: backend.DeadlinePolicy) void {}
     pub fn cancel(_: *IntegrationDeadline, _: backend.UtteranceId) void {}
 };
 
