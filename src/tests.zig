@@ -23,6 +23,7 @@ test {
     _ = @import("grant_sequence.zig"); // the serialized cold-start TCC request sequence (#130)
     _ = @import("model_store.zig");
     _ = @import("local_model_recovery.zig");
+    _ = @import("local_provisioner.zig"); // the Local Provisioner: recovery ordering driven via a fake seam
     _ = @import("status_item.zig");
     _ = @import("failure_observation.zig");
     _ = @import("menu.zig");

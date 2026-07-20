@@ -75,11 +75,8 @@ const operation_channel = @import("operation_channel.zig");
 const model_operation = @import("model_operation.zig");
 const local_backend = @import("local_backend.zig");
 const model_store = @import("model_store.zig");
-const local_model_recovery = @import("local_model_recovery.zig");
+const local_provisioner = @import("local_provisioner.zig");
 const status_item = @import("status_item.zig");
-const failure_observation = @import("failure_observation.zig");
-
-const FailureObservation = failure_observation.FailureObservation;
 
 const Session = session_mod.Session;
 const LocalAdapter = local_backend.Adapter(local_backend.ProcessHelper);
@@ -268,7 +265,7 @@ const DaemonDeps = struct {
     }
 
     pub fn prepareLocal(self: *DaemonDeps) ?*LocalAdapter {
-        return self.daemon.prepareLocalHelper();
+        return self.daemon.provisioner.warm();
     }
 
     /// The Backend Router asks between reconciliation and preparation, exactly once
@@ -300,6 +297,133 @@ const DaemonDeps = struct {
     }
 };
 const BackendRouter = backend_router.Router(DaemonDeps);
+
+/// Local Provisioner seam: the daemon-side effects behind LocalProvisioner.warm(). The
+/// opaque Install carries the RuntimeLease across verify and both spawn attempts; the real
+/// startHelper transfers it into the warmed LocalAdapter on success, and abandon() releases
+/// it (a no-op once taken) on every early return. All model_store / subprocess / adapter
+/// coupling lives here, so the Provisioner's recovery ordering stays fakeable.
+const LocalProvisionerDeps = struct {
+    pub const LocalResource = LocalAdapter;
+    pub const Install = struct {
+        root_buf: [std.fs.max_path_bytes]u8 = undefined,
+        root_len: usize = 0,
+        helper_buf: [std.fs.max_path_bytes]u8 = undefined,
+        helper_len: usize = 0,
+        model_buf: [std.fs.max_path_bytes]u8 = undefined,
+        model_len: usize = 0,
+        artifact: model_store.ArtifactIdentity = undefined,
+        lease: model_store.RuntimeLease = undefined,
+
+        fn root(self: *const Install) []const u8 {
+            return self.root_buf[0..self.root_len];
+        }
+        fn helperPath(self: *const Install) []const u8 {
+            return self.helper_buf[0..self.helper_len];
+        }
+        fn modelPath(self: *const Install) []const u8 {
+            return self.model_buf[0..self.model_len];
+        }
+    };
+
+    daemon: *Daemon,
+
+    pub fn resolveInstall(self: *LocalProvisionerDeps) ?Install {
+        const d = self.daemon;
+        const raw_home = std.c.getenv("HOME") orelse return null;
+        const home = std.mem.span(raw_home);
+        var install: Install = .{};
+        const helper = std.fmt.bufPrint(&install.helper_buf, "{s}/.local/libexec/type-wave/type-wave-whisper", .{home}) catch return null;
+        install.helper_len = helper.len;
+        const root = model_store.rootPath(home, &install.root_buf) catch return null;
+        install.root_len = root.len;
+        install.lease = model_store.RuntimeLease.acquire(d.io, install.root()) catch return null;
+        const model = (model_store.activeModelPath(d.io, install.root(), &install.model_buf) catch {
+            install.lease.release();
+            return null;
+        }) orelse {
+            install.lease.release();
+            return null;
+        };
+        install.model_len = model.len;
+        install.artifact = (model_store.activeArtifact(d.io, install.root()) catch {
+            install.lease.release();
+            return null;
+        }) orelse {
+            install.lease.release();
+            return null;
+        };
+        return install;
+    }
+
+    pub fn verify(self: *LocalProvisionerDeps, install: *const Install) !local_provisioner.Integrity {
+        const cancel = model_store.CancelToken{};
+        return model_store.verifyActiveInstallation(self.daemon.io, install.root(), model_store.pinned_manifest, &model_store.trusted_manifests, &cancel, null);
+    }
+
+    pub fn startHelper(self: *LocalProvisionerDeps, install: *Install) local_provisioner.StartOutcome(LocalAdapter) {
+        const d = self.daemon;
+        const helper = local_backend.ProcessHelper.start(d.alloc, d.io, install.helperPath(), install.modelPath(), install.artifact) catch |failure| {
+            return .{ .spawn_failed = failure };
+        };
+        const local = d.alloc.create(LocalAdapter) catch {
+            helper.shutdown();
+            return .no_adapter;
+        };
+        local.* = LocalAdapter.init(d.alloc, d.io, helper, .{
+            .ctx = d,
+            .final = Daemon.localFinal,
+            .failed = Daemon.localFailed,
+        });
+        local.setInferenceRoot(install.root(), &install.lease) catch {
+            helper.shutdown();
+            d.alloc.destroy(local);
+            return .no_adapter;
+        };
+        local.bindHelperEvents();
+        return .{ .started = local };
+    }
+
+    pub fn abandon(_: *LocalProvisionerDeps, install: *Install) void {
+        install.lease.release();
+    }
+
+    pub fn installationProbe(self: *LocalProvisionerDeps) bool {
+        const d = self.daemon;
+        const raw_home = std.c.getenv("HOME") orelse return false;
+        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root = model_store.rootPath(std.mem.span(raw_home), &root_buf) catch return false;
+        if (model_store.modelRemovalPending(d.io, root)) return false;
+        var model_buf: [std.fs.max_path_bytes]u8 = undefined;
+        return (model_store.activeModelPath(d.io, root, &model_buf) catch return false) != null;
+    }
+
+    pub fn removeSuperseded(self: *LocalProvisionerDeps) void {
+        const d = self.daemon;
+        const raw_home = std.c.getenv("HOME") orelse return;
+        var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root = model_store.rootPath(std.mem.span(raw_home), &root_buf) catch return;
+        const removed = model_store.removeInactiveInstallations(d.io, root) catch |failure| {
+            if (failure == error.ModelOperationInProgress or failure == error.ModelInferenceActive) return;
+            feedback.log("  superseded Model Installation cleanup failed: {s}; retrying while idle\n", .{@errorName(failure)});
+            return;
+        };
+        if (removed > 0) feedback.log("  removed {d} superseded Model Installation(s) after helper drain\n", .{removed});
+    }
+
+    pub fn note(_: *LocalProvisionerDeps, event: local_provisioner.Event) void {
+        switch (event) {
+            .absent => feedback.log("  local Model Installation is absent; Install is required\n", .{}),
+            .corrupt => |reason| feedback.log("  local Model Installation is corrupt ({s}); Repair or Remove is required\n", .{@tagName(reason)}),
+            .verify_failed => |failure| feedback.log("  local Model Installation verification failed: {s}; runtime Retry remains available\n", .{@errorName(failure)}),
+            .load_failed => |failure| feedback.log("  local Whisper load failed: {s}; verifying the Model Installation offline\n", .{@errorName(failure)}),
+            .runtime_failure => |failure| feedback.log("  local Whisper runtime failure after verified installation: {s}; send SIGHUP to Retry\n", .{@errorName(failure)}),
+            .runtime_failure_after_verify => |failure| feedback.log("  Model Installation verified, but local runtime load failed again: {s}; send SIGHUP to Retry\n", .{@errorName(failure)}),
+            .adapter_unavailable => feedback.log("  local Whisper unavailable: adapter allocation failed\n", .{}),
+        }
+    }
+};
+const LocalProvisioner = local_provisioner.LocalProvisioner(LocalProvisionerDeps);
 
 /// Real dependencies for insertion_adapter.zig. The adapter owns the asynchronous
 /// Insertion policy; daemon.zig supplies the concrete macOS mechanism, Settings Snapshot,
@@ -451,8 +575,8 @@ const Daemon = struct {
     /// `CGPreflightPostEventAccess` can stay stale-`false` for the process lifetime
     /// after a live grant, so this latch is the only trustworthy in-process signal.
     post_event_observed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    local_model_recovery: local_model_recovery.Recovery = .{},
-    local_failure: FailureObservation = .{},
+    provisioner_deps: LocalProvisionerDeps = undefined,
+    provisioner: LocalProvisioner = undefined,
 
     /// Always-on live-transcript subscriber: Final Transcripts from the read-loop thread
     /// trampoline into the Coordinator. Installed at every Session.connect, before the read
@@ -476,129 +600,12 @@ const Daemon = struct {
         obsDropped(ctx, id);
     }
 
-    fn localModelPath(io: std.Io, buf: []u8) ?[]const u8 {
-        const raw_home = std.c.getenv("HOME") orelse {
-            return null;
-        };
-        const home = std.mem.span(raw_home);
-        var root_buf: [4096]u8 = undefined;
-        const root = model_store.rootPath(home, &root_buf) catch return null;
-        return model_store.activeModelPath(io, root, buf) catch null;
-    }
-
-    fn localInstallationPresent(self: *Daemon) bool {
-        const raw_home = std.c.getenv("HOME") orelse return false;
-        var root_buf: [4096]u8 = undefined;
-        const root = model_store.rootPath(std.mem.span(raw_home), &root_buf) catch return false;
-        if (model_store.modelRemovalPending(self.io, root)) return false;
-        var model_buf: [4096]u8 = undefined;
-        return self.local_model_recovery.installationUsable() and localModelPath(self.io, &model_buf) != null;
-    }
-
-    fn removeInactiveModelInstallations(self: *Daemon) void {
-        const raw_home = std.c.getenv("HOME") orelse return;
-        var root_buf: [4096]u8 = undefined;
-        const root = model_store.rootPath(std.mem.span(raw_home), &root_buf) catch return;
-        const removed = model_store.removeInactiveInstallations(self.io, root) catch |failure| {
-            if (failure == error.ModelOperationInProgress or failure == error.ModelInferenceActive) return;
-            feedback.log("  superseded Model Installation cleanup failed: {s}; retrying while idle\n", .{@errorName(failure)});
-            return;
-        };
-        if (removed > 0) feedback.log("  removed {d} superseded Model Installation(s) after helper drain\n", .{removed});
-    }
-
-    fn prepareLocalHelper(self: *Daemon) ?*LocalAdapter {
-        const raw_home = std.c.getenv("HOME") orelse return null;
-        const home = std.mem.span(raw_home);
-        var helper_buf: [4096]u8 = undefined;
-        var model_buf: [4096]u8 = undefined;
-        var root_buf: [4096]u8 = undefined;
-        const helper_path = std.fmt.bufPrint(&helper_buf, "{s}/.local/libexec/type-wave/type-wave-whisper", .{home}) catch return null;
-        const root = model_store.rootPath(home, &root_buf) catch return null;
-        var runtime_lease = model_store.RuntimeLease.acquire(self.io, root) catch return null;
-        defer runtime_lease.release();
-        const model_path = localModelPath(self.io, &model_buf) orelse return null;
-        const active_artifact = (model_store.activeArtifact(self.io, root) catch return null) orelse return null;
-        if (self.local_model_recovery.current() == .verifying) {
-            const usable = self.verifyLocalInstallation(root) orelse return null;
-            if (self.local_model_recovery.verificationFinished(usable) != .load) return null;
-        }
-        if (self.local_model_recovery.current() == .corrupt or self.local_model_recovery.current() == .runtime_failure) return null;
-
-        const helper = local_backend.ProcessHelper.start(self.alloc, self.io, helper_path, model_path, .{
-            .size = active_artifact.size,
-            .sha256 = active_artifact.sha256,
-        }) catch |failure| retry: {
-            if (self.local_model_recovery.loadFailed() != .verify) {
-                self.local_failure.setError("Local runtime load failed", failure);
-                feedback.log("  local Whisper runtime failure after verified installation: {s}; send SIGHUP to Retry\n", .{@errorName(failure)});
-                return null;
-            }
-            feedback.log("  local Whisper load failed: {s}; verifying the Model Installation offline\n", .{@errorName(failure)});
-            const usable = self.verifyLocalInstallation(root) orelse return null;
-            if (self.local_model_recovery.verificationFinished(usable) != .load) return null;
-            break :retry local_backend.ProcessHelper.start(self.alloc, self.io, helper_path, model_path, .{
-                .size = active_artifact.size,
-                .sha256 = active_artifact.sha256,
-            }) catch |retry_failure| {
-                _ = self.local_model_recovery.loadFailed();
-                self.local_failure.setError("Local runtime load failed", retry_failure);
-                feedback.log("  Model Installation verified, but local runtime load failed again: {s}; send SIGHUP to Retry\n", .{@errorName(retry_failure)});
-                return null;
-            };
-        };
-        self.local_model_recovery.loadSucceeded();
-        self.local_failure.clear();
-        const local = self.alloc.create(LocalAdapter) catch {
-            helper.shutdown();
-            feedback.log("  local Whisper unavailable: adapter allocation failed\n", .{});
-            return null;
-        };
-        local.* = LocalAdapter.init(self.alloc, self.io, helper, .{
-            .ctx = self,
-            .final = Daemon.localFinal,
-            .failed = Daemon.localFailed,
-        });
-        local.setInferenceRoot(root, &runtime_lease) catch {
-            helper.shutdown();
-            self.alloc.destroy(local);
-            return null;
-        };
-        local.bindHelperEvents();
-        return local;
-    }
-
-    fn verifyLocalInstallation(self: *Daemon, root: []const u8) ?bool {
-        const cancel = model_store.CancelToken{};
-        const integrity = model_store.verifyActiveInstallation(self.io, root, model_store.pinned_manifest, &model_store.trusted_manifests, &cancel, null) catch |failure| {
-            self.local_model_recovery.verificationFailed();
-            self.local_failure.setError("Model Installation verification failed", failure);
-            feedback.log("  local Model Installation verification failed: {s}; runtime Retry remains available\n", .{@errorName(failure)});
-            return null;
-        };
-        return switch (integrity) {
-            .usable => true,
-            .absent => {
-                feedback.log("  local Model Installation is absent; Install is required\n", .{});
-                return false;
-            },
-            .corrupt => |reason| {
-                var buffer: [256]u8 = undefined;
-                if (std.fmt.bufPrint(&buffer, "Model Installation corrupt: {s}", .{@tagName(reason)})) |detail|
-                    self.local_failure.set(detail)
-                else |_| {}
-                feedback.log("  local Model Installation is corrupt ({s}); Repair or Remove is required\n", .{@tagName(reason)});
-                return false;
-            },
-        };
-    }
-
     fn localRetryLoop(self: *Daemon) void {
         while (!g_quit.load(.acquire)) {
             if (g_retry_local.swap(false, .acq_rel) and self.transcription.selected() == .local) {
                 if (self.transcription.retryLocal()) {
                     feedback.log("  local Whisper Retry requested\n", .{});
-                } else if (self.local_model_recovery.retry() != .none) {
+                } else if (self.provisioner.requestRetry()) {
                     feedback.log("  local Whisper load Retry requested\n", .{});
                 }
             }
@@ -684,7 +691,7 @@ const Daemon = struct {
     /// Backend Router mid-tick (DaemonDeps.wants) and again after self-heal effects.
     fn gatherOutcome(self: *Daemon) configuration_phase.Outcome {
         const selected = self.transcription.selected();
-        const local_installation = self.localInstallationPresent();
+        const local_installation = self.provisioner.installationPresent();
         const key = if (selected == .openai and !self.transcription.resourcePresent(.openai))
             config.loadApiKeyOnly(self.io, self.alloc)
         else
@@ -737,7 +744,7 @@ const Daemon = struct {
             // is selected and no local helper exists. Busy operation/inference locks defer
             // cleanup to the next supervisor tick without disturbing dictation.
             if (self.transcription.activeId() == 0)
-                self.removeInactiveModelInstallations();
+                self.provisioner.removeSuperseded();
             self.capture_enabled.store(outcome.configured and self.transcription.available() and !self.paused.load(.acquire), .release);
         }
     }
@@ -856,13 +863,13 @@ const Daemon = struct {
             self.inputMonitoringFact(),
             self.postEventFact(),
             false,
-            self.localInstallationPresent(),
+            self.provisioner.installationPresent(),
         ));
         var installation: status_item.Installation = .absent;
         var operation: status_item.Operation = .idle;
         var operation_bytes: ?status_item.ByteProgress = null;
         var installation_identity: ?status_item.InstallationIdentity = null;
-        var failure_detail = self.local_failure.current();
+        var failure_detail = self.provisioner.failureDetail();
         if (std.c.getenv("HOME")) |raw_home| {
             var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
             if (model_store.rootPath(std.mem.span(raw_home), &root_buffer)) |root| {
@@ -891,7 +898,7 @@ const Daemon = struct {
                 }
             } else |_| {}
         }
-        const recovery_state = self.local_model_recovery.current();
+        const recovery_state = self.provisioner.recoveryState();
         if (recovery_state == .corrupt) installation = .corrupt;
         if (self.model_operation_runner.current()) |observed| {
             if (observed.active or operation != .paused) {
@@ -1023,6 +1030,8 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     daemon.transcription = BackendRouter.init(io, &daemon.router_deps, selected_backend);
     daemon.model_operation_runner_deps = .{ .daemon = &daemon };
     daemon.model_operation_runner = ModelOperationRunner.init(&daemon.model_operation_runner_deps);
+    daemon.provisioner_deps = .{ .daemon = &daemon };
+    daemon.provisioner = LocalProvisioner.init(&daemon.provisioner_deps);
 
     // ---- modules that need neither a grant nor the key to construct ----
     try daemon.capture.init();
