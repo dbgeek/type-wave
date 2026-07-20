@@ -47,6 +47,17 @@ CASES = [
     ("sv-correction-name", "skicka mailet till Johan eh nej till Kalle", "Skicka mailet till Kalle"),
     ("sv-handsoff-nej", "nej det tycker jag inte", "unchanged"),
     ("mixed-sv-en", "vi kör en quick sync imorgon um typ klockan tio", "Vi kör en quick sync imorgon typ klockan tio"),
+    # Round 4 — phrase-scope restructuring (the v3 miss) and new shapes
+    ("scope-count", "we need three laptops no two", "We need two laptops"),
+    ("scope-sv-list", "ta med kaffe och bullar nej bara kaffe", "Ta med bara kaffe"),
+    ("multi-correction", "meet at 9 no 10 in room 4 no room 5", "Meet at 10 in room 5"),
+    ("multi-sentence", "Send the invoice today. um Actually no send it tomorrow morning.", "Send the invoice tomorrow morning."),
+    ("decimal", "the dose is 3.5 no 3.7 milligrams", "The dose is 3.7 milligrams"),
+    ("sv-date", "vi ses på fredag nej lördag", "Vi ses på lördag"),
+    ("sv-eller-nej", "vi tar tisdag eller nej onsdag", "Vi tar onsdag"),
+    ("handsoff-or-question", "should we do Tuesday or Wednesday", "unchanged (a question to keep, not answer)"),
+    ("handsoff-inte-utan", "inte imorgon utan på torsdag", "unchanged (deliberate contrast)"),
+    ("handsoff-spelled-email", "my email is johan at example dot com", "unchanged (no reformatting)"),
 ]
 
 
@@ -64,13 +75,16 @@ def api_key():
 
 
 def rewrite(conn, key, utterance):
-    body = json.dumps({
+    req = {
         "model": MODEL,
         "instructions": PROMPT,
         "input": utterance,
         "reasoning": {"effort": "none"},
         "max_output_tokens": 1000,
-    })
+    }
+    if os.environ.get("TEMPERATURE"):  # probe: gpt-5 family may reject this
+        req["temperature"] = float(os.environ["TEMPERATURE"])
+    body = json.dumps(req)
     t0 = time.monotonic()
     conn.request("POST", "/v1/responses", body=body, headers={
         "Authorization": f"Bearer {key}",

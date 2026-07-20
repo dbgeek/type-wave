@@ -1,0 +1,138 @@
+model=gpt-5.4-mini  reasoning=none  cases=27
+
+[correction-time]     981 ms
+  in:   Book a meeting at 20:00 no 18:00
+  out:  Book a meeting at 18:00
+  hope: Book a meeting at 18:00
+
+[correction-name]     906 ms
+  in:   today I saw person Johan... no his name was Kalle
+  out:  Today I saw person Kalle.
+  hope: Today I saw person Kalle
+
+[correction-imean]    4525 ms
+  in:   send the report to Anna I mean to Erik
+  out:  Send the report to Erik
+  hope: Send the report to Erik
+
+[correction-number]     599 ms
+  in:   the budget is 40 no wait 45 thousand
+  out:  The budget is 45 thousand
+  hope: The budget is 45 thousand
+
+[fillers-en]     726 ms
+  in:   um so I think we should uh probably start with the mmm backend
+  out:  So I think we should probably start with the backend
+  hope: So I think we should probably start with the backend
+
+[fillers-aaaa]    1028 ms
+  in:   aaaa write a summary of the meeting
+  out:  Write a summary of the meeting
+  hope: Write a summary of the meeting
+
+[handsoff-no-answer]     682 ms
+  in:   no I don't think so
+  out:  No I don't think so
+  hope: unchanged
+
+[handsoff-no-quantifier]     747 ms
+  in:   there are no meetings tomorrow
+  out:  There are no meetings tomorrow
+  hope: unchanged
+
+[handsoff-final-no]     962 ms
+  in:   the answer is no
+  out:  The answer is no
+  hope: unchanged
+
+[handsoff-clean]     707 ms
+  in:   This sentence is already clean.
+  out:  This sentence is already clean.
+  hope: unchanged
+
+[edge-not-emphasis]     892 ms
+  in:   call me at 08:15 not 08:50
+  out:  Call me at 08:15 not 08:50
+  hope: keep 08:15 (emphasis, not a self-correction)
+
+[numbers]     611 ms
+  in:   add 20 plus 30 no 35
+  out:  Add 20 plus 35
+  hope: Add 20 plus 35
+
+[names-scope]     746 ms
+  in:   Johan and Kalle are coming no just Kalle
+  out:  Just Kalle is coming
+  hope: Just Kalle is coming (scope of 'no' is fuzzy)
+
+[sv-correction]     707 ms
+  in:   boka ett möte klockan åtta nej nio
+  out:  Boka ett möte klockan nio
+  hope: Boka ett möte klockan nio
+
+[sv-correction-name]     803 ms
+  in:   skicka mailet till Johan eh nej till Kalle
+  out:  Skicka mailet till Kalle
+  hope: Skicka mailet till Kalle
+
+[sv-handsoff-nej]     675 ms
+  in:   nej det tycker jag inte
+  out:  Nej det tycker jag inte
+  hope: unchanged
+
+[mixed-sv-en]     989 ms
+  in:   vi kör en quick sync imorgon um typ klockan tio
+  out:  Vi kör en quick sync imorgon typ klockan tio
+  hope: Vi kör en quick sync imorgon typ klockan tio
+
+[scope-count]     894 ms
+  in:   we need three laptops no two
+  out:  We need two laptops
+  hope: We need two laptops
+
+[scope-sv-list]     807 ms
+  in:   ta med kaffe och bullar nej bara kaffe
+  out:  Ta med bara kaffe
+  hope: Ta med bara kaffe
+
+[multi-correction]     909 ms
+  in:   meet at 9 no 10 in room 4 no room 5
+  out:  Meet at 10 in room 5
+  hope: Meet at 10 in room 5
+
+[multi-sentence]     625 ms
+  in:   Send the invoice today. um Actually no send it tomorrow morning.
+  out:  Send the invoice tomorrow morning.
+  hope: Send the invoice tomorrow morning.
+
+[decimal]    1448 ms
+  in:   the dose is 3.5 no 3.7 milligrams
+  out:  The dose is 3.7 milligrams
+  hope: The dose is 3.7 milligrams
+
+[sv-date]    1944 ms
+  in:   vi ses på fredag nej lördag
+  out:  Vi ses på lördag
+  hope: Vi ses på lördag
+
+[sv-eller-nej]     650 ms
+  in:   vi tar tisdag eller nej onsdag
+  out:  Vi tar onsdag
+  hope: Vi tar onsdag
+
+[handsoff-or-question]     653 ms
+  in:   should we do Tuesday or Wednesday
+  out:  Should we do Tuesday or Wednesday
+  hope: unchanged (a question to keep, not answer)
+
+[handsoff-inte-utan]     773 ms
+  in:   inte imorgon utan på torsdag
+  out:  Inte imorgon utan på torsdag
+  hope: unchanged (deliberate contrast)
+
+[handsoff-spelled-email]     710 ms
+  in:   my email is johan at example dot com
+  out:  My email is johan at example dot com
+  hope: unchanged (no reformatting)
+
+latency ms — first(cold): 981  warm p50: 760  warm max: 4525
