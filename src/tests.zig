@@ -18,6 +18,8 @@ test {
     _ = @import("hud.zig");
     _ = @import("insert.zig"); // ensureTrailingSpace (the Insertion separator)
     _ = @import("insertion_adapter.zig");
+    _ = @import("rewrite_adapter.zig"); // the Backtrack Rewrite seam (docs/backtrack-spec.md)
+    _ = @import("openai_rewrite.zig"); // the locked Responses call: request build + output extraction
     _ = @import("readiness.zig");
     _ = @import("configuration_phase.zig");
     _ = @import("grant_sequence.zig"); // the serialized cold-start TCC request sequence (#130)

@@ -12,8 +12,8 @@
 //! # Shape
 //!
 //!   - **Outbound seams are comptime-generic deps.** `Coordinator(Deps)` calls
-//!     `deps.audio` / `deps.transcription` / `deps.insertion` / `deps.deadline` /
-//!     `deps.feedback` by duck-typed method name. Real adapters in daemon.zig / surface.zig;
+//!     `deps.audio` / `deps.transcription` / `deps.rewrite` / `deps.insertion` /
+//!     `deps.deadline` / `deps.feedback` by duck-typed method name. Real adapters in daemon.zig / surface.zig;
 //!     fakes in the tests. No vtables, no @ptrCast — a shape mismatch is a compile error.
 //!   - **Inbound events arrive via `handle(event)`**, serialized on one `os_unfair_lock`.
 //!     The tap (press/release), the always-on Transcription observer (partial/final), the
@@ -23,11 +23,16 @@
 //!
 //! # Phases (ADR-0001: fully serialized)
 //!
-//!   idle → capturing → awaiting_final → inserting → idle
+//!   idle → capturing → awaiting_final → [rewriting →] inserting → idle
 //!
 //!   `.inserting` is blocking: one Utterance resolves fully (paste included) before the
 //!   next hold is accepted. This is what lets `hideIfFinal` collapse to `hide()` — nothing
 //!   can repaint the pill mid-Insertion. See ADR-0001 for the traded-away #19 overlap.
+//!
+//!   `.rewriting` (docs/backtrack-spec.md) sits between `awaiting_final` and `inserting`
+//!   and is entered only when the Lease pinned Backtrack on AND the OpenAI backend at
+//!   press. It is just as blocking as `.inserting` — Talk Key presses are rejected — and
+//!   the green processing HUD spans it unchanged (released → resolution, no new state).
 
 const std = @import("std");
 const feedback = @import("feedback.zig");
@@ -37,6 +42,12 @@ pub const UtteranceId = backend.UtteranceId;
 
 /// Outcome the insert worker reports back as the `.inserted` event.
 pub const InsertResult = enum { ok, failed };
+
+/// Outcome the Rewrite worker reports back as the `.rewritten` event
+/// (docs/backtrack-spec.md). `.failed` means the OpenAI call did not yield a usable
+/// rewrite — the event then carries the raw Final Transcript so dictation never
+/// breaks; the distinction feeds the degraded-insertion surface (spec §UX 4).
+pub const RewriteResult = enum { ok, failed };
 
 /// Everything that can happen *to* an Utterance, from whichever thread observed it.
 /// The `final` slice borrows the Transcription Session's accumulator and is valid only
@@ -51,10 +62,14 @@ pub const Event = union(enum) {
     backend_failed: UtteranceId,
     cooperative_cancel: UtteranceId,
     deadline: UtteranceId,
+    /// Reverse edge from the Rewrite worker (docs/backtrack-spec.md). Like `final`,
+    /// the `text` slice borrows the worker's buffer and is valid only for the
+    /// duration of the `handle` call — the insertion seam copies synchronously.
+    rewritten: struct { id: UtteranceId, text: []const u8, result: RewriteResult },
     inserted: struct { id: UtteranceId, result: InsertResult },
 };
 
-const Phase = enum { idle, capturing, awaiting_final, inserting };
+const Phase = enum { idle, capturing, awaiting_final, rewriting, inserting };
 
 /// A single fast, self-contained mutex (os_unfair_lock — same choice as hud.zig, since
 /// std.Thread.Mutex is gone on this Zig nightly and std.Io.Mutex needs an Io the pure
@@ -98,6 +113,7 @@ pub fn Coordinator(comptime Deps: type) type {
                 .backend_failed => |id| self.onBackendFailed(id),
                 .cooperative_cancel => |id| self.onCooperativeCancel(id),
                 .deadline => |id| self.onDeadline(id),
+                .rewritten => |e| self.onRewritten(e.id, e.text, e.result),
                 .inserted => |e| self.onInserted(e.id, e.result),
             }
         }
@@ -186,8 +202,28 @@ pub fn Coordinator(comptime Deps: type) type {
             }
             // No feedback edge here: the processing dots have been up since `released`
             // and hold until `.inserted` resolves (wayfinder #26/#27).
+            //
+            // Backtrack (docs/backtrack-spec.md): when the Lease pinned it on with the
+            // OpenAI backend at press, the Final Transcript detours through the Rewrite
+            // seam; the `.rewritten` reverse edge then reaches the insertion seam. The
+            // processing dots span the extra wait unchanged.
+            if (self.active.?.backend == .openai and self.active.?.backtrack) {
+                self.deps.rewrite.submit(id, text); // copies text; worker rewrites, then .rewritten
+                self.phase = .rewriting; // blocking, exactly like .inserting (ADR-0001)
+                return;
+            }
             self.deps.insertion.submit(id, text); // copies text; worker inserts, then .inserted
             self.phase = .inserting; // blocking: next hold waits (ADR-0001)
+        }
+
+        fn onRewritten(self: *Self, id: UtteranceId, text: []const u8, r: RewriteResult) void {
+            if (!self.matches(id, .rewriting)) return;
+            // `.failed` already carries the raw Final Transcript (the worker's fallback):
+            // dictation never breaks; the worker logged the downgrade. The degraded
+            // surface cue is the follow-on ticket (spec §UX 4).
+            _ = r;
+            self.deps.insertion.submit(id, text); // copies text; worker inserts, then .inserted
+            self.phase = .inserting;
         }
 
         fn onDeadline(self: *Self, id: UtteranceId) void {
@@ -220,7 +256,9 @@ pub fn Coordinator(comptime Deps: type) type {
                     feedback.log("  part of that was lost — the whole Utterance was discarded; hold the Talk Key and say it again\n", .{});
                     self.abandon();
                 },
-                .idle, .inserting => {},
+                // .rewriting: the Transcription Backend already delivered its Final
+                // Transcript; a late backend failure cannot invalidate the rewrite.
+                .idle, .rewriting, .inserting => {},
             }
         }
 
@@ -281,6 +319,7 @@ const FakeBackends = struct {
     begin_result: anyerror!void = {},
     release_result: anyerror!void = {},
     backend_kind: backend.Backend = .openai,
+    backtrack: bool = false,
     language: []const u8 = "en",
     policy: backend.DeadlinePolicy = backend.openai_deadline,
     began: usize = 0,
@@ -307,6 +346,7 @@ const FakeBackends = struct {
             .backend = self.backend_kind,
             .language = self.language,
             .deadline = self.policy,
+            .backtrack = self.backtrack,
             .ctx = self,
             .commands = &commands,
         };
@@ -363,6 +403,22 @@ const FakeInsertion = struct {
     }
 };
 
+const FakeRewrite = struct {
+    submits: usize = 0,
+    last_id: UtteranceId = 0,
+    last: [256]u8 = undefined,
+    last_len: usize = 0,
+    fn submit(self: *FakeRewrite, id: UtteranceId, text: []const u8) void {
+        self.submits += 1;
+        self.last_id = id;
+        @memcpy(self.last[0..text.len], text);
+        self.last_len = text.len;
+    }
+    fn lastText(self: *FakeRewrite) []const u8 {
+        return self.last[0..self.last_len];
+    }
+};
+
 const FakeDeadline = struct {
     arms: usize = 0,
     cancels: usize = 0,
@@ -401,6 +457,7 @@ const FakeFeedback = struct {
 const TestDeps = struct {
     audio: *FakeAudio,
     backends: *FakeBackends,
+    rewrite: *FakeRewrite,
     insertion: *FakeInsertion,
     deadline: *FakeDeadline,
     feedback: *FakeFeedback,
@@ -409,6 +466,7 @@ const TestDeps = struct {
 const Harness = struct {
     audio: FakeAudio = .{},
     backends: FakeBackends = .{},
+    rewrite: FakeRewrite = .{},
     insertion: FakeInsertion = .{},
     deadline: FakeDeadline = .{},
     feedback: FakeFeedback = .{},
@@ -418,6 +476,7 @@ const Harness = struct {
         self.co = Coordinator(TestDeps).init(.{
             .audio = &self.audio,
             .backends = &self.backends,
+            .rewrite = &self.rewrite,
             .insertion = &self.insertion,
             .deadline = &self.deadline,
             .feedback = &self.feedback,
@@ -727,4 +786,140 @@ test "16 begin and release failures abandon without leaving the Coordinator busy
     h.backends.release_result = {};
     co.handle(.press);
     try expectEqual(@as(usize, 3), h.backends.began);
+}
+
+// ---- Backtrack: the Rewrite seam (docs/backtrack-spec.md) -----------------------
+
+test "17 backtrack happy path: final detours through the Rewrite seam, the rewrite inserts" {
+    var h = Harness{};
+    h.backends.backtrack = true; // pinned .openai + Backtrack on at press
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "at 20:00 no 18:00" } });
+    try expectEqual(@as(usize, 1), h.rewrite.submits);
+    try expectEqualStrings("at 20:00 no 18:00", h.rewrite.lastText());
+    try expectEqual(@as(usize, 0), h.insertion.submits); // not inserted yet
+    try expect(h.deadline.cancels == 1); // release deadline resolved by the final
+
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "At 18:00", .result = .ok } });
+    try expectEqual(@as(usize, 1), h.insertion.submits);
+    try expectEqualStrings("At 18:00", h.insertion.lastText());
+
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
+    try expect(h.feedback.inserteds == 1);
+    try expectEqual(@as(usize, 1), h.backends.resolved);
+    co.handle(.press); // fully resolved — next hold accepted
+    try expect(h.backends.began == 2);
+}
+
+test "18 backtrack off, or the local backend, inserts the raw final unchanged" {
+    var off = Harness{};
+    const co_off = off.wire(); // .openai but backtrack off
+    co_off.handle(.press);
+    co_off.handle(.release);
+    co_off.handle(.{ .final = .{ .id = 1, .text = "raw" } });
+    try expectEqual(@as(usize, 0), off.rewrite.submits);
+    try expectEqual(@as(usize, 1), off.insertion.submits);
+
+    var local = Harness{};
+    local.backends.backend_kind = .local;
+    local.backends.backtrack = true; // enabled, but Backtrack never applies on local
+    const co_local = local.wire();
+    co_local.handle(.press);
+    co_local.handle(.release);
+    co_local.handle(.{ .final = .{ .id = 1, .text = "stays raw" } });
+    try expectEqual(@as(usize, 0), local.rewrite.submits);
+    try expectEqual(@as(usize, 1), local.insertion.submits);
+    try expectEqualStrings("stays raw", local.insertion.lastText());
+}
+
+test "19 enablement is pinned at press: a mid-Utterance flip does not change the in-flight Utterance" {
+    var h = Harness{};
+    h.backends.backtrack = true;
+    const co = h.wire();
+    co.handle(.press); // Lease pins backtrack=true
+    h.backends.backtrack = false; // settings flip mid-Utterance
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "still rewrites" } });
+    try expectEqual(@as(usize, 1), h.rewrite.submits);
+
+    // And the mirror image: off at press stays off even if enabled mid-flight.
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "x", .result = .ok } });
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
+    co.handle(.press); // Lease pins backtrack=false
+    h.backends.backtrack = true;
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 2, .text = "raw path" } });
+    try expectEqual(@as(usize, 1), h.rewrite.submits); // unchanged
+    try expectEqual(@as(usize, 2), h.insertion.submits);
+}
+
+test "20 press during .rewriting is dropped (ADR-0001)" {
+    var h = Harness{};
+    h.backends.backtrack = true;
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "text" } }); // → rewriting
+    co.handle(.press); // must be dropped — one Utterance resolves fully first
+    try expect(h.backends.began == 1);
+    try expect(h.audio.started == 1);
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "text", .result = .ok } });
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
+    co.handle(.press);
+    try expect(h.backends.began == 2);
+}
+
+test "21 failed rewrite inserts the carried raw Final Transcript" {
+    var h = Harness{};
+    h.backends.backtrack = true;
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "um the raw one" } });
+    // The worker's fallback: .failed carries the raw text back for insertion.
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "um the raw one", .result = .failed } });
+    try expectEqual(@as(usize, 1), h.insertion.submits);
+    try expectEqualStrings("um the raw one", h.insertion.lastText());
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
+    try expect(h.feedback.inserteds == 1);
+}
+
+test "22 stale mismatched or phase-invalid rewritten events cannot advance an Utterance" {
+    var h = Harness{};
+    h.backends.backtrack = true;
+    const co = h.wire();
+    // no Utterance in flight
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "ghost", .result = .ok } });
+    try expectEqual(@as(usize, 0), h.insertion.submits);
+
+    co.handle(.press);
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "early", .result = .ok } }); // while capturing
+    co.handle(.release);
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "before final", .result = .ok } }); // awaiting_final
+    try expectEqual(@as(usize, 0), h.insertion.submits);
+
+    co.handle(.{ .final = .{ .id = 1, .text = "raw" } }); // → rewriting
+    co.handle(.{ .rewritten = .{ .id = 99, .text = "wrong Utterance", .result = .ok } });
+    try expectEqual(@as(usize, 0), h.insertion.submits);
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "right", .result = .ok } });
+    try expectEqual(@as(usize, 1), h.insertion.submits);
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "duplicate", .result = .ok } }); // now .inserting
+    try expectEqual(@as(usize, 1), h.insertion.submits);
+    try expectEqualStrings("right", h.insertion.lastText());
+}
+
+test "23 backend failure during .rewriting is ignored (final already delivered)" {
+    var h = Harness{};
+    h.backends.backtrack = true;
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "text" } }); // → rewriting
+    co.handle(.{ .backend_failed = 1 });
+    try expectEqual(@as(usize, 0), h.backends.cancelled);
+    try expectEqual(@as(usize, 0), h.feedback.abandoneds);
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "text", .result = .ok } });
+    try expectEqual(@as(usize, 1), h.insertion.submits);
 }

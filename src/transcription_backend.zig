@@ -72,6 +72,11 @@ pub const Lease = struct {
     backend: Backend,
     language: Language,
     deadline: DeadlinePolicy,
+    /// Backtrack enablement, read from the Settings Snapshot at Talk Key press and
+    /// pinned here by the Backend Router so a mid-Utterance settings flip cannot
+    /// half-apply (docs/backtrack-spec.md). The rewrite fires only when this is set
+    /// AND `backend == .openai`; the backends themselves never read it.
+    backtrack: bool = false,
     ctx: *anyopaque,
     commands: *const Commands,
 

@@ -42,6 +42,9 @@
 //!                        happens here, menu actions included.
 //!   - insert worker    : the InsertionAdapter — drains one insert job, performs the slow
 //!                        Insertion off the Coordinator's mutex, then reports `.inserted`.
+//!   - rewrite worker   : the RewriteAdapter (docs/backtrack-spec.md) — drains one
+//!                        Backtrack rewrite job, makes the OpenAI Responses call off the
+//!                        Coordinator's mutex, then reports `.rewritten`.
 //!   - deadline timer   : the DeadlineAdapter — fires `.deadline` if a Final Transcript does
 //!                        not arrive within the release-anchored window.
 //!   - supervisor       : the self-heal loop (config phase above).
@@ -66,6 +69,8 @@ const menu_mod = @import("menu.zig");
 const appkit = @import("appkit.zig");
 const keychain = @import("keychain.zig");
 const insertion_adapter = @import("insertion_adapter.zig");
+const rewrite_adapter = @import("rewrite_adapter.zig");
+const openai_rewrite = @import("openai_rewrite.zig");
 const readiness = @import("readiness.zig");
 const configuration_phase = @import("configuration_phase.zig");
 const grant_sequence = @import("grant_sequence.zig");
@@ -282,6 +287,12 @@ const DaemonDeps = struct {
         return self.daemon.store.current().language;
     }
 
+    /// Stamped onto every new Lease at acquire, so Backtrack enablement is pinned at
+    /// Talk Key press (docs/backtrack-spec.md) like the backend and language.
+    pub fn backtrack(self: *DaemonDeps) bool {
+        return self.daemon.store.current().backtrack;
+    }
+
     pub fn note(self: *DaemonDeps, event: backend_router.Event) void {
         _ = self;
         switch (event) {
@@ -457,6 +468,37 @@ const RealInsertionDeps = struct {
 };
 const InsertionAdapter = insertion_adapter.InsertionAdapter(RealInsertionDeps);
 
+/// Real dependencies for rewrite_adapter.zig (docs/backtrack-spec.md). The adapter owns
+/// the asynchronous Rewrite policy; daemon.zig supplies the OpenAI mechanism — the
+/// long-lived HTTP client whose connection pool keeps HTTPS warm across Utterances, the
+/// existing OpenAI key loader — the process quit flag, and the reverse edge into the
+/// Coordinator.
+const RealRewriteDeps = struct {
+    daemon: *Daemon,
+
+    co_ctx: *anyopaque = undefined,
+    on_done: *const fn (*anyopaque, coord.UtteranceId, []const u8, coord.RewriteResult) void = undefined,
+
+    pub fn rewrite(self: *RealRewriteDeps, raw: []const u8, out: []u8) anyerror![]const u8 {
+        const d = self.daemon;
+        // Freshly loaded per rewrite, like the supervisor's poll — env override first,
+        // then the keychain item. Freed after the call; only Sessions retain a key.
+        const key = config.loadApiKeyOnly(d.io, d.alloc) orelse return error.RewriteKeyMissing;
+        defer d.alloc.free(key);
+        return openai_rewrite.rewrite(&d.rewrite_http, d.alloc, key, raw, out);
+    }
+    pub fn complete(self: *RealRewriteDeps, id: coord.UtteranceId, text: []const u8, result: coord.RewriteResult) void {
+        self.on_done(self.co_ctx, id, text, result);
+    }
+    pub fn shouldQuit(_: *RealRewriteDeps) bool {
+        return g_quit.load(.acquire);
+    }
+    pub fn idle(_: *RealRewriteDeps) void {
+        _ = usleep(2_000);
+    }
+};
+const RewriteAdapter = rewrite_adapter.RewriteAdapter(RealRewriteDeps);
+
 /// Deadline seam: a small timer thread. `arm` (Coordinator releasing an Utterance) sets
 /// the backend's cooperative and final fire times; `cancel` (Final Transcript) clears both.
 /// Claimed actions re-enter the Coordinator, whose identity/phase guard rejects stale races.
@@ -497,6 +539,7 @@ const DeadlineAdapter = struct {
 const RealDeps = struct {
     audio: *cap.Capture,
     backends: *BackendRouter,
+    rewrite: *RewriteAdapter,
     insertion: *InsertionAdapter,
     deadline: *DeadlineAdapter,
     feedback: *surface.Surface,
@@ -508,6 +551,10 @@ const Coord = coord.Coordinator(RealDeps);
 fn insertDoneTramp(ctx: *anyopaque, id: coord.UtteranceId, result: coord.InsertResult) void {
     const co: *Coord = @ptrCast(@alignCast(ctx));
     co.handle(.{ .inserted = .{ .id = id, .result = result } });
+}
+fn rewriteDoneTramp(ctx: *anyopaque, id: coord.UtteranceId, text: []const u8, result: coord.RewriteResult) void {
+    const co: *Coord = @ptrCast(@alignCast(ctx));
+    co.handle(.{ .rewritten = .{ .id = id, .text = text, .result = result } });
 }
 fn deadlineFireTramp(ctx: *anyopaque, id: backend.UtteranceId) void {
     const co: *Coord = @ptrCast(@alignCast(ctx));
@@ -547,6 +594,13 @@ const Daemon = struct {
     // ---- the Coordinator's real adapters + the Coordinator itself (wired in run()) ----
     router_deps: DaemonDeps = undefined,
     transcription: BackendRouter = undefined,
+    /// The Backtrack Rewrite worker's HTTP client (docs/backtrack-spec.md): a fresh
+    /// std.http.Client use — the realtime websocket is not reusable for a REST call.
+    /// Its connection pool keeps the HTTPS connection warm across Utterances. Only the
+    /// rewrite worker thread touches it; never deinitialized (process-lifetime, like
+    /// the Session).
+    rewrite_http: std.http.Client = undefined,
+    rewrite: RewriteAdapter = undefined,
     insertion: InsertionAdapter = undefined,
     deadline: DeadlineAdapter = .{},
     feedback_surface: surface.Surface = undefined,
@@ -1016,8 +1070,8 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     first_snapshot.* = config.loadSettingsOnly(io, alloc);
     const settings = first_snapshot.*;
     const selected_backend = settings.transcription_backend;
-    std.debug.print("config: backend={s} talk_key={s} model=\"{s}\" language=\"{s}\" delay=\"{s}\" noise_reduction={s} insertion={s} pre_paste_ms={d} overlay={}\n", .{
-        @tagName(selected_backend), @tagName(settings.talk_key), settings.model, settings.language, settings.delay, @tagName(settings.noise_reduction), @tagName(settings.insertion), settings.pre_paste_ms, settings.overlay,
+    std.debug.print("config: backend={s} talk_key={s} model=\"{s}\" language=\"{s}\" delay=\"{s}\" noise_reduction={s} insertion={s} pre_paste_ms={d} overlay={} backtrack={}\n", .{
+        @tagName(selected_backend), @tagName(settings.talk_key), settings.model, settings.language, settings.delay, @tagName(settings.noise_reduction), @tagName(settings.insertion), settings.pre_paste_ms, settings.overlay, settings.backtrack,
     });
 
     var daemon = Daemon{
@@ -1060,10 +1114,13 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     // ---- wire the real adapters, then the Coordinator that drives them ----
     daemon.feedback_surface = .{ .cues = &daemon.cues, .hud = &daemon.hud };
     daemon.deadline.io = io;
+    daemon.rewrite_http = .{ .allocator = alloc, .io = io };
+    daemon.rewrite = RewriteAdapter.init(.{ .daemon = &daemon });
     daemon.insertion = InsertionAdapter.init(.{ .inserter = &daemon.inserter, .store = &daemon.store });
     daemon.coordinator = Coord.init(.{
         .audio = &daemon.capture,
         .backends = &daemon.transcription,
+        .rewrite = &daemon.rewrite,
         .insertion = &daemon.insertion,
         .deadline = &daemon.deadline,
         .feedback = &daemon.feedback_surface,
@@ -1071,6 +1128,8 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     // Reverse edges: the worker/timer threads re-enter the now-constructed Coordinator.
     daemon.insertion.deps.co_ctx = &daemon.coordinator;
     daemon.insertion.deps.on_done = insertDoneTramp;
+    daemon.rewrite.deps.co_ctx = &daemon.coordinator;
+    daemon.rewrite.deps.on_done = rewriteDoneTramp;
     daemon.deadline.co_ctx = &daemon.coordinator;
     daemon.deadline.on_cooperative_cancel = cooperativeCancelTramp;
     daemon.deadline.on_fire = deadlineFireTramp;
@@ -1122,6 +1181,8 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     // ---- threads ----
     const worker = try std.Thread.spawn(.{}, InsertionAdapter.workerLoop, .{&daemon.insertion});
     worker.detach();
+    const rewrite_worker = try std.Thread.spawn(.{}, RewriteAdapter.workerLoop, .{&daemon.rewrite});
+    rewrite_worker.detach();
     const timer = try std.Thread.spawn(.{}, DeadlineAdapter.timerLoop, .{&daemon.deadline});
     timer.detach();
     // The supervisor is JOINED at shutdown (below), so it can't race the session teardown.
