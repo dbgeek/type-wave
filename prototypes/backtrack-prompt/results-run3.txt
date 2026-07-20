@@ -1,0 +1,88 @@
+model=gpt-5.4-mini  reasoning=none  cases=17
+
+[correction-time]     870 ms
+  in:   Book a meeting at 20:00 no 18:00
+  out:  Book a meeting at 18:00
+  hope: Book a meeting at 18:00
+
+[correction-name]     675 ms
+  in:   today I saw person Johan... no his name was Kalle
+  out:  Today I saw person Kalle.
+  hope: Today I saw person Kalle
+
+[correction-imean]     899 ms
+  in:   send the report to Anna I mean to Erik
+  out:  Send the report to Erik
+  hope: Send the report to Erik
+
+[correction-number]     781 ms
+  in:   the budget is 40 no wait 45 thousand
+  out:  The budget is 45 thousand
+  hope: The budget is 45 thousand
+
+[fillers-en]     959 ms
+  in:   um so I think we should uh probably start with the mmm backend
+  out:  So I think we should probably start with the backend
+  hope: So I think we should probably start with the backend
+
+[fillers-aaaa]    2749 ms
+  in:   aaaa write a summary of the meeting
+  out:  Write a summary of the meeting
+  hope: Write a summary of the meeting
+
+[handsoff-no-answer]     761 ms
+  in:   no I don't think so
+  out:  No I don't think so
+  hope: unchanged
+
+[handsoff-no-quantifier]     670 ms
+  in:   there are no meetings tomorrow
+  out:  There are no meetings tomorrow
+  hope: unchanged
+
+[handsoff-final-no]     701 ms
+  in:   the answer is no
+  out:  The answer is no
+  hope: unchanged
+
+[handsoff-clean]    2932 ms
+  in:   This sentence is already clean.
+  out:  This sentence is already clean.
+  hope: unchanged
+
+[edge-not-emphasis]     650 ms
+  in:   call me at 08:15 not 08:50
+  out:  Call me at 08:15 not 08:50
+  hope: keep 08:15 (emphasis, not a self-correction)
+
+[numbers]     929 ms
+  in:   add 20 plus 30 no 35
+  out:  Add 20 plus 35
+  hope: Add 20 plus 35
+
+[names-scope]     805 ms
+  in:   Johan and Kalle are coming no just Kalle
+  out:  Johan and Kalle are coming, just Kalle
+  hope: Just Kalle is coming (scope of 'no' is fuzzy)
+
+[sv-correction]     790 ms
+  in:   boka ett möte klockan åtta nej nio
+  out:  Boka ett möte klockan nio
+  hope: Boka ett möte klockan nio
+
+[sv-correction-name]     948 ms
+  in:   skicka mailet till Johan eh nej till Kalle
+  out:  Skicka mailet till Kalle
+  hope: Skicka mailet till Kalle
+
+[sv-handsoff-nej]     676 ms
+  in:   nej det tycker jag inte
+  out:  Nej det tycker jag inte
+  hope: unchanged
+
+[mixed-sv-en]     897 ms
+  in:   vi kör en quick sync imorgon um typ klockan tio
+  out:  Vi kör en quick sync imorgon typ klockan tio
+  hope: Vi kör en quick sync imorgon typ klockan tio
+
+latency ms — first(cold): 870  warm p50: 797  warm max: 2932
