@@ -72,6 +72,19 @@ generation-tagged replacement. It reaches every effect (connect, warm, narrate) 
 a dependency seam it is handed, so it is exercised by scripted events, not hardware.
 _Avoid_: transcription adapter, backend manager
 
+**Local Provisioner**:
+The daemon's one route that warms the local Transcription Backend from its Model
+Installation — behind the Backend Router's local `warm` effect. It owns the load-verify →
+spawn → recovery latch: on a load failure it verifies the Model Installation offline once
+(distinguishing corruption from a runtime load failure), and a verified-load failure then
+latches until a SIGHUP retry. It owns the corruption/runtime-failure decision state and the
+cross-thread failure the Status Item reads, and reaches every effect (resolve, verify,
+spawn, build the adapter, cleanup) through a dependency seam it is handed, so its recovery
+ordering is exercised by scripted verify/load outcomes, not real subprocesses. Lives in
+`src/local_provisioner.zig`; distinct from the Model Operation Runner, which runs
+user-authorized Model Operations rather than warming the runtime.
+_Avoid_: local backend manager, warmer, model runner
+
 **Model Installation**:
 A verified local copy of the pinned model artifact (currently ggml-large-v3-turbo; see `packaging/share/type-wave/PROVENANCE`) that the local Transcription Backend can use offline. Downloaded credential-free; it exists independently of any Model Operation in progress.
 _Avoid_: downloaded model, model cache
