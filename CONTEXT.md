@@ -106,6 +106,19 @@ _Avoid_: local backend manager, warmer, model runner
 A verified local copy of the pinned model artifact (currently ggml-large-v3-turbo; see `packaging/share/type-wave/PROVENANCE`) that the local Transcription Backend can use offline. Downloaded credential-free; it exists independently of any Model Operation in progress.
 _Avoid_: downloaded model, model cache
 
+**Installation Receipt**:
+The verified on-disk identity-and-provenance record of a Model Installation — repository,
+revision, runtime, artifact, size, and sha256 — serialized as `active.receipt` at the models
+root and mirrored byte-for-byte in each installation's `PROVENANCE`. `MODEL_MANIFEST` (the
+bare size/sha256 file) and `partial.meta` (the download-resume record) are sibling
+serializations of the same identity. The Installation Receipt codec (`src/receipt.zig`) is
+the one place that knows those formats: pure, allocation-free `encode`/`parse`/`matches` over
+the shared `key=value` line grammar, exercised directly rather than through a download. It
+holds no I/O and no trust policy — model_store owns every read/write and decides *which*
+trusted Manifest a receipt authenticates against.
+_Avoid_: manifest (that names the trusted pin, not the on-disk record), provenance (that
+names the mirror copy, not the concept)
+
 **Model Operation**:
 A user-authorized acquisition, verification, activation, repair, or removal acting on a Model Installation. An operation may be in progress while the current Model Installation remains usable.
 _Avoid_: download state, model task

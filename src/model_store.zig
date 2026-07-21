@@ -3,6 +3,7 @@
 const std = @import("std");
 const artifact_identity = @import("artifact_identity.zig");
 const installation_identity = @import("installation_identity.zig");
+const receipt = @import("receipt.zig");
 
 const StatFs = extern struct {
     block_size: u32,
@@ -434,8 +435,8 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
                         var receipt_buffer: [1024]u8 = undefined;
                         const active = (try activeReceipt(self.io, self.root, &receipt_buffer)) orelse return error.NoModelInstallation;
                         if (!receiptMatchesManifest(active, self.manifest)) return error.ModelInstallationIdentityMismatch;
-                        const runtime_sha256 = receiptRuntimeDigest(active) orelse return error.ModelInstallationMetadataInvalid;
-                        const parsed = parseActiveReceipt(active) orelse return error.ModelInstallationMetadataInvalid;
+                        const parsed = receipt.Receipt.parse(active) orelse return error.ModelInstallationMetadataInvalid;
+                        const runtime_sha256 = parsed.runtime_sha256;
                         const physical_id = parsed.directory_id orelse self.manifest.installation_id;
                         var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
                         const directory = try std.fmt.bufPrint(&directory_buffer, "{s}/installations/{s}", .{ self.root, physical_id });
@@ -781,6 +782,20 @@ const Partial = struct {
     validator: Validator,
 };
 
+/// The complete on-disk identity of a Manifest — the seam between model_store's `Manifest`
+/// and the Installation Receipt codec's vocabulary.
+fn manifestIdentity(manifest: Manifest) receipt.Identity {
+    return .{
+        .repository = manifest.repository,
+        .revision = manifest.revision,
+        .runtime = manifest.runtime,
+        .artifact = manifest.artifact,
+        .installation_id = manifest.installation_id,
+        .size = manifest.size,
+        .sha256 = manifest.sha256,
+    };
+}
+
 fn loadPartial(io: std.Io, root: []const u8, manifest: Manifest) !?Partial {
     var stage_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const stage = try std.fmt.bufPrint(&stage_buffer, "{s}/staging-{s}", .{ root, manifest.installation_id });
@@ -794,26 +809,14 @@ fn loadPartial(io: std.Io, root: []const u8, manifest: Manifest) !?Partial {
         },
         else => return failure,
     };
-    const offset_text = receiptValue(metadata, "offset=") orelse return discardInvalidPartial(io, stage);
-    const offset = std.fmt.parseInt(u64, offset_text, 10) catch return discardInvalidPartial(io, stage);
-    const expected_digest = std.fmt.bytesToHex(manifest.sha256, .lower);
-    var size_buffer: [32]u8 = undefined;
-    const expected_size = try std.fmt.bufPrint(&size_buffer, "{d}", .{manifest.size});
-    const identity_matches = std.mem.eql(u8, receiptValue(metadata, "schema=") orelse "", "1") and
-        std.mem.eql(u8, receiptValue(metadata, "repository=") orelse "", manifest.repository) and
-        std.mem.eql(u8, receiptValue(metadata, "revision=") orelse "", manifest.revision) and
-        std.mem.eql(u8, receiptValue(metadata, "runtime=") orelse "", manifest.runtime) and
-        std.mem.eql(u8, receiptValue(metadata, "artifact=") orelse "", manifest.artifact) and
-        std.mem.eql(u8, receiptValue(metadata, "installation_id=") orelse "", manifest.installation_id) and
-        std.mem.eql(u8, receiptValue(metadata, "size=") orelse "", expected_size) and
-        std.mem.eql(u8, receiptValue(metadata, "sha256=") orelse "", &expected_digest);
-    const validator = if (receiptValue(metadata, "etag=")) |etag|
+    const parsed = receipt.Partial.parse(metadata) orelse return discardInvalidPartial(io, stage);
+    const validator = if (parsed.etag) |etag|
         Validator.init(.etag, etag) catch return discardInvalidPartial(io, stage)
-    else if (receiptValue(metadata, "last_modified=")) |last_modified|
+    else if (parsed.last_modified) |last_modified|
         Validator.init(.last_modified, last_modified) catch return discardInvalidPartial(io, stage)
     else
         return discardInvalidPartial(io, stage);
-    if (!identity_matches or offset == 0 or offset > manifest.size)
+    if (!parsed.matches(manifestIdentity(manifest)) or parsed.offset == 0 or parsed.offset > manifest.size)
         return discardInvalidPartial(io, stage);
 
     var model_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -821,8 +824,8 @@ fn loadPartial(io: std.Io, root: []const u8, manifest: Manifest) !?Partial {
     var model = std.Io.Dir.cwd().openFile(io, model_path, .{}) catch return discardInvalidPartial(io, stage);
     defer model.close(io);
     const stat = model.stat(io) catch return discardInvalidPartial(io, stage);
-    if (stat.size != offset) return discardInvalidPartial(io, stage);
-    return .{ .offset = offset, .validator = validator };
+    if (stat.size != parsed.offset) return discardInvalidPartial(io, stage);
+    return .{ .offset = parsed.offset, .validator = validator };
 }
 
 fn discardInvalidPartial(io: std.Io, stage: []const u8) !?Partial {
@@ -831,15 +834,15 @@ fn discardInvalidPartial(io: std.Io, stage: []const u8) !?Partial {
 }
 
 fn writePartialMetadata(io: std.Io, stage: []const u8, manifest: Manifest, offset: u64, validator: Validator) !void {
-    const digest = std.fmt.bytesToHex(manifest.sha256, .lower);
     const etag = if (validator.kind == .etag) validator.value() else "";
     const last_modified = if (validator.kind == .last_modified) validator.value() else "";
     var text_buffer: [4096]u8 = undefined;
-    const text = try std.fmt.bufPrint(
-        &text_buffer,
-        "schema=1\nrepository={s}\nrevision={s}\nruntime={s}\nartifact={s}\ninstallation_id={s}\nsize={d}\nsha256={s}\noffset={d}\netag={s}\nlast_modified={s}\n",
-        .{ manifest.repository, manifest.revision, manifest.runtime, manifest.artifact, manifest.installation_id, manifest.size, &digest, offset, etag, last_modified },
-    );
+    const text = try (receipt.PartialWrite{
+        .identity = manifestIdentity(manifest),
+        .offset = offset,
+        .etag = etag,
+        .last_modified = last_modified,
+    }).encode(&text_buffer);
     var tmp_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = try std.fmt.bufPrint(&tmp_path_buffer, "{s}/partial.meta.tmp", .{stage});
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -862,23 +865,14 @@ fn verifyArtifactCancelable(io: std.Io, path: []const u8, manifest: Manifest, ca
     return stat;
 }
 
-fn receipt(manifest: Manifest, runtime_sha256: [32]u8, model_stat: std.Io.File.Stat, buffer: []u8) ![]const u8 {
-    return receiptForDirectory(manifest, null, runtime_sha256, model_stat, buffer);
-}
-
-fn receiptForDirectory(manifest: Manifest, directory_id: ?[]const u8, runtime_sha256: [32]u8, model_stat: std.Io.File.Stat, buffer: []u8) ![]const u8 {
-    const hex = std.fmt.bytesToHex(manifest.sha256, .lower);
-    const runtime_hex = std.fmt.bytesToHex(runtime_sha256, .lower);
-    if (directory_id) |physical| return std.fmt.bufPrint(
-        buffer,
-        "schema=3\nrepository={s}\nrevision={s}\nruntime={s}\nruntime_sha256={s}\nartifact={s}\ninstallation_id={s}\ndirectory_id={s}\nsize={d}\nmodel_mtime_ns={d}\nsha256={s}\ninstalled_by=type-wave-v{s}\n",
-        .{ manifest.repository, manifest.revision, manifest.runtime, &runtime_hex, manifest.artifact, manifest.installation_id, physical, manifest.size, model_stat.mtime.nanoseconds, &hex, manifest.installer_version },
-    );
-    return std.fmt.bufPrint(
-        buffer,
-        "schema=2\nrepository={s}\nrevision={s}\nruntime={s}\nruntime_sha256={s}\nartifact={s}\ninstallation_id={s}\nsize={d}\nmodel_mtime_ns={d}\nsha256={s}\ninstalled_by=type-wave-v{s}\n",
-        .{ manifest.repository, manifest.revision, manifest.runtime, &runtime_hex, manifest.artifact, manifest.installation_id, manifest.size, model_stat.mtime.nanoseconds, &hex, manifest.installer_version },
-    );
+fn provenanceOf(manifest: Manifest, directory_id: ?[]const u8, runtime_sha256: [32]u8, model_stat: std.Io.File.Stat) receipt.Provenance {
+    return .{
+        .identity = manifestIdentity(manifest),
+        .directory_id = directory_id,
+        .runtime_sha256 = runtime_sha256,
+        .mtime_ns = model_stat.mtime.nanoseconds,
+        .installer_version = manifest.installer_version,
+    };
 }
 
 fn writeProvenance(io: std.Io, directory: []const u8, manifest: Manifest, runtime_sha256: [32]u8, model_stat: std.Io.File.Stat) !void {
@@ -887,16 +881,15 @@ fn writeProvenance(io: std.Io, directory: []const u8, manifest: Manifest, runtim
 
 fn writeProvenanceForDirectory(io: std.Io, directory: []const u8, manifest: Manifest, directory_id: ?[]const u8, runtime_sha256: [32]u8, model_stat: std.Io.File.Stat) !void {
     var text_buffer: [1024]u8 = undefined;
-    const text = try receiptForDirectory(manifest, directory_id, runtime_sha256, model_stat, &text_buffer);
+    const text = try provenanceOf(manifest, directory_id, runtime_sha256, model_stat).encode(&text_buffer);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, "{s}/PROVENANCE", .{directory});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text, .flags = .{ .permissions = .fromMode(0o600) } });
 }
 
 fn writeArtifactManifest(io: std.Io, directory: []const u8, manifest: Manifest) !void {
-    const digest = std.fmt.bytesToHex(manifest.sha256, .lower);
     var text_buffer: [256]u8 = undefined;
-    const text = try std.fmt.bufPrint(&text_buffer, "size={d}\nsha256={s}\n", .{ manifest.size, &digest });
+    const text = try artifact_identity.encode(.{ .size = manifest.size, .sha256 = manifest.sha256 }, &text_buffer);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, "{s}/MODEL_MANIFEST", .{directory});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text, .flags = .{ .permissions = .fromMode(0o600) } });
@@ -908,7 +901,7 @@ fn publishReceipt(io: std.Io, root: []const u8, manifest: Manifest, runtime_sha2
 
 fn publishReceiptForDirectory(io: std.Io, root: []const u8, manifest: Manifest, directory_id: ?[]const u8, runtime_sha256: [32]u8, model_stat: std.Io.File.Stat) !void {
     var text_buffer: [1024]u8 = undefined;
-    const text = try receiptForDirectory(manifest, directory_id, runtime_sha256, model_stat, &text_buffer);
+    const text = try provenanceOf(manifest, directory_id, runtime_sha256, model_stat).encode(&text_buffer);
     var tmp_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const tmp = try std.fmt.bufPrint(&tmp_buffer, "{s}/active.receipt.tmp", .{root});
     var active_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -934,75 +927,9 @@ pub fn activeInstallationPresent(io: std.Io, root: []const u8, manifest: Manifes
     return receiptMatchesManifest(actual, manifest);
 }
 
-fn safePathComponent(value: []const u8) bool {
-    return value.len > 0 and
-        !std.mem.eql(u8, value, ".") and
-        !std.mem.eql(u8, value, "..") and
-        std.mem.indexOfAny(u8, value, "/\\") == null;
-}
-
-const ReceiptSchema = enum { legacy, immutable, generation };
-
-const ParsedReceipt = struct {
-    schema: ReceiptSchema,
-    artifact: []const u8,
-    installation_id: ?[]const u8,
-    directory_id: ?[]const u8,
-    identity: ArtifactIdentity,
-    mtime_ns: i96,
-};
-
-fn parseActiveReceipt(actual: []const u8) ?ParsedReceipt {
-    const schema_text = receiptValue(actual, "schema=") orelse return null;
-    const artifact = receiptValue(actual, "artifact=") orelse return null;
-    if (!safePathComponent(artifact)) return null;
-    const identity = receiptArtifact(actual) orelse return null;
-    const mtime_ns = std.fmt.parseInt(i96, receiptValue(actual, "model_mtime_ns=") orelse return null, 10) catch return null;
-    if (receiptRuntimeDigest(actual) == null) return null;
-    if (std.mem.eql(u8, schema_text, "1")) return .{
-        .schema = .legacy,
-        .artifact = artifact,
-        .installation_id = null,
-        .directory_id = null,
-        .identity = identity,
-        .mtime_ns = mtime_ns,
-    };
-    const installation_id = receiptValue(actual, "installation_id=") orelse return null;
-    if (!safePathComponent(installation_id)) return null;
-    if (std.mem.eql(u8, schema_text, "2")) return .{
-        .schema = .immutable,
-        .artifact = artifact,
-        .installation_id = installation_id,
-        .directory_id = installation_id,
-        .identity = identity,
-        .mtime_ns = mtime_ns,
-    };
-    if (!std.mem.eql(u8, schema_text, "3")) return null;
-    const directory_id = receiptValue(actual, "directory_id=") orelse return null;
-    if (!safePathComponent(directory_id)) return null;
-    return .{
-        .schema = .generation,
-        .artifact = artifact,
-        .installation_id = installation_id,
-        .directory_id = directory_id,
-        .identity = identity,
-        .mtime_ns = mtime_ns,
-    };
-}
-
 fn receiptMatchesManifest(actual: []const u8, manifest: Manifest) bool {
-    var size_buffer: [32]u8 = undefined;
-    const expected_size = std.fmt.bufPrint(&size_buffer, "{d}", .{manifest.size}) catch return false;
-    const expected_digest = std.fmt.bytesToHex(manifest.sha256, .lower);
-    const parsed = parseActiveReceipt(actual) orelse return false;
-    const installation_matches = parsed.schema == .legacy or std.mem.eql(u8, parsed.installation_id.?, manifest.installation_id);
-    return installation_matches and
-        std.mem.eql(u8, receiptValue(actual, "repository=") orelse return false, manifest.repository) and
-        std.mem.eql(u8, receiptValue(actual, "revision=") orelse return false, manifest.revision) and
-        std.mem.eql(u8, receiptValue(actual, "runtime=") orelse return false, manifest.runtime) and
-        std.mem.eql(u8, receiptValue(actual, "artifact=") orelse return false, manifest.artifact) and
-        std.mem.eql(u8, receiptValue(actual, "size=") orelse return false, expected_size) and
-        std.mem.eql(u8, receiptValue(actual, "sha256=") orelse return false, &expected_digest);
+    const parsed = receipt.Receipt.parse(actual) orelse return false;
+    return parsed.matches(manifestIdentity(manifest));
 }
 
 fn trustedManifest(actual: []const u8, expected: Manifest, additional: ?[]const Manifest) ?Manifest {
@@ -1048,7 +975,7 @@ fn verifyActiveInstallationUnlocked(
 ) !InstallationIntegrity {
     var receipt_buffer: [1024]u8 = undefined;
     const actual = (try activeReceipt(io, root, &receipt_buffer)) orelse return .absent;
-    const parsed = parseActiveReceipt(actual) orelse return .{ .corrupt = .invalid_receipt };
+    const parsed = receipt.Receipt.parse(actual) orelse return .{ .corrupt = .invalid_receipt };
 
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     if (trustedManifest(actual, expected, additional_trusted) == null) return .{ .corrupt = .identity_mismatch };
@@ -1084,35 +1011,13 @@ fn verifyActiveInstallationUnlocked(
         else => return failure,
     };
     var expected_manifest_buffer: [256]u8 = undefined;
-    const expected_manifest = try std.fmt.bufPrint(
-        &expected_manifest_buffer,
-        "size={d}\nsha256={s}\n",
-        .{ parsed.identity.size, &std.fmt.bytesToHex(parsed.identity.sha256, .lower) },
-    );
+    const expected_manifest = try artifact_identity.encode(parsed.identity, &expected_manifest_buffer);
     if (!std.mem.eql(u8, installed_manifest, expected_manifest)) return .{ .corrupt = .manifest_mismatch };
     return .{ .usable = parsed.identity };
 }
 
 fn receiptArtifact(actual: []const u8) ?ArtifactIdentity {
     return artifact_identity.parse(actual) catch null;
-}
-
-fn receiptRuntimeDigest(receipt_text: []const u8) ?[32]u8 {
-    const encoded = receiptValue(receipt_text, "runtime_sha256=") orelse return null;
-    if (encoded.len != 64) return null;
-    var digest: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&digest, encoded) catch return null;
-    return digest;
-}
-
-fn receiptValue(receipt_text: []const u8, prefix: []const u8) ?[]const u8 {
-    var lines = std.mem.splitScalar(u8, receipt_text, '\n');
-    while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, prefix)) continue;
-        const value = line[prefix.len..];
-        return if (value.len == 0) null else value;
-    }
-    return null;
 }
 
 pub fn sha256File(io: std.Io, path: []const u8) ![32]u8 {
@@ -1154,7 +1059,7 @@ pub fn rootPath(home: []const u8, buffer: []u8) ![]const u8 {
 pub fn activeModelPath(io: std.Io, root: []const u8, buffer: []u8) !?[]const u8 {
     var receipt_buffer: [1024]u8 = undefined;
     const actual = (try activeReceipt(io, root, &receipt_buffer)) orelse return null;
-    const parsed = parseActiveReceipt(actual) orelse return null;
+    const parsed = receipt.Receipt.parse(actual) orelse return null;
     if (parsed.directory_id) |directory_id|
         return validateReceiptPath(io, root, actual, directory_id, parsed.artifact, parsed.identity.size, parsed.mtime_ns, buffer);
 
@@ -1167,7 +1072,7 @@ pub fn activeModelPath(io: std.Io, root: []const u8, buffer: []u8) !?[]const u8 
     defer installations.close(io);
     var entries = installations.iterate();
     while (try entries.next(io)) |entry| {
-        if (entry.kind != .directory or !safePathComponent(entry.name)) continue;
+        if (entry.kind != .directory or !receipt.safePathComponent(entry.name)) continue;
         if (try validateReceiptPath(io, root, actual, entry.name, parsed.artifact, parsed.identity.size, parsed.mtime_ns, buffer)) |path| return path;
     }
     return null;
@@ -1225,17 +1130,17 @@ pub fn activeInstallationIdentity(io: std.Io, root: []const u8) !?InstallationId
     if ((try activeModelPath(io, root, &path_buffer)) == null) return null;
     var receipt_buffer: [1024]u8 = undefined;
     const actual = (try activeReceipt(io, root, &receipt_buffer)) orelse return null;
-    const parsed = parseActiveReceipt(actual) orelse return null;
+    const parsed = receipt.Receipt.parse(actual) orelse return null;
     return .{
-        .repository = installation_identity.Text.init(receiptValue(actual, "repository=") orelse return null) catch return null,
-        .revision = installation_identity.Text.init(receiptValue(actual, "revision=") orelse return null) catch return null,
-        .runtime = installation_identity.Text.init(receiptValue(actual, "runtime=") orelse return null) catch return null,
-        .runtime_sha256 = receiptRuntimeDigest(actual) orelse return null,
+        .repository = installation_identity.Text.init(parsed.repository orelse return null) catch return null,
+        .revision = installation_identity.Text.init(parsed.revision orelse return null) catch return null,
+        .runtime = installation_identity.Text.init(parsed.runtime orelse return null) catch return null,
+        .runtime_sha256 = parsed.runtime_sha256,
         .artifact = installation_identity.Text.init(parsed.artifact) catch return null,
         .installation_id = if (parsed.installation_id) |value| installation_identity.Text.init(value) catch return null else null,
         .artifact_size = parsed.identity.size,
         .artifact_sha256 = parsed.identity.sha256,
-        .installed_by = installation_identity.Text.init(receiptValue(actual, "installed_by=") orelse return null) catch return null,
+        .installed_by = installation_identity.Text.init(parsed.installed_by orelse return null) catch return null,
     };
 }
 

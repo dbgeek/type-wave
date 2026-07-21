@@ -7,6 +7,11 @@ pub const Identity = struct {
     sha256: [32]u8,
 };
 
+/// Serialize the size/digest identity — the whole of a `MODEL_MANIFEST` file.
+pub fn encode(self: Identity, buffer: []u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "size={d}\nsha256={s}\n", .{ self.size, &std.fmt.bytesToHex(self.sha256, .lower) });
+}
+
 pub fn parse(text: []const u8) !Identity {
     const size = try std.fmt.parseInt(u64, lineValue(text, "size=") orelse return error.InvalidArtifactIdentity, 10);
     const encoded = lineValue(text, "sha256=") orelse return error.InvalidArtifactIdentity;
