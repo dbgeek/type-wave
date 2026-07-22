@@ -226,6 +226,80 @@ fn sleepMs(ms: i64) void {
 /// daemon can word the two states differently; both mean "not ready, buffer locally".
 pub const State = enum(u8) { connecting, ready, reconnecting, closed };
 
+// ---- the maintenance decider: pure per-tick keepalive + reconnect policy ------------
+
+/// Why the maintenance loop cycles the link — carried on the decision so the operator log
+/// stays specific after the policy moved behind the seam. A `.reconnect` with no reason
+/// resumes a drop the read loop already logged (the `.reconnecting`-state case), so no
+/// second line prints.
+const ReconnectReason = enum { params_changed, link_dropped, approaching_cap, no_pong };
+
+/// One coherent snapshot the maintenance thread gathers per tick.
+const MaintenanceFacts = struct {
+    state: State,
+    streaming: bool,
+    now: i64,
+    expires_at_ms: i64,
+    awaiting_pong: bool,
+    last_ping_ms: i64,
+    last_pong_ms: i64,
+    read_ended: bool,
+    params_dirty: bool,
+};
+
+const MaintenanceAction = union(enum) {
+    idle,
+    ping,
+    reconnect: ?ReconnectReason,
+};
+
+const MaintenanceDecision = struct {
+    action: MaintenanceAction,
+    /// The `awaiting_pong` probe flag after this tick (a healthy pong clears it).
+    awaiting_pong: bool,
+};
+
+fn reconnectMessage(reason: ReconnectReason) []const u8 {
+    return switch (reason) {
+        .params_changed => "session: transcription settings changed — cycling the session",
+        .link_dropped => "session: link dropped (read loop ended) — reconnecting",
+        .approaching_cap => "session: approaching the 60-min cap — cycling the session",
+        .no_pong => "session: no pong within the timeout — reconnecting",
+    };
+}
+
+/// The maintenance loop's per-tick decision: keepalive cadence, drop/expiry/params-change
+/// detection, and the idle-only reconnect gate — pure, fed a `MaintenanceFacts` snapshot
+/// (the Supervisor / `Router.tick` shape). The loop gathers the facts and runs the effect;
+/// all the policy lives here, exercised by fed values rather than a live link.
+fn maintenanceDecision(f: MaintenanceFacts) MaintenanceDecision {
+    switch (f.state) {
+        .closed, .connecting => return .{ .action = .idle, .awaiting_pong = f.awaiting_pong },
+        .reconnecting => return .{
+            // A drop was flagged (possibly mid-Utterance); cycle once idle, without a second
+            // log line (the drop was logged where it was detected).
+            .action = if (!f.streaming) .{ .reconnect = null } else .idle,
+            .awaiting_pong = f.awaiting_pong,
+        },
+        .ready => {},
+    }
+    if (f.streaming) return .{ .action = .idle, .awaiting_pong = f.awaiting_pong }; // never disturb a live Capture
+    if (f.params_dirty) return .{ .action = .{ .reconnect = .params_changed }, .awaiting_pong = f.awaiting_pong };
+    if (f.read_ended) return .{ .action = .{ .reconnect = .link_dropped }, .awaiting_pong = f.awaiting_pong };
+    if (f.expires_at_ms != 0 and f.now >= f.expires_at_ms - expiry_margin_ms)
+        return .{ .action = .{ .reconnect = .approaching_cap }, .awaiting_pong = f.awaiting_pong };
+    var awaiting = f.awaiting_pong;
+    if (f.awaiting_pong and f.now - f.last_ping_ms >= pong_timeout_ms) {
+        if (f.last_pong_ms >= f.last_ping_ms) {
+            awaiting = false; // pong arrived — healthy
+        } else {
+            return .{ .action = .{ .reconnect = .no_pong }, .awaiting_pong = awaiting };
+        }
+    }
+    if (f.now - f.last_ping_ms >= ping_interval_ms) return .{ .action = .ping, .awaiting_pong = awaiting };
+    return .{ .action = .idle, .awaiting_pong = awaiting };
+}
+
 /// The Transport seam (mirrors local_backend's Helper seam, #154): everything the Session
 /// does to the wire, behind one contract, so the read/write data path and the three
 /// lifecycle FSMs are exercised against a `FakeTransport` rather than a live socket. The
@@ -820,51 +894,36 @@ pub fn Session(comptime Transport: type) type {
 
         // ---- maintenance: keepalive + drop detection + reconnect --------------------
 
+        /// Gather the impure facts the pure `maintenanceDecision` runs on (one coherent
+        /// per-tick snapshot; the ADR-0005 gather/decide split).
+        fn maintenanceFacts(self: *Self) MaintenanceFacts {
+            return .{
+                .state = self.state.load(.acquire),
+                .streaming = self.streaming.load(.acquire),
+                .now = nowMs(),
+                .expires_at_ms = self.expires_at_ms.load(.acquire),
+                .awaiting_pong = self.awaiting_pong,
+                .last_ping_ms = self.last_ping_ms,
+                .last_pong_ms = self.last_pong_ms.load(.acquire),
+                .read_ended = self.read_ended.load(.acquire),
+                .params_dirty = self.params_dirty.load(.acquire),
+            };
+        }
+
         fn maintenanceLoop(self: *Self) void {
             while (self.state.load(.acquire) != .closed) {
                 sleepMs(maint_tick_ms);
-                switch (self.state.load(.acquire)) {
-                    .closed => return,
-                    .connecting => continue, // connect() drives the first handshake
-                    .reconnecting => {
-                        // A drop was flagged (possibly mid-Utterance); cycle once idle.
-                        if (!self.streaming.load(.acquire)) self.reconnect();
-                        continue;
-                    },
-                    .ready => {},
-                }
-                if (self.streaming.load(.acquire)) continue; // never disturb an in-flight Capture stream
-
-                // Live-apply (wayfinder #32): a session-shaped setting changed — cycle now,
-                // while idle; openClient re-reads the snapshot into the session.update.
-                if (self.params_dirty.load(.acquire)) {
-                    feedback.log("  session: transcription settings changed — cycling the session\n", .{});
-                    self.reconnect();
-                    continue;
-                }
-
-                const now = nowMs();
-                if (self.read_ended.load(.acquire)) {
-                    feedback.log("  session: link dropped (read loop ended) — reconnecting\n", .{});
-                    self.reconnect();
-                    continue;
-                }
-                const exp = self.expires_at_ms.load(.acquire);
-                if (exp != 0 and now >= exp - expiry_margin_ms) {
-                    feedback.log("  session: approaching the 60-min cap — cycling the session\n", .{});
-                    self.reconnect();
-                    continue;
-                }
-                if (self.awaiting_pong and now - self.last_ping_ms >= pong_timeout_ms) {
-                    if (self.last_pong_ms.load(.acquire) >= self.last_ping_ms) {
-                        self.awaiting_pong = false; // pong arrived — healthy
-                    } else {
-                        feedback.log("  session: no pong within {d}ms — reconnecting\n", .{pong_timeout_ms});
+                if (self.state.load(.acquire) == .closed) return; // prompt shutdown
+                const decision = maintenanceDecision(self.maintenanceFacts());
+                self.awaiting_pong = decision.awaiting_pong; // a healthy pong clears the probe
+                switch (decision.action) {
+                    .idle => {},
+                    .ping => self.sendPing(),
+                    .reconnect => |reason| {
+                        if (reason) |r| feedback.log("  {s}\n", .{reconnectMessage(r)});
                         self.reconnect();
-                        continue;
-                    }
+                    },
                 }
-                if (now - self.last_ping_ms >= ping_interval_ms) self.sendPing();
             }
         }
 
@@ -1481,4 +1540,77 @@ test "the sender drops a commit whose Utterance identity cannot register" {
     try std.testing.expectEqual(@as(usize, 1), rec.drops);
     try std.testing.expectEqual(@as(backend.UtteranceId, 90), rec.drop_id);
     try std.testing.expect(std.mem.indexOf(u8, sess.transport.written(), "commit") == null);
+}
+
+// ---- the maintenance decider: pure, fed a Facts snapshot ----
+
+/// A ready, idle, healthy session: recently pinged, pong current, far from the cap.
+fn healthyReady() MaintenanceFacts {
+    return .{
+        .state = .ready,
+        .streaming = false,
+        .now = 100_000,
+        .expires_at_ms = 0, // no deadline known yet ⇒ never triggers the cap branch
+        .awaiting_pong = false,
+        .last_ping_ms = 100_000,
+        .last_pong_ms = 100_000,
+        .read_ended = false,
+        .params_dirty = false,
+    };
+}
+
+test "maintenance stays idle while connecting, and while a Capture stream is live" {
+    var f = healthyReady();
+    f.state = .connecting;
+    try std.testing.expectEqual(MaintenanceAction.idle, maintenanceDecision(f).action);
+
+    f = healthyReady();
+    f.streaming = true;
+    try std.testing.expectEqual(MaintenanceAction.idle, maintenanceDecision(f).action);
+}
+
+test "maintenance resumes a flagged reconnect only once the Capture stream is idle" {
+    var f = healthyReady();
+    f.state = .reconnecting;
+    f.streaming = true;
+    try std.testing.expectEqual(MaintenanceAction.idle, maintenanceDecision(f).action); // never mid-Utterance
+
+    f.streaming = false;
+    const d = maintenanceDecision(f);
+    try std.testing.expect(d.action == .reconnect);
+    try std.testing.expectEqual(@as(?ReconnectReason, null), d.action.reconnect); // no second log line
+}
+
+test "maintenance reconnects a ready idle session on params change, drop, cap, and missing pong" {
+    var f = healthyReady();
+    f.params_dirty = true;
+    try std.testing.expectEqual(@as(?ReconnectReason, .params_changed), maintenanceDecision(f).action.reconnect);
+
+    f = healthyReady();
+    f.read_ended = true;
+    try std.testing.expectEqual(@as(?ReconnectReason, .link_dropped), maintenanceDecision(f).action.reconnect);
+
+    f = healthyReady();
+    f.expires_at_ms = f.now + expiry_margin_ms - 1; // inside the reconnect margin
+    try std.testing.expectEqual(@as(?ReconnectReason, .approaching_cap), maintenanceDecision(f).action.reconnect);
+
+    f = healthyReady();
+    f.awaiting_pong = true;
+    f.last_ping_ms = f.now - pong_timeout_ms; // waited out the pong window…
+    f.last_pong_ms = f.now - pong_timeout_ms - 1; // …and the last pong predates the ping
+    try std.testing.expectEqual(@as(?ReconnectReason, .no_pong), maintenanceDecision(f).action.reconnect);
+}
+
+test "maintenance clears the probe when a healthy pong arrived, and pings on cadence" {
+    var f = healthyReady();
+    f.awaiting_pong = true;
+    f.last_ping_ms = f.now - pong_timeout_ms; // window elapsed
+    f.last_pong_ms = f.now; // but the pong is current ⇒ healthy
+    const healthy = maintenanceDecision(f);
+    try std.testing.expectEqual(MaintenanceAction.idle, healthy.action);
+    try std.testing.expectEqual(false, healthy.awaiting_pong); // probe cleared
+
+    f = healthyReady();
+    f.last_ping_ms = f.now - ping_interval_ms; // due for the next keepalive
+    try std.testing.expectEqual(MaintenanceAction.ping, maintenanceDecision(f).action);
 }
