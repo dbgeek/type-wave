@@ -85,7 +85,7 @@ const model_store = @import("model_store.zig");
 const local_provisioner = @import("local_provisioner.zig");
 const status_item = @import("status_item.zig");
 
-const Session = session_mod.Session;
+const Session = session_mod.Session(session_mod.WebsocketTransport);
 const LocalAdapter = local_backend.Adapter(whisper_process_helper.ProcessHelper);
 
 extern "c" fn usleep(usec: c_uint) c_int;
