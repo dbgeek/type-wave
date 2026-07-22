@@ -2,6 +2,7 @@ const std = @import("std");
 const core = @import("whisper_helper_core.zig");
 const ipc = @import("whisper_ipc.zig");
 const artifact_identity = @import("artifact_identity.zig");
+const Layout = @import("layout.zig").Layout;
 const WhisperRuntime = @import("whisper_runtime.zig").Runtime;
 
 const Server = struct {
@@ -167,11 +168,13 @@ const InspectedArtifact = struct {
 };
 
 fn readArtifactIdentity(io: std.Io, model_path: []const u8) !core.Artifact {
-    const directory = std.fs.path.dirname(model_path) orelse return error.InvalidModelPath;
+    // The Models Layout spells MODEL_MANIFEST / PROVENANCE, so the helper's identity read
+    // stays single-homed with model_store's writes across the process boundary.
+    const directory = Layout.dir(std.fs.path.dirname(model_path) orelse return error.InvalidModelPath);
     var manifest_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const manifest_path = try std.fmt.bufPrint(&manifest_path_buffer, "{s}/MODEL_MANIFEST", .{directory});
+    const manifest_path = try directory.manifest(&manifest_path_buffer);
     var provenance_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const provenance_path = try std.fmt.bufPrint(&provenance_path_buffer, "{s}/PROVENANCE", .{directory});
+    const provenance_path = try directory.provenance(&provenance_path_buffer);
     var identity_buffer: [1024]u8 = undefined;
     const identity = std.Io.Dir.cwd().readFile(io, manifest_path, &identity_buffer) catch |failure| switch (failure) {
         error.FileNotFound => try std.Io.Dir.cwd().readFile(io, provenance_path, &identity_buffer),

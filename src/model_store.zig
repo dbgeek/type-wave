@@ -4,6 +4,8 @@ const std = @import("std");
 const artifact_identity = @import("artifact_identity.zig");
 const installation_identity = @import("installation_identity.zig");
 const receipt = @import("receipt.zig");
+const layout = @import("layout.zig");
+const Layout = layout.Layout;
 
 const StatFs = extern struct {
     block_size: u32,
@@ -37,9 +39,12 @@ const staging_overhead_bytes: u64 = 16 * 1024 * 1024;
 /// at most one chunk. 32 MiB keeps the pinned model near ~50 requests while re-downloading
 /// at most 32 MiB on resume.
 const default_chunk_size: u64 = 32 * 1024 * 1024;
-const removal_intent_name = ".removal.pending";
-const runtime_lock_name = ".runtime.lock";
-const inference_lock_name = ".inference.lock";
+// The gate-file names live in the Models Layout so the literal is single-homed; aliased
+// here so the lock-protocol call sites keep reading in model_store's own vocabulary.
+const removal_intent_name = layout.removal_intent_name;
+const runtime_lock_name = layout.runtime_lock_name;
+const inference_lock_name = layout.inference_lock_name;
+const operation_lock_name = layout.operation_lock_name;
 
 pub const pinned_manifest = Manifest{
     .repository = "ggerganov/whisper.cpp",
@@ -224,7 +229,7 @@ const SharedFileLease = struct {
     fn acquire(io: std.Io, root: []const u8, lock_name: []const u8, intent_name: []const u8, blocked: anyerror) !SharedFileLease {
         try std.Io.Dir.cwd().createDirPath(io, root);
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ root, lock_name });
+        const path = try Layout.init(root).child(lock_name, &path_buffer);
         const file = try std.Io.Dir.cwd().createFile(io, path, .{ .lock = .shared });
         var lease = SharedFileLease{ .io = io, .file = file };
         errdefer lease.release();
@@ -348,7 +353,8 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
 
         fn beginLocked(self: *Self) !LockedOperation {
             try std.Io.Dir.cwd().createDirPath(self.io, self.root);
-            const path = try std.fmt.allocPrint(self.allocator, "{s}/.operation.lock", .{self.root});
+            var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const path = try self.allocator.dupe(u8, try Layout.init(self.root).child(operation_lock_name, &path_buffer));
             errdefer self.allocator.free(path);
             const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .lock = .exclusive });
             return .{ .allocator = self.allocator, .io = self.io, .path = path, .file = file };
@@ -362,9 +368,11 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
         }
 
         fn stagePaths(self: *Self) !StagePaths {
-            const directory = try std.fmt.allocPrint(self.allocator, "{s}/staging-{s}", .{ self.root, self.manifest.installation_id });
+            var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const directory = try self.allocator.dupe(u8, try Layout.init(self.root).stagingDir(self.manifest.installation_id, &directory_buffer));
             errdefer self.allocator.free(directory);
-            const model = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ directory, self.manifest.artifact });
+            var model_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const model = try self.allocator.dupe(u8, try Layout.dir(directory).model(self.manifest.artifact, &model_buffer));
             return .{ .allocator = self.allocator, .directory = directory, .model = model };
         }
 
@@ -439,9 +447,9 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
                         const runtime_sha256 = parsed.runtime_sha256;
                         const physical_id = parsed.directory_id orelse self.manifest.installation_id;
                         var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
-                        const directory = try std.fmt.bufPrint(&directory_buffer, "{s}/installations/{s}", .{ self.root, physical_id });
+                        const directory = try Layout.init(self.root).installationDir(physical_id, &directory_buffer);
                         var model_buffer: [std.fs.max_path_bytes]u8 = undefined;
-                        const model = try std.fmt.bufPrint(&model_buffer, "{s}/{s}", .{ directory, self.manifest.artifact });
+                        const model = try Layout.dir(directory).model(self.manifest.artifact, &model_buffer);
                         const stat = try verifyArtifactCancelable(self.io, model, self.manifest, &self.cancel, self.observer);
                         try writeArtifactManifest(self.io, directory, self.manifest);
                         const generation = if (parsed.schema == .generation) physical_id else null;
@@ -509,9 +517,9 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
 
         fn rebuildKnownInstallationMetadata(self: *Self) !void {
             var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
-            const directory = try std.fmt.bufPrint(&directory_buffer, "{s}/installations/{s}", .{ self.root, self.manifest.installation_id });
+            const directory = try Layout.init(self.root).installationDir(self.manifest.installation_id, &directory_buffer);
             var model_buffer: [std.fs.max_path_bytes]u8 = undefined;
-            const model = try std.fmt.bufPrint(&model_buffer, "{s}/{s}", .{ directory, self.manifest.artifact });
+            const model = try Layout.dir(directory).model(self.manifest.artifact, &model_buffer);
             const stat = try verifyArtifactCancelable(self.io, model, self.manifest, &self.cancel, self.observer);
             self.notify(.smoke_testing);
             const runtime_sha256 = try self.smoke.run(model, &self.cancel);
@@ -598,17 +606,18 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
             var activation_lock = try waitForInferenceDrain(self.io, self.root, &self.cancel);
             defer activation_lock.close(self.io);
 
-            const installations = try std.fmt.allocPrint(self.allocator, "{s}/installations", .{self.root});
-            defer self.allocator.free(installations);
+            const l = Layout.init(self.root);
+            var installations_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const installations = try l.installations(&installations_buffer);
             try std.Io.Dir.cwd().createDirPath(self.io, installations);
             if (policy == .replace_invalid) {
-                const directory_id = try std.fmt.allocPrint(self.allocator, "{s}-repair-{d}", .{ self.manifest.installation_id, prepared.stat.mtime.nanoseconds });
-                defer self.allocator.free(directory_id);
-                const repaired_dir = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ installations, directory_id });
-                defer self.allocator.free(repaired_dir);
+                var directory_id_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const directory_id = try Layout.repairName(self.manifest.installation_id, prepared.stat.mtime.nanoseconds, &directory_id_buffer);
+                var repaired_dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const repaired_dir = try l.installationDir(directory_id, &repaired_dir_buffer);
                 try writeProvenanceForDirectory(self.io, stage_dir, self.manifest, directory_id, prepared.runtime_sha256, prepared.stat);
                 var metadata_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-                const metadata_path = try std.fmt.bufPrint(&metadata_path_buffer, "{s}/partial.meta", .{stage_dir});
+                const metadata_path = try Layout.dir(stage_dir).partialMeta(&metadata_path_buffer);
                 std.Io.Dir.cwd().deleteFile(self.io, metadata_path) catch |failure| if (failure != error.FileNotFound) return failure;
                 self.notify(.activating);
                 try std.Io.Dir.renameAbsolute(stage_dir, repaired_dir, self.io);
@@ -618,8 +627,8 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
                 };
                 return;
             }
-            const final_dir = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ installations, self.manifest.installation_id });
-            defer self.allocator.free(final_dir);
+            var final_dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const final_dir = try l.installationDir(self.manifest.installation_id, &final_dir_buffer);
             const final_exists = exists: {
                 std.Io.Dir.cwd().access(self.io, final_dir, .{}) catch |failure| switch (failure) {
                     error.FileNotFound => break :exists false,
@@ -628,8 +637,8 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
                 break :exists true;
             };
             if (final_exists) {
-                const final_model = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ final_dir, self.manifest.artifact });
-                defer self.allocator.free(final_model);
+                var final_model_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const final_model = try Layout.dir(final_dir).model(self.manifest.artifact, &final_model_buffer);
                 prepared = try self.prepareInstallation(final_model, final_dir);
             }
 
@@ -638,7 +647,7 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
                 try std.Io.Dir.cwd().deleteTree(self.io, stage_dir);
             } else {
                 var metadata_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-                const metadata_path = try std.fmt.bufPrint(&metadata_path_buffer, "{s}/partial.meta", .{stage_dir});
+                const metadata_path = try Layout.dir(stage_dir).partialMeta(&metadata_path_buffer);
                 std.Io.Dir.cwd().deleteFile(self.io, metadata_path) catch |failure| if (failure != error.FileNotFound) return failure;
                 try std.Io.Dir.renameAbsolute(stage_dir, final_dir, self.io);
             }
@@ -671,7 +680,7 @@ fn waitForInferenceDrain(io: std.Io, root: []const u8, cancel: *const CancelToke
 
 fn waitForExclusiveLease(io: std.Io, root: []const u8, lock_name: []const u8, cancel: *const CancelToken) !std.Io.File {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ root, lock_name });
+    const path = try Layout.init(root).child(lock_name, &path_buffer);
     while (true) {
         if (cancel.isRequested()) return error.ModelOperationCancelled;
         return std.Io.Dir.cwd().createFile(io, path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |failure| switch (failure) {
@@ -686,7 +695,7 @@ fn waitForExclusiveLease(io: std.Io, root: []const u8, lock_name: []const u8, ca
 
 fn intentFilePresent(io: std.Io, root: []const u8, name: []const u8) bool {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ root, name }) catch return false;
+    const path = Layout.init(root).child(name, &path_buffer) catch return false;
     std.Io.Dir.cwd().access(io, path, .{}) catch return false;
     return true;
 }
@@ -694,33 +703,34 @@ fn intentFilePresent(io: std.Io, root: []const u8, name: []const u8) bool {
 fn writeIntentFile(io: std.Io, root: []const u8, name: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, root);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ root, name });
+    const path = try Layout.init(root).child(name, &path_buffer);
     var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .permissions = .fromMode(0o600) });
     file.close(io);
 }
 
 fn removeIntentFile(io: std.Io, root: []const u8, name: []const u8) void {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ root, name }) catch return;
+    const path = Layout.init(root).child(name, &path_buffer) catch return;
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
 }
 
 fn removeModelData(io: std.Io, root: []const u8) !void {
+    const l = Layout.init(root);
     var receipt_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const receipt_path = try std.fmt.bufPrint(&receipt_path_buffer, "{s}/active.receipt", .{root});
+    const receipt_path = try l.activeReceipt(&receipt_path_buffer);
     std.Io.Dir.cwd().deleteFile(io, receipt_path) catch |failure| if (failure != error.FileNotFound) return failure;
     var receipt_tmp_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const receipt_tmp = try std.fmt.bufPrint(&receipt_tmp_path_buffer, "{s}/active.receipt.tmp", .{root});
+    const receipt_tmp = try l.activeReceiptTmp(&receipt_tmp_path_buffer);
     std.Io.Dir.cwd().deleteFile(io, receipt_tmp) catch |failure| if (failure != error.FileNotFound) return failure;
     var installations_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const installations = try std.fmt.bufPrint(&installations_path_buffer, "{s}/installations", .{root});
+    const installations = try l.installations(&installations_path_buffer);
     std.Io.Dir.cwd().deleteTree(io, installations) catch |failure| if (failure != error.FileNotFound) return failure;
 
     var root_dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer root_dir.close(io);
     var entries = root_dir.iterate();
     while (try entries.next(io)) |entry| {
-        if (entry.kind == .directory and std.mem.startsWith(u8, entry.name, "staging-"))
+        if (entry.kind == .directory and Layout.isStagingDir(entry.name))
             try root_dir.deleteTree(io, entry.name);
     }
 }
@@ -744,7 +754,7 @@ fn recoverPartial(io: std.Io, root: []const u8, manifest: Manifest) !Recovery {
 pub fn recoveryState(io: std.Io, root: []const u8, manifest: Manifest) !Recovery {
     try std.Io.Dir.cwd().createDirPath(io, root);
     var lock_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const lock_path = try std.fmt.bufPrint(&lock_path_buffer, "{s}/.operation.lock", .{root});
+    const lock_path = try Layout.init(root).child(operation_lock_name, &lock_path_buffer);
     var lock = std.Io.Dir.cwd().createFile(io, lock_path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |failure| switch (failure) {
         error.WouldBlock => return .{ .phase = .downloading, .bytes = .{ .completed = 0, .total = manifest.size } },
         else => return failure,
@@ -756,12 +766,12 @@ pub fn recoveryState(io: std.Io, root: []const u8, manifest: Manifest) !Recovery
 
 fn discardStaleStages(io: std.Io, root: []const u8, manifest: Manifest) !void {
     var desired_buffer: [std.fs.max_name_bytes]u8 = undefined;
-    const desired = try std.fmt.bufPrint(&desired_buffer, "staging-{s}", .{manifest.installation_id});
+    const desired = try Layout.stagingName(manifest.installation_id, &desired_buffer);
     var root_dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer root_dir.close(io);
     var entries = root_dir.iterate();
     while (try entries.next(io)) |entry| {
-        if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, "staging-") or std.mem.eql(u8, entry.name, desired)) continue;
+        if (entry.kind != .directory or !Layout.isStagingDir(entry.name) or std.mem.eql(u8, entry.name, desired)) continue;
         try root_dir.deleteTree(io, entry.name);
     }
 }
@@ -769,11 +779,11 @@ fn discardStaleStages(io: std.Io, root: []const u8, manifest: Manifest) !void {
 pub fn discardIncomplete(io: std.Io, root: []const u8, manifest: Manifest) !void {
     try std.Io.Dir.cwd().createDirPath(io, root);
     var lock_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const lock_path = try std.fmt.bufPrint(&lock_path_buffer, "{s}/.operation.lock", .{root});
+    const lock_path = try Layout.init(root).child(operation_lock_name, &lock_path_buffer);
     var lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .lock = .exclusive });
     defer lock.close(io);
     var stage_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const stage = try std.fmt.bufPrint(&stage_buffer, "{s}/staging-{s}", .{ root, manifest.installation_id });
+    const stage = try Layout.init(root).stagingDir(manifest.installation_id, &stage_buffer);
     try discardStage(io, stage);
 }
 
@@ -798,9 +808,9 @@ fn manifestIdentity(manifest: Manifest) receipt.Identity {
 
 fn loadPartial(io: std.Io, root: []const u8, manifest: Manifest) !?Partial {
     var stage_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const stage = try std.fmt.bufPrint(&stage_buffer, "{s}/staging-{s}", .{ root, manifest.installation_id });
+    const stage = try Layout.init(root).stagingDir(manifest.installation_id, &stage_buffer);
     var metadata_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const metadata_path = try std.fmt.bufPrint(&metadata_path_buffer, "{s}/partial.meta", .{stage});
+    const metadata_path = try Layout.dir(stage).partialMeta(&metadata_path_buffer);
     var metadata_buffer: [4096]u8 = undefined;
     const metadata = std.Io.Dir.cwd().readFile(io, metadata_path, &metadata_buffer) catch |failure| switch (failure) {
         error.FileNotFound => {
@@ -820,7 +830,7 @@ fn loadPartial(io: std.Io, root: []const u8, manifest: Manifest) !?Partial {
         return discardInvalidPartial(io, stage);
 
     var model_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const model_path = try std.fmt.bufPrint(&model_path_buffer, "{s}/{s}", .{ stage, manifest.artifact });
+    const model_path = try Layout.dir(stage).model(manifest.artifact, &model_path_buffer);
     var model = std.Io.Dir.cwd().openFile(io, model_path, .{}) catch return discardInvalidPartial(io, stage);
     defer model.close(io);
     const stat = model.stat(io) catch return discardInvalidPartial(io, stage);
@@ -843,10 +853,11 @@ fn writePartialMetadata(io: std.Io, stage: []const u8, manifest: Manifest, offse
         .etag = etag,
         .last_modified = last_modified,
     }).encode(&text_buffer);
+    const stage_dir = Layout.dir(stage);
     var tmp_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_path_buffer, "{s}/partial.meta.tmp", .{stage});
+    const tmp_path = try stage_dir.partialMetaTmp(&tmp_path_buffer);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "{s}/partial.meta", .{stage});
+    const path = try stage_dir.partialMeta(&path_buffer);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp_path, .data = text, .flags = .{ .permissions = .fromMode(0o600) } });
     try std.Io.Dir.renameAbsolute(tmp_path, path, io);
 }
@@ -883,7 +894,7 @@ fn writeProvenanceForDirectory(io: std.Io, directory: []const u8, manifest: Mani
     var text_buffer: [1024]u8 = undefined;
     const text = try provenanceOf(manifest, directory_id, runtime_sha256, model_stat).encode(&text_buffer);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "{s}/PROVENANCE", .{directory});
+    const path = try Layout.dir(directory).provenance(&path_buffer);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text, .flags = .{ .permissions = .fromMode(0o600) } });
 }
 
@@ -891,7 +902,7 @@ fn writeArtifactManifest(io: std.Io, directory: []const u8, manifest: Manifest) 
     var text_buffer: [256]u8 = undefined;
     const text = try artifact_identity.encode(.{ .size = manifest.size, .sha256 = manifest.sha256 }, &text_buffer);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buffer, "{s}/MODEL_MANIFEST", .{directory});
+    const path = try Layout.dir(directory).manifest(&path_buffer);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text, .flags = .{ .permissions = .fromMode(0o600) } });
 }
 
@@ -902,10 +913,11 @@ fn publishReceipt(io: std.Io, root: []const u8, manifest: Manifest, runtime_sha2
 fn publishReceiptForDirectory(io: std.Io, root: []const u8, manifest: Manifest, directory_id: ?[]const u8, runtime_sha256: [32]u8, model_stat: std.Io.File.Stat) !void {
     var text_buffer: [1024]u8 = undefined;
     const text = try provenanceOf(manifest, directory_id, runtime_sha256, model_stat).encode(&text_buffer);
+    const l = Layout.init(root);
     var tmp_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp = try std.fmt.bufPrint(&tmp_buffer, "{s}/active.receipt.tmp", .{root});
+    const tmp = try l.activeReceiptTmp(&tmp_buffer);
     var active_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const active = try std.fmt.bufPrint(&active_buffer, "{s}/active.receipt", .{root});
+    const active = try l.activeReceipt(&active_buffer);
     var file = try std.Io.Dir.cwd().createFile(io, tmp, .{ .permissions = .fromMode(0o600) });
     defer file.close(io);
     try file.writeStreamingAll(io, text);
@@ -918,7 +930,7 @@ pub fn activeInstallationPresent(io: std.Io, root: []const u8, manifest: Manifes
     if ((try activeModelPath(io, root, &path_buffer)) == null) return false;
 
     var receipt_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const receipt_path = try std.fmt.bufPrint(&receipt_path_buffer, "{s}/active.receipt", .{root});
+    const receipt_path = try Layout.init(root).activeReceipt(&receipt_path_buffer);
     var actual_buffer: [1024]u8 = undefined;
     const actual = std.Io.Dir.cwd().readFile(io, receipt_path, &actual_buffer) catch |failure| switch (failure) {
         error.FileNotFound => return false,
@@ -942,7 +954,7 @@ fn trustedManifest(actual: []const u8, expected: Manifest, additional: ?[]const 
 
 fn activeReceipt(io: std.Io, root: []const u8, buffer: []u8) !?[]const u8 {
     var receipt_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const receipt_path = try std.fmt.bufPrint(&receipt_path_buffer, "{s}/active.receipt", .{root});
+    const receipt_path = try Layout.init(root).activeReceipt(&receipt_path_buffer);
     return std.Io.Dir.cwd().readFile(io, receipt_path, buffer) catch |failure| switch (failure) {
         error.FileNotFound => null,
         else => return failure,
@@ -959,7 +971,7 @@ pub fn verifyActiveInstallation(
 ) !InstallationIntegrity {
     try std.Io.Dir.cwd().createDirPath(io, root);
     var lock_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const lock_path = try std.fmt.bufPrint(&lock_path_buffer, "{s}/.operation.lock", .{root});
+    const lock_path = try Layout.init(root).child(operation_lock_name, &lock_path_buffer);
     var lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .lock = .exclusive });
     defer lock.close(io);
     return verifyActiveInstallationUnlocked(io, root, expected, additional_trusted, cancel, observer);
@@ -979,9 +991,11 @@ fn verifyActiveInstallationUnlocked(
 
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     if (trustedManifest(actual, expected, additional_trusted) == null) return .{ .corrupt = .identity_mismatch };
-    const path = if (parsed.directory_id) |directory_id|
-        try std.fmt.bufPrint(&path_buffer, "{s}/installations/{s}/{s}", .{ root, directory_id, parsed.artifact })
-    else
+    const path = if (parsed.directory_id) |directory_id| path: {
+        var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const install_dir = try Layout.init(root).installationDir(directory_id, &dir_buffer);
+        break :path try Layout.dir(install_dir).model(parsed.artifact, &path_buffer);
+    } else
         (try activeModelPath(io, root, &path_buffer)) orelse return .{ .corrupt = .invalid_receipt };
 
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |failure| switch (failure) {
@@ -994,9 +1008,9 @@ fn verifyActiveInstallationUnlocked(
     const digest = try sha256FileObserved(io, path, stat.size, cancel, observer);
     if (!std.mem.eql(u8, &digest, &parsed.identity.sha256)) return .{ .corrupt = .digest_mismatch };
 
-    const installation_dir = std.fs.path.dirname(path) orelse return .{ .corrupt = .invalid_receipt };
+    const installation_dir = Layout.dir(std.fs.path.dirname(path) orelse return .{ .corrupt = .invalid_receipt });
     var provenance_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const provenance_path = try std.fmt.bufPrint(&provenance_path_buffer, "{s}/PROVENANCE", .{installation_dir});
+    const provenance_path = try installation_dir.provenance(&provenance_path_buffer);
     var provenance_buffer: [1024]u8 = undefined;
     const provenance = std.Io.Dir.cwd().readFile(io, provenance_path, &provenance_buffer) catch |failure| switch (failure) {
         error.FileNotFound => return .{ .corrupt = .provenance_mismatch },
@@ -1004,7 +1018,7 @@ fn verifyActiveInstallationUnlocked(
     };
     if (!std.mem.eql(u8, actual, provenance)) return .{ .corrupt = .provenance_mismatch };
     var manifest_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const manifest_path = try std.fmt.bufPrint(&manifest_path_buffer, "{s}/MODEL_MANIFEST", .{installation_dir});
+    const manifest_path = try installation_dir.manifest(&manifest_path_buffer);
     var installed_manifest_buffer: [256]u8 = undefined;
     const installed_manifest = std.Io.Dir.cwd().readFile(io, manifest_path, &installed_manifest_buffer) catch |failure| switch (failure) {
         error.FileNotFound => return .{ .corrupt = .manifest_mismatch },
@@ -1064,7 +1078,7 @@ pub fn activeModelPath(io: std.Io, root: []const u8, buffer: []u8) !?[]const u8 
         return validateReceiptPath(io, root, actual, directory_id, parsed.artifact, parsed.identity.size, parsed.mtime_ns, buffer);
 
     var installations_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const installations_path = try std.fmt.bufPrint(&installations_path_buffer, "{s}/installations", .{root});
+    const installations_path = try Layout.init(root).installations(&installations_path_buffer);
     var installations = std.Io.Dir.cwd().openDir(io, installations_path, .{ .iterate = true }) catch |failure| switch (failure) {
         error.FileNotFound => return null,
         else => return failure,
@@ -1088,7 +1102,9 @@ fn validateReceiptPath(
     mtime_ns: i96,
     buffer: []u8,
 ) !?[]const u8 {
-    const path = try std.fmt.bufPrint(buffer, "{s}/installations/{s}/{s}", .{ root, installation_id, artifact });
+    var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const install_dir = Layout.dir(try Layout.init(root).installationDir(installation_id, &dir_buffer));
+    const path = try install_dir.model(artifact, buffer);
     var model = std.Io.Dir.cwd().openFile(io, path, .{}) catch |failure| switch (failure) {
         error.FileNotFound => return null,
         else => return failure,
@@ -1097,7 +1113,7 @@ fn validateReceiptPath(
     const stat = try model.stat(io);
     if (stat.size != size or stat.mtime.nanoseconds != mtime_ns) return null;
     var provenance_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const provenance_path = try std.fmt.bufPrint(&provenance_path_buffer, "{s}/installations/{s}/PROVENANCE", .{ root, installation_id });
+    const provenance_path = try install_dir.provenance(&provenance_path_buffer);
     var provenance_buffer: [1024]u8 = undefined;
     const provenance = std.Io.Dir.cwd().readFile(io, provenance_path, &provenance_buffer) catch |failure| switch (failure) {
         error.FileNotFound => return null,
@@ -1148,15 +1164,16 @@ pub fn activeInstallationIdentity(io: std.Io, root: []const u8) !?InstallationId
 /// down. The operation and inference locks make this safe against another process starting
 /// maintenance or a late local Utterance.
 pub fn removeInactiveInstallations(io: std.Io, root: []const u8) !usize {
+    const l = Layout.init(root);
     var operation_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const operation_path = try std.fmt.bufPrint(&operation_path_buffer, "{s}/.operation.lock", .{root});
+    const operation_path = try l.child(operation_lock_name, &operation_path_buffer);
     var operation_lock = std.Io.Dir.cwd().createFile(io, operation_path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |failure| switch (failure) {
         error.WouldBlock => return error.ModelOperationInProgress,
         else => return failure,
     };
     defer operation_lock.close(io);
     var inference_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const inference_path = try std.fmt.bufPrint(&inference_path_buffer, "{s}/.inference.lock", .{root});
+    const inference_path = try l.child(inference_lock_name, &inference_path_buffer);
     var inference_lock = std.Io.Dir.cwd().createFile(io, inference_path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |failure| switch (failure) {
         error.WouldBlock => return error.ModelInferenceActive,
         else => return failure,
@@ -1168,7 +1185,7 @@ pub fn removeInactiveInstallations(io: std.Io, root: []const u8) !usize {
     const active_directory = std.fs.path.dirname(active_path) orelse return error.InvalidModelPath;
     const active_id = std.fs.path.basename(active_directory);
     var installations_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const installations_path = try std.fmt.bufPrint(&installations_path_buffer, "{s}/installations", .{root});
+    const installations_path = try l.installations(&installations_path_buffer);
     var installations = try std.Io.Dir.cwd().openDir(io, installations_path, .{ .iterate = true });
     defer installations.close(io);
     var removed: usize = 0;
@@ -1350,7 +1367,7 @@ test "Model Operation verifies and smoke-tests before publishing the active rece
     try std.testing.expect(smoke.called);
     try std.testing.expect(try activeInstallationPresent(std.testing.io, root_buf[0..root_len], test_manifest));
     var receipt_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const receipt_path = try std.fmt.bufPrint(&receipt_path_buf, "{s}/active.receipt", .{root_buf[0..root_len]});
+    const receipt_path = try Layout.init(root_buf[0..root_len]).activeReceipt(&receipt_path_buf);
     var receipt_buf: [1024]u8 = undefined;
     const published = try std.Io.Dir.cwd().readFile(std.testing.io, receipt_path, &receipt_buf);
     try std.testing.expect(std.mem.indexOf(u8, published, "hf_secret") == null);
@@ -1396,9 +1413,10 @@ test "explicit Verify rejects self-consistent metadata outside the trusted manif
     const root = root_buf[0..root_len];
     try installTestModel(root);
     var receipt_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const receipt_path = try std.fmt.bufPrint(&receipt_path_buf, "{s}/active.receipt", .{root});
+    const receipt_path = try Layout.init(root).activeReceipt(&receipt_path_buf);
     var provenance_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const provenance_path = try std.fmt.bufPrint(&provenance_path_buf, "{s}/installations/{s}/PROVENANCE", .{ root, test_manifest.installation_id });
+    var provenance_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const provenance_path = try Layout.dir(try Layout.init(root).installationDir(test_manifest.installation_id, &provenance_dir_buf)).provenance(&provenance_path_buf);
     var receipt_buffer: [1024]u8 = undefined;
     const original = try std.Io.Dir.cwd().readFile(std.testing.io, receipt_path, &receipt_buffer);
     const forged = try std.mem.replaceOwned(u8, std.testing.allocator, original, "revision=test-revision", "revision=forged-revision");
@@ -1455,12 +1473,12 @@ test "confirmed Repair replaces only an invalid artifact through authenticated a
     const repaired_path = (try activeModelPath(std.testing.io, root, &repaired_path_buf)).?;
     try std.testing.expect(std.mem.indexOf(u8, repaired_path, "test-installation-repair-") != null);
     var old_directory_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const old_directory = try std.fmt.bufPrint(&old_directory_buf, "{s}/installations/{s}", .{ root, test_manifest.installation_id });
+    const old_directory = try Layout.init(root).installationDir(test_manifest.installation_id, &old_directory_buf);
     try std.Io.Dir.cwd().access(std.testing.io, old_directory, .{});
 
     const repaired_directory = std.fs.path.dirname(repaired_path).?;
     var repaired_manifest_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const repaired_manifest = try std.fmt.bufPrint(&repaired_manifest_buf, "{s}/MODEL_MANIFEST", .{repaired_directory});
+    const repaired_manifest = try Layout.dir(repaired_directory).manifest(&repaired_manifest_buf);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = repaired_manifest, .data = "damaged metadata\n" });
     transport.calls = 0;
     try operation.repair(.offline_only);
@@ -1528,7 +1546,8 @@ test "Repair rebuilds invalid installation metadata without network access" {
     var operation = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
     try operation.install();
     var manifest_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const manifest_path = try std.fmt.bufPrint(&manifest_path_buf, "{s}/installations/{s}/MODEL_MANIFEST", .{ root, test_manifest.installation_id });
+    var manifest_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const manifest_path = try Layout.dir(try Layout.init(root).installationDir(test_manifest.installation_id, &manifest_dir_buf)).manifest(&manifest_path_buf);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = manifest_path, .data = "damaged metadata\n" });
     transport.calls = 0;
 
@@ -1549,7 +1568,7 @@ test "Repair reconstructs an invalid receipt from verified pinned local data" {
     var operation = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
     try operation.install();
     var receipt_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const receipt_path = try std.fmt.bufPrint(&receipt_path_buf, "{s}/active.receipt", .{root});
+    const receipt_path = try Layout.init(root).activeReceipt(&receipt_path_buf);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = receipt_path, .data = "invalid receipt\n" });
     transport.calls = 0;
     smoke.called = false;
@@ -1573,13 +1592,14 @@ test "an interrupted receipt publish is recoverable and startup rejects changed 
     try operation.install();
 
     var receipt_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const receipt_path = try std.fmt.bufPrint(&receipt_path_buf, "{s}/active.receipt", .{root});
+    const receipt_path = try Layout.init(root).activeReceipt(&receipt_path_buf);
     try std.Io.Dir.cwd().deleteFile(std.testing.io, receipt_path);
     try operation.install();
     try std.testing.expect(try activeInstallationPresent(std.testing.io, root, test_manifest));
 
     var model_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const model_path = try std.fmt.bufPrint(&model_path_buf, "{s}/installations/{s}/{s}", .{ root, test_manifest.installation_id, test_manifest.artifact });
+    var model_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const model_path = try Layout.dir(try Layout.init(root).installationDir(test_manifest.installation_id, &model_dir_buf)).model(test_manifest.artifact, &model_path_buf);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = model_path, .data = "changed" });
     try std.testing.expect(!try activeInstallationPresent(std.testing.io, root, test_manifest));
 }
@@ -1591,7 +1611,7 @@ test "failed verification or smoke test cannot replace the active receipt" {
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
     const root = root_buf[0..root_len];
     var receipt_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const receipt_path = try std.fmt.bufPrint(&receipt_path_buf, "{s}/active.receipt", .{root});
+    const receipt_path = try Layout.init(root).activeReceipt(&receipt_path_buf);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = receipt_path, .data = "previous installation\n" });
 
     var short_transport = ShortTransport{};
@@ -1656,9 +1676,10 @@ test "a schema-one receipt remains usable and reports an embedded replacement" {
     try operation.install();
 
     var receipt_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const receipt_path = try std.fmt.bufPrint(&receipt_path_buf, "{s}/active.receipt", .{root});
+    const receipt_path = try Layout.init(root).activeReceipt(&receipt_path_buf);
     var provenance_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const provenance_path = try std.fmt.bufPrint(&provenance_path_buf, "{s}/installations/{s}/PROVENANCE", .{ root, test_manifest.installation_id });
+    var provenance_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const provenance_path = try Layout.dir(try Layout.init(root).installationDir(test_manifest.installation_id, &provenance_dir_buf)).provenance(&provenance_path_buf);
     var receipt_buf: [1024]u8 = undefined;
     const current = try std.Io.Dir.cwd().readFile(std.testing.io, receipt_path, &receipt_buf);
     const old_schema = try std.mem.replaceOwned(u8, std.testing.allocator, current, "schema=2", "schema=1");
@@ -1717,7 +1738,7 @@ test "replacement activation waits for the active inference lease to drain" {
     try std.testing.expect(!try updateAvailable(std.testing.io, root, desired));
     try std.testing.expect(try activeInstallationPresent(std.testing.io, root, desired));
     var previous_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const previous_path = try std.fmt.bufPrint(&previous_path_buf, "{s}/installations/{s}", .{ root, test_manifest.installation_id });
+    const previous_path = try Layout.init(root).installationDir(test_manifest.installation_id, &previous_path_buf);
     try std.Io.Dir.cwd().access(std.testing.io, previous_path, .{});
     try std.testing.expectEqual(@as(usize, 1), try removeInactiveInstallations(std.testing.io, root));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, previous_path, .{}));
@@ -1747,10 +1768,10 @@ test "confirmed removal rejects new local Utterances, drains the helper, and rem
     var model_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     try std.testing.expect((try activeModelPath(std.testing.io, root, &model_path_buf)) == null);
     var installations_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const installations = try std.fmt.bufPrint(&installations_path_buf, "{s}/installations", .{root});
+    const installations = try Layout.init(root).installations(&installations_path_buf);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, installations, .{}));
     var stage_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const stage = try std.fmt.bufPrint(&stage_path_buf, "{s}/staging-{s}", .{ root, test_manifest.installation_id });
+    const stage = try Layout.init(root).stagingDir(test_manifest.installation_id, &stage_path_buf);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stage, .{}));
 }
 
@@ -1768,10 +1789,12 @@ test "restart exposes a validator-bound partial as paused without network activi
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
     const root = root_buf[0..root_len];
-    const stage = try std.fmt.allocPrint(std.testing.allocator, "{s}/staging-{s}", .{ root, test_manifest.installation_id });
+    var stage_alloc_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const stage = try std.testing.allocator.dupe(u8, try Layout.init(root).stagingDir(test_manifest.installation_id, &stage_alloc_buf));
     defer std.testing.allocator.free(stage);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, stage);
-    const model = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ stage, test_manifest.artifact });
+    var model_alloc_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const model = try std.testing.allocator.dupe(u8, try Layout.dir(stage).model(test_manifest.artifact, &model_alloc_buf));
     defer std.testing.allocator.free(model);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = model, .data = "pinned" });
     const metadata = try std.fmt.allocPrint(
@@ -1788,7 +1811,8 @@ test "restart exposes a validator-bound partial as paused without network activi
         },
     );
     defer std.testing.allocator.free(metadata);
-    const metadata_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/partial.meta", .{stage});
+    var metadata_alloc_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const metadata_path = try std.testing.allocator.dupe(u8, try Layout.dir(stage).partialMeta(&metadata_alloc_buf));
     defer std.testing.allocator.free(metadata_path);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = metadata_path, .data = metadata });
 
@@ -1809,13 +1833,16 @@ test "restart discards a partial whose immutable identity no longer matches" {
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
     const root = root_buf[0..root_len];
-    const stage = try std.fmt.allocPrint(std.testing.allocator, "{s}/staging-{s}", .{ root, test_manifest.installation_id });
+    var stage_alloc_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const stage = try std.testing.allocator.dupe(u8, try Layout.init(root).stagingDir(test_manifest.installation_id, &stage_alloc_buf));
     defer std.testing.allocator.free(stage);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, stage);
-    const model = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ stage, test_manifest.artifact });
+    var model_alloc_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const model = try std.testing.allocator.dupe(u8, try Layout.dir(stage).model(test_manifest.artifact, &model_alloc_buf));
     defer std.testing.allocator.free(model);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = model, .data = "pinned" });
-    const metadata_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/partial.meta", .{stage});
+    var metadata_alloc_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const metadata_path = try std.testing.allocator.dupe(u8, try Layout.dir(stage).partialMeta(&metadata_alloc_buf));
     defer std.testing.allocator.free(metadata_path);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = metadata_path, .data = "schema=1\nrevision=obsolete\noffset=6\netag=\"old\"\n" });
 
@@ -2016,7 +2043,7 @@ test "cancellation during hashing preserves the active installation boundary" {
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
     const root = root_buf[0..root_len];
     var receipt_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const receipt_path = try std.fmt.bufPrint(&receipt_path_buf, "{s}/active.receipt", .{root});
+    const receipt_path = try Layout.init(root).activeReceipt(&receipt_path_buf);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = receipt_path, .data = "previous installation\n" });
     var transport = FakeTransport{};
     var smoke = FakeSmoke{};
@@ -2042,7 +2069,7 @@ test "cancellation during transfer leaves the working receipt untouched" {
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
     const root = root_buf[0..root_len];
     var receipt_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const receipt_path = try std.fmt.bufPrint(&receipt_path_buf, "{s}/active.receipt", .{root});
+    const receipt_path = try Layout.init(root).activeReceipt(&receipt_path_buf);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = receipt_path, .data = "working\n" });
     var transport = CancellingTransport{};
     var smoke = FakeSmoke{};
@@ -2235,10 +2262,12 @@ const MalformedValidatorTransport = struct {
 };
 
 fn writeTestPartial(root: []const u8, bytes: []const u8, etag: []const u8) !void {
-    const stage = try std.fmt.allocPrint(std.testing.allocator, "{s}/staging-{s}", .{ root, test_manifest.installation_id });
+    var stage_alloc_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const stage = try std.testing.allocator.dupe(u8, try Layout.init(root).stagingDir(test_manifest.installation_id, &stage_alloc_buf));
     defer std.testing.allocator.free(stage);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, stage);
-    const model = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ stage, test_manifest.artifact });
+    var model_alloc_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const model = try std.testing.allocator.dupe(u8, try Layout.dir(stage).model(test_manifest.artifact, &model_alloc_buf));
     defer std.testing.allocator.free(model);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = model, .data = bytes });
     const metadata = try std.fmt.allocPrint(
@@ -2247,7 +2276,8 @@ fn writeTestPartial(root: []const u8, bytes: []const u8, etag: []const u8) !void
         .{ test_manifest.repository, test_manifest.revision, test_manifest.runtime, test_manifest.artifact, test_manifest.installation_id, test_manifest.size, &std.fmt.bytesToHex(test_manifest.sha256, .lower), bytes.len, etag },
     );
     defer std.testing.allocator.free(metadata);
-    const metadata_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/partial.meta", .{stage});
+    var metadata_alloc_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const metadata_path = try std.testing.allocator.dupe(u8, try Layout.dir(stage).partialMeta(&metadata_alloc_buf));
     defer std.testing.allocator.free(metadata_path);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = metadata_path, .data = metadata });
 }
