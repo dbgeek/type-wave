@@ -31,7 +31,10 @@ flowchart TD
     ROUTER -->|Local, offline| LW[Local Whisper Backend<br/>Segmenter cuts at silences]
     OA --> FT[Final Transcript]
     LW --> FT
-    FT --> INS([Insertion at Focused Target cursor])
+    FT --> BT{Backtrack on?<br/>OpenAI only}
+    BT -->|yes| RW[OpenAI Rewrite<br/>corrections + fillers removed]
+    BT -->|no / Local, or on failure| INS
+    RW --> INS([Insertion at Focused Target cursor])
 ```
 
 The default **Talk Key** is Right Option. Holding it opens one **Utterance**; while it
