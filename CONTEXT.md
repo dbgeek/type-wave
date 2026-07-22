@@ -131,6 +131,22 @@ trusted Manifest a receipt authenticates against.
 _Avoid_: manifest (that names the trusted pin, not the on-disk record), provenance (that
 names the mirror copy, not the concept)
 
+**Models Layout**:
+The single owner of the on-disk path grammar of the models root: `active.receipt` and its
+`.tmp` write sibling, `installations/{id}` and the `PROVENANCE` / `MODEL_MANIFEST` files
+inside each, the `staging-{id}` and `{id}-repair-{ns}` generation directories and their
+`partial.meta`, and the `.operation.lock` / `.runtime.lock` / `.inference.lock` /
+`.removal.pending` gate files. Where the Installation Receipt codec owns the *format* of
+those bytes, the Models Layout owns *where* they live — pure and allocation-free
+(`src/layout.zig`), each accessor writing into a caller buffer and reading no clock or
+filesystem, so it is exercised directly by fed values. `Layout.Dir` — the directory-relative
+half (`PROVENANCE` / `MODEL_MANIFEST` / `partial.meta`, whatever the directory kind) — is the
+one piece shared with the Whisper Helper process, so the file names stay single-homed across
+both processes: a rename here cannot silently desync the helper's identity read. model_store
+owns every read/write; the Layout owns only the names. Distinct from the Installation Receipt,
+which is the record; the Layout is its address.
+_Avoid_: paths helper, fs utils (they name a grab-bag, not the single owner)
+
 **Model Operation**:
 A user-authorized acquisition, verification, activation, repair, or removal acting on a Model Installation. An operation may be in progress while the current Model Installation remains usable.
 _Avoid_: download state, model task
