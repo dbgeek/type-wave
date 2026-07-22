@@ -364,16 +364,18 @@ pub const WebsocketTransport = struct {
         return .{ .thread = try self.client.readLoopInNewThread(handler) };
     }
 
-    pub fn write(self: *WebsocketTransport, bytes: []const u8) !void {
+    // The data-write methods take `[]u8` because the library masks each frame in place
+    // (a websocket client MUST mask); every Session write buffer is a mutable local.
+    pub fn write(self: *WebsocketTransport, bytes: []u8) !void {
         try self.client.write(bytes);
     }
-    pub fn writePing(self: *WebsocketTransport, bytes: []const u8) !void {
+    pub fn writePing(self: *WebsocketTransport, bytes: []u8) !void {
         try self.client.writePing(bytes);
     }
-    pub fn writePong(self: *WebsocketTransport, bytes: []const u8) !void {
+    pub fn writePong(self: *WebsocketTransport, bytes: []u8) !void {
         try self.client.writePong(bytes);
     }
-    pub fn writeCloseFrame(self: *WebsocketTransport, bytes: []const u8) !void {
+    pub fn writeCloseFrame(self: *WebsocketTransport, bytes: []u8) !void {
         try self.client.writeFrame(websocket.OpCode.close, bytes);
     }
     /// Force the socket down to unblock a half-open read (readLoop requires a blocking read,
@@ -1233,20 +1235,20 @@ const FakeTransport = struct {
         self.reads_started += 1;
         return .{};
     }
-    fn write(self: *FakeTransport, bytes: []const u8) !void {
+    fn write(self: *FakeTransport, bytes: []u8) !void {
         self.writes += 1;
         if (self.write_len + bytes.len <= self.write_buf.len) {
             @memcpy(self.write_buf[self.write_len..][0..bytes.len], bytes);
             self.write_len += bytes.len;
         }
     }
-    fn writePing(self: *FakeTransport, _: []const u8) !void {
+    fn writePing(self: *FakeTransport, _: []u8) !void {
         self.pings += 1;
     }
-    fn writePong(self: *FakeTransport, _: []const u8) !void {
+    fn writePong(self: *FakeTransport, _: []u8) !void {
         self.pongs += 1;
     }
-    fn writeCloseFrame(self: *FakeTransport, _: []const u8) !void {
+    fn writeCloseFrame(self: *FakeTransport, _: []u8) !void {
         self.close_frames += 1;
     }
     fn forceClose(self: *FakeTransport) void {
