@@ -46,6 +46,18 @@ Transcription Backend's adapter drives it under its own lock and owns everything
 cut. Lives in `src/segmenter.zig`, exercised by fed (rms, pcm) pairs, not real audio.
 _Avoid_: chunker, splitter, VAD (it is not a general voice-activity detector)
 
+**Whisper Helper**:
+The warm, private child process that transcribes a Segment's PCM off the daemon's main
+process — the "warm helper" the Backend Router and Local Provisioner keep alive. Its
+parent-side owner (`ProcessHelper`, `src/whisper_process_helper.zig`) holds the pipe
+protocol, the single-slot reservation, the two-lock write discipline, and the crash →
+fail-active → backoff → relaunch recovery ladder, surfacing only identity-tagged terminal
+events. The local Transcription Backend's Segmenting adapter drives it across the **Helper
+seam** — `reserveUtterance` / `submit` / `requestCancel` / `cancel` and the `final` / `failed`
+reverse edge — whose contract lives with that adapter (`local_backend.assertHelper`), so the
+adapter is exercised against a `FakeHelper` rather than a real subprocess.
+_Avoid_: whisper server, worker, subprocess (that names the mechanism, not the role)
+
 **Insertion**:
 Placing a Final Transcript at the cursor of the Focused Target. Every Insertion ends with
 a single trailing space, so consecutive Insertions don't run their words together.

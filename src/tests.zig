@@ -10,6 +10,7 @@ test {
     _ = @import("backend_router.zig");
     _ = @import("segmenter.zig");
     _ = @import("local_backend.zig");
+    _ = @import("whisper_process_helper.zig"); // the parent-side ProcessHelper + its acceptance tests
     _ = @import("whisper_ipc.zig");
     _ = @import("whisper_helper_core.zig");
     _ = @import("whisper_supervisor.zig");
