@@ -124,8 +124,13 @@ pub const PrimaryAction = enum {
     operation_progress,
 };
 
+/// The two-tier menu-bar icon (CONTEXT.md, Status Item): `normal` when dictation can fire,
+/// `dimmed` when it needs attention (paused / a missing grant / a backend failure).
+pub const IconTier = enum { normal, dimmed };
+
 pub const Presentation = struct {
     headline: Headline,
+    icon_tier: IconTier,
     primary_action: PrimaryAction,
     show_openai_controls: bool,
     audio_stays_on_mac: bool,
@@ -140,8 +145,12 @@ pub const Presentation = struct {
 
 pub fn derive(s: Snapshot) Presentation {
     const operation_active = s.operation.isActive();
+    const hl = headline(s);
     return .{
-        .headline = headline(s),
+        .headline = hl,
+        // The dim tier folds the readiness attention signal with the backend-failure
+        // headline into one field, so the menu no longer re-ORs two modules' terms.
+        .icon_tier = if (s.health.needsAttention() or hl == .backend_failure) .dimmed else .normal,
         .primary_action = primaryAction(s),
         .show_openai_controls = s.selected_backend == .openai,
         .audio_stays_on_mac = s.selected_backend == .local and
@@ -158,6 +167,70 @@ pub fn derive(s: Snapshot) Presentation {
             .runtime_unavailable
         else
             .none,
+    };
+}
+
+/// The Model Operation Runner's live observation, in status_item-native types (mirrors
+/// model_operation's `Current` so this module needn't import — and cycle with — that one).
+pub const Observation = struct {
+    active: bool,
+    phase: Operation,
+    bytes: ?ByteProgress,
+    failure_detail: ?FailureDetail,
+};
+
+/// The daemon-gathered readings `project` assembles a `Snapshot` from. Everything here is
+/// already mapped to status_item-native values by the daemon's gathering glue (the
+/// model_store I/O and the recovery-phase -> Operation map); this struct carries no
+/// model_store or provisioner types, so the projection policy stays pure and testable.
+pub const Readings = struct {
+    selected_backend: backend.Backend,
+    health: readiness.Health,
+    terminal_backend_failure: bool = false,
+    local_runtime_failure: bool = false,
+    /// The on-disk installation view before the corrupt override (absent/ready/update).
+    installation: Installation = .absent,
+    recovery_is_corrupt: bool = false,
+    /// The on-disk operation view before the runner override.
+    operation: Operation = .idle,
+    operation_bytes: ?ByteProgress = null,
+    installation_identity: ?InstallationIdentity = null,
+    provisioner_failure_detail: ?FailureDetail = null,
+    observed: ?Observation = null,
+};
+
+/// Assemble the `Snapshot` the menu renders from the daemon's readings — the corrupt
+/// override and the runner-observation precedence that used to live inline in
+/// daemon.menuStatus. Pure policy over already-mapped values; the I/O and the enum mapping
+/// stay in the daemon.
+pub fn project(r: Readings) Snapshot {
+    var installation = r.installation;
+    if (r.recovery_is_corrupt) installation = .corrupt;
+
+    var operation = r.operation;
+    var operation_bytes = r.operation_bytes;
+    var failure_detail = r.provisioner_failure_detail;
+    if (r.observed) |o| {
+        // The Runner's live observation overrides the on-disk recovery view — except a
+        // paused operation stays paused unless the Runner is actively driving one, so a
+        // stale idle observation cannot erase a paused resume point.
+        if (o.active or operation != .paused) {
+            operation = o.phase;
+            operation_bytes = o.bytes;
+        }
+        failure_detail = o.failure_detail;
+    }
+
+    return .{
+        .selected_backend = r.selected_backend,
+        .health = r.health,
+        .terminal_backend_failure = r.terminal_backend_failure,
+        .local_runtime_failure = r.local_runtime_failure,
+        .installation = installation,
+        .operation = operation,
+        .operation_bytes = operation_bytes,
+        .installation_identity = r.installation_identity,
+        .failure_detail = failure_detail,
     };
 }
 
@@ -345,4 +418,89 @@ test "Local Model failures identify the actionable recovery" {
     try std.testing.expectEqual(ModelFailure.operation_failed, derive(snap(.{ .operation = .failed })).model_failure);
     try std.testing.expectEqual(ModelFailure.operation_cancelled, derive(snap(.{ .operation = .cancelled })).model_failure);
     try std.testing.expectEqual(ModelFailure.none, derive(snap(.{})).model_failure);
+}
+
+test "icon dims on the readiness attention signal and the backend-failure headline" {
+    // Attention statuses dim the icon.
+    try std.testing.expectEqual(IconTier.dimmed, derive(snap(.{ .health = .{ .paused = true, .status = .ready_offline } })).icon_tier);
+    try std.testing.expectEqual(IconTier.dimmed, derive(snap(.{ .health = .{ .paused = false, .status = .microphone_needed }, .installation = .absent })).icon_tier);
+    // A backend failure dims even when readiness alone would not (folds the second term).
+    try std.testing.expectEqual(IconTier.dimmed, derive(snap(.{ .terminal_backend_failure = true })).icon_tier);
+    // A ready backend keeps the icon normal.
+    try std.testing.expectEqual(IconTier.normal, derive(snap(.{})).icon_tier);
+    try std.testing.expectEqual(IconTier.normal, derive(snap(.{
+        .selected_backend = .openai,
+        .health = .{ .paused = false, .status = .ready },
+    })).icon_tier);
+}
+
+fn reads(fields: struct {
+    installation: Installation = .ready,
+    recovery_is_corrupt: bool = false,
+    operation: Operation = .idle,
+    operation_bytes: ?ByteProgress = null,
+    provisioner_failure_detail: ?FailureDetail = null,
+    observed: ?Observation = null,
+}) Readings {
+    return .{
+        .selected_backend = .local,
+        .health = .{ .paused = false, .status = .ready_offline },
+        .installation = fields.installation,
+        .recovery_is_corrupt = fields.recovery_is_corrupt,
+        .operation = fields.operation,
+        .operation_bytes = fields.operation_bytes,
+        .provisioner_failure_detail = fields.provisioner_failure_detail,
+        .observed = fields.observed,
+    };
+}
+
+test "project: the corrupt recovery flag overrides the on-disk installation view" {
+    try std.testing.expectEqual(Installation.corrupt, project(reads(.{ .installation = .ready, .recovery_is_corrupt = true })).installation);
+    try std.testing.expectEqual(Installation.ready, project(reads(.{ .installation = .ready, .recovery_is_corrupt = false })).installation);
+}
+
+test "project: an active runner observation overrides the on-disk operation and bytes" {
+    const s = project(reads(.{
+        .operation = .idle,
+        .operation_bytes = null,
+        .observed = .{ .active = true, .phase = .installing, .bytes = .{ .completed = 3, .total = 9 }, .failure_detail = null },
+    }));
+    try std.testing.expectEqual(Operation.installing, s.operation);
+    try std.testing.expectEqual(@as(u64, 3), s.operation_bytes.?.completed);
+}
+
+test "project: a paused operation survives a stale inactive observation" {
+    // observed.active = false AND on-disk op == .paused → the paused resume point stays.
+    const s = project(reads(.{
+        .operation = .paused,
+        .operation_bytes = .{ .completed = 5, .total = 10 },
+        .observed = .{ .active = false, .phase = .idle, .bytes = null, .failure_detail = null },
+    }));
+    try std.testing.expectEqual(Operation.paused, s.operation);
+    try std.testing.expectEqual(@as(u64, 5), s.operation_bytes.?.completed);
+}
+
+test "project: a non-paused on-disk operation yields to an inactive observation" {
+    // observed.active = false but on-disk op != .paused → the observation still wins.
+    const s = project(reads(.{
+        .operation = .installing,
+        .observed = .{ .active = false, .phase = .idle, .bytes = null, .failure_detail = null },
+    }));
+    try std.testing.expectEqual(Operation.idle, s.operation);
+}
+
+test "project: failure_detail comes from the observation whenever one is present" {
+    const provisioner_detail = try FailureDetail.init("provisioner");
+    const observed_detail = try FailureDetail.init("runner");
+
+    // No observation → the provisioner detail passes through.
+    const without = project(reads(.{ .provisioner_failure_detail = provisioner_detail }));
+    try std.testing.expectEqualStrings("provisioner", without.failure_detail.?.value());
+
+    // Observation present → its detail replaces the provisioner's, regardless of activity.
+    const with = project(reads(.{
+        .provisioner_failure_detail = provisioner_detail,
+        .observed = .{ .active = false, .phase = .idle, .bytes = null, .failure_detail = observed_detail },
+    }));
+    try std.testing.expectEqualStrings("runner", with.failure_detail.?.value());
 }

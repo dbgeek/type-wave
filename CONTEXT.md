@@ -188,5 +188,9 @@ _Avoid_: manager, controller, self-heal loop (that names the daemon thread, not 
 The daemon's menu-bar presence (icon near the clock): a two-tier icon — normal when
 dictation can fire, dimmed when it can't (paused / no key / permission missing) — whose
 menu shows the status line and edits every setting live. Recording/processing feedback
-stays the HUD's job, never the Status Item's.
+stays the HUD's job, never the Status Item's. Its presentation is pure: the daemon gathers
+raw readings, `status_item.project` assembles them into a `Snapshot` (the corrupt override
+and the Model Operation Runner precedence), and `status_item.derive` turns that into the
+`Presentation` the menu renders — including the two-tier icon as its `icon_tier`. The menu
+(`menu.zig`) is the AppKit adapter that reads that `Presentation`; it decides no status.
 _Avoid_: tray icon, menu-bar app (the daemon is one process, not a separate app)

@@ -928,11 +928,13 @@ const Daemon = struct {
             false,
             self.provisioner.installationPresent(),
         ));
+        // Gathering glue: the model_store I/O and the recovery-phase -> Operation map that
+        // stay in the daemon. The corrupt override and runner precedence are status_item's
+        // pure `project` (Candidate 2 of the 2026-07-22 architecture review).
         var installation: status_item.Installation = .absent;
         var operation: status_item.Operation = .idle;
         var operation_bytes: ?status_item.ByteProgress = null;
         var installation_identity: ?status_item.InstallationIdentity = null;
-        var failure_detail = self.provisioner.failureDetail();
         if (std.c.getenv("HOME")) |raw_home| {
             var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
             if (model_store.rootPath(std.mem.span(raw_home), &root_buffer)) |root| {
@@ -962,25 +964,25 @@ const Daemon = struct {
             } else |_| {}
         }
         const recovery_state = self.provisioner.recoveryState();
-        if (recovery_state == .corrupt) installation = .corrupt;
-        if (self.model_operation_runner.current()) |observed| {
-            if (observed.active or operation != .paused) {
-                operation = observed.phase;
-                operation_bytes = observed.bytes;
-            }
-            failure_detail = observed.failure_detail;
-        }
-        return .{
+        const observed: ?status_item.Observation = if (self.model_operation_runner.current()) |c| .{
+            .active = c.active,
+            .phase = c.phase,
+            .bytes = c.bytes,
+            .failure_detail = c.failure_detail,
+        } else null;
+        return status_item.project(.{
             .selected_backend = self.store.current().transcription_backend,
             .health = h,
             .terminal_backend_failure = self.store.current().transcription_backend == .local and recovery_state == .runtime_failure,
             .local_runtime_failure = recovery_state == .runtime_failure,
             .installation = installation,
+            .recovery_is_corrupt = recovery_state == .corrupt,
             .operation = operation,
             .operation_bytes = operation_bytes,
             .installation_identity = installation_identity,
-            .failure_detail = failure_detail,
-        };
+            .provisioner_failure_detail = self.provisioner.failureDetail(),
+            .observed = observed,
+        });
     }
 
     /// A session-shaped setting changed: nudge the Session to cycle when idle. Before
