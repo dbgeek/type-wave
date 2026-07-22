@@ -79,12 +79,13 @@ const backend_router = @import("backend_router.zig");
 const operation_channel = @import("operation_channel.zig");
 const model_operation = @import("model_operation.zig");
 const local_backend = @import("local_backend.zig");
+const whisper_process_helper = @import("whisper_process_helper.zig");
 const model_store = @import("model_store.zig");
 const local_provisioner = @import("local_provisioner.zig");
 const status_item = @import("status_item.zig");
 
 const Session = session_mod.Session;
-const LocalAdapter = local_backend.Adapter(local_backend.ProcessHelper);
+const LocalAdapter = local_backend.Adapter(whisper_process_helper.ProcessHelper);
 
 extern "c" fn usleep(usec: c_uint) c_int;
 extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
@@ -374,7 +375,7 @@ const LocalProvisionerDeps = struct {
 
     pub fn startHelper(self: *LocalProvisionerDeps, install: *Install) local_provisioner.StartOutcome(LocalAdapter) {
         const d = self.daemon;
-        const helper = local_backend.ProcessHelper.start(d.alloc, d.io, install.helperPath(), install.modelPath(), install.artifact) catch |failure| {
+        const helper = whisper_process_helper.ProcessHelper.start(d.alloc, d.io, install.helperPath(), install.modelPath(), install.artifact) catch |failure| {
             return .{ .spawn_failed = failure };
         };
         const local = d.alloc.create(LocalAdapter) catch {

@@ -16,6 +16,7 @@ const daemon = @import("daemon.zig");
 const keychain = @import("keychain.zig");
 const model_store = @import("model_store.zig");
 const local_backend = @import("local_backend.zig");
+const whisper_process_helper = @import("whisper_process_helper.zig");
 const operation_channel = @import("operation_channel.zig");
 
 /// True only when the daemon spawned this process as a Model Operation child
@@ -197,7 +198,7 @@ const HelperSmoke = struct {
 
     pub fn run(self: *HelperSmoke, model: []const u8, cancel: *const model_store.CancelToken) ![32]u8 {
         if (cancel.isRequested()) return error.ModelOperationCancelled;
-        try local_backend.smokeTest(self.allocator, self.io, self.executable, model, cancel.signalFlag());
+        try whisper_process_helper.smokeTest(self.allocator, self.io, self.executable, model, cancel.signalFlag());
         if (cancel.isRequested()) return error.ModelOperationCancelled;
         return model_store.sha256File(self.io, self.executable);
     }
