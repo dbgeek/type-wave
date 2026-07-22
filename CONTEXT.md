@@ -172,6 +172,18 @@ prerequisite: an OpenAI API key or a verified local Model Installation; transien
 readiness and pause state affect status, but do not define this phase.
 _Avoid_: setup state, readiness state, configured flag
 
+**Supervisor**:
+The pure per-tick decider of the daemon's self-heal nudges — the Talk Key tap re-arm and
+the PostEvent probe (#127/#129) — plus the superseded-Model-Installation cleanup and the
+capture-enable gate (the Talk Key press gate: `configured` AND a live backend AND not
+paused). Fed a `Facts` snapshot and the Configuration Phase `Outcome`, it returns an
+`Actions` bundle the daemon's self-heal loop executes; it reads the Configuration Phase
+and sits beside the grant sequence but owns neither — those stay peer machines the daemon
+drives. Lives in `src/supervisor.zig`, exercised by fed facts. Pure by choice, not
+necessity (ADR-0005): the daemon keeps the impure fact-gathering and runs the effects, so
+the async rearm/probe nudges stay visible in the loop.
+_Avoid_: manager, controller, self-heal loop (that names the daemon thread, not the decider)
+
 **Status Item**:
 The daemon's menu-bar presence (icon near the clock): a two-tier icon — normal when
 dictation can fire, dimmed when it can't (paused / no key / permission missing) — whose
