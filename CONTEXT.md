@@ -85,8 +85,24 @@ The app and text field that own the cursor at the moment of Insertion.
 _Avoid_: active window
 
 **Transcription Session**:
-The live connection to the transcription service over which an Utterance's audio streams out and transcripts stream back.
+The live connection to the transcription service over which an Utterance's audio streams
+out and transcripts stream back (the warm OpenAI Realtime link, `src/session.zig`). It
+owns the read-loop dispatch, the outbound-ring sender drain, and the keepalive/reconnect
+maintenance — each now a tested surface behind the **Session Transport** seam, so the
+whole warm lifecycle is exercised by fed events, not a live socket.
 _Avoid_: websocket (mechanism)
+
+**Session Transport**:
+The seam the Transcription Session speaks the wire through: `connect` / `startReadLoop` /
+`write` / `writePing` / `writePong` / `writeCloseFrame` / `close`, behind one contract
+(`assertTransport`) so `Session(comptime Transport)` is generic over it — the OpenAI twin
+of the local backend's Helper seam. The production adapter is `WebsocketTransport` (a thin
+wrapper over the vendored `websocket.Client` that also owns the read-loop thread handle); a
+`FakeTransport` records writes and drives the read loop synchronously, so `serverMessage`
+dispatch, the sender drain, and the pure `maintenanceDecision` are tested off it rather
+than against live OpenAI. It carries no policy — the Session decides; the Transport only
+moves bytes.
+_Avoid_: socket, client (mechanism), connection
 
 **Transcription Backend**:
 The selected source of a Final Transcript for an Utterance; it may also emit Partial Transcripts. OpenAI is the default backend; the local Whisper backend is an offline alternative.
