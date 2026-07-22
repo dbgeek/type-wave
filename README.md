@@ -15,7 +15,7 @@ foreground while developing, or as a signed per-user LaunchAgent for daily use.
        width="640">
 </p>
 
-> **Status:** experimental research project, `v0.0.0`, Apple Silicon macOS only.
+> **Status:** experimental research project, `v0.1.2`, Apple Silicon macOS only.
 > Single-maintainer, no support or SLA — small fixes welcome, larger changes worth
 > discussing first. The hold-to-talk -> transcribe -> insert pipeline works end-to-end
 > on either backend. Distribution hardening (hardened runtime, entitlements,
@@ -46,6 +46,15 @@ Transcript on release. **Local Whisper** runs offline: its **Segmenter** cuts a 
 Utterance into **Segments** at silences and transcribes them in the background, and the
 ordered **Segment Transcripts** concatenate into the Final Transcript. In local mode the
 audio never leaves the Mac.
+
+With the opt-in **Backtrack** setting on and OpenAI selected, one more stage sits between
+the Final Transcript and Insertion: a single OpenAI **Rewrite** pass applies spoken
+self-corrections ("at 20:00 no 18:00" → "at 18:00") and drops fillers ("um", "öh"), so the
+inserted text is what you meant to say. Enablement is pinned at Talk Key press, a
+mid-Utterance flip cannot half-apply, and any rewrite failure or timeout falls back to
+inserting the raw transcript — dictation never breaks. Backtrack sends the transcript
+**text** to OpenAI and needs internet; it does not apply on the Local backend, where the
+raw transcript inserts unchanged.
 
 Across the whole lifecycle the **Utterance Coordinator** owns the state machine from
 Talk Key press to a resolved Insertion. The floating **HUD** is silent visual feedback
@@ -130,6 +139,7 @@ cp packaging/config.example.zon ~/.config/type-wave/config.zon
 | `insertion` | `.paste` | `.paste` or `.keystroke` |
 | `pre_paste_ms` | `25` | Pasteboard settle delay before Cmd-V |
 | `overlay` | `true` | Show the silent waveform/processing HUD |
+| `backtrack` | `false` | Opt-in OpenAI rewrite of spoken self-corrections and fillers; OpenAI backend only, sends transcript text to the cloud |
 
 The menu bar is the live settings writer. It swaps in complete immutable settings
 snapshots and patches single fields in `config.zon` while preserving comments. Hand
@@ -199,9 +209,10 @@ is a live CoreAudio start/stop probe and uses real microphone IO.
 The daemon is thin wiring around testable state machines and OS adapters.
 
 The **Utterance Coordinator** in `src/coordinator.zig` owns the utterance lifecycle:
-`idle -> capturing -> awaiting_final -> inserting -> idle`. It handles the overlap
-guard, release-anchored deadline, empty or failed transcripts, dropped sessions, and
-failed insertions. Hardware and OS effects reach it through seams.
+`idle -> capturing -> awaiting_final -> rewriting -> inserting -> idle`. The optional
+`rewriting` phase runs the Backtrack pass when it applies and is otherwise a pass-through.
+It handles the overlap guard, release-anchored deadline, empty or failed transcripts,
+dropped sessions, and failed insertions. Hardware and OS effects reach it through seams.
 
 `src/daemon.zig` builds the real adapters, starts the threads, runs the menu/HUD/tap
 main loop, and supervises readiness. Three state machines remain outside the Coordinator:
@@ -221,6 +232,8 @@ configuration readiness in `src/configuration_phase.zig`, transcription link sta
 | `src/tap.zig` | Global Talk Key observation |
 | `src/insert.zig` | Clipboard paste and synthetic keystroke insertion |
 | `src/insertion_adapter.zig` | Async insertion worker around the Coordinator |
+| `src/rewrite_adapter.zig` | Async Backtrack rewrite worker; falls back to the raw transcript on failure |
+| `src/openai_rewrite.zig` | OpenAI Responses API rewrite mechanism over a warm HTTPS client |
 | `src/menu.zig` | Menu-bar status item and live settings UI |
 | `src/hud.zig` | Silent waveform/processing overlay |
 | `src/surface.zig` | HUD-vs-sound feedback arbitration |
