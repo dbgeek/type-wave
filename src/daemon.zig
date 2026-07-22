@@ -73,6 +73,7 @@ const rewrite_adapter = @import("rewrite_adapter.zig");
 const openai_rewrite = @import("openai_rewrite.zig");
 const readiness = @import("readiness.zig");
 const configuration_phase = @import("configuration_phase.zig");
+const supervisor = @import("supervisor.zig");
 const grant_sequence = @import("grant_sequence.zig");
 const backend = @import("transcription_backend.zig");
 const backend_router = @import("backend_router.zig");
@@ -757,27 +758,27 @@ const Daemon = struct {
         return self.configuration.tick(self.configurationFacts(im, pe, key != null, local_installation));
     }
 
+    /// Gather this tick's Supervisor facts — the impure OS/router/grant reads the pure
+    /// Supervisor decides on. Read at end-of-tick (after the grant sequence advanced and
+    /// the Backend Router prepared) so backend/grant facts are current. ADR-0005 keeps
+    /// this gathering in the daemon rather than behind a Supervisor seam.
+    fn supervisorFacts(self: *Daemon) supervisor.Facts {
+        return .{
+            .tap_enabled = self.tap.isEnabled(),
+            .grants_reached_post_event = self.grants.reached(.post_event),
+            .post_event_granted = self.postEventFact(),
+            .no_utterance_in_flight = self.transcription.activeId() == 0,
+            .backend_available = self.transcription.available(),
+            .paused = self.paused.load(.acquire),
+        };
+    }
+
     fn supervisorLoop(self: *Daemon) void {
         var first = true;
         while (!g_quit.load(.acquire)) {
             if (!first) sleepInterruptible(supervisor_tick_ms);
             first = false;
             if (g_quit.load(.acquire)) return;
-
-            // Input Monitoring re-arm (#127/#129): CGEventTapEnable on a created-while-
-            // denied port is permanently inert, and the preflight is stale in-process —
-            // only a fresh CGEventTapCreate re-consults tccd, so the create attempt IS
-            // the grant detector. It must run on the tap's run-loop thread; schedule it
-            // there and read the outcome as isEnabled on the next tick (the #129 spike
-            // saw the tap live on the very next poll after granting).
-            if (!self.tap.isEnabled()) self.tap.scheduleRecreate();
-
-            // PostEvent attempt-then-observe (#129): once its prompt has had its chance
-            // to surface, post an invisible tagged probe each tick until one round-trips
-            // our own live tap (onSelfEvent latches it). Denied posts are silently
-            // dropped, so an ungranted state just keeps probing at supervisor cadence.
-            if (self.grants.reached(.post_event) and self.tap.isEnabled() and !self.postEventFact())
-                insertmod.postTaggedProbe();
 
             // #130's serialized cold-start requests + all [N/3] narration.
             self.tickGrantSequence();
@@ -792,15 +793,22 @@ const Daemon = struct {
             // the state users see at the end of this poll tick.
             if (changed_facts) outcome = self.gatherOutcome();
 
-            if (outcome.actions.announce_ready)
+            // The Supervisor decides this tick's self-heal nudges + the capture-enable
+            // gate; the daemon runs the effects here. The rearm/probe nudges are async —
+            // scheduleRecreate posts to the tap's run-loop thread, postTaggedProbe posts a
+            // synthetic event — so their outcomes land next tick regardless of where in
+            // the tick they fire (#127/#129). See ADR-0005.
+            const acts = supervisor.tick(self.supervisorFacts(), outcome);
+            if (acts.rearm_tap) self.tap.scheduleRecreate();
+            if (acts.post_probe) insertmod.postTaggedProbe();
+            if (acts.announce_ready)
                 feedback.log("  READY — hold {s}, speak, release; the transcript lands at the cursor.\n", .{keyName(self.store.current().talk_key)});
-            if (outcome.actions.report_missing) |report| self.reportMissing(report);
-            // Cheap nonblocking reconciliation also catches updates activated while OpenAI
-            // is selected and no local helper exists. Busy operation/inference locks defer
-            // cleanup to the next supervisor tick without disturbing dictation.
-            if (self.transcription.activeId() == 0)
-                self.provisioner.removeSuperseded();
-            self.capture_enabled.store(outcome.configured and self.transcription.available() and !self.paused.load(.acquire), .release);
+            if (acts.report_missing) |report| self.reportMissing(report);
+            // Reclaim a superseded Model Installation only with no Utterance in flight;
+            // busy operation/inference locks defer cleanup to the next tick without
+            // disturbing dictation.
+            if (acts.remove_superseded) self.provisioner.removeSuperseded();
+            self.capture_enabled.store(acts.capture_enabled, .release);
         }
     }
 
@@ -1187,7 +1195,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     const timer = try std.Thread.spawn(.{}, DeadlineAdapter.timerLoop, .{&daemon.deadline});
     timer.detach();
     // The supervisor is JOINED at shutdown (below), so it can't race the session teardown.
-    const supervisor = try std.Thread.spawn(.{}, Daemon.supervisorLoop, .{&daemon});
+    const supervisor_thread = try std.Thread.spawn(.{}, Daemon.supervisorLoop, .{&daemon});
     const local_retry = try std.Thread.spawn(.{}, Daemon.localRetryLoop, .{&daemon});
 
     _ = signal(SIGINT, onSignal);
@@ -1212,7 +1220,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     // memory, and skipping the free avoids any race with the detached worker/timer that may
     // still hold the pointer (same process-lifetime-singleton stance as config).
     feedback.log("shutting down…\n", .{});
-    supervisor.join();
+    supervisor_thread.join();
     local_retry.join();
     daemon.transcription.shutdown();
     feedback.log("bye.\n", .{});
