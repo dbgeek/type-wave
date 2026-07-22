@@ -568,7 +568,7 @@ pub const Menu = struct {
         self.last_snapshot = snapshot;
         const h = snapshot.health;
         const presentation = status_item.derive(snapshot);
-        const needs_attention = h.needsAttention() or presentation.headline == .backend_failure;
+        const dimmed = presentation.icon_tier == .dimmed;
 
         var img = sfSymbol("waveform.badge.mic");
         if (img != null) {
@@ -579,9 +579,9 @@ pub const Menu = struct {
             msg1v(self.button, "setTitle:", nsstr(""));
         } else {
             // No SF Symbols on this macOS — a text glyph keeps the item clickable.
-            msg1v(self.button, "setTitle:", nsstr(if (needs_attention) "tw!" else "tw"));
+            msg1v(self.button, "setTitle:", nsstr(if (dimmed) "tw!" else "tw"));
         }
-        msgDouble(self.button, "setAlphaValue:", if (needs_attention) 0.35 else 1.0);
+        msgDouble(self.button, "setAlphaValue:", if (dimmed) 0.35 else 1.0);
         msg1v(self.status_line, "setTitle:", nsstr(statusText(presentation, snapshot.selected_backend)));
         msg1v(self.pause_item, "setTitle:", nsstr(if (h.paused) "Resume dictation" else "Pause dictation"));
 
