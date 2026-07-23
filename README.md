@@ -209,41 +209,107 @@ is a live CoreAudio start/stop probe and uses real microphone IO.
 
 ## Architecture
 
-The daemon is thin wiring around testable state machines and OS adapters.
+The daemon is thin wiring around testable state machines and OS adapters. It transcribes
+through either of two backends — OpenAI Realtime (streaming, the default) or offline local
+Whisper — selected at runtime behind a Backend Router.
 
 The **Utterance Coordinator** in `src/coordinator.zig` owns the utterance lifecycle:
 `idle -> capturing -> awaiting_final -> rewriting -> inserting -> idle`. The optional
-`rewriting` phase runs the Backtrack pass when it applies and is otherwise a pass-through.
-It handles the overlap guard, release-anchored deadline, empty or failed transcripts,
-dropped sessions, and failed insertions. Hardware and OS effects reach it through seams.
+`rewriting` phase runs the Backtrack pass (OpenAI only) when it applies and is otherwise a
+pass-through. It handles the overlap guard, release-anchored deadline, empty or failed
+transcripts, dropped sessions, and failed insertions. Hardware and OS effects reach it
+through seams.
 
-`src/daemon.zig` builds the real adapters, starts the threads, runs the menu/HUD/tap
-main loop, and supervises readiness. Three state machines remain outside the Coordinator:
-configuration readiness in `src/configuration_phase.zig`, transcription link state in
-`src/session.zig`, and local load-failure classification in `src/local_model_recovery.zig`.
+`src/daemon.zig` builds the real adapters, starts the threads, runs the menu/HUD/tap main
+loop, and drives readiness through a pure per-tick self-heal decider (`src/supervisor.zig`).
+Several state machines run outside the Coordinator: configuration readiness
+(`src/configuration_phase.zig`), OpenAI link state (`src/session.zig`), backend selection
+(`src/backend_router.zig`), local load-failure classification
+(`src/local_model_recovery.zig`), the local Whisper helper lifecycle
+(`src/whisper_supervisor.zig`), and the cold-start permission-grant sequence
+(`src/grant_sequence.zig`).
+
+**Core pipeline**
 
 | Module | Role |
 | --- | --- |
 | `src/main.zig` | CLI entry point and `--set-key` subcommand |
 | `src/daemon.zig` | Long-running daemon wiring, threads, supervisor, menu seams |
 | `src/coordinator.zig` | Utterance lifecycle state machine |
+| `src/supervisor.zig` | Pure per-tick self-heal decider and capture-enable gate |
+| `src/appkit.zig` | NSApplication bring-up and main run loop |
+
+**Transcription backends**
+
+| Module | Role |
+| --- | --- |
+| `src/backend_router.zig` | Utterance-to-backend routing with the drain-then-switch selection FSM |
+| `src/transcription_backend.zig` | Backend-neutral transcription contract and deadline types |
+| `src/session.zig` | Warm OpenAI Realtime transcription session and reconnect logic |
+| `src/local_backend.zig` | Segmenting local Whisper transcription backend adapter |
+| `src/segmenter.zig` | Pure silence-cut segment policy |
+
+**Local Whisper runtime**
+
+| Module | Role |
+| --- | --- |
+| `src/whisper_runtime.zig` | whisper.cpp Metal runtime FFI wrapper |
+| `src/whisper_helper.zig` | Whisper Helper subprocess server (runtime plus IPC loop) |
+| `src/whisper_helper_core.zig` | Pinned model identity and inference preparation/gate core |
+| `src/whisper_ipc.zig` | Whisper Helper IPC frame protocol |
+| `src/whisper_process_helper.zig` | Parent-side warm helper process owner and relaunch ladder |
+| `src/whisper_supervisor.zig` | Whisper Helper event/state machine and recovery budget |
+
+**Local model provisioning & storage**
+
+| Module | Role |
+| --- | --- |
+| `src/model_store.zig` | Explicit credential-free Model Operations and atomic Model Installation activation |
+| `src/model_operation.zig` | Model Operation child-process runner and its observation |
+| `src/operation_channel.zig` | Typed Model Operation observation wire (child stdout) |
+| `src/local_provisioner.zig` | Warms the local backend with corruption-vs-runtime recovery latch |
+| `src/local_model_recovery.zig` | Local integrity verification versus runtime-load recovery policy |
+| `src/layout.zig` | Single owner of the on-disk models-root path grammar |
+| `src/artifact_identity.zig` | Pure size/sha256 model-artifact identity codec |
+| `src/installation_identity.zig` | Owned Model Installation receipt identity for cross-thread presentation |
+| `src/receipt.zig` | Installation Receipt codec (schemas plus PROVENANCE/partial.meta) |
+
+**Configuration & readiness**
+
+| Module | Role |
+| --- | --- |
 | `src/config.zig` | ZON settings, key loading, immutable settings snapshots, config writes |
 | `src/configuration_phase.zig` | Setup readiness transitions and reporting |
 | `src/readiness.zig` | Pure readiness/status policy |
-| `src/session.zig` | Warm OpenAI Realtime transcription session and reconnect logic |
+| `src/grant_sequence.zig` | Serialized cold-start TCC grant request sequence |
+| `src/failure_observation.zig` | Cross-thread failure snapshot the status item reads |
+
+**Audio, insertion & input**
+
+| Module | Role |
+| --- | --- |
 | `src/capture.zig` | CoreAudio capture |
 | `src/tap.zig` | Global Talk Key observation |
 | `src/insert.zig` | Clipboard paste and synthetic keystroke insertion |
 | `src/insertion_adapter.zig` | Async insertion worker around the Coordinator |
+
+**Backtrack rewrite**
+
+| Module | Role |
+| --- | --- |
 | `src/rewrite_adapter.zig` | Async Backtrack rewrite worker; falls back to the raw transcript on failure |
 | `src/openai_rewrite.zig` | OpenAI Responses API rewrite mechanism over a warm HTTPS client |
-| `src/menu.zig` | Menu-bar status item and live settings UI |
+
+**UI, feedback & platform**
+
+| Module | Role |
+| --- | --- |
+| `src/menu.zig` | Menu-bar AppKit item and live settings UI |
+| `src/status_item.zig` | Pure status-item presentation policy |
 | `src/hud.zig` | Silent waveform/processing overlay |
 | `src/surface.zig` | HUD-vs-sound feedback arbitration |
 | `src/feedback.zig` | Sound cues and timestamped logging |
 | `src/keychain.zig` | OpenAI login-Keychain item |
-| `src/model_store.zig` | Explicit credential-free Model Operation and atomic Model Installation activation |
-| `src/local_model_recovery.zig` | Local integrity verification versus runtime-load recovery policy |
 | `src/info_plist.zig` | Embedded `Info.plist` Mach-O section |
 
 ## Repository Layout
