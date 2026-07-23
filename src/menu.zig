@@ -662,13 +662,16 @@ pub const Menu = struct {
     /// Repopulate the Recent Insertions rows from the pure `Presentation.history` (spec §4.1):
     /// masked, newest-first, dot colour + failed/degraded tag already decided by `derive`.
     /// Called at `menuWillOpen` so relative times stay fresh — the only impure input,
-    /// `feedback.nowMs()`, is read here, never in the value-compared `Snapshot`.
+    /// `feedback.nowMs()`, is read here, never in the value-compared `Snapshot`. Reuses the
+    /// `Snapshot` `refreshChrome` just cached (both run on open) rather than re-reading
+    /// `host.status`, which does model_store I/O; the `orelse` fetch covers the init-time
+    /// resting build before the first `refreshChrome`.
     fn rebuildHistory(self: *Menu) void {
         if (self.history_parent == null) return;
         const pool = objc_autoreleasePoolPush();
         defer objc_autoreleasePoolPop(pool);
 
-        const view = status_item.derive(self.host.status(self.host.ctx)).history;
+        const view = status_item.derive(self.last_snapshot orelse self.host.status(self.host.ctx)).history;
         if (view.count == 0) {
             // Empty ring: the parent itself reads disabled "No recent insertions" (spec §4).
             msg1v(self.history_parent, "setTitle:", nsstr("No recent insertions"));
