@@ -1,6 +1,6 @@
 .{
     .name = .type_wave,
-    .version = "0.1.2", // x-release-please-version
+    .version = "0.1.3", // x-release-please-version
     .fingerprint = 0xd0b68818c78be1d,
     // Floor guard (docs/toolchain.md): fail loudly if built with a Zig older than
     // the flake-locked nightly. NOT a ceiling — forward drift is caught by flake.lock.

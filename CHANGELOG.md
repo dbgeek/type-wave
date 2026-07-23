@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3](https://github.com/dbgeek/type-wave/compare/v0.1.2...v0.1.3) (2026-07-23)
+
+
+### Features
+
+* **config:** vocabulary schema, load-time clamp & comment-preserving round-trip ([#171](https://github.com/dbgeek/type-wave/issues/171)) ([#175](https://github.com/dbgeek/type-wave/issues/175)) ([9557af5](https://github.com/dbgeek/type-wave/commit/9557af5335c2e42b675ebcddb1111b7a9b65ecc2))
+* **vocab:** pure buildPrompt glossary + Whisper budget estimation ([#172](https://github.com/dbgeek/type-wave/issues/172)) ([#177](https://github.com/dbgeek/type-wave/issues/177)) ([f25b8fa](https://github.com/dbgeek/type-wave/commit/f25b8fa7e7bc98358a1d5c565602c636722b210f))
+
 ## [0.1.2](https://github.com/dbgeek/type-wave/compare/v0.1.1...v0.1.2) (2026-07-20)
 
 
