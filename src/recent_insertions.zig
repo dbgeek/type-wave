@@ -29,7 +29,11 @@ pub const capacity = 20;
 
 /// One stored Insertion Record — the authoritative, text-bearing entry the ring owns. Unlike
 /// `coord.InsertionRecord` (borrowed slices crossing the seam) this holds its own inline
-/// copies, sized like the Coordinator's `pending` / `raw` buffers so any transcript fits.
+/// copies. Both buffers are `[8192]` and hold the whole transcript with no loss: the trimmed
+/// `raw` is capped at 8192 bytes at the source (`coordinator.raw`), and the with-space
+/// `inserted` reaches at most 8192 bytes too — the Coordinator's `pending` scratch buffer is
+/// `[8193]` only to give `ensureTrailingSpace` room for content + space + a NUL it doesn't
+/// store, so the returned slice never exceeds 8192.
 pub const Record = struct {
     inserted_bytes: [8192]u8 = undefined,
     inserted_len: usize = 0,
@@ -50,14 +54,14 @@ pub const Record = struct {
     }
 };
 
-/// A self-contained `os_unfair_lock` leaf lock — same primitive the Coordinator, rewrite
-/// adapter, and HUD use; zero-initializable so the ring builds for free.
-const Lock = struct {
+/// A self-contained `os_unfair_lock` wrapper — the same `Mutex` shape `coordinator.zig` uses,
+/// here as the ring's leaf lock; zero-initializable so the ring builds for free.
+const Mutex = struct {
     lock_: OsUnfairLock = .{},
-    fn lock(self: *Lock) void {
+    fn lock(self: *Mutex) void {
         os_unfair_lock_lock(&self.lock_);
     }
-    fn unlock(self: *Lock) void {
+    fn unlock(self: *Mutex) void {
         os_unfair_lock_unlock(&self.lock_);
     }
 };
@@ -66,7 +70,7 @@ extern "c" fn os_unfair_lock_lock(lock: *OsUnfairLock) void;
 extern "c" fn os_unfair_lock_unlock(lock: *OsUnfairLock) void;
 
 pub const Ring = struct {
-    mu: Lock = .{},
+    mu: Mutex = .{},
     /// A circular buffer: writes advance `head`; the newest live entry is at `head - 1`.
     buf: [capacity]Record = undefined,
     head: usize = 0,
