@@ -35,6 +35,7 @@ const tapmod = @import("tap.zig");
 const insertmod = @import("insert.zig");
 const keychain = @import("keychain.zig");
 const feedback = @import("feedback.zig");
+const vocab = @import("vocab.zig");
 
 // ---- ObjC runtime primitives (same pattern as hud.zig / the #31 spike) -------
 const id = ?*anyopaque;
@@ -115,10 +116,15 @@ inline fn newMenu() id {
     return msg(msg(cls("NSMenu"), "alloc"), "init");
 }
 const NSRect = extern struct { x: f64, y: f64, w: f64, h: f64 };
-inline fn secureField(rect: NSRect) id {
-    const allocd = msg(cls("NSSecureTextField"), "alloc");
+/// `[[Cls alloc] initWithFrame:rect]` — the API-key field and the vocabulary editor's
+/// NSScrollView + NSTextView accessory (the multi-line step up, spec §3) share this.
+inline fn allocInitFrame(class_name: [*:0]const u8, rect: NSRect) id {
+    const allocd = msg(cls(class_name), "alloc");
     const f: *const fn (id, SEL, NSRect) callconv(.c) id = @ptrCast(&objc_msgSend);
     return f(allocd, sel_registerName("initWithFrame:"), rect);
+}
+inline fn secureField(rect: NSRect) id {
+    return allocInitFrame("NSSecureTextField", rect);
 }
 inline fn mainScreen() id {
     return msg(cls("NSScreen"), "mainScreen");
@@ -359,6 +365,82 @@ fn primaryText(action: status_item.PrimaryAction, operation: status_item.Operati
 }
 
 // =====================================================================================
+// Vocabulary editing (spec §3/§4) — the pure halves, kept off AppKit so they unit-test
+// without a display. `onVocabulary` below is the thin ObjC glue that drives them.
+// =====================================================================================
+
+// " — local only" and "…" as UTF-8 bytes (the file's convention for the em dash / ellipsis).
+const local_only_suffix = " \xe2\x80\x94 local only";
+const dialog_ellipsis = "\xe2\x80\xa6";
+
+/// The Vocabulary menu-item title from the live term count and the active backend. Local:
+/// `Vocabulary (off)` / `Vocabulary (3 terms)…`. OpenAI: the same with a ` — local only`
+/// suffix that replaces the disclosure ellipsis — the list is editable but inert there
+/// until you switch to Local (spec §4). Static fallback on the (unreachable) format overflow.
+fn vocabularyTitle(buf: []u8, count: usize, selected: backend.Backend) [:0]const u8 {
+    if (count == 0)
+        return std.fmt.bufPrintSentinel(buf, "Vocabulary (off){s}", .{
+            if (selected == .openai) local_only_suffix else "",
+        }, 0) catch "Vocabulary";
+    const unit = if (count == 1) "term" else "terms";
+    if (selected == .openai)
+        return std.fmt.bufPrintSentinel(buf, "Vocabulary ({d} {s}){s}", .{ count, unit, local_only_suffix }, 0) catch "Vocabulary";
+    return std.fmt.bufPrintSentinel(buf, "Vocabulary ({d} {s}){s}", .{ count, unit, dialog_ellipsis }, 0) catch "Vocabulary";
+}
+
+/// Split the editor's text into the entered vocabulary list (spec §3): one term per line,
+/// each trimmed of surrounding whitespace, blank lines dropped. Terms are duped into `gpa`
+/// so they outlive the dialog's autorelease pool once pinned in the leaked Settings
+/// snapshot; the structural 100-char / 128-item clamp is `config.clampVocabulary`, applied
+/// next. Caller owns the outer slice (the inner strings leak by design, config.Store's
+/// model). Null on OOM.
+fn parseVocabularyLines(gpa: std.mem.Allocator, text: []const u8) ?[]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(gpa);
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const owned = gpa.dupe(u8, trimmed) catch return null;
+        list.append(gpa, owned) catch return null;
+    }
+    return list.toOwnedSlice(gpa) catch null;
+}
+
+/// The editor's pre-filled text — the current (already clamped) list joined one term per
+/// line, so load-clamped items are visibly absent on the next open (surface-by-round-trip,
+/// spec §3). Empty list → empty string (the placeholder case). Caller owns it; null on OOM.
+fn prefillText(gpa: std.mem.Allocator, list: []const []const u8) ?[:0]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (list, 0..) |item, i| {
+        if (i != 0) out.append(gpa, '\n') catch return null;
+        out.appendSlice(gpa, item) catch return null;
+    }
+    return out.toOwnedSliceSentinel(gpa, 0) catch null;
+}
+
+/// The follow-up informational alert body when Save's structural clamp dropped items
+/// (spec §3) — names the count and the caps so the user sees why terms vanished.
+fn droppedItemsMessage(buf: []u8, dropped: usize) [:0]const u8 {
+    const unit = if (dropped == 1) "term" else "terms";
+    return std.fmt.bufPrintSentinel(buf, "Dropped {d} {s} over the limit (100 characters per term, 128 terms max). The rest were saved.", .{ dropped, unit }, 0) catch "Some terms over the limit were dropped.";
+}
+
+/// The dialog's informativeText (spec §3/§6): the always-present "one term per line"
+/// guidance plus the read-at-use behaviour, and — when the current list is near/over the
+/// conservative Whisper token budget (§2) — a soft, non-blocking truncation hint carrying
+/// the estimate. Advisory only; Save never blocks on it.
+fn vocabularyInfoText(buf: []u8, list: []const []const u8) [:0]const u8 {
+    const base = "One term per line, most important first. Biases the Local (Whisper) backend at your next dictation; ignored on OpenAI.";
+    return switch (vocab.budget(list)) {
+        .ok => std.fmt.bufPrintSentinel(buf, "{s}", .{base}, 0) catch base,
+        .near => std.fmt.bufPrintSentinel(buf, "{s} Getting long (~{d} tokens) — nearing the local Whisper limit.", .{ base, vocab.estimateTokens(list) }, 0) catch base,
+        .over => std.fmt.bufPrintSentinel(buf, "{s} Long list (~{d} tokens) — the tail may be truncated for local Whisper.", .{ base, vocab.estimateTokens(list) }, 0) catch base,
+    };
+}
+
+// =====================================================================================
 // The Menu. One instance for the process lifetime; the C-ABI action handlers reach it
 // through the module-level pointer (they receive only ObjC's self/_cmd/sender).
 // =====================================================================================
@@ -385,6 +467,7 @@ pub const Menu = struct {
     set_api_key_item: id = null,
     pause_item: id = null, // title flips Pause/Resume
     overlay_item: id = null, // checkbox mirror of settings.overlay
+    vocabulary_item: id = null, // title reflects the live term count + backend (spec §3/§4)
     backtrack_item: id = null, // checkbox mirror of settings.backtrack
     backtrack_cloud_item: id = null, // disclosure line 1 (static; on and off)
     backtrack_backend_item: id = null, // disclosure line 2 (swaps on Local + on)
@@ -452,6 +535,8 @@ pub const Menu = struct {
         addSeparator(menu);
         self.set_api_key_item = self.addAction(menu, "Set OpenAI API Key\xe2\x80\xa6", "onSetApiKey:");
         self.pause_item = self.addAction(menu, "Pause dictation", "onPause:");
+        self.vocabulary_item = self.addAction(menu, "Vocabulary (off)", "onVocabulary:");
+        self.syncVocabulary(); // title from the current list count + backend
         _ = self.addAction(menu, "Open config file", "onOpenConfig:");
         addSeparator(menu);
         _ = self.addAction(menu, "Quit type-wave", "onQuit:");
@@ -556,6 +641,16 @@ pub const Menu = struct {
         const snap = self.store.current();
         msgLong(self.backtrack_item, "setState:", if (snap.backtrack) NSControlStateOn else NSControlStateOff);
         msg1v(self.backtrack_backend_item, "setTitle:", nsstr(backtrackLine2(snap)));
+    }
+
+    /// Re-title the Vocabulary item from the current snapshot's term count and backend
+    /// (spec §3/§4). Called on init, on Save, on a backend switch, and on menu open (to
+    /// pick up a hand-edited list) — the same cadence as `syncBacktrack`.
+    fn syncVocabulary(self: *Menu) void {
+        const snap = self.store.current();
+        var buf: [96]u8 = undefined;
+        const title = vocabularyTitle(&buf, snap.vocabulary.len, snap.transcription_backend);
+        msg1v(self.vocabulary_item, "setTitle:", nsstr(title.ptr));
     }
 
     /// Push the independent state axes into the compact hierarchy. Cheap when nothing
@@ -720,7 +815,10 @@ fn onRadio(_: id, _: SEL, sender: id) callconv(.c) void {
     applyOption(&next, gi, oi);
     m.commitSettings(next, g.field, g.opts[oi].zon, g.session_shaped);
     m.syncGroup(gi);
-    if (gi == 0) m.syncBacktrack(); // backend switch re-words Backtrack disclosure line 2
+    if (gi == 0) {
+        m.syncBacktrack(); // backend switch re-words Backtrack disclosure line 2
+        m.syncVocabulary(); // …and flips the Vocabulary item's `— local only` suffix (§4)
+    }
     feedback.log("  menu: {s} → {s}{s}\n", .{
         g.title,                                                                 g.opts[oi].label,
         if (g.session_shaped) " (binds at the next idle session cycle)" else "",
@@ -898,6 +996,90 @@ test "backtrackLine2 sharpens to not-applying only on Local with Backtrack on" {
     try std.testing.expect(std.mem.indexOf(u8, std.mem.span(backtrackLine2(&on_local)), sharpened) != null);
 }
 
+// ---- vocabulary editing pure halves (spec §3/§4) --------------------------------------
+
+test "vocabularyTitle reflects the count, plural, and backend-aware suffix" {
+    var buf: [96]u8 = undefined;
+    // Local: `(off)` / `(N terms)…`, no suffix.
+    try std.testing.expectEqualStrings("Vocabulary (off)", vocabularyTitle(&buf, 0, .local));
+    try std.testing.expectEqualStrings("Vocabulary (1 term)\xe2\x80\xa6", vocabularyTitle(&buf, 1, .local));
+    try std.testing.expectEqualStrings("Vocabulary (3 terms)\xe2\x80\xa6", vocabularyTitle(&buf, 3, .local));
+    // OpenAI: the ` — local only` suffix replaces the disclosure ellipsis (§4).
+    try std.testing.expectEqualStrings("Vocabulary (off) \xe2\x80\x94 local only", vocabularyTitle(&buf, 0, .openai));
+    try std.testing.expectEqualStrings("Vocabulary (3 terms) \xe2\x80\x94 local only", vocabularyTitle(&buf, 3, .openai));
+}
+
+test "parseVocabularyLines splits, trims, and drops blank lines" {
+    const list = parseVocabularyLines(std.testing.allocator, "  type-wave \n\nwhisper.cpp\n   \nBjorn").?;
+    defer {
+        for (list) |item| std.testing.allocator.free(item);
+        std.testing.allocator.free(list);
+    }
+    try std.testing.expectEqual(@as(usize, 3), list.len);
+    try std.testing.expectEqualStrings("type-wave", list[0]);
+    try std.testing.expectEqualStrings("whisper.cpp", list[1]);
+    try std.testing.expectEqualStrings("Bjorn", list[2]);
+}
+
+test "parseVocabularyLines yields an empty list for blank/empty text" {
+    const empty = parseVocabularyLines(std.testing.allocator, "").?;
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    const spaces = parseVocabularyLines(std.testing.allocator, "  \n\t\n").?;
+    defer std.testing.allocator.free(spaces);
+    try std.testing.expectEqual(@as(usize, 0), spaces.len);
+}
+
+test "prefillText joins one term per line; empty list yields an empty field" {
+    const text = prefillText(std.testing.allocator, &.{ "type-wave", "whisper.cpp" }).?;
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("type-wave\nwhisper.cpp", text);
+
+    const empty = prefillText(std.testing.allocator, &.{}).?;
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "prefill → parse round-trips a list byte-for-byte" {
+    const original = [_][]const u8{ "type-wave", "whisper.cpp", "Bjorn" };
+    const text = prefillText(std.testing.allocator, &original).?;
+    defer std.testing.allocator.free(text);
+    const back = parseVocabularyLines(std.testing.allocator, text).?;
+    defer {
+        for (back) |item| std.testing.allocator.free(item);
+        std.testing.allocator.free(back);
+    }
+    try std.testing.expectEqual(original.len, back.len);
+    for (original, back) |a, b| try std.testing.expectEqualStrings(a, b);
+}
+
+test "droppedItemsMessage pluralizes and names the structural caps" {
+    var buf: [160]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, droppedItemsMessage(&buf, 1), "Dropped 1 term ") != null);
+    const many = droppedItemsMessage(&buf, 5);
+    try std.testing.expect(std.mem.indexOf(u8, many, "Dropped 5 terms ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, many, "128 terms max") != null);
+}
+
+test "vocabularyInfoText always guides, and adds a soft hint only when near/over budget" {
+    var buf: [256]u8 = undefined;
+    const short = vocabularyInfoText(&buf, &.{ "type-wave", "whisper.cpp" });
+    try std.testing.expect(std.mem.indexOf(u8, short, "One term per line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, short, "tokens") == null); // no hint when well within budget
+
+    // A list past the conservative Whisper budget trips the soft, non-blocking hint (§6).
+    const term = blk: {
+        var b: [50]u8 = undefined;
+        @memset(&b, 'a');
+        break :blk b;
+    };
+    var backing: [20][]const u8 = undefined;
+    for (&backing) |*slot| slot.* = &term;
+    const long = vocabularyInfoText(&buf, &backing);
+    try std.testing.expect(std.mem.indexOf(u8, long, "truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, long, "tokens") != null);
+}
+
 fn onOpenConfig(_: id, _: SEL, _: id) callconv(.c) void {
     const m = g_menu orelse return;
     var buf: [4096]u8 = undefined;
@@ -945,6 +1127,79 @@ fn onSetApiKey(_: id, _: SEL, _: id) callconv(.c) void {
     }
 }
 
+/// The Vocabulary editor (spec §3): NSAlert + a multi-line NSTextView-in-NSScrollView
+/// accessory pre-filled with the current (clamped) list, one term per line. Save parses →
+/// trims → drops blanks → applies the §1 structural clamp → commits `session_shaped = false`
+/// (no session cycle; Whisper reads the list fresh at the next Talk-Key press). Cancel is a
+/// no-op. When the clamp dropped items, a follow-up alert names the count. The item edits on
+/// both backends; on OpenAI it is inert (§4) — the menu title already says `— local only`.
+fn onVocabulary(_: id, _: SEL, _: id) callconv(.c) void {
+    const m = g_menu orelse return;
+    const pool = objc_autoreleasePoolPush();
+    defer objc_autoreleasePoolPop(pool);
+
+    // Accessory app not frontmost → activate so the modal takes keystrokes (#31).
+    msgBool(appkit.app(), "activateIgnoringOtherApps:", true);
+
+    const current = m.store.current();
+
+    const alert = msg(msg(cls("NSAlert"), "alloc"), "init");
+    msg1v(alert, "setMessageText:", nsstr("Edit Vocabulary"));
+    var info_buf: [256]u8 = undefined;
+    msg1v(alert, "setInformativeText:", nsstr(vocabularyInfoText(&info_buf, current.vocabulary).ptr));
+    _ = msg1(alert, "addButtonWithTitle:", nsstr("Save"));
+    _ = msg1(alert, "addButtonWithTitle:", nsstr("Cancel"));
+
+    // Multi-line accessory: a bezeled, vertically-scrolling NSTextView. Disable the smart
+    // substitutions that would silently mangle terms (curly quotes, dash swaps, replacement).
+    const frame = NSRect{ .x = 0, .y = 0, .w = 320, .h = 160 };
+    const scroll = allocInitFrame("NSScrollView", frame);
+    msgBool(scroll, "setHasVerticalScroller:", true);
+    msgLong(scroll, "setBorderType:", 2); // NSBezelBorder
+    const text_view = allocInitFrame("NSTextView", frame);
+    msgBool(text_view, "setRichText:", false);
+    msgBool(text_view, "setSmartInsertDeleteEnabled:", false);
+    msgBool(text_view, "setAutomaticQuoteSubstitutionEnabled:", false);
+    msgBool(text_view, "setAutomaticDashSubstitutionEnabled:", false);
+    msgBool(text_view, "setAutomaticTextReplacementEnabled:", false);
+    msgBool(text_view, "setAutomaticSpellingCorrectionEnabled:", false);
+
+    // Pre-fill with the loaded (already clamped) list — items the load clamp dropped are
+    // visibly absent (surface-by-round-trip, spec §3). Empty list → empty field.
+    if (prefillText(m.alloc, current.vocabulary)) |prefill| {
+        defer m.alloc.free(prefill);
+        msg1v(text_view, "setString:", nsstr(prefill.ptr));
+    }
+    msg1v(scroll, "setDocumentView:", text_view);
+    msg1v(alert, "setAccessoryView:", scroll);
+    msg1v(msg(alert, "window"), "setInitialFirstResponder:", text_view);
+
+    if (msgLongR(alert, "runModal") != NSAlertFirstButtonReturn) return; // Cancel — no-op
+
+    // Read → split/trim/drop-blank → structural clamp. Terms are duped into m.alloc so they
+    // outlive this pool inside the leaked snapshot; dropped = entered − committed (§3).
+    const entered = parseVocabularyLines(m.alloc, std.mem.span(utf8(msg(text_view, "string")))) orelse return;
+    const committed = config.clampVocabulary(m.alloc, entered) orelse return;
+    const dropped = entered.len - committed.len;
+
+    var next = current.*;
+    next.vocabulary = committed;
+    const value = config.serializeVocabularyValue(m.alloc, committed) orelse return;
+    defer m.alloc.free(value);
+    m.commitSettings(next, "vocabulary", value, false); // read-at-use — never session_shaped (§4)
+    m.syncVocabulary();
+    feedback.log("  menu: Vocabulary → {d} terms{s}\n", .{ committed.len, if (dropped > 0) " (clamped)" else "" });
+
+    if (dropped > 0) {
+        var note_buf: [160]u8 = undefined;
+        const note = msg(msg(cls("NSAlert"), "alloc"), "init");
+        msg1v(note, "setMessageText:", nsstr("Some terms were dropped"));
+        msg1v(note, "setInformativeText:", nsstr(droppedItemsMessage(&note_buf, dropped).ptr));
+        _ = msg1(note, "addButtonWithTitle:", nsstr("OK"));
+        _ = msgLongR(note, "runModal");
+    }
+}
+
 fn onQuit(_: id, _: SEL, _: id) callconv(.c) void {
     const m = g_menu orelse return;
     feedback.log("  menu: Quit — shutting down cleanly\n", .{});
@@ -971,6 +1226,7 @@ fn onMenuWillOpen(_: id, _: SEL, _: id) callconv(.c) void {
     for (0..groups.len) |gi| m.syncGroup(gi);
     msgLong(m.overlay_item, "setState:", if (m.store.current().overlay) NSControlStateOn else NSControlStateOff);
     m.syncBacktrack(); // pick up a hand-edited .backtrack and re-word line 2 for the backend
+    m.syncVocabulary(); // pick up a hand-edited vocabulary list (count) + backend suffix
     m.last_snapshot = null; // force refresh after settings or external model-state changes
     m.refreshChrome();
 }
@@ -993,6 +1249,7 @@ fn makeTarget() id {
     _ = class_addMethod(target_cls, sel_registerName("onPause:"), @ptrCast(&onPause), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onOpenConfig:"), @ptrCast(&onOpenConfig), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onSetApiKey:"), @ptrCast(&onSetApiKey), v_at);
+    _ = class_addMethod(target_cls, sel_registerName("onVocabulary:"), @ptrCast(&onVocabulary), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onQuit:"), @ptrCast(&onQuit), v_at);
     _ = class_addMethod(target_cls, sel_registerName("menuWillOpen:"), @ptrCast(&onMenuWillOpen), v_at);
     _ = class_addMethod(target_cls, sel_registerName("twStop:"), @ptrCast(&onStop), v_at);

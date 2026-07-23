@@ -107,7 +107,10 @@ const vocab_max_items = 128;
 /// fragment, so we drop whole items rather than truncate. Returns a freshly allocated
 /// outer slice referencing the input's (leaked) string storage; the inner strings are
 /// not copied. Null on OOM lets the caller keep the unclamped list.
-fn clampVocabulary(gpa: std.mem.Allocator, list: []const []const u8) ?[]const []const u8 {
+///
+/// Public so the menu's Save (spec §3) clamps the just-edited list through the exact same
+/// structural rules as the load path — one authority for the 100-char / 128-item caps.
+pub fn clampVocabulary(gpa: std.mem.Allocator, list: []const []const u8) ?[]const []const u8 {
     var kept: std.ArrayList([]const u8) = .empty;
     errdefer kept.deinit(gpa);
     for (list) |item| {
@@ -536,12 +539,32 @@ fn serializeInto(w: *std.Io.Writer, s: Settings) std.Io.Writer.Error!void {
 /// feature discoverable in the generated file), else `.vocabulary = .{ "a", "b" },`.
 /// The single-line form is what `findZonField`'s quote-aware array patch expects.
 fn serializeVocabulary(w: *std.Io.Writer, vocab: []const []const u8) std.Io.Writer.Error!void {
-    try w.writeAll("    .vocabulary = .{");
+    try w.writeAll("    .vocabulary = ");
+    try writeVocabularyValue(w, vocab);
+    try w.writeAll(",\n");
+}
+
+/// The array *value* alone — `.{}` when empty, else `.{ "a", "b" }` — with no field name,
+/// indent, or trailing comma. The single-line, quote-aware shape `findZonField`'s array
+/// patch expects. Shared by the full-file serializer above and the menu's field-patch.
+fn writeVocabularyValue(w: *std.Io.Writer, vocab: []const []const u8) std.Io.Writer.Error!void {
+    try w.writeAll(".{");
     for (vocab, 0..) |item, i| {
         try w.writeAll(if (i == 0) " " else ", ");
         try writeZonString(w, item);
     }
-    try w.writeAll(if (vocab.len == 0) "},\n" else " },\n");
+    try w.writeAll(if (vocab.len == 0) "}" else " }");
+}
+
+/// Serialize a vocabulary list to the ZON array value the menu hands `writeField` on Save
+/// (spec §3) — `.{}` / `.{ "a", "b" }`, one line, escaped, caller-owned (NUL-terminated so
+/// it drops straight into an ObjC string too). Null on OOM. Single-homes the value format
+/// and escaping with the full-file serializer via `writeVocabularyValue`.
+pub fn serializeVocabularyValue(gpa: std.mem.Allocator, vocab: []const []const u8) ?[:0]u8 {
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    writeVocabularyValue(&out.writer, vocab) catch return null;
+    return gpa.dupeSentinel(u8, out.written(), 0) catch null;
 }
 
 /// Write `s` as a ZON string literal, escaping so an item holding a quote, backslash or
@@ -790,6 +813,21 @@ test "clampVocabulary drops the overflow tail beyond the whole-list cap" {
     const clamped = clampVocabulary(talloc, &backing) orelse return error.OutOfMemory;
     defer talloc.free(clamped);
     try std.testing.expectEqual(@as(usize, vocab_max_items), clamped.len);
+}
+
+test "serializeVocabularyValue emits the bare array the menu patch feeds writeField" {
+    const empty = serializeVocabularyValue(talloc, &.{}) orelse return error.SerializeFailed;
+    defer talloc.free(empty);
+    try std.testing.expectEqualStrings(".{}", empty);
+
+    const populated = serializeVocabularyValue(talloc, &.{ "type-wave", "whisper.cpp" }) orelse return error.SerializeFailed;
+    defer talloc.free(populated);
+    try std.testing.expectEqualStrings(".{ \"type-wave\", \"whisper.cpp\" }", populated);
+
+    // A value carrying a quote/backslash stays escaped so the patched file re-parses.
+    const tricky = serializeVocabularyValue(talloc, &.{"a\"b\\c"}) orelse return error.SerializeFailed;
+    defer talloc.free(tricky);
+    try std.testing.expectEqualStrings(".{ \"a\\\"b\\\\c\" }", tricky);
 }
 
 test "serializeSettings writes an empty vocabulary explicitly and round-trips" {
