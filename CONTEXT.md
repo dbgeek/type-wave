@@ -81,6 +81,17 @@ The frontmost application at Insertion time as recorded in an Insertion Record's
 `focused_app` hint — bundle id plus display name, read best-effort from `NSWorkspace`. A
 hint, not the Focused Target: it names the app, never the text field.
 
+**Recent Insertions View**:
+The **text-free, masked projection** of the Recent Insertions ring that rides through the
+pure Status Item pipeline (`status_item.project` / `derive`) for rendering — one
+`HistoryEntryView` per entry: `{ char_len, app: AppIdentity, timestamp, outcome }`, no
+transcript bytes. It is fixed-size and `std.meta.eql`-comparable so the menu's snapshot
+early-out keeps working, and it keeps transcript text out of the projected `Snapshot`
+entirely (privacy by construction): the actual `inserted` / `raw` text is fetched from the
+authoritative ring on demand only at reveal / copy / re-insert. Distinct from the Insertion
+Record, which is the authoritative, text-bearing entry the ring owns.
+_Avoid_: history model, menu record (vague); Insertion Record (that's the text-bearing entry, not this masked view)
+
 **Backtrack**:
 The opt-in rewrite pass between an Utterance's Final Transcript and its Insertion
 (docs/backtrack-spec.md): one OpenAI call applies spoken self-corrections ("at 20:00 no
