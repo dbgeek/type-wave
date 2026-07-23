@@ -20,6 +20,8 @@ test {
     _ = @import("hud.zig");
     _ = @import("insert.zig"); // ensureTrailingSpace (the Insertion separator)
     _ = @import("insertion_adapter.zig");
+    _ = @import("recent_insertions.zig"); // the daemon-owned Recent Insertions ring (ADR-0006)
+    _ = @import("app_focus.zig"); // the best-effort App Identity reader (NSWorkspace boundary)
     _ = @import("rewrite_adapter.zig"); // the Backtrack Rewrite seam (docs/backtrack-spec.md)
     _ = @import("openai_rewrite.zig"); // the locked Responses call: request build + output extraction
     _ = @import("readiness.zig");

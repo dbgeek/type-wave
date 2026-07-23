@@ -39,6 +39,7 @@
 const std = @import("std");
 const feedback = @import("feedback.zig");
 const backend = @import("transcription_backend.zig");
+const insert = @import("insert.zig");
 
 pub const UtteranceId = backend.UtteranceId;
 
@@ -54,6 +55,57 @@ pub const InsertKind = enum { normal, raw_fallback };
 /// still landed — no error cue — but the downgrade earns the amber HUD pulse. The insertion
 /// mechanism failing outright is still `.failed`, whatever the submitted kind.
 pub const InsertResult = enum { ok, degraded, failed };
+
+/// Best-effort **App Identity** hint (CONTEXT.md) stamped into an Insertion Record's
+/// `focused_app`: the frontmost app's bundle id + display name, read best-effort from
+/// `NSWorkspace` on the insert worker at the moment the text lands — never under
+/// `coordinator.mu` (ADR-0006). Fixed inline buffers, zero-filled past the length so the
+/// value stays `std.meta.eql`-comparable for the future text-free Recent Insertions View
+/// projection (#186). Nullable, never load-bearing.
+pub const AppIdentity = struct {
+    bundle_id_bytes: [255]u8 = std.mem.zeroes([255]u8),
+    bundle_id_len: u8 = 0,
+    name_bytes: [255]u8 = std.mem.zeroes([255]u8),
+    name_len: u8 = 0,
+
+    pub fn init(bundle_id: []const u8, display_name: []const u8) AppIdentity {
+        var self = AppIdentity{};
+        const b = @min(bundle_id.len, self.bundle_id_bytes.len);
+        @memcpy(self.bundle_id_bytes[0..b], bundle_id[0..b]);
+        self.bundle_id_len = @intCast(b);
+        const n = @min(display_name.len, self.name_bytes.len);
+        @memcpy(self.name_bytes[0..n], display_name[0..n]);
+        self.name_len = @intCast(n);
+        return self;
+    }
+    pub fn bundleId(self: *const AppIdentity) []const u8 {
+        return self.bundle_id_bytes[0..self.bundle_id_len];
+    }
+    pub fn displayName(self: *const AppIdentity) []const u8 {
+        return self.name_bytes[0..self.name_len];
+    }
+};
+
+/// The write payload handed across the recorder seam at `onInserted` (ADR-0006). The
+/// `inserted` / `raw` slices borrow Coordinator-local buffers and are valid **only for the
+/// duration of the `record` call** — the daemon-owned ring copies them into its own inline
+/// buffers under its leaf lock (exactly the memcpy discipline the rest of the seams use).
+/// Assembled once per resolved Insertion, whatever the outcome.
+pub const InsertionRecord = struct {
+    /// The with-space bytes that hit the cursor (post-Rewrite when Backtrack ran, raw
+    /// otherwise) — byte-identical to the insert because the Coordinator buffers it through
+    /// the same `ensureTrailingSpace` the Insertion adapter applies.
+    inserted: []const u8,
+    /// The trimmed Final Transcript, present only on the Backtrack detour (its pre-Rewrite
+    /// form); `null` for non-Backtrack Utterances, where it would equal `inserted`.
+    raw: ?[]const u8,
+    /// `feedback.nowMs()` stamped at `onInserted`.
+    timestamp: i64,
+    /// Known only at `onInserted`; `.failed` insertions are recorded too (§2.2).
+    outcome: InsertResult,
+    /// Read off-mutex on the insert worker, carried back through the `.inserted` report.
+    focused_app: ?AppIdentity,
+};
 
 /// Outcome the Rewrite worker reports back as the `.rewritten` event
 /// (docs/backtrack-spec.md). `.failed` means the OpenAI call did not yield a usable
@@ -88,7 +140,10 @@ pub const Event = union(enum) {
     /// the `text` slice borrows the worker's buffer and is valid only for the
     /// duration of the `handle` call — the insertion seam copies synchronously.
     rewritten: struct { id: UtteranceId, text: []const u8, result: RewriteResult },
-    inserted: struct { id: UtteranceId, result: InsertResult },
+    /// The insert worker's reverse edge. `focused_app` is the App Identity hint read
+    /// off-mutex the moment the text landed (ADR-0006), stamped into the Insertion Record
+    /// here under the lock; defaulted so the Coordinator's own tests can omit it.
+    inserted: struct { id: UtteranceId, result: InsertResult, focused_app: ?AppIdentity = null },
 };
 
 const Phase = enum { idle, capturing, awaiting_final, rewriting, inserting };
@@ -125,9 +180,23 @@ pub fn Coordinator(comptime Deps: type) type {
         /// to the Transcription Session's accumulator, so the whole transcript fits.
         raw: [8192]u8 = undefined,
         raw_len: usize = 0,
+        /// The **with-space** Insertion text, buffered from the submit sites so the Insertion
+        /// Record committed at `onInserted` holds bytes byte-identical to what hit the cursor
+        /// (ADR-0006 §capture). Sized like the Insertion adapter's job buffer so
+        /// `ensureTrailingSpace` produces the same result the adapter does.
+        pending: [8193]u8 = undefined,
+        pending_len: usize = 0,
 
         pub fn init(deps: Deps) Self {
             return .{ .deps = deps };
+        }
+
+        /// Stash the with-space form of the text this Utterance is inserting, applying the
+        /// same `ensureTrailingSpace` the Insertion adapter applies at `submit` — so the
+        /// buffered `inserted` bytes match the cursor exactly. Called at every submit site.
+        fn bufferPending(self: *Self, text: []const u8) void {
+            const s = insert.ensureTrailingSpace(&self.pending, text);
+            self.pending_len = s.len;
         }
 
         /// The one entry point. Serializes every inbound edge onto the state machine.
@@ -142,7 +211,7 @@ pub fn Coordinator(comptime Deps: type) type {
                 .cooperative_cancel => |id| self.onCooperativeCancel(id),
                 .deadline => |e| self.onDeadline(e.id, e.kind),
                 .rewritten => |e| self.onRewritten(e.id, e.text, e.result),
-                .inserted => |e| self.onInserted(e.id, e.result),
+                .inserted => |e| self.onInserted(e.id, e.result, e.focused_app),
             }
         }
 
@@ -245,6 +314,7 @@ pub fn Coordinator(comptime Deps: type) type {
                 self.phase = .rewriting; // blocking, exactly like .inserting (ADR-0001)
                 return;
             }
+            self.bufferPending(text); // stash the with-space form for the Insertion Record
             self.deps.insertion.submit(id, text, .normal); // copies text; worker inserts, then .inserted
             self.phase = .inserting; // blocking: next hold waits (ADR-0001)
         }
@@ -256,6 +326,7 @@ pub fn Coordinator(comptime Deps: type) type {
             // dictation never breaks; the worker logged the downgrade. The `.raw_fallback`
             // kind rides the insert so `.inserted` earns the amber pulse (spec §UX 4, ADR-0004).
             const kind: InsertKind = if (r == .failed) .raw_fallback else .normal;
+            self.bufferPending(text); // stash the with-space form for the Insertion Record
             self.deps.insertion.submit(id, text, kind); // copies text; worker inserts, then .inserted
             self.phase = .inserting;
         }
@@ -268,6 +339,7 @@ pub fn Coordinator(comptime Deps: type) type {
                 // error cue — text still lands. The abandoned call's late `.rewritten`
                 // is stale-rejected by the phase guard.
                 feedback.log("  Backtrack rewrite exceeded {d} ms — inserting the raw Final Transcript\n", .{rewrite_deadline.final_ms});
+                self.bufferPending(self.raw[0..self.raw_len]); // stash the with-space form for the Insertion Record
                 self.deps.insertion.submit(id, self.raw[0..self.raw_len], .raw_fallback); // earns the amber pulse
                 self.phase = .inserting;
                 return;
@@ -307,8 +379,20 @@ pub fn Coordinator(comptime Deps: type) type {
             }
         }
 
-        fn onInserted(self: *Self, id: UtteranceId, r: InsertResult) void {
+        fn onInserted(self: *Self, id: UtteranceId, r: InsertResult, focused_app: ?AppIdentity) void {
             if (!self.matches(id, .inserting)) return;
+            // Commit the Insertion Record (ADR-0006): buffer-then-commit realizes §2.2's
+            // retention rule for free — only Utterances that reach here are recorded, and
+            // `.failed` reaches here (the primary recovery case). `raw` is present only on
+            // the Backtrack detour (the Lease's pinned flag), where the pre-Rewrite transcript
+            // was copied at `onFinal`; a non-Backtrack `raw` would just equal `inserted`.
+            self.deps.recorder.record(.{
+                .inserted = self.pending[0..self.pending_len],
+                .raw = if (self.active.?.backtrack) self.raw[0..self.raw_len] else null,
+                .timestamp = feedback.nowMs(),
+                .outcome = r,
+                .focused_app = focused_app,
+            });
             switch (r) {
                 .ok => self.deps.feedback.inserted(),
                 // Raw-transcript fallback landed: dictation held (no error cue), but the
@@ -510,6 +594,43 @@ const FakeFeedback = struct {
     }
 };
 
+/// The write-only recorder seam (ADR-0006): the Coordinator hands a finished Insertion
+/// Record here under `coordinator.mu`. The real daemon backs it with the leaf-locked ring;
+/// this fake just captures the last record so the tests can assert on it.
+const FakeRecorder = struct {
+    records: usize = 0,
+    last_inserted: [256]u8 = undefined,
+    last_inserted_len: usize = 0,
+    last_has_raw: bool = false,
+    last_raw: [256]u8 = undefined,
+    last_raw_len: usize = 0,
+    last_outcome: InsertResult = .ok,
+    last_timestamp: i64 = 0,
+    last_focused_app: ?AppIdentity = null,
+    fn record(self: *FakeRecorder, rec: InsertionRecord) void {
+        self.records += 1;
+        @memcpy(self.last_inserted[0..rec.inserted.len], rec.inserted);
+        self.last_inserted_len = rec.inserted.len;
+        if (rec.raw) |raw| {
+            self.last_has_raw = true;
+            @memcpy(self.last_raw[0..raw.len], raw);
+            self.last_raw_len = raw.len;
+        } else {
+            self.last_has_raw = false;
+            self.last_raw_len = 0;
+        }
+        self.last_outcome = rec.outcome;
+        self.last_timestamp = rec.timestamp;
+        self.last_focused_app = rec.focused_app;
+    }
+    fn lastInserted(self: *FakeRecorder) []const u8 {
+        return self.last_inserted[0..self.last_inserted_len];
+    }
+    fn lastRaw(self: *FakeRecorder) []const u8 {
+        return self.last_raw[0..self.last_raw_len];
+    }
+};
+
 const TestDeps = struct {
     audio: *FakeAudio,
     backends: *FakeBackends,
@@ -517,6 +638,7 @@ const TestDeps = struct {
     insertion: *FakeInsertion,
     deadline: *FakeDeadline,
     feedback: *FakeFeedback,
+    recorder: *FakeRecorder,
 };
 
 const Harness = struct {
@@ -526,6 +648,7 @@ const Harness = struct {
     insertion: FakeInsertion = .{},
     deadline: FakeDeadline = .{},
     feedback: FakeFeedback = .{},
+    recorder: FakeRecorder = .{},
     co: Coordinator(TestDeps) = undefined,
 
     fn wire(self: *Harness) *Coordinator(TestDeps) {
@@ -536,6 +659,7 @@ const Harness = struct {
             .insertion = &self.insertion,
             .deadline = &self.deadline,
             .feedback = &self.feedback,
+            .recorder = &self.recorder,
         });
         return &self.co;
     }
@@ -1081,4 +1205,120 @@ test "27 a stale release-anchored deadline cannot fire the rewrite fallback earl
     co.handle(.{ .rewritten = .{ .id = 1, .text = "rewritten", .result = .ok } });
     try expectEqual(@as(usize, 1), h.insertion.submits);
     try expectEqualStrings("rewritten", h.insertion.lastText());
+}
+
+// ---- Recent Insertions: the write-only recorder seam (ADR-0006, spec §1–§3) ------
+
+test "28 a completed dictation records exactly one Insertion Record with the with-space text" {
+    var h = Harness{};
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "hello world" } });
+    try expectEqual(@as(usize, 0), h.recorder.records); // not until the insert resolves
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
+    try expectEqual(@as(usize, 1), h.recorder.records);
+    // `inserted` carries the single trailing space that actually hit the cursor.
+    try expectEqualStrings("hello world ", h.recorder.lastInserted());
+    try expectEqual(InsertResult.ok, h.recorder.last_outcome);
+    try expect(!h.recorder.last_has_raw); // no Rewrite ran → raw absent
+    try expect(h.recorder.last_timestamp != 0); // stamped at onInserted
+}
+
+test "29 a .failed insertion is still recorded (the primary recovery case)" {
+    var h = Harness{};
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "lost text" } });
+    co.handle(.{ .inserted = .{ .id = 1, .result = .failed } });
+    try expectEqual(@as(usize, 1), h.recorder.records);
+    try expectEqualStrings("lost text ", h.recorder.lastInserted());
+    try expectEqual(InsertResult.failed, h.recorder.last_outcome);
+}
+
+test "30 empty and abandoned Utterances are not recorded" {
+    // empty Final Transcript
+    var empty = Harness{};
+    const co_empty = empty.wire();
+    co_empty.handle(.press);
+    co_empty.handle(.release);
+    co_empty.handle(.{ .final = .{ .id = 1, .text = "" } });
+    try expectEqual(@as(usize, 0), empty.recorder.records);
+
+    // abandoned: no Final Transcript within the deadline
+    var deadline = Harness{};
+    const co_deadline = deadline.wire();
+    co_deadline.handle(.press);
+    co_deadline.handle(.release);
+    co_deadline.handle(.{ .deadline = .{ .id = 1, .kind = .release } });
+    try expectEqual(@as(usize, 0), deadline.recorder.records);
+
+    // abandoned: backend failure mid-Utterance
+    var backend_fail = Harness{};
+    const co_bf = backend_fail.wire();
+    co_bf.handle(.press);
+    co_bf.handle(.release);
+    co_bf.handle(.{ .backend_failed = 1 });
+    try expectEqual(@as(usize, 0), backend_fail.recorder.records);
+}
+
+test "31 a Backtrack Utterance records the resolved text plus the pre-Rewrite raw" {
+    var h = Harness{};
+    h.backends.backtrack = true;
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "at 20:00 no 18:00" } });
+    co.handle(.{ .rewritten = .{ .id = 1, .text = "At 18:00", .result = .ok } });
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
+    try expectEqual(@as(usize, 1), h.recorder.records);
+    try expectEqualStrings("At 18:00 ", h.recorder.lastInserted()); // the with-space rewrite
+    try expect(h.recorder.last_has_raw);
+    try expectEqualStrings("at 20:00 no 18:00", h.recorder.lastRaw()); // trimmed, pre-Rewrite
+    try expectEqual(InsertResult.ok, h.recorder.last_outcome);
+}
+
+test "32 a rewrite-timeout fallback is recorded degraded with the raw Final Transcript" {
+    var h = Harness{};
+    h.backends.backtrack = true;
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "um the raw one" } });
+    co.handle(.{ .deadline = .{ .id = 1, .kind = .rewrite } }); // budget fires → raw fallback inserts
+    co.handle(.{ .inserted = .{ .id = 1, .result = .degraded } });
+    try expectEqual(@as(usize, 1), h.recorder.records);
+    try expectEqualStrings("um the raw one ", h.recorder.lastInserted());
+    try expect(h.recorder.last_has_raw);
+    try expectEqualStrings("um the raw one", h.recorder.lastRaw());
+    try expectEqual(InsertResult.degraded, h.recorder.last_outcome);
+}
+
+test "33 focused_app rides the .inserted report and is stamped into the record" {
+    var h = Harness{};
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "note" } });
+    const app = AppIdentity.init("com.tinyspeck.slackmacgap", "Slack");
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok, .focused_app = app } });
+    try expectEqual(@as(usize, 1), h.recorder.records);
+    try expect(h.recorder.last_focused_app != null);
+    try expectEqualStrings("com.tinyspeck.slackmacgap", h.recorder.last_focused_app.?.bundleId());
+    try expectEqualStrings("Slack", h.recorder.last_focused_app.?.displayName());
+}
+
+test "34 a stale/mismatched .inserted does not record" {
+    var h = Harness{};
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "text" } }); // → inserting
+    co.handle(.{ .inserted = .{ .id = 99, .result = .ok } }); // wrong id
+    try expectEqual(@as(usize, 0), h.recorder.records);
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } }); // the real one
+    try expectEqual(@as(usize, 1), h.recorder.records);
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } }); // duplicate late edge, now idle
+    try expectEqual(@as(usize, 1), h.recorder.records);
 }

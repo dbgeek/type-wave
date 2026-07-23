@@ -691,6 +691,15 @@ const IntegrationDeadline = struct {
     pub fn cancel(_: *IntegrationDeadline, _: backend.UtteranceId) void {}
 };
 
+/// The Recent Insertions recorder seam (ADR-0006): this integration only checks the local
+/// insert path resolves, so the recorder just counts writes.
+const IntegrationRecorder = struct {
+    records: usize = 0,
+    pub fn record(self: *IntegrationRecorder, _: coordinator.InsertionRecord) void {
+        self.records += 1;
+    }
+};
+
 const IntegrationFeedback = struct {
     abandoned_count: usize = 0,
     pub fn listening(_: *IntegrationFeedback) void {}
@@ -709,6 +718,7 @@ const IntegrationDeps = struct {
     insertion: *IntegrationInsertion,
     deadline: *IntegrationDeadline,
     feedback: *IntegrationFeedback,
+    recorder: *IntegrationRecorder,
 };
 const IntegrationCoordinator = coordinator.Coordinator(IntegrationDeps);
 
@@ -929,6 +939,7 @@ test "local Transcription Backend drives one Insertion and abandons empty or fai
     var rewrite = IntegrationRewrite{};
     var deadline = IntegrationDeadline{};
     var surface = IntegrationFeedback{};
+    var recorder = IntegrationRecorder{};
     var co = IntegrationCoordinator.init(.{
         .audio = &audio,
         .backends = &backends,
@@ -936,6 +947,7 @@ test "local Transcription Backend drives one Insertion and abandons empty or fai
         .insertion = &insertion,
         .deadline = &deadline,
         .feedback = &surface,
+        .recorder = &recorder,
     });
     bridge.co = &co;
 

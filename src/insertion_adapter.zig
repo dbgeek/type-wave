@@ -80,12 +80,16 @@ pub fn InsertionAdapter(comptime Deps: type) type {
                 const note = if (result == .degraded) " [raw fallback]" else "";
                 feedback.log("  inserted at the cursor (+{d}ms after the Final Transcript; mechanism {d}ms){s}\n", .{ now - self.submitted_at_ms, now - t_pick, note });
             }
+            // App Identity hint for the Insertion Record (ADR-0006 §3.3): read off-mutex here,
+            // the moment the text landed — never under coordinator.mu — and carried back
+            // through the `.inserted` report. Best-effort; a null just leaves the hint empty.
+            const focused_app = self.deps.focusedApp();
             // Report completion *before* the deferred clipboard restore (issue #38): the
             // Coordinator leaves `.inserting` at the Cmd-V settle, so the ~300 ms restore
             // pads this worker's time, not the lockout. Serialization is the ordering
             // guard — the restore finishes before this loop can drain the next job, so a
             // following paste never interleaves with a pending restore.
-            self.deps.complete(self.job_id, result);
+            self.deps.complete(self.job_id, result, focused_app);
             self.deps.finishInsert();
             return true;
         }
@@ -110,6 +114,8 @@ const FakeDeps = struct {
     completions: usize = 0,
     last_completion_id: coord.UtteranceId = 0,
     last_completion: coord.InsertResult = .ok,
+    last_focused_app: ?coord.AppIdentity = null,
+    focused_app: ?coord.AppIdentity = null,
     finishes: usize = 0,
     completions_at_finish: usize = 0,
     quit: bool = false,
@@ -128,10 +134,15 @@ const FakeDeps = struct {
         return self.result;
     }
 
-    fn complete(self: *FakeDeps, id: coord.UtteranceId, result: coord.InsertResult) void {
+    fn complete(self: *FakeDeps, id: coord.UtteranceId, result: coord.InsertResult, focused_app: ?coord.AppIdentity) void {
         self.completions += 1;
         self.last_completion_id = id;
         self.last_completion = result;
+        self.last_focused_app = focused_app;
+    }
+
+    fn focusedApp(self: *FakeDeps) ?coord.AppIdentity {
+        return self.focused_app;
     }
 
     fn finishInsert(self: *FakeDeps) void {
@@ -231,6 +242,26 @@ test "completion is reported before the deferred clipboard restore (issue #38)" 
     // guard: runOnce finishes the restore before it can drain the next job.
     try std.testing.expectEqual(@as(usize, 1), adapter.deps.finishes);
     try std.testing.expectEqual(@as(usize, 1), adapter.deps.completions_at_finish);
+}
+
+test "the worker captures the focused app and carries it into the completion (ADR-0006)" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{
+        .focused_app = coord.AppIdentity.init("com.tinyspeck.slackmacgap", "Slack"),
+    });
+
+    adapter.submit(7, "hello", .normal);
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expect(adapter.deps.last_focused_app != null);
+    try std.testing.expectEqualStrings("Slack", adapter.deps.last_focused_app.?.displayName());
+    try std.testing.expectEqualStrings("com.tinyspeck.slackmacgap", adapter.deps.last_focused_app.?.bundleId());
+}
+
+test "a null focused app carries through as a null hint" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{}); // focused_app defaults to null
+
+    adapter.submit(7, "hello", .normal);
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expect(adapter.deps.last_focused_app == null);
 }
 
 test "runOnce reports idle without touching dependencies" {
