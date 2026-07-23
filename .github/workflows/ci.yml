@@ -15,6 +15,12 @@
 #                    (the single biggest wall-clock lever — memoizes Zig + the whisper build).
 #
 # The `test` job name is the required status-check context on `main` (branch protection).
+#
+# Zig-change gating (pull_request only): the job ALWAYS runs so the required `test`
+# context is always posted — otherwise a path-filtered workflow would never report and
+# branch protection would block the merge forever. Instead we detect whether any Zig
+# sources changed and skip the expensive Nix + `zig build test` steps when they didn't,
+# reporting a fast green `test`. push(main)/workflow_dispatch always run the full gate.
 
 name: CI
 
@@ -29,9 +35,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# Least privilege: the gate only reads the tree.
+# Least privilege: read the tree, plus PR file lists for the change filter.
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   test:
@@ -41,17 +48,41 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # On pull_request, flag whether any Zig sources changed vs the base ref.
+      - name: Detect Zig changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            zig:
+              - '**/*.zig'
+              - 'build.zig.zon'
+
+      # Single gate switch: run the full suite unless this is a PR with no Zig changes.
+      - name: Decide whether to run the gate
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ] || [ "${{ steps.changes.outputs.zig }}" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No Zig files changed in this PR — skipping the build/test gate." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # Reproduce the exact pinned dev shell (Zig + cmake/ninja/python3/mypy) from flake.lock.
       - name: Install Nix
+        if: steps.gate.outputs.run == 'true'
         uses: DeterminateSystems/nix-installer-action@main
 
       # Free, ephemeral Nix-store speed cache (GitHub Actions cache backed).
       - name: Magic Nix Cache
+        if: steps.gate.outputs.run == 'true'
         uses: DeterminateSystems/magic-nix-cache-action@main
 
       # Zig global cache — memoizes compilation and the whisper Metal build output.
       # Keyed on the toolchain/build inputs; falls back to the newest partial match.
       - name: Cache ~/.cache/zig
+        if: steps.gate.outputs.run == 'true'
         uses: actions/cache@v4
         with:
           path: ~/.cache/zig
@@ -62,4 +93,5 @@ jobs:
 
       # The release gate: the full headless test suite, run inside the pinned dev shell.
       - name: zig build test
+        if: steps.gate.outputs.run == 'true'
         run: nix develop --command zig build test
