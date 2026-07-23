@@ -67,6 +67,7 @@ const Job = struct {
         var gate_finished = false;
         defer {
             if (!gate_finished) server.gate.finish();
+            server.allocator.free(self.request.prompt);
             server.allocator.free(self.request.pcm);
             server.allocator.destroy(self);
         }
@@ -138,8 +139,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         };
         switch (frame) {
             .transcribe => |request| {
-                frame = undefined; // request PCM ownership moves to the inference job.
+                frame = undefined; // request PCM + prompt ownership moves to the inference job.
                 server.begin(request) catch |failure| {
+                    allocator.free(request.prompt);
                     allocator.free(request.pcm);
                     const message = @errorName(failure);
                     try server.write(.{ .failed = .{ .id = request.id, .code = 4, .message = message } });

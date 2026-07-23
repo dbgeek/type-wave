@@ -11,6 +11,7 @@ extern fn tw_whisper_request_cancel(runtime: *RuntimeHandle) bool;
 extern fn tw_whisper_transcribe(
     runtime: *RuntimeHandle,
     language: u8,
+    prompt: [*:0]const u8,
     samples: [*]const f32,
     sample_count: usize,
     text: *?[*]const u8,
@@ -51,13 +52,20 @@ pub const Runtime = struct {
         self: *Runtime,
         allocator: std.mem.Allocator,
         language: ipc.Language,
+        prompt: []const u8,
         samples: []const f32,
     ) ![]u8 {
+        // The C ABI takes a NUL-terminated glossary next to `language`; a sentinel-terminated
+        // copy is borrowed across the synchronous inference and freed here (spec §5). An empty
+        // prompt sentinel-terminates to "", which the bridge maps to a null initial_prompt.
+        const prompt_z = try allocator.dupeZ(u8, prompt);
+        defer allocator.free(prompt_z);
         var text: ?[*]const u8 = null;
         var text_len: usize = 0;
         const status = tw_whisper_transcribe(
             self.handle orelse return error.ModelNotLoaded,
             @intFromEnum(language),
+            prompt_z.ptr,
             samples.ptr,
             samples.len,
             &text,

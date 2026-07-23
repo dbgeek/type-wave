@@ -58,10 +58,14 @@ static bool should_abort(void * user_data) {
     return runtime->cancelled.load(std::memory_order_acquire);
 }
 
-static whisper_full_params parameters(tw_whisper_runtime * runtime, const char * language) {
+static whisper_full_params parameters(tw_whisper_runtime * runtime, const char * language, const char * prompt) {
     whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     params.n_threads = 4;
     params.language = language;
+    // Custom-vocabulary biasing (docs/vocab-biasing-spec.md §5): the borrowed glossary lives
+    // across the synchronous whisper_full below, so no C++ heap is taken on the inference path.
+    // An empty/absent prompt leaves initial_prompt null — byte-identical to the pre-biasing no-op.
+    params.initial_prompt = (prompt != nullptr && prompt[0] != '\0') ? prompt : nullptr;
     params.detect_language = false;
     params.no_context = true;
     params.no_timestamps = true;
@@ -119,6 +123,7 @@ extern "C" void tw_whisper_begin_inference(tw_whisper_runtime * runtime) {
 extern "C" int tw_whisper_transcribe(
     tw_whisper_runtime * runtime,
     uint8_t language,
+    const char * prompt,
     const float * samples,
     size_t sample_count,
     const char ** text,
@@ -126,7 +131,7 @@ extern "C" int tw_whisper_transcribe(
     const char * language_name = language == 1 ? "en" : language == 2 ? "sv" : language == 3 ? "auto" : nullptr;
     if (language_name == nullptr || sample_count == 0 || sample_count > static_cast<size_t>(INT32_MAX)) return 2;
 
-    const int status = whisper_full(runtime->context, parameters(runtime, language_name), samples,
+    const int status = whisper_full(runtime->context, parameters(runtime, language_name, prompt), samples,
                                     static_cast<int>(sample_count));
     if (status != 0) return runtime->cancelled.load(std::memory_order_acquire) ? 3 : 1;
 

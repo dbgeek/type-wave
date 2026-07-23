@@ -32,6 +32,9 @@
 //!   deps.language() backend.Language — the Settings Snapshot language for new Leases.
 //!   deps.backtrack() bool — the Settings Snapshot Backtrack enablement, stamped onto
 //!     every new Lease so it is pinned at Talk Key press (docs/backtrack-spec.md).
+//!   deps.vocabulary() backend.Vocabulary — the Settings Snapshot vocabulary list, pinned
+//!     onto every new Lease at press so all Segments of an Utterance bias identically
+//!     (docs/vocab-biasing-spec.md §5). Only the local backend reads it; OpenAI ignores it.
 //!   deps.note(Event) — narration for the caller's log. Invoked outside the router
 //!     mutex; it must not call back into the Router.
 
@@ -173,9 +176,11 @@ pub fn Router(comptime Deps: type) type {
                 self.resolve(id);
                 return null;
             }
-            // Pin Backtrack enablement at press, alongside the backend and language the
-            // Lease already carries — a mid-Utterance settings flip cannot half-apply.
+            // Pin Backtrack enablement and the vocabulary list at press, alongside the backend
+            // and language the Lease already carries — a mid-Utterance settings flip cannot
+            // half-apply, so every Segment of the Utterance biases toward one coherent list.
             lease.?.backtrack = self.deps.backtrack();
+            lease.?.vocabulary = self.deps.vocabulary();
             return lease;
         }
 
@@ -448,7 +453,7 @@ const FakeSession = struct {
         .request_cancel = noopCancel,
         .cancel = noopCancel,
     };
-    fn noopBegin(_: *anyopaque, _: backend.UtteranceId, _: backend.Language) !void {}
+    fn noopBegin(_: *anyopaque, _: backend.UtteranceId, _: backend.Language, _: backend.Vocabulary) !void {}
     fn noopAppend(_: *anyopaque, _: backend.UtteranceId, _: []const u8) !void {}
     fn noopRelease(_: *anyopaque, _: backend.UtteranceId) !void {}
     fn noopCancel(_: *anyopaque, _: backend.UtteranceId) void {}
@@ -531,6 +536,7 @@ const FakeDeps = struct {
     pending_wants: Wants = .{},
     lang: backend.Language = "en",
     backtrack_enabled: bool = false,
+    vocab: backend.Vocabulary = &.{},
     events: [16]Event = undefined,
     event_count: usize = 0,
     /// Reentry hook simulating a menu selection landing while a connect is in flight
@@ -559,6 +565,9 @@ const FakeDeps = struct {
     }
     pub fn backtrack(self: *FakeDeps) bool {
         return self.backtrack_enabled;
+    }
+    pub fn vocabulary(self: *FakeDeps) backend.Vocabulary {
+        return self.vocab;
     }
     pub fn note(self: *FakeDeps, event: Event) void {
         self.events[self.event_count] = event;
@@ -612,6 +621,23 @@ test "a new Lease pins the Settings Snapshot Backtrack enablement at acquire" {
 
     const next = router.acquire(8).?;
     try std.testing.expect(!next.backtrack);
+}
+
+test "a new Lease pins the Settings Snapshot vocabulary list at acquire" {
+    var deps = FakeDeps{ .vocab = &.{ "type-wave", "whisper.cpp" } };
+    var router = testRouter(&deps, .local);
+    deps.pending_wants = .{ .prepare_local = true };
+    try std.testing.expect(router.tick(.local));
+
+    const lease = router.acquire(7).?;
+    try std.testing.expectEqual(@as(usize, 2), lease.vocabulary.len);
+    try std.testing.expectEqualStrings("type-wave", lease.vocabulary[0]);
+    deps.vocab = &.{}; // mid-Utterance edit — the pinned Lease keeps its list
+    try std.testing.expectEqual(@as(usize, 2), lease.vocabulary.len);
+    router.resolve(7);
+
+    const next = router.acquire(8).?;
+    try std.testing.expectEqual(@as(usize, 0), next.vocabulary.len);
 }
 
 test "a switch lands only after the active Utterance drains" {

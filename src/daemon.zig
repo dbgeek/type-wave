@@ -295,6 +295,13 @@ const DaemonDeps = struct {
         return self.daemon.store.current().backtrack;
     }
 
+    /// The vocabulary list pinned onto every new Lease at acquire (read-at-use, Talk Key
+    /// press), a zero-copy slice into the current immutable Settings Snapshot. Only the
+    /// local Whisper backend biases toward it (docs/vocab-biasing-spec.md §5).
+    pub fn vocabulary(self: *DaemonDeps) backend.Vocabulary {
+        return self.daemon.store.current().vocabulary;
+    }
+
     pub fn note(self: *DaemonDeps, event: backend_router.Event) void {
         _ = self;
         switch (event) {

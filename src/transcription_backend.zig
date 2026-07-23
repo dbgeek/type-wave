@@ -13,6 +13,12 @@ pub const Backend = enum {
 /// Settings Snapshot from which the lease was acquired.
 pub const Language = []const u8;
 
+/// The raw user vocabulary list (docs/vocab-biasing-spec.md §5) — a flat, unweighted set
+/// of terms. Like `Language`, it is a zero-copy slice into the immutable, leak-by-design
+/// Settings Snapshot the Lease was acquired from, so pinning it costs no allocation. Empty
+/// means no biasing; only the local Whisper backend reads it (OpenAI ignores it, §4).
+pub const Vocabulary = []const []const u8;
+
 pub const DeadlinePolicy = struct {
     cooperative_cancel_ms: ?u32 = null,
     final_ms: u32,
@@ -70,7 +76,7 @@ pub const DeadlineState = struct {
 /// Commands implemented by a concrete Transcription Backend. A Lease pins this
 /// table, its context, language, and deadline for the full Utterance lifecycle.
 pub const Commands = struct {
-    begin: *const fn (ctx: *anyopaque, id: UtteranceId, language: Language) anyerror!void,
+    begin: *const fn (ctx: *anyopaque, id: UtteranceId, language: Language, vocabulary: Vocabulary) anyerror!void,
     append_audio: *const fn (ctx: *anyopaque, id: UtteranceId, pcm: []const u8) anyerror!void,
     release: *const fn (ctx: *anyopaque, id: UtteranceId) anyerror!void,
     request_cancel: *const fn (ctx: *anyopaque, id: UtteranceId) void,
@@ -87,11 +93,16 @@ pub const Lease = struct {
     /// half-apply (docs/backtrack-spec.md). The rewrite fires only when this is set
     /// AND `backend == .openai`; the backends themselves never read it.
     backtrack: bool = false,
+    /// The vocabulary list read from the Settings Snapshot at Talk Key press and pinned here
+    /// by the Backend Router, mirroring `language` (docs/vocab-biasing-spec.md §5). Every
+    /// Segment of this Utterance biases toward the same list, so a mid-Utterance edit cannot
+    /// half-apply. Only the local Whisper `begin` consumes it; OpenAI's `begin` ignores it.
+    vocabulary: Vocabulary = &.{},
     ctx: *anyopaque,
     commands: *const Commands,
 
     pub fn begin(self: Lease) !void {
-        try self.commands.begin(self.ctx, self.id, self.language);
+        try self.commands.begin(self.ctx, self.id, self.language, self.vocabulary);
     }
 
     pub fn appendAudio(self: Lease, pcm: []const u8) !void {
@@ -117,6 +128,7 @@ const Recorder = struct {
     last_id: UtteranceId = 0,
     last_language: [16]u8 = undefined,
     last_language_len: usize = 0,
+    last_vocabulary_len: usize = 0,
     pcm: [16]u8 = undefined,
     pcm_len: usize = 0,
 
@@ -136,11 +148,12 @@ const Recorder = struct {
         self.call_count += 1;
         self.last_id = id;
     }
-    fn begin(ctx: *anyopaque, id: UtteranceId, language: Language) !void {
+    fn begin(ctx: *anyopaque, id: UtteranceId, language: Language, vocabulary: Vocabulary) !void {
         const self = from(ctx);
         self.record('b', id);
         @memcpy(self.last_language[0..language.len], language);
         self.last_language_len = language.len;
+        self.last_vocabulary_len = vocabulary.len;
     }
     fn appendAudio(ctx: *anyopaque, id: UtteranceId, pcm: []const u8) !void {
         const self = from(ctx);
@@ -166,6 +179,7 @@ test "lease pins metadata and forwards identity-tagged backend commands" {
         .backend = .openai,
         .language = "sv",
         .deadline = .{ .final_ms = 15_000 },
+        .vocabulary = &.{ "type-wave", "Bjørn" },
         .ctx = &recorder,
         .commands = &Recorder.commands,
     };
@@ -181,6 +195,7 @@ test "lease pins metadata and forwards identity-tagged backend commands" {
     try std.testing.expectEqualStrings("barqc", recorder.calls[0..recorder.call_count]);
     try std.testing.expectEqual(@as(UtteranceId, 73), recorder.last_id);
     try std.testing.expectEqualStrings("sv", recorder.last_language[0..recorder.last_language_len]);
+    try std.testing.expectEqual(@as(usize, 2), recorder.last_vocabulary_len); // pinned list reached begin
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, recorder.pcm[0..recorder.pcm_len]);
     try std.testing.expectEqual(Backend.openai, lease.backend);
     try std.testing.expectEqual(@as(u32, 15_000), lease.deadline.final_ms);

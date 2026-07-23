@@ -171,18 +171,22 @@ acceptance rerun.
   timeout must abandon the active Utterance. The daemon must reject all remaining bytes
   from that helper instance before starting another.
 
-### 3.3 Version 1 IPC
+### 3.3 Version 2 IPC
 
 Each frame has a 12-byte little-endian header: ASCII magic `TWW1`, `u16 version` (value
-`1`), `u16 kind`, and `u32 payload_length`, followed by exactly that many payload bytes.
-The maximum payload is 2 MiB. Reserved values, invalid UTF-8, inconsistent lengths, trailing
-bytes, and frames over the limit are protocol failures.
+`2`), `u16 kind`, and `u32 payload_length`, followed by exactly that many payload bytes.
+The maximum payload is 2 MiB. Invalid UTF-8, inconsistent lengths, trailing bytes, and
+frames over the limit are protocol failures. Version 2 added the `transcribe` frame's
+length-prefixed vocabulary prompt region (docs/vocab-biasing-spec.md §5), consuming the
+former reserved bytes; a daemon only ever talks to a helper it spawned from the current
+on-disk binary, so a partial upgrade surfaces as a transient helper-startup failure via
+the existing `UnsupportedVersion` rejection, not a live cross-version pipe.
 
 | Kind | Direction | Payload |
 | --- | --- | --- |
 | `ready` | helper -> daemon | 32-byte model digest after successful warm-up |
 | `startup_failed` | helper -> daemon | `u16 code`, `u32 message_len`, UTF-8 diagnostic |
-| `transcribe` | daemon -> helper | `u64 id`, `u8 language`, 7 reserved zero bytes, `u32 pcm_len`, PCM |
+| `transcribe` | daemon -> helper | `u64 id`, `u8 language`, `u16 prompt_len`, UTF-8 vocabulary prompt, `u32 pcm_len`, PCM |
 | `cancel` | daemon -> helper | `u64 id` |
 | `final` | helper -> daemon | `u64 id`, `u32 text_len`, UTF-8 Final Transcript |
 | `failed` | helper -> daemon | `u64 id`, `u16 code`, `u32 message_len`, UTF-8 diagnostic |

@@ -10,6 +10,7 @@ const helper_supervisor = @import("whisper_supervisor.zig");
 const coordinator = @import("coordinator.zig");
 const model_store = @import("model_store.zig");
 const segmentation = @import("segmenter.zig");
+const vocab = @import("vocab.zig");
 
 extern "c" fn usleep(usec: c_uint) c_int;
 
@@ -74,7 +75,7 @@ fn bufferRms(pcm: []const u8) f32 {
 ///   usesModel(*Helper, []const u8) bool
 ///   setEvents(*Helper, Events) void
 ///   reserveUtterance(*Helper, backend.UtteranceId) !void
-///   submit(*Helper, backend.UtteranceId, ipc.Language, []const u8) !void
+///   submit(*Helper, backend.UtteranceId, ipc.Language, []const u8 prompt, []const u8 pcm) !void
 ///   requestCancel(*Helper, backend.UtteranceId) void
 ///   cancel(*Helper, backend.UtteranceId) void
 ///   shutdown(*Helper) void
@@ -105,6 +106,11 @@ pub fn Adapter(comptime Helper: type) type {
         mu: std.Io.Mutex = .init,
         active_id: ?backend.UtteranceId = null,
         language: ipc.Language = .english,
+        /// The bare comma glossary built once per Utterance in `begin` from the Lease-pinned
+        /// vocabulary (docs/vocab-biasing-spec.md §5), owned for the Utterance and re-sent on
+        /// every Segment `submit`. Empty (`&.{}`) is the no-op — the helper leaves
+        /// `initial_prompt` null. Freed and reset by `resetUtteranceStateLocked`.
+        prompt: []u8 = &.{},
         released: bool = false,
         /// Set once any Segment of this Utterance fails — realizes all-or-nothing: no
         /// further Segment is submitted and the Utterance is discarded whole.
@@ -202,7 +208,7 @@ pub fn Adapter(comptime Helper: type) type {
             self.helper.retry();
         }
 
-        pub fn begin(self: *Self, id: backend.UtteranceId, language: backend.Language) !void {
+        pub fn begin(self: *Self, id: backend.UtteranceId, language: backend.Language, vocabulary: backend.Vocabulary) !void {
             self.mu.lockUncancelable(self.io);
             defer self.mu.unlock(self.io);
             if (self.active_id != null) return error.Busy;
@@ -224,6 +230,10 @@ pub fn Adapter(comptime Helper: type) type {
             // The helper is reserved per Segment (at submit), not per Utterance: a long
             // Utterance submits many Segments, one at a time, through the same single slot.
             self.resetUtteranceStateLocked();
+            // Build the glossary once for the whole Utterance from the Lease-pinned list, so
+            // every Segment biases toward the same terms (spec §5). Reset above cleared any
+            // prior prompt, so a build failure here leaks nothing and releases the lease.
+            self.prompt = try vocab.buildPrompt(self.allocator, vocabulary);
             self.inference_lease = inference_lease;
             self.active_id = id;
             self.released = false;
@@ -387,7 +397,7 @@ pub fn Adapter(comptime Helper: type) type {
                 self.failed = true;
                 return true;
             };
-            self.helper.submit(seg_id, self.language, seg.pcm) catch {
+            self.helper.submit(seg_id, self.language, self.prompt, seg.pcm) catch {
                 self.helper.cancel(seg_id); // undo the reservation we just took
                 self.allocator.free(seg.pcm);
                 self.failed = true;
@@ -460,6 +470,8 @@ pub fn Adapter(comptime Helper: type) type {
             self.pending.clearRetainingCapacity();
             self.segmenter.reset();
             self.assembled.clearRetainingCapacity();
+            self.allocator.free(self.prompt); // free(&.{}) is a no-op, so the empty case is safe
+            self.prompt = &.{};
             self.in_flight_id = null;
             self.segments_cut = 0;
             self.segments_done = 0;
@@ -473,6 +485,7 @@ pub fn Adapter(comptime Helper: type) type {
             self.pending.deinit(self.allocator);
             self.segmenter.deinit(self.allocator);
             self.assembled.deinit(self.allocator);
+            self.allocator.free(self.prompt); // an Utterance torn down mid-flight still owns one
         }
 
         fn releaseInferenceLease(self: *Self) void {
@@ -483,8 +496,8 @@ pub fn Adapter(comptime Helper: type) type {
         fn from(ctx: *anyopaque) *Self {
             return @ptrCast(@alignCast(ctx));
         }
-        fn beginCommand(ctx: *anyopaque, id: backend.UtteranceId, language: backend.Language) !void {
-            try from(ctx).begin(id, language);
+        fn beginCommand(ctx: *anyopaque, id: backend.UtteranceId, language: backend.Language, vocabulary: backend.Vocabulary) !void {
+            try from(ctx).begin(id, language, vocabulary);
         }
         fn appendCommand(ctx: *anyopaque, id: backend.UtteranceId, pcm: []const u8) !void {
             try from(ctx).appendAudio(id, pcm);
@@ -517,6 +530,8 @@ const FakeHelper = struct {
     lease_id: ?backend.UtteranceId = null,
     last_id: backend.UtteranceId = 0,
     language: ipc.Language = .english,
+    last_prompt: [256]u8 = undefined,
+    last_prompt_len: usize = 0,
     ids: [64]backend.UtteranceId = undefined,
     lens: [64]usize = undefined,
     pcm: [4096]u8 = undefined,
@@ -540,13 +555,15 @@ const FakeHelper = struct {
         self.reserves += 1;
     }
 
-    fn submit(self: *FakeHelper, id: backend.UtteranceId, language: ipc.Language, pcm: []const u8) !void {
+    fn submit(self: *FakeHelper, id: backend.UtteranceId, language: ipc.Language, prompt: []const u8, pcm: []const u8) !void {
         if (self.submit_error) return error.BrokenPipe;
         if (self.lease_id != id) return error.WrongUtterance;
         self.ids[self.submits] = id;
         self.lens[self.submits] = pcm.len;
         @memcpy(self.pcm[self.pcm_len..][0..pcm.len], pcm);
         self.pcm_len += pcm.len;
+        @memcpy(self.last_prompt[0..prompt.len], prompt);
+        self.last_prompt_len = prompt.len;
         self.submits += 1;
         self.last_id = id;
         self.language = language;
@@ -722,7 +739,7 @@ test "a short Utterance is one Segment, submitted once after release, byte-for-b
         var adapter = Adapter(FakeHelper).init(std.testing.allocator, std.testing.io, &helper, events.events());
         defer adapter.deinit();
 
-        try adapter.begin(41, case[0]);
+        try adapter.begin(41, case[0], &.{});
         try adapter.appendAudio(41, &.{ 1, 2 });
         try adapter.appendAudio(41, &.{ 3, 4, 5, 6 });
         try std.testing.expectEqual(@as(usize, 0), helper.submits); // nothing mid-Utterance
@@ -742,6 +759,37 @@ test "a short Utterance is one Segment, submitted once after release, byte-for-b
     }
 }
 
+test "the pinned vocabulary builds one glossary re-sent on every Segment; empty stays a no-op" {
+    var helper = FakeHelper{};
+    var events = EventRecorder{};
+    var adapter = Adapter(FakeHelper).init(std.testing.allocator, std.testing.io, &helper, events.events());
+    adapter.segmenter.policy = tiny_policy;
+    defer adapter.deinit();
+
+    // A biased Utterance: begin builds "type-wave, Bjørn" once and every Segment carries it.
+    try adapter.begin(2, "en", &.{ "type-wave", "Bjørn" });
+    try adapter.appendAudio(2, &loud4);
+    try adapter.appendAudio(2, &quiet4); // cut + submit Segment 0
+    try std.testing.expectEqual(@as(usize, 1), helper.submits);
+    try std.testing.expectEqualStrings("type-wave, Bjørn", helper.last_prompt[0..helper.last_prompt_len]);
+
+    deliverFinal(&helper, &adapter, segmentId(2, 0), "part");
+    try adapter.appendAudio(2, &loud4);
+    try adapter.appendAudio(2, &quiet4); // cut + submit Segment 1 — the same glossary is re-sent
+    try std.testing.expectEqual(@as(usize, 2), helper.submits);
+    try std.testing.expectEqualStrings("type-wave, Bjørn", helper.last_prompt[0..helper.last_prompt_len]);
+    try adapter.release(2);
+    deliverFinal(&helper, &adapter, segmentId(2, 1), "two");
+    try std.testing.expectEqual(@as(usize, 1), events.finals);
+
+    // An empty list is the pure no-op: the helper receives a zero-length prompt.
+    try adapter.begin(3, "en", &.{});
+    try adapter.appendAudio(3, &.{ 1, 2 });
+    try adapter.release(3);
+    try std.testing.expectEqual(@as(usize, 3), helper.submits);
+    try std.testing.expectEqual(@as(usize, 0), helper.last_prompt_len);
+}
+
 test "a long Utterance is cut at a pause into ordered Segments assembled into one Final Transcript" {
     var helper = FakeHelper{};
     var events = EventRecorder{};
@@ -749,7 +797,7 @@ test "a long Utterance is cut at a pause into ordered Segments assembled into on
     adapter.segmenter.policy = tiny_policy;
     defer adapter.deinit();
 
-    try adapter.begin(3, "en");
+    try adapter.begin(3, "en", &.{});
     // Speech reaches the soft floor, then a pause closes the first Segment in the background.
     try adapter.appendAudio(3, &loud4);
     try adapter.appendAudio(3, &quiet4);
@@ -780,7 +828,7 @@ test "no pause forces a cut at the hard max" {
     adapter.segmenter.policy = .{ .soft_floor_bytes = 4, .hard_max_bytes = 8, .pause_bytes = 4, .silence_rms = 0.5 };
     defer adapter.deinit();
 
-    try adapter.begin(5, "en");
+    try adapter.begin(5, "en", &.{});
     // Unbroken speech — no pause ever — is force-cut once it reaches the 8-byte hard max.
     try adapter.appendAudio(5, &loud4);
     try std.testing.expectEqual(@as(usize, 0), helper.submits);
@@ -797,7 +845,7 @@ test "any Segment failing discards the whole Utterance, even an already-transcri
     adapter.segmenter.policy = tiny_policy;
     defer adapter.deinit();
 
-    try adapter.begin(6, "en");
+    try adapter.begin(6, "en", &.{});
     try adapter.appendAudio(6, &loud4);
     try adapter.appendAudio(6, &quiet4); // cut + submit Segment 0
     deliverFinal(&helper, &adapter, segmentId(6, 0), "part one"); // transcribes fine
