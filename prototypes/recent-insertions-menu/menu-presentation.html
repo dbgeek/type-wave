@@ -1,0 +1,531 @@
+<title>Recent Insertions — menu presentation</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    /* page chrome */
+    --wall: #e9e7ee;
+    --wall-2: #dcd9e4;
+    --ink: #1d1b22;
+    --ink-soft: #55525e;
+    --hair: #cfccd8;
+    --card: #ffffff;
+    --accent: #6b5bd2;
+
+    /* macOS menu material — light */
+    --menu-bg: rgba(246, 246, 249, 0.82);
+    --menu-border: rgba(0,0,0,0.10);
+    --menu-shadow: 0 12px 40px rgba(0,0,0,0.28), 0 1px 0 rgba(255,255,255,0.6) inset;
+    --menu-ink: #17171a;
+    --menu-2nd: #8a8a90;
+    --menu-sep: rgba(0,0,0,0.10);
+    --menu-hi: #0a6cff;
+    --menu-hi-ink: #ffffff;
+    --disabled: #b4b4ba;
+
+    --fail: #e0392b;
+    --fail-soft: rgba(224,57,43,0.12);
+    --degraded: #b26a00;
+    --degraded-soft: rgba(178,106,0,0.14);
+
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --wall: #17161b;
+      --wall-2: #201e26;
+      --ink: #ecebf2;
+      --ink-soft: #a19eac;
+      --hair: #302d38;
+      --card: #211f28;
+      --accent: #9c8dff;
+
+      --menu-bg: rgba(43, 43, 47, 0.80);
+      --menu-border: rgba(255,255,255,0.10);
+      --menu-shadow: 0 14px 44px rgba(0,0,0,0.55), 0 1px 0 rgba(255,255,255,0.10) inset;
+      --menu-ink: #f2f2f5;
+      --menu-2nd: #98989f;
+      --menu-sep: rgba(255,255,255,0.12);
+      --menu-hi: #2b7bff;
+      --menu-hi-ink: #ffffff;
+      --disabled: #6a6a72;
+
+      --fail: #ff6b5e;
+      --fail-soft: rgba(255,107,94,0.16);
+      --degraded: #f0a83a;
+      --degraded-soft: rgba(240,168,58,0.16);
+    }
+  }
+  :root[data-theme="dark"] {
+    --wall:#17161b; --wall-2:#201e26; --ink:#ecebf2; --ink-soft:#a19eac; --hair:#302d38; --card:#211f28; --accent:#9c8dff;
+    --menu-bg:rgba(43,43,47,0.80); --menu-border:rgba(255,255,255,0.10); --menu-shadow:0 14px 44px rgba(0,0,0,0.55),0 1px 0 rgba(255,255,255,0.10) inset;
+    --menu-ink:#f2f2f5; --menu-2nd:#98989f; --menu-sep:rgba(255,255,255,0.12); --menu-hi:#2b7bff; --menu-hi-ink:#fff; --disabled:#6a6a72;
+    --fail:#ff6b5e; --fail-soft:rgba(255,107,94,0.16); --degraded:#f0a83a; --degraded-soft:rgba(240,168,58,0.16);
+  }
+  :root[data-theme="light"] {
+    --wall:#e9e7ee; --wall-2:#dcd9e4; --ink:#1d1b22; --ink-soft:#55525e; --hair:#cfccd8; --card:#fff; --accent:#6b5bd2;
+    --menu-bg:rgba(246,246,249,0.82); --menu-border:rgba(0,0,0,0.10); --menu-shadow:0 12px 40px rgba(0,0,0,0.28),0 1px 0 rgba(255,255,255,0.6) inset;
+    --menu-ink:#17171a; --menu-2nd:#8a8a90; --menu-sep:rgba(0,0,0,0.10); --menu-hi:#0a6cff; --menu-hi-ink:#fff; --disabled:#b4b4ba;
+    --fail:#e0392b; --fail-soft:rgba(224,57,43,0.12); --degraded:#b26a00; --degraded-soft:rgba(178,106,0,0.14);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    font-family: var(--ui);
+    color: var(--ink);
+    background:
+      radial-gradient(1200px 600px at 78% -10%, var(--wall-2), transparent 60%),
+      var(--wall);
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    padding: clamp(18px, 3.5vw, 44px);
+  }
+
+  header.pagehead { max-width: 1080px; margin: 0 auto 22px; }
+  .eyebrow {
+    font: 600 12px/1 var(--mono);
+    letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--accent);
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  .eyebrow::before { content:""; width: 26px; height: 2px; background: var(--accent); border-radius: 2px; }
+  h1 {
+    font: 650 clamp(24px, 3.4vw, 36px)/1.08 var(--ui);
+    letter-spacing: -0.02em; text-wrap: balance;
+    margin: 12px 0 8px;
+  }
+  .sub { color: var(--ink-soft); max-width: 62ch; font-size: 15px; line-height: 1.5; margin: 0; }
+  .sub a { color: var(--accent); text-decoration: none; border-bottom: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); }
+
+  .stage {
+    max-width: 1080px; margin: 0 auto;
+    display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.9fr);
+    gap: 22px; align-items: start;
+  }
+  @media (max-width: 860px) { .stage { grid-template-columns: 1fr; } }
+
+  /* ---- desktop backdrop that holds the menu ---- */
+  .desktop {
+    position: relative;
+    border-radius: 16px;
+    overflow: hidden;
+    border: 1px solid var(--hair);
+    background:
+      linear-gradient(160deg, #3a6ea5 0%, #6a4e97 46%, #b0537d 100%);
+    min-height: 520px;
+    box-shadow: 0 20px 50px rgba(0,0,0,0.18);
+  }
+  :root[data-theme="dark"] .desktop, .desktop {
+    background: linear-gradient(160deg, #274b73 0%, #4a366e 48%, #7d3a57 100%);
+  }
+  .menubar {
+    height: 30px; display: flex; align-items: center; justify-content: flex-end;
+    gap: 18px; padding: 0 14px;
+    background: rgba(20,20,25,0.28);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    color: rgba(255,255,255,0.92); font-size: 13px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+  .menubar .glyph { opacity: 0.9; font-size: 13px; }
+  .menubar .app-icon {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 22px; border-radius: 6px;
+    background: rgba(255,255,255,0.22);
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.25) inset;
+  }
+  .menubar .clock { font-variant-numeric: tabular-nums; }
+  .wave { display:flex; align-items:center; gap:2px; height:14px; }
+  .wave i { width:2px; border-radius:2px; background: #fff; display:block; }
+
+  /* the dropdown */
+  .drop-anchor { position: absolute; top: 30px; right: 96px; }
+  .menu {
+    position: absolute; top: 6px; right: 0;
+    min-width: 250px;
+    background: var(--menu-bg);
+    backdrop-filter: blur(26px) saturate(160%); -webkit-backdrop-filter: blur(26px) saturate(160%);
+    border: 0.5px solid var(--menu-border);
+    border-radius: 10px;
+    box-shadow: var(--menu-shadow);
+    padding: 5px;
+    color: var(--menu-ink);
+    font-size: 13.5px;
+    z-index: 3;
+  }
+  .mrow {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 9px; border-radius: 6px; min-height: 24px;
+    white-space: nowrap; cursor: default; position: relative;
+  }
+  .mrow.hi { background: var(--menu-hi); color: var(--menu-hi-ink); }
+  .mrow.hi .k, .mrow.hi .chev, .mrow.hi .m2 { color: rgba(255,255,255,0.85); }
+  .mrow .lbl { flex: 1; }
+  .mrow .chev { color: var(--menu-2nd); font-size: 11px; }
+  .mrow .k { color: var(--menu-2nd); font: 12px var(--ui); }
+  .mrow.disabled { color: var(--disabled); }
+  .msep { height: 0.5px; background: var(--menu-sep); margin: 5px 8px; }
+  .mhead { font: 600 11px/1 var(--ui); letter-spacing: 0.02em; color: var(--menu-2nd); padding: 6px 9px 3px; text-transform: uppercase; }
+
+  /* submenu flyout */
+  .flyout {
+    position: absolute; top: 40px; right: 258px;
+    min-width: 292px; max-width: 320px;
+    background: var(--menu-bg);
+    backdrop-filter: blur(26px) saturate(160%); -webkit-backdrop-filter: blur(26px) saturate(160%);
+    border: 0.5px solid var(--menu-border);
+    border-radius: 10px; box-shadow: var(--menu-shadow);
+    padding: 5px; color: var(--menu-ink); font-size: 13px; z-index: 4;
+  }
+  .flyout .cap { font: 500 11px/1.3 var(--mono); color: var(--menu-2nd); padding: 4px 9px 7px; }
+
+  .entry { display:flex; align-items:center; gap:9px; padding: 5px 9px; border-radius: 6px; min-height: 34px; }
+  .entry:hover { background: color-mix(in srgb, var(--menu-hi) 14%, transparent); }
+  .entry.hi { background: var(--menu-hi); color: var(--menu-hi-ink); }
+  .entry.hi .meta, .entry.hi .chev { color: rgba(255,255,255,0.82); }
+  .entry .status-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: color-mix(in srgb, var(--menu-2nd) 55%, transparent); }
+  .entry.ok .status-dot { background: #34c759; }
+  .entry.degraded .status-dot { background: var(--degraded); }
+  .entry.failed .status-dot { background: var(--fail); box-shadow: 0 0 0 3px var(--fail-soft); }
+  .entry .body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .entry .txt { font: 13px/1.25 var(--ui); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .entry .txt.masked { font-family: var(--mono); letter-spacing: 1px; color: var(--menu-ink); }
+  .entry .meta { font: 11px/1 var(--mono); color: var(--menu-2nd); display:flex; gap:7px; align-items:center; }
+  .entry .meta .app { color: var(--menu-ink); opacity:0.75; }
+  .entry.hi .meta .app { color: rgba(255,255,255,0.9); }
+  .tag { font: 600 9.5px/1 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 5px; border-radius: 4px; }
+  .tag.failed { color: var(--fail); background: var(--fail-soft); }
+  .tag.degraded { color: var(--degraded); background: var(--degraded-soft); }
+  .entry .chev { color: var(--menu-2nd); font-size: 11px; flex: none; }
+  .reveal-btn {
+    font: 500 11px var(--ui); border: 0.5px solid var(--menu-border);
+    background: transparent; color: var(--menu-ink); border-radius: 5px;
+    padding: 2px 7px; cursor: pointer; flex: none;
+  }
+  .reveal-btn:hover { background: color-mix(in srgb, var(--menu-hi) 18%, transparent); }
+  .entry.hi .reveal-btn { border-color: rgba(255,255,255,0.4); color:#fff; }
+
+  /* per-entry action flyout (variant 1 & 3) */
+  .actions {
+    position: absolute; top: 92px; right: 606px;
+    min-width: 168px; background: var(--menu-bg);
+    backdrop-filter: blur(26px) saturate(160%); -webkit-backdrop-filter: blur(26px) saturate(160%);
+    border: 0.5px solid var(--menu-border); border-radius: 10px; box-shadow: var(--menu-shadow);
+    padding: 5px; z-index: 5; color: var(--menu-ink); font-size: 13px;
+  }
+  .actions .preview { font: 12px/1.35 var(--ui); color: var(--menu-ink); padding: 6px 9px; max-width: 220px; white-space: normal; border-bottom: 0.5px solid var(--menu-sep); margin-bottom: 4px; }
+  .hint { position:absolute; bottom: 12px; left: 14px; right: 14px; color: rgba(255,255,255,0.9);
+    font: 12px/1.4 var(--ui); background: rgba(0,0,0,0.30); border:1px solid rgba(255,255,255,0.14);
+    backdrop-filter: blur(8px); padding: 8px 11px; border-radius: 8px; }
+  .hint b { font-weight: 650; }
+  kbd { font: 11px var(--mono); background: rgba(255,255,255,0.16); border:1px solid rgba(255,255,255,0.22);
+    border-radius: 4px; padding: 1px 5px; }
+
+  /* ---- side panel ---- */
+  .panel { display: flex; flex-direction: column; gap: 16px; }
+  .segmented {
+    display: flex; background: var(--card); border: 1px solid var(--hair); border-radius: 11px; padding: 4px; gap: 3px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+  }
+  .segmented button {
+    flex: 1; border: 0; background: transparent; color: var(--ink-soft);
+    font: 600 12.5px var(--ui); padding: 8px 6px; border-radius: 8px; cursor: pointer;
+    display: flex; flex-direction: column; align-items: center; gap: 2px; line-height: 1.15;
+  }
+  .segmented button .vnum { font: 700 10px var(--mono); opacity: 0.55; }
+  .segmented button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+  .segmented button[aria-pressed="true"] .vnum { opacity: 0.8; }
+  .segmented button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .card { background: var(--card); border: 1px solid var(--hair); border-radius: 13px; padding: 16px 17px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+  .card h3 { margin: 0 0 3px; font: 650 15px var(--ui); letter-spacing: -0.01em; }
+  .card .tagline { margin: 0 0 11px; color: var(--ink-soft); font-size: 12.5px; line-height: 1.4; }
+  .forks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 9px; }
+  .forks li { display: grid; grid-template-columns: 16px 1fr; gap: 9px; font-size: 12.8px; line-height: 1.4; color: var(--ink); }
+  .forks li .d { color: var(--accent); font-weight: 700; }
+  .forks li .cost .d { color: var(--degraded); }
+  .forks .lab { font: 600 10.5px var(--mono); letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-soft); }
+
+  .reqs { display: flex; flex-direction: column; gap: 10px; }
+  .req { display: grid; grid-template-columns: 20px 1fr; gap: 10px; align-items: start; font-size: 12.8px; line-height: 1.4; }
+  .req .chk { width: 18px; height: 18px; border-radius: 5px; background: color-mix(in srgb, #34c759 22%, transparent); color: #1f9d43; display: grid; place-items: center; font-size: 11px; font-weight: 800; }
+  .req .chk.warn { background: var(--degraded-soft); color: var(--degraded); }
+  .req b { font-weight: 650; }
+  .req .how { color: var(--ink-soft); display: block; margin-top: 1px; }
+
+  .noteline { font-size: 11.5px; color: var(--ink-soft); line-height: 1.5; }
+  .noteline code { font: 11px var(--mono); background: color-mix(in srgb, var(--accent) 12%, transparent); padding: 1px 5px; border-radius: 4px; color: var(--accent); }
+
+  .foot { max-width: 1080px; margin: 22px auto 0; color: var(--ink-soft); font-size: 12px; line-height: 1.6; }
+  .foot code { font: 11px var(--mono); color: var(--ink); }
+
+  .toggle-theme {
+    position: fixed; top: 14px; right: 14px; z-index: 20;
+    font: 600 12px var(--ui); border: 1px solid var(--hair); background: var(--card); color: var(--ink);
+    border-radius: 8px; padding: 7px 11px; cursor: pointer;
+  }
+</style>
+
+<button class="toggle-theme" id="themeBtn" aria-label="Toggle theme">◐ Theme</button>
+
+<header class="pagehead">
+  <span class="eyebrow">Ticket #186 · prototype</span>
+  <h1>Recent Insertions — how it presents in the Status&nbsp;Item menu</h1>
+  <p class="sub">A throwaway mockup to react to. Three concrete layouts for surfacing the in-memory ring (N&nbsp;=&nbsp;20, newest-first) under the menu-bar item. Every entry is <b>masked by default</b>; text appears only on a deliberate reveal, and <b>failed</b> insertions — the primary recovery case — are marked. Switch variants below; the reveal and failed-marker interactions are live.</p>
+</header>
+
+<div class="stage">
+  <!-- MOCKUP -->
+  <div class="desktop" id="desktop">
+    <div class="menubar">
+      <span class="glyph">🔋</span>
+      <span class="glyph">📶</span>
+      <span class="app-icon" title="type-wave">
+        <span class="wave"><i style="height:6px"></i><i style="height:12px"></i><i style="height:8px"></i><i style="height:14px"></i><i style="height:5px"></i></span>
+      </span>
+      <span class="clock">9:41 AM</span>
+    </div>
+
+    <!-- main menu -->
+    <div class="drop-anchor">
+      <div class="menu" role="menu">
+        <div class="mrow disabled"><span class="lbl">Listening — Local model</span></div>
+        <div class="msep"></div>
+        <div class="mrow"><span class="lbl">Pause dictation</span></div>
+        <div class="mrow"><span class="lbl">Backtrack last</span><span class="k">⌥⌫</span></div>
+        <div class="msep"></div>
+        <div class="mrow hi"><span class="lbl">Recent Insertions</span><span class="chev">▶︎</span></div>
+        <div class="mrow"><span class="lbl">Vocabulary…</span></div>
+        <div class="mrow"><span class="lbl">Settings…</span><span class="k">⌘,</span></div>
+        <div class="msep"></div>
+        <div class="mrow"><span class="lbl">Quit type-wave</span><span class="k">⌘Q</span></div>
+      </div>
+    </div>
+
+    <!-- submenu flyout: filled by JS -->
+    <div class="flyout" id="flyout"></div>
+    <!-- per-entry action flyout (variants 1 & 3) -->
+    <div id="actions"></div>
+
+    <div class="hint" id="hint"></div>
+  </div>
+
+  <!-- SIDE PANEL -->
+  <div class="panel">
+    <div class="segmented" role="tablist" aria-label="Layout variants">
+      <button id="v1" aria-pressed="true"  onclick="setVariant(1)"><span class="vnum">VAR 1</span>Entry ▸ actions</button>
+      <button id="v2" aria-pressed="false" onclick="setVariant(2)"><span class="vnum">VAR 2</span>Flat + ⌥ reveal</button>
+      <button id="v3" aria-pressed="false" onclick="setVariant(3)"><span class="vnum">VAR 3</span>Recovery-first</button>
+    </div>
+
+    <div class="card" id="forkCard"></div>
+
+    <div class="card">
+      <h3>Inherited hard requirements</h3>
+      <p class="tagline">Privacy rules locked by the retention decision (#184) — not UX preferences. Every variant must honour them.</p>
+      <div class="reqs">
+        <div class="req">
+          <span class="chk">✓</span>
+          <div><b>Masked by default.</b><span class="how">Idle menu leaks no transcript. Rows show <code>••••••</code> · char-count · App Identity · time.</span></div>
+        </div>
+        <div class="req">
+          <span class="chk">✓</span>
+          <div><b>Deliberate reveal.</b><span class="how">Text appears only on an explicit act — the affordance differs per variant (that's the fork).</span></div>
+        </div>
+        <div class="req">
+          <span class="chk">✓</span>
+          <div><b>.failed marker.</b><span class="how">Never-inserted entries are visually distinct so you can spot what needs re-inserting.</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Left open for the reaction</h3>
+      <p class="noteline" style="margin:0">
+        <b>Pure-split fit (fork D).</b> The look doesn't decide this — but the presentation does. Does the ring ride inside
+        <code>status_item.Snapshot</code> via <code>project</code>/<code>derive</code> (menu stays a dumb adapter), or does the menu read the ring directly at <code>menuWillOpen</code>?
+        Note <code>refreshChrome</code> early-outs on unchanged snapshots, so the list likely needs its own refresh path either way. My lean: <b>direct read at menuWillOpen</b> — 20 masked rows don't belong in the value-compared Snapshot. Confirm on reaction.
+      </p>
+    </div>
+  </div>
+</div>
+
+<p class="foot">
+  Sample ring: 5 of 20 shown. Green dot = <code>ok</code>, amber = <code>degraded</code>, red = <code>failed</code>.
+  Mockup only — no real data. Reveal state is per-entry and resets on variant switch. macOS menu material rendered with the system font (SF), matching the real <code>NSMenu</code>.
+</p>
+
+<script>
+  // ---- sample ring (newest first) ----
+  const RING = [
+    { txt: "send me the deck when you get a chance", app: "Slack",    when: "2m",  chars: 39, outcome: "failed" },
+    { txt: "let's move the standup to eleven thirty", app: "Messages", when: "6m",  chars: 40, outcome: "ok" },
+    { txt: "the API returns a 429 under sustained load", app: "Code",  when: "13m", chars: 43, outcome: "degraded" },
+    { txt: "quarterly numbers are looking strong",     app: "Mail",   when: "24m", chars: 37, outcome: "ok" },
+    { txt: "remember to water the plants tonight",      app: "Notes",  when: "1h",  chars: 37, outcome: "ok" },
+  ];
+
+  let variant = 1;
+  let revealed = new Set();     // indices revealed (variants 1 & 3 via button/action)
+  let optHeld = false;          // variant 2: ⌥ held reveals all
+  let openActions = null;       // variant 1 & 3: which entry's action flyout is open
+
+  const dots = n => "•".repeat(Math.min(n, 8));
+
+  function maskedLabel(e) {
+    return `<span class="meta"><span class="app">${e.app}</span> · ${e.chars} chars · ${e.when} ago</span>`;
+  }
+
+  function entryHTML(e, i, opts) {
+    const show = opts.show;
+    const cls = ["entry", e.outcome];
+    if (openActions === i) cls.push("hi");
+    let right = "";
+    if (opts.chev) right = `<span class="chev">▶︎</span>`;
+    else if (opts.revealBtn && !show) right = `<button class="reveal-btn" onclick="event.stopPropagation();toggleReveal(${i})">Reveal</button>`;
+    let tag = "";
+    if (e.outcome === "failed") tag = `<span class="tag failed">failed</span>`;
+    else if (e.outcome === "degraded") tag = `<span class="tag degraded">degraded</span>`;
+    const textEl = show
+      ? `<div class="txt">${e.txt}</div>`
+      : `<div class="txt masked">${dots(e.chars)}</div>`;
+    return `<div class="${cls.join(' ')}" onclick="${opts.onclick||''}">
+        <span class="status-dot"></span>
+        <div class="body">
+          ${textEl}
+          <div class="meta"><span class="app">${e.app}</span> · ${e.chars} chars · ${e.when} ago ${tag}</div>
+        </div>
+        ${right}
+      </div>`;
+  }
+
+  function render() {
+    const fly = document.getElementById('flyout');
+    const act = document.getElementById('actions');
+    const hint = document.getElementById('hint');
+    act.className = ''; act.innerHTML = '';
+    let rows = '';
+
+    if (variant === 1) {
+      fly.innerHTML = `<div class="cap">Recent Insertions · 20 total</div>` +
+        RING.map((e,i)=>entryHTML(e,i,{ chev:true, show:false,
+          onclick:`openEntryActions(${i})` })).join('');
+      hint.innerHTML = `<b>Variant 1 — Entry ▸ actions.</b> Each masked row opens its own submenu: <b>Reveal · Copy · Re-insert</b>. Reveal is an explicit menu item. Click a row.`;
+      if (openActions !== null) renderActions(openActions);
+    }
+
+    else if (variant === 2) {
+      fly.innerHTML = `<div class="cap">Recent Insertions · 20 total · hold ⌥ to reveal</div>` +
+        RING.map((e,i)=>entryHTML(e,i,{ show: optHeld,
+          onclick:`flashReinsert(${i})` })).join('') +
+        `<div class="msep"></div>
+         <div class="entry" style="min-height:26px" onclick="flashCopy()"><span class="status-dot" style="background:transparent"></span><div class="body"><div class="txt" style="opacity:.8">Copy highlighted entry <span style="float:right;font:12px var(--mono);color:var(--menu-2nd)">⌘C</span></div></div></div>`;
+      hint.innerHTML = `<b>Variant 2 — Flat rows.</b> Click a row to <b>re-insert</b> (primary). Hold <kbd>⌥</kbd> to reveal all text in place; <kbd>⌘C</kbd> copies the highlighted row. Fewest clicks, but reveal & copy lean on modifiers.`;
+    }
+
+    else if (variant === 3) {
+      const failed = RING.map((e,i)=>({e,i})).filter(x=>x.e.outcome==="failed");
+      const rest   = RING.map((e,i)=>({e,i})).filter(x=>x.e.outcome!=="failed");
+      let html = '';
+      if (failed.length) {
+        html += `<div class="mhead" style="color:var(--fail)">⚠ Needs attention · never inserted</div>`;
+        html += failed.map(x=>entryHTML(x.e,x.i,{ chev:true, show:false, onclick:`openEntryActions(${x.i})` })).join('');
+        html += `<div class="msep"></div>`;
+      }
+      html += `<div class="mhead">Recent</div>`;
+      html += rest.map(x=>entryHTML(x.e,x.i,{ chev:true, show:false, onclick:`openEntryActions(${x.i})` })).join('');
+      fly.innerHTML = html;
+      hint.innerHTML = `<b>Variant 3 — Recovery-first.</b> Failed insertions pinned in a <b>⚠ Needs attention</b> section at the top — the lost-dictation case leads. Otherwise identical per-entry submenus to Variant 1.`;
+      if (openActions !== null) renderActions(openActions);
+    }
+  }
+
+  function renderActions(i) {
+    const e = RING[i];
+    const act = document.getElementById('actions');
+    const isRevealed = revealed.has(i);
+    act.className = 'actions';
+    act.innerHTML =
+      (isRevealed ? `<div class="preview">“${e.txt}”</div>` : '') +
+      `<div class="mrow" onclick="event.stopPropagation();toggleReveal(${i})"><span class="lbl">${isRevealed?'Hide text':'Reveal text'}</span></div>
+       <div class="mrow" onclick="event.stopPropagation();flashCopy()"><span class="lbl">Copy</span><span class="k">⌘C</span></div>
+       <div class="mrow" onclick="event.stopPropagation();flashReinsert(${i})"><span class="lbl">Re-insert here</span></div>`;
+  }
+
+  function openEntryActions(i){ openActions = (openActions===i? null : i); render(); }
+  function toggleReveal(i){ if(revealed.has(i)) revealed.delete(i); else revealed.add(i);
+    // in variants 1 & 3, reveal shows inline too
+    if (variant===1 || variant===3){ renderRowReveal(); } render(); }
+
+  // For v1/v3 we re-render; the entry's masked/shown state follows `revealed`
+  function renderRowReveal(){ /* handled in render via show flag below */ }
+
+  // patch entryHTML show flag for v1/v3 based on revealed set
+  const _entryHTML = entryHTML;
+  entryHTML = function(e,i,opts){
+    if ((variant===1||variant===3) && !('forceShow' in opts)) opts.show = revealed.has(i);
+    return _entryHTML(e,i,opts);
+  };
+
+  function flashReinsert(i){ toast(`Re-inserted “${RING[i].txt.slice(0,24)}…” at current cursor`); }
+  function flashCopy(){ toast(`Copied to clipboard`); }
+  function toast(msg){
+    const hint = document.getElementById('hint');
+    const prev = hint.innerHTML;
+    hint.innerHTML = `✓ ${msg}`;
+    hint.style.background = 'rgba(20,120,60,0.42)';
+    clearTimeout(window.__t); window.__t = setTimeout(()=>{ hint.style.background=''; render(); }, 1400);
+  }
+
+  function setVariant(v){
+    variant = v; revealed = new Set(); openActions = null; optHeld = false;
+    for (const id of ['v1','v2','v3']) document.getElementById(id).setAttribute('aria-pressed', String(id==='v'+v));
+    renderFork(); render();
+  }
+
+  // ---- fork descriptions per variant ----
+  const FORKS = {
+    1: { h:"Entry ▸ actions", t:"A submenu per entry. Reveal, Copy and Re-insert are explicit items — nothing hidden behind a modifier.",
+      items:[
+        ["Nesting","3 levels deep (menu ▸ list ▸ entry ▸ action). Familiar macOS pattern, but a lot of travel to re-insert.","d"],
+        ["Reveal","An explicit <b>Reveal text</b> item — most discoverable, most privacy-legible.","d"],
+        ["Actions","Copy + Re-insert always visible; no hidden gestures.","d"],
+        ["Cost","Slowest for the common case (re-insert the last thing).","cost"],
+      ]},
+    2: { h:"Flat + ⌥ reveal", t:"One tap to re-insert. Reveal and copy ride on modifier keys.",
+      items:[
+        ["Nesting","2 levels. Click a row = re-insert immediately. Fastest recovery.","d"],
+        ["Reveal","Hold <kbd>⌥</kbd> to reveal all — cheap to peek, but undiscoverable and reveals everything at once.","cost"],
+        ["Actions","Copy via <kbd>⌘C</kbd> on the highlighted row — awkward in a menu.","cost"],
+        ["Risk","Click-to-reinsert is destructive-ish with no confirm; easy to fire by accident.","cost"],
+      ]},
+    3: { h:"Recovery-first", t:"Variant 1's structure, but failed insertions are pinned in a ⚠ section at the top — the map's stated primary use-case leads.",
+      items:[
+        ["Ordering","Failed entries surface first under <b>Needs attention</b>; ok/degraded below in a Recent group.","d"],
+        ["Framing","Matches the ticket's north star — 'recover a lost dictation' is the reason this feature exists.","d"],
+        ["Reveal","Same explicit per-entry items as Variant 1.","d"],
+        ["Cost","Two-section layout is busier; ordering is no longer strictly chronological.","cost"],
+      ]},
+  };
+  function renderFork(){
+    const f = FORKS[variant];
+    document.getElementById('forkCard').innerHTML =
+      `<h3>Variant ${variant} · ${f.h}</h3><p class="tagline">${f.t}</p>
+       <ul class="forks">` +
+      f.items.map(([lab,txt,kind])=>`<li class="${kind==='cost'?'cost':''}"><span class="d">${kind==='cost'?'△':'●'}</span><div><span class="lab">${lab}</span><br>${txt}</div></li>`).join('') +
+      `</ul>`;
+  }
+
+  // ⌥ handling for variant 2
+  window.addEventListener('keydown', e=>{ if(e.altKey && variant===2 && !optHeld){ optHeld=true; render(); }});
+  window.addEventListener('keyup',   e=>{ if(!e.altKey && optHeld){ optHeld=false; render(); }});
+
+  // theme toggle
+  document.getElementById('themeBtn').onclick = ()=>{
+    const r = document.documentElement;
+    const cur = r.getAttribute('data-theme') || (matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
+    r.setAttribute('data-theme', cur==='dark'?'light':'dark');
+  };
+
+  renderFork(); render();
+</script>
