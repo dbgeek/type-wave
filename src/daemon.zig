@@ -69,6 +69,8 @@ const menu_mod = @import("menu.zig");
 const appkit = @import("appkit.zig");
 const keychain = @import("keychain.zig");
 const insertion_adapter = @import("insertion_adapter.zig");
+const recent_insertions = @import("recent_insertions.zig");
+const app_focus = @import("app_focus.zig");
 const rewrite_adapter = @import("rewrite_adapter.zig");
 const openai_rewrite = @import("openai_rewrite.zig");
 const readiness = @import("readiness.zig");
@@ -453,7 +455,7 @@ const RealInsertionDeps = struct {
     store: *config.Store,
 
     co_ctx: *anyopaque = undefined,
-    on_done: *const fn (*anyopaque, coord.UtteranceId, coord.InsertResult) void = undefined,
+    on_done: *const fn (*anyopaque, coord.UtteranceId, coord.InsertResult, ?coord.AppIdentity) void = undefined,
 
     pub fn insertionPlan(self: *RealInsertionDeps) insertmod.Plan {
         const s = self.store.current(); // one snapshot: method + settle stay coherent
@@ -462,8 +464,13 @@ const RealInsertionDeps = struct {
     pub fn insert(self: *RealInsertionDeps, plan: insertmod.Plan, text: [*:0]const u8) insertmod.InsertError!void {
         return self.inserter.insert(plan, text);
     }
-    pub fn complete(self: *RealInsertionDeps, id: coord.UtteranceId, result: coord.InsertResult) void {
-        self.on_done(self.co_ctx, id, result);
+    /// The App Identity hint (ADR-0006 §3.3): read off-mutex on the insert worker, the moment
+    /// the text lands. A cross-process NSWorkspace query — deliberately kept off coordinator.mu.
+    pub fn focusedApp(_: *RealInsertionDeps) ?coord.AppIdentity {
+        return app_focus.frontmost();
+    }
+    pub fn complete(self: *RealInsertionDeps, id: coord.UtteranceId, result: coord.InsertResult, focused_app: ?coord.AppIdentity) void {
+        self.on_done(self.co_ctx, id, result, focused_app);
     }
     pub fn finishInsert(self: *RealInsertionDeps) void {
         self.inserter.drainDeferredRestore();
@@ -552,14 +559,15 @@ const RealDeps = struct {
     insertion: *InsertionAdapter,
     deadline: *DeadlineAdapter,
     feedback: *surface.Surface,
+    recorder: *recent_insertions.Ring,
 };
 const Coord = coord.Coordinator(RealDeps);
 
 // Reverse-edge trampolines: the adapters' worker/timer threads carry the Coordinator as an
 // opaque pointer and re-enter it here (its concrete type is known at this wiring site).
-fn insertDoneTramp(ctx: *anyopaque, id: coord.UtteranceId, result: coord.InsertResult) void {
+fn insertDoneTramp(ctx: *anyopaque, id: coord.UtteranceId, result: coord.InsertResult, focused_app: ?coord.AppIdentity) void {
     const co: *Coord = @ptrCast(@alignCast(ctx));
-    co.handle(.{ .inserted = .{ .id = id, .result = result } });
+    co.handle(.{ .inserted = .{ .id = id, .result = result, .focused_app = focused_app } });
 }
 fn rewriteDoneTramp(ctx: *anyopaque, id: coord.UtteranceId, text: []const u8, result: coord.RewriteResult) void {
     const co: *Coord = @ptrCast(@alignCast(ctx));
@@ -611,6 +619,10 @@ const Daemon = struct {
     rewrite_http: std.http.Client = undefined,
     rewrite: RewriteAdapter = undefined,
     insertion: InsertionAdapter = undefined,
+    /// The daemon-owned Recent Insertions ring (ADR-0006): written through the Coordinator's
+    /// recorder seam at `onInserted`, read by the menu (later work) under its own leaf lock.
+    /// Heap-free and zero-initializable, so it lives inline on the daemon.
+    recent_insertions: recent_insertions.Ring = .{},
     deadline: DeadlineAdapter = .{},
     feedback_surface: surface.Surface = undefined,
     coordinator: Coord = undefined,
@@ -1142,6 +1154,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
         .insertion = &daemon.insertion,
         .deadline = &daemon.deadline,
         .feedback = &daemon.feedback_surface,
+        .recorder = &daemon.recent_insertions,
     });
     // Reverse edges: the worker/timer threads re-enter the now-constructed Coordinator.
     daemon.insertion.deps.co_ctx = &daemon.coordinator;
