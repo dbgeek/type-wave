@@ -6,7 +6,7 @@ import sys
 import time
 
 DIGEST = bytes.fromhex("1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69")
-sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 1, 1, len(DIGEST)) + DIGEST)
+sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 2, 1, len(DIGEST)) + DIGEST)
 sys.stdout.buffer.flush()
 mode = sys.argv[1]
 header = sys.stdin.buffer.read(12)
@@ -24,6 +24,6 @@ elif mode == "inference":
     request_id = struct.unpack("<Q", payload[:8])[0]
     message = b"inference failed"
     failed = struct.pack("<QHI", request_id, 1, len(message)) + message
-    sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 1, 6, len(failed)) + failed)
+    sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 2, 6, len(failed)) + failed)
     sys.stdout.buffer.flush()
     time.sleep(2)

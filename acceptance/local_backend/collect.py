@@ -25,7 +25,7 @@ import gate
 
 
 MAGIC = b"TWW1"
-VERSION = 1
+VERSION = 2
 READY = 1
 TRANSCRIBE = 3
 FINAL = 5
@@ -318,7 +318,9 @@ class Helper:
         request_id = self.next_id
         self.next_id += 1
         language_id = {"en": 1, "sv": 2, "auto": 3}[language]
-        payload = struct.pack("<QB7xI", request_id, language_id, len(pcm)) + pcm
+        # v2 Transcribe layout: id(Q) language(B) prompt_len(H) prompt(N) pcm_len(I) pcm.
+        # The acceptance driver never biases, so the prompt region is empty (prompt_len 0).
+        payload = struct.pack("<QBH", request_id, language_id, 0) + struct.pack("<I", len(pcm)) + pcm
         assert self.process.stdin is not None and self.process.stdout is not None
         started = time.monotonic_ns()
         self.process.stdin.write(struct.pack("<4sHHI", MAGIC, VERSION, TRANSCRIBE, len(payload)) + payload)

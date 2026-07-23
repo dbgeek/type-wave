@@ -85,7 +85,7 @@ pub fn runInferenceAlloc(
 ) !ipc.Frame {
     const samples = try resample24To16Alloc(allocator, request.pcm);
     defer allocator.free(samples);
-    const text = runtime.transcribe(allocator, request.language, samples) catch |failure| {
+    const text = runtime.transcribe(allocator, request.language, request.prompt, samples) catch |failure| {
         const message = try allocator.dupe(u8, @errorName(failure));
         return .{ .failed = .{ .id = request.id, .code = 1, .message = message } };
     };
@@ -168,14 +168,14 @@ test "helper keeps one identity-tagged inference active and cancels only its ide
     try std.testing.expect(fake.cancelled.load(.acquire));
     try std.testing.expect(!gate.cancel(FakeRuntime, &fake, 41));
 
-    var cancelled = try runInferenceAlloc(FakeRuntime, &fake, std.testing.allocator, .{ .id = 41, .language = .english, .pcm = &pcm });
+    var cancelled = try runInferenceAlloc(FakeRuntime, &fake, std.testing.allocator, .{ .id = 41, .language = .english, .prompt = "", .pcm = &pcm });
     defer cancelled.deinit(std.testing.allocator);
     gate.finish();
     try std.testing.expectEqual(@as(u64, 41), cancelled.failed.id);
     try std.testing.expectEqualStrings("Cancelled", cancelled.failed.message);
 
     try gate.begin(FakeRuntime, &fake, 43);
-    var completed = try runInferenceAlloc(FakeRuntime, &fake, std.testing.allocator, .{ .id = 43, .language = .auto_detect, .pcm = &pcm });
+    var completed = try runInferenceAlloc(FakeRuntime, &fake, std.testing.allocator, .{ .id = 43, .language = .auto_detect, .prompt = "", .pcm = &pcm });
     defer completed.deinit(std.testing.allocator);
     gate.finish();
     try std.testing.expectEqual(@as(u64, 43), completed.final.id);
@@ -226,8 +226,9 @@ const FakeRuntime = struct {
         self.cancelled.store(false, .release);
     }
 
-    fn transcribe(self: *@This(), allocator: std.mem.Allocator, language: ipc.Language, samples: []const f32) ![]u8 {
+    fn transcribe(self: *@This(), allocator: std.mem.Allocator, language: ipc.Language, prompt: []const u8, samples: []const f32) ![]u8 {
         _ = language;
+        _ = prompt;
         _ = samples;
         if (self.cancelled.load(.acquire)) return error.Cancelled;
         return allocator.dupe(u8, "transcribed");

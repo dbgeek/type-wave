@@ -225,7 +225,11 @@ pub const ProcessHelper = struct {
         self.lease_id = id;
     }
 
-    pub fn submit(self: *ProcessHelper, id: backend.UtteranceId, language: ipc.Language, pcm: []const u8) !void {
+    pub fn submit(self: *ProcessHelper, id: backend.UtteranceId, language: ipc.Language, prompt: []const u8, pcm: []const u8) !void {
+        // The glossary prompt (docs/vocab-biasing-spec.md §5) is copied alongside the PCM and
+        // owned by the write worker, so it survives the caller's synchronously-freed buffers.
+        const owned_prompt = try self.allocator.dupe(u8, prompt);
+        errdefer self.allocator.free(owned_prompt);
         const owned_pcm = try self.allocator.dupe(u8, pcm);
         errdefer self.allocator.free(owned_pcm);
 
@@ -246,7 +250,7 @@ pub const ProcessHelper = struct {
         const fd = self.stdin_fd;
         self.mu.unlock(self.io);
 
-        const writer = std.Thread.spawn(.{}, submitWorker, .{ self, id, language, owned_pcm, generation, fd }) catch |failure| {
+        const writer = std.Thread.spawn(.{}, submitWorker, .{ self, id, language, owned_prompt, owned_pcm, generation, fd }) catch |failure| {
             self.mu.lockUncancelable(self.io);
             if (self.generation == generation and self.supervisor.active_id == id)
                 _ = self.failActiveLocked(id);
@@ -260,10 +264,12 @@ pub const ProcessHelper = struct {
         self: *ProcessHelper,
         id: backend.UtteranceId,
         language: ipc.Language,
+        prompt: []u8,
         pcm: []u8,
         generation: u64,
         fd: std.c.fd_t,
     ) void {
+        defer self.allocator.free(prompt);
         defer self.allocator.free(pcm);
         self.write_mu.lockUncancelable(self.io);
         defer self.write_mu.unlock(self.io);
@@ -272,7 +278,7 @@ pub const ProcessHelper = struct {
         self.mu.unlock(self.io);
         if (!current) return;
         ipc.writeFd(self.allocator, fd, .{
-            .transcribe = .{ .id = id, .language = language, .pcm = pcm },
+            .transcribe = .{ .id = id, .language = language, .prompt = prompt, .pcm = pcm },
         }) catch self.writeFailed(id, generation);
     }
 
@@ -505,7 +511,7 @@ test "hard cancellation terminates a non-responsive helper process" {
         std.testing.allocator.destroy(helper);
     }
     try helper.reserveUtterance(991);
-    try helper.submit(991, .english, &.{ 0, 0, 0, 0 });
+    try helper.submit(991, .english, "", &.{ 0, 0, 0, 0 });
 
     const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
     _ = usleep(9_500_000);
@@ -548,7 +554,7 @@ test "helper crash malformed IPC and inference failure abandon active Utterances
         adapter.bindHelperEvents();
         defer adapter.deinit();
 
-        try adapter.begin(881, "en");
+        try adapter.begin(881, "en", &.{});
         try adapter.appendAudio(881, &.{ 0, 0, 0, 0 });
         try adapter.release(881);
         var waited_ms: usize = 0;

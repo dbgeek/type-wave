@@ -54,7 +54,7 @@ class CollectTests(unittest.TestCase):
                 #!/usr/bin/env python3
                 import struct, sys
                 digest = bytes.fromhex("1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69")
-                sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 1, 1, len(digest)) + digest)
+                sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 2, 1, len(digest)) + digest)
                 sys.stdout.buffer.flush()
                 count = 0
                 while True:
@@ -68,7 +68,7 @@ class CollectTests(unittest.TestCase):
                     text = (b"Do not delete three files!" if count % 2 == 0 else b"Do not delete three files.")
                     count += 1
                     response = struct.pack("<QI", request_id, len(text)) + text
-                    sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 1, 5, len(response)) + response)
+                    sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 2, 5, len(response)) + response)
                     sys.stdout.buffer.flush()
                 """), encoding="utf-8")
             fake_helper.chmod(fake_helper.stat().st_mode | stat.S_IXUSR)
@@ -143,14 +143,14 @@ class CollectTests(unittest.TestCase):
                     #!/usr/bin/env python3
                     import struct, sys
                     digest = bytes.fromhex("1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69")
-                    sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 1, 1, len(digest)) + digest)
+                    sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 2, 1, len(digest)) + digest)
                     sys.stdout.buffer.flush()
                     header = sys.stdin.buffer.read(12)
                     _, _, _, length = struct.unpack("<4sHHI", header)
                     payload = sys.stdin.buffer.read(length)
                     request_id = struct.unpack("<Q", payload[:8])[0]
                     response = {response_expression}
-                    sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 1, 5, len(response)) + response)
+                    sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 2, 5, len(response)) + response)
                     sys.stdout.buffer.flush()
                     """), encoding="utf-8")
                 fake_helper.chmod(fake_helper.stat().st_mode | stat.S_IXUSR)
@@ -167,7 +167,7 @@ class CollectTests(unittest.TestCase):
                 #!/usr/bin/env python3
                 import struct, sys, time
                 digest = bytes.fromhex("1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69")
-                sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 1, 1, len(digest)) + digest)
+                sys.stdout.buffer.write(struct.pack("<4sHHI", b"TWW1", 2, 1, len(digest)) + digest)
                 sys.stdout.buffer.flush()
                 header = sys.stdin.buffer.read(12)
                 _, _, _, length = struct.unpack("<4sHHI", header)

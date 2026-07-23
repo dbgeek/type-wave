@@ -402,7 +402,7 @@ const FakeBackends = struct {
     fn from(ctx: *anyopaque) *FakeBackends {
         return @ptrCast(@alignCast(ctx));
     }
-    fn begin(ctx: *anyopaque, id: UtteranceId, _: backend.Language) !void {
+    fn begin(ctx: *anyopaque, id: UtteranceId, _: backend.Language, _: backend.Vocabulary) !void {
         const self = from(ctx);
         self.began += 1;
         self.last_id = id;

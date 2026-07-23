@@ -1,7 +1,7 @@
 # Private Whisper helper
 
 `type-wave-whisper` is the persistent, offline inference process for the pinned
-Whisper Large v3 Turbo F16 artifact. It accepts only a model path and version 1 frames on
+Whisper Large v3 Turbo F16 artifact. It accepts only a model path and version 2 frames on
 stdin, writes frames on stdout, and reserves stderr for bounded operational diagnostics.
 It has no downloader, credential input, network client, or OpenAI fallback.
 

@@ -598,7 +598,10 @@ pub fn Session(comptime Transport: type) type {
         fn leaseSelf(ctx: *anyopaque) *Self {
             return @ptrCast(@alignCast(ctx));
         }
-        fn leaseBegin(ctx: *anyopaque, id: backend.UtteranceId, language: backend.Language) !void {
+        fn leaseBegin(ctx: *anyopaque, id: backend.UtteranceId, language: backend.Language, vocabulary: backend.Vocabulary) !void {
+            // Vocabulary biasing is local-Whisper-only; the OpenAI session ignores the pinned
+            // list (docs/vocab-biasing-spec.md §4 — inert with a menu signal, not wired).
+            _ = vocabulary;
             try leaseSelf(ctx).beginUtterance(id, language);
         }
         fn leaseAppend(ctx: *anyopaque, id: backend.UtteranceId, pcm: []const u8) !void {

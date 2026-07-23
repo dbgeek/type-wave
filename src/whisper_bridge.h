@@ -19,6 +19,7 @@ bool tw_whisper_request_cancel(tw_whisper_runtime * runtime);
 int tw_whisper_transcribe(
     tw_whisper_runtime * runtime,
     uint8_t language,
+    const char * prompt,
     const float * samples,
     size_t sample_count,
     const char ** text,
