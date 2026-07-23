@@ -26,11 +26,15 @@ pub fn InsertionAdapter(comptime Deps: type) type {
     return struct {
         const Self = @This();
 
+        /// One job slot's byte buffer: the Coordinator's 8192-byte transcript window plus a
+        /// NUL terminator for insert.paste's NSString. Shared by both slots below.
+        const job_buf_len = 8193;
+
         deps: Deps,
 
         /// The single insert job (NUL-terminated for insert.paste's NSString). Written by
         /// `submit` before the `pending` release-store; read by the worker after acquire.
-        job: [8193]u8 = undefined,
+        job: [job_buf_len]u8 = undefined,
         job_id: coord.UtteranceId = 0,
         /// Which text this job carries (docs/backtrack-spec.md §UX 4): a `.raw_fallback`
         /// job that inserts cleanly reports `.degraded` instead of `.ok`, so the HUD pulses
@@ -42,6 +46,20 @@ pub fn InsertionAdapter(comptime Deps: type) type {
         /// threads by the `pending` release-store / acquire-swap, like `job`.
         submitted_at_ms: i64 = 0,
         pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        /// A second, **Coordinator-less** job slot (recent-insertions spec §5, issue #194).
+        /// Re-insert / Copy dispatch a verbatim replay through here carrying no Utterance
+        /// identity — no overlap guard, no release-anchored deadline, no poison abandonment,
+        /// and no reverse edge into the Coordinator (so it never reaches `onInserted` / the
+        /// ring). It rides the *same* single worker as `job`, which is what serializes it
+        /// against dictation inserts: the worker drains at most one job per tick, so a bypass
+        /// replay can never interleave with a live Utterance's `job` / `pending` state or the
+        /// clipboard-swap dance. A dedicated slot (not `job`) so the two producers — the
+        /// Coordinator under its mutex, the menu off the main thread — never clobber each
+        /// other. NUL-terminated for insert's NSString, ordered across threads by
+        /// `bypass_pending` exactly like `job` by `pending`.
+        bypass_job: [job_buf_len]u8 = undefined,
+        bypass_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
         pub fn init(deps: Deps) Self {
             return .{ .deps = deps };
@@ -58,10 +76,39 @@ pub fn InsertionAdapter(comptime Deps: type) type {
             self.pending.store(true, .release);
         }
 
+        /// Coordinator-less seam (recent-insertions spec §5, issue #194). Hands the worker a
+        /// verbatim replay of already-final bytes — the shared seam the menu's Re-insert /
+        /// Copy actions dispatch through. Unlike `submit` it carries no `UtteranceId`: the
+        /// worker inserts the bytes and never reports back, so a replay is never a Final
+        /// Transcript and never records to the ring (§5.1.4). `inserted` rows already carry
+        /// their single trailing space, so `ensureTrailingSpace` is an idempotent no-op here
+        /// (§5.1.3); it also guarantees the NUL terminator the worker's NSString cast needs.
+        /// Runs off the menu thread; the caller must not submit while a bypass job is still
+        /// pending (mirrors `submit`'s single-producer contract).
+        pub fn submitBypass(self: *Self, text: []const u8) void {
+            _ = insertmod.ensureTrailingSpace(&self.bypass_job, text);
+            self.bypass_pending.store(true, .release);
+        }
+
         /// One worker tick. Exposed so tests can drive the adapter without spawning a
-        /// thread or sleeping. Returns whether a job was drained.
+        /// thread or sleeping. Returns whether a job was drained. Dictation jobs take
+        /// priority (time-sensitive); the Coordinator-less replay defers to them and, being
+        /// drained on the same single thread, can never run concurrently with one.
         pub fn runOnce(self: *Self) bool {
-            if (!self.pending.swap(false, .acquire)) return false;
+            if (self.pending.swap(false, .acquire)) {
+                self.runInsertion();
+                return true;
+            }
+            if (self.bypass_pending.swap(false, .acquire)) {
+                self.runBypass();
+                return true;
+            }
+            return false;
+        }
+
+        /// Drain the one pending dictation job: insert it, report `.inserted` back into the
+        /// Coordinator (which records the Insertion Record), then drain the deferred restore.
+        fn runInsertion(self: *Self) void {
             const t_pick = feedback.nowMs();
 
             const z: [*:0]const u8 = @ptrCast(&self.job);
@@ -91,7 +138,26 @@ pub fn InsertionAdapter(comptime Deps: type) type {
             // following paste never interleaves with a pending restore.
             self.deps.complete(self.job_id, result, focused_app);
             self.deps.finishInsert();
-            return true;
+        }
+
+        /// Drain the one pending Coordinator-less job (spec §5): insert the stored bytes
+        /// verbatim, then drain the deferred restore on the worker — same clipboard-swap
+        /// discipline as a dictation insert, which is what lets a following Copy drain
+        /// safely without racing this one (§5.2.7). Deliberately **no** `complete` /
+        /// `focusedApp`: a replay carries no Utterance identity, so it never reaches
+        /// `onInserted` and never writes the ring, on success or failure (§5.1.4). A failed
+        /// replay is silent but for the log — it is not a dictation, so it earns no `.failed`
+        /// record.
+        fn runBypass(self: *Self) void {
+            const t_pick = feedback.nowMs();
+            const z: [*:0]const u8 = @ptrCast(&self.bypass_job);
+            const plan = self.deps.insertionPlan();
+            if (self.deps.insert(plan, z)) |_| {
+                feedback.log("  re-inserted at the cursor (mechanism {d}ms)\n", .{feedback.nowMs() - t_pick});
+            } else |e| {
+                feedback.log("  re-insertion failed: {s}\n", .{explainInsert(e)});
+            }
+            self.deps.finishInsert();
         }
 
         /// Process jobs until the owning daemon is quitting. Idle behavior stays with the
@@ -270,4 +336,62 @@ test "runOnce reports idle without touching dependencies" {
     try std.testing.expect(!adapter.runOnce());
     try std.testing.expectEqual(@as(usize, 0), adapter.deps.calls);
     try std.testing.expectEqual(@as(usize, 0), adapter.deps.completions);
+}
+
+// --- Coordinator-less (bypass) jobs — recent-insertions spec §5, issue #194 ---
+
+test "a bypass job inserts verbatim and never reports back to the Coordinator" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{});
+
+    // Stored `inserted` bytes already carry their trailing space; the seam replays them.
+    adapter.submitBypass("recovered text ");
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqualStrings("recovered text ", adapter.deps.lastText());
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.calls);
+    // No Utterance identity: nothing reaches onInserted / the ring (spec §5.1.4).
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.completions);
+    // The deferred clipboard restore is still drained on the worker (spec §5.2.7).
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.finishes);
+}
+
+test "a bypass job applies the trailing-space invariant idempotently" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{});
+
+    // A row stored without its space still lands with exactly one; a row that already
+    // has one is unchanged (spec §5.1.3 — ensureTrailingSpace is a no-op there).
+    adapter.submitBypass("no space");
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqualStrings("no space ", adapter.deps.lastText());
+}
+
+test "a failed bypass insert stays silent — no completion, restore still drained" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{ .result = error.PostEventDenied });
+
+    adapter.submitBypass("recovered ");
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.calls);
+    // A failed re-insert produces no `.failed` record — it is not a dictation (spec §5.1.4).
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.completions);
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.finishes);
+}
+
+test "a bypass job is serialized against — never clobbers — a pending dictation job" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{});
+
+    // Both sources hand off before the worker runs; the separate slots must not clobber.
+    adapter.submit(7, "dictation", .normal);
+    adapter.submitBypass("replay ");
+
+    // The dictation job drains first, faithfully, and reports to the Coordinator.
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqualStrings("dictation ", adapter.deps.lastText());
+    try std.testing.expectEqual(@as(coord.UtteranceId, 7), adapter.deps.last_completion_id);
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.completions);
+
+    // The bypass job drains on the next tick — serialized, never interleaved, no report.
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqualStrings("replay ", adapter.deps.lastText());
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.completions);
+
+    try std.testing.expect(!adapter.runOnce());
 }
