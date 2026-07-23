@@ -15,6 +15,7 @@ test {
     _ = @import("whisper_helper_core.zig");
     _ = @import("whisper_supervisor.zig");
     _ = @import("config.zig");
+    _ = @import("vocab.zig"); // the pure vocabulary helpers: buildPrompt glossary + budget estimation
     _ = @import("session.zig");
     _ = @import("hud.zig");
     _ = @import("insert.zig"); // ensureTrailingSpace (the Insertion separator)
