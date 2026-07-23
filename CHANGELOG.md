@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.4](https://github.com/dbgeek/type-wave/compare/v0.1.3...v0.1.4) (2026-07-23)
+
+
+### Features
+
+* **menu:** vocabulary editing dialog, state-reflecting item & local-only signal ([#173](https://github.com/dbgeek/type-wave/issues/173)) ([#179](https://github.com/dbgeek/type-wave/issues/179)) ([4e99963](https://github.com/dbgeek/type-wave/commit/4e99963f63addca16538215ec121b18f222a5eb0))
+* **vocab:** v2 Whisper wire + Lease-pinned initial_prompt biasing ([#174](https://github.com/dbgeek/type-wave/issues/174)) ([#181](https://github.com/dbgeek/type-wave/issues/181)) ([ff81927](https://github.com/dbgeek/type-wave/commit/ff8192775d1d06b3cf49fd0e859006369178b963))
+
 ## [0.1.3](https://github.com/dbgeek/type-wave/compare/v0.1.2...v0.1.3) (2026-07-23)
 
 
