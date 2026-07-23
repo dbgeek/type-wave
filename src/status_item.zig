@@ -7,6 +7,8 @@ const std = @import("std");
 const backend = @import("transcription_backend.zig");
 const installation_identity = @import("installation_identity.zig");
 const readiness = @import("readiness.zig");
+const coord = @import("coordinator.zig");
+const recent_insertions = @import("recent_insertions.zig");
 
 pub const Installation = enum {
     absent,
@@ -70,6 +72,31 @@ pub const ModelFailure = enum {
     operation_cancelled,
 };
 
+/// The text-free masked projection of one Insertion Record — the **Recent Insertions View**
+/// (CONTEXT.md, spec §4.1). It carries only metadata: no `inserted` / `raw` transcript
+/// bytes ever reach it, so the whole `Snapshot` stays privacy-clean by construction. Fixed
+/// inline fields make it `std.meta.eql`-comparable, so it rides through `project` / `derive`
+/// without breaking `refreshChrome`'s snapshot early-out.
+pub const HistoryEntryView = struct {
+    char_len: u16 = 0,
+    app: ?coord.AppIdentity = null,
+    timestamp: i64 = 0,
+    outcome: coord.InsertResult = .ok,
+};
+
+/// Project one authoritative Insertion Record to its text-free view. Reads the record's
+/// byte buffer for the codepoint count only — no transcript bytes leave the ring's side.
+pub fn historyEntryView(rec: *const recent_insertions.Record) HistoryEntryView {
+    const bytes = rec.inserted();
+    const chars = std.unicode.utf8CountCodepoints(bytes) catch bytes.len;
+    return .{
+        .char_len = @intCast(@min(chars, std.math.maxInt(u16))),
+        .app = rec.focused_app,
+        .timestamp = rec.timestamp,
+        .outcome = rec.outcome,
+    };
+}
+
 pub const Snapshot = struct {
     selected_backend: backend.Backend,
     health: readiness.Health,
@@ -80,6 +107,11 @@ pub const Snapshot = struct {
     operation_bytes: ?ByteProgress = null,
     installation_identity: ?InstallationIdentity = null,
     failure_detail: ?FailureDetail = null,
+    /// The Recent Insertions View — masked, text-free, newest-first (spec §4.1). Fixed
+    /// `[capacity]`; only `[0..history_count]` is live. Kept `eql`-comparable so the menu's
+    /// snapshot early-out keeps working.
+    history: [recent_insertions.capacity]HistoryEntryView = @splat(.{}),
+    history_count: usize = 0,
 };
 
 pub const ByteProgress = struct { completed: u64, total: u64 };
@@ -128,6 +160,31 @@ pub const PrimaryAction = enum {
 /// `dimmed` when it needs attention (paused / a missing grant / a backend failure).
 pub const IconTier = enum { normal, dimmed };
 
+/// The status dot colour for one history entry (spec §4): green `ok`, amber `degraded`,
+/// red `failed`.
+pub const HistoryDot = enum { ok, degraded, failed };
+
+/// The distinct outcome tag rendered beside the dot so a never-inserted (`failed`) or
+/// `degraded` entry is unmistakable (spec §2.4 / §4). `.none` for a clean `ok` insertion.
+pub const HistoryTag = enum { none, degraded, failed };
+
+/// One entry as the menu renders it — the derived, still text-free descriptor. `derive`
+/// turns each `HistoryEntryView` into this (dot colour + tag from the outcome), leaving the
+/// menu a dumb adapter that only formats the masked label (spec §4.1).
+pub const HistoryEntry = struct {
+    dot: HistoryDot = .ok,
+    tag: HistoryTag = .none,
+    char_len: u16 = 0,
+    app: ?coord.AppIdentity = null,
+    timestamp: i64 = 0,
+};
+
+/// The rendered Recent Insertions View: newest-first entries, `[0..count]` live.
+pub const HistoryView = struct {
+    entries: [recent_insertions.capacity]HistoryEntry = @splat(.{}),
+    count: usize = 0,
+};
+
 pub const Presentation = struct {
     headline: Headline,
     icon_tier: IconTier,
@@ -137,16 +194,42 @@ pub const Presentation = struct {
     model_operation_uses_network: bool,
     model_actions: std.EnumSet(ModelAction),
     model_failure: ModelFailure,
+    history: HistoryView,
 
     pub fn allowsModelAction(self: Presentation, action: ModelAction) bool {
         return self.model_actions.contains(action);
     }
 };
 
+/// The derived dot colour + tag for one recorded outcome (spec §4).
+fn historyDot(outcome: coord.InsertResult) HistoryDot {
+    return switch (outcome) { .ok => .ok, .degraded => .degraded, .failed => .failed };
+}
+fn historyTag(outcome: coord.InsertResult) HistoryTag {
+    return switch (outcome) { .ok => .none, .degraded => .degraded, .failed => .failed };
+}
+
+/// Turn the text-free views the `Snapshot` carries into the menu-ready `HistoryView`
+/// (dot colour + tag), preserving the ring's newest-first order.
+fn deriveHistory(s: Snapshot) HistoryView {
+    var view = HistoryView{ .count = s.history_count };
+    for (s.history[0..s.history_count], 0..) |entry, i| {
+        view.entries[i] = .{
+            .dot = historyDot(entry.outcome),
+            .tag = historyTag(entry.outcome),
+            .char_len = entry.char_len,
+            .app = entry.app,
+            .timestamp = entry.timestamp,
+        };
+    }
+    return view;
+}
+
 pub fn derive(s: Snapshot) Presentation {
     const operation_active = s.operation.isActive();
     const hl = headline(s);
     return .{
+        .history = deriveHistory(s),
         .headline = hl,
         // The dim tier folds the readiness attention signal with the backend-failure
         // headline into one field, so the menu no longer re-ORs two modules' terms.
@@ -197,6 +280,10 @@ pub const Readings = struct {
     installation_identity: ?InstallationIdentity = null,
     provisioner_failure_detail: ?FailureDetail = null,
     observed: ?Observation = null,
+    /// The daemon's text-free projection of the Recent Insertions ring, newest-first
+    /// (spec §4.1). `[0..history_count]` is live.
+    history: [recent_insertions.capacity]HistoryEntryView = @splat(.{}),
+    history_count: usize = 0,
 };
 
 /// Assemble the `Snapshot` the menu renders from the daemon's readings — the corrupt
@@ -231,6 +318,8 @@ pub fn project(r: Readings) Snapshot {
         .operation_bytes = operation_bytes,
         .installation_identity = r.installation_identity,
         .failure_detail = failure_detail,
+        .history = r.history,
+        .history_count = r.history_count,
     };
 }
 
@@ -307,6 +396,56 @@ fn primaryAction(s: Snapshot) PrimaryAction {
     if (s.terminal_backend_failure) return .retry_local_runtime;
     if (s.installation == .update_available) return .update_local_model;
     return .none;
+}
+
+/// A short relative-time phrase for a history row (spec §4). `delta_ms` is `now - timestamp`;
+/// impure `now` stays with the caller so this — and `historyLabel` — remain pure and testable.
+fn relativeTime(buf: []u8, delta_ms_in: i64) []const u8 {
+    const delta_ms: i64 = if (delta_ms_in < 0) 0 else delta_ms_in;
+    const secs = @divTrunc(delta_ms, 1000);
+    if (secs < 60) return "just now";
+    const mins = @divTrunc(secs, 60);
+    if (mins < 60) return std.fmt.bufPrint(buf, "{d}m ago", .{mins}) catch "just now";
+    const hours = @divTrunc(mins, 60);
+    if (hours < 24) return std.fmt.bufPrint(buf, "{d}h ago", .{hours}) catch "just now";
+    return std.fmt.bufPrint(buf, "{d}d ago", .{@divTrunc(hours, 24)}) catch "just now";
+}
+
+/// Format one masked entry label — **metadata only, never transcript text** (spec §4):
+/// `<dot> <masked run> · <n> chars · <App> · <time>  [<tag>]`. The dot colour rides an
+/// emoji glyph (green/amber/red) since a menu title carries no per-glyph colour; the `•`
+/// run is a capped stand-in for the hidden transcript, and `char_len` reports its length.
+/// Returns a sentinel-terminated slice for `NSString`; `now_ms` is the caller's clock.
+pub fn historyLabel(buf: []u8, entry: HistoryEntry, now_ms: i64) [:0]const u8 {
+    const dot: [:0]const u8 = switch (entry.dot) {
+        .ok => "\xf0\x9f\x9f\xa2", // 🟢
+        .degraded => "\xf0\x9f\x9f\xa1", // 🟡
+        .failed => "\xf0\x9f\x94\xb4", // 🔴
+    };
+    const tag = switch (entry.tag) {
+        .none => "",
+        .degraded => "  [degraded]",
+        .failed => "  [failed]",
+    };
+    var bullets: [8 * 3]u8 = undefined; // •, U+2022, is 3 bytes; capped at 8
+    const runs: usize = @max(@as(usize, 1), @min(@as(usize, entry.char_len), 8));
+    var bi: usize = 0;
+    while (bi < runs * 3) : (bi += 3) @memcpy(bullets[bi..][0..3], "\xe2\x80\xa2");
+    const run = bullets[0 .. runs * 3];
+
+    var when: [24]u8 = undefined;
+    const ago = relativeTime(&when, now_ms - entry.timestamp);
+
+    const mid = " \xc2\xb7 "; // " · " (U+00B7)
+    if (entry.app) |app| {
+        if (app.displayName().len > 0)
+            return std.fmt.bufPrintSentinel(buf, "{s} {s}{s}{d} chars{s}{s}{s}{s}{s}", .{
+                dot, run, mid, entry.char_len, mid, app.displayName(), mid, ago, tag,
+            }, 0) catch dot;
+    }
+    return std.fmt.bufPrintSentinel(buf, "{s} {s}{s}{d} chars{s}{s}{s}", .{
+        dot, run, mid, entry.char_len, mid, ago, tag,
+    }, 0) catch dot;
 }
 
 fn snap(fields: struct {
@@ -503,4 +642,102 @@ test "project: failure_detail comes from the observation whenever one is present
         .observed = .{ .active = false, .phase = .idle, .bytes = null, .failure_detail = observed_detail },
     }));
     try std.testing.expectEqualStrings("runner", with.failure_detail.?.value());
+}
+
+// ============================================================================
+// Recent Insertions View — the text-free pure split (spec §4.1).
+// ============================================================================
+
+fn record(text: []const u8, outcome: coord.InsertResult, app: ?coord.AppIdentity) recent_insertions.Record {
+    var rec = recent_insertions.Record{};
+    @memcpy(rec.inserted_bytes[0..text.len], text);
+    rec.inserted_len = text.len;
+    rec.outcome = outcome;
+    rec.timestamp = 1000;
+    rec.focused_app = app;
+    return rec;
+}
+
+test "historyEntryView projects metadata only — no transcript bytes cross" {
+    const rec = record("at 18:00 ", .degraded, coord.AppIdentity.init("com.tinyspeck.slackmacgap", "Slack"));
+    const view = historyEntryView(&rec);
+    try std.testing.expectEqual(@as(u16, 9), view.char_len); // codepoints of "at 18:00 " incl. trailing space
+    try std.testing.expectEqual(coord.InsertResult.degraded, view.outcome);
+    try std.testing.expectEqual(@as(i64, 1000), view.timestamp);
+    try std.testing.expectEqualStrings("Slack", view.app.?.displayName());
+    // The view type has no field that could carry `inserted` / `raw` text at all.
+    try std.testing.expect(!@hasField(HistoryEntryView, "inserted"));
+    try std.testing.expect(!@hasField(HistoryEntryView, "raw"));
+}
+
+test "historyEntryView counts UTF-8 codepoints, not bytes" {
+    const rec = record("café ", .ok, null); // 'é' is 2 bytes, 1 codepoint → 5 chars
+    try std.testing.expectEqual(@as(u16, 5), historyEntryView(&rec).char_len);
+}
+
+fn history(views: []const HistoryEntryView) Snapshot {
+    var s = snap(.{});
+    for (views, 0..) |v, i| s.history[i] = v;
+    s.history_count = views.len;
+    return s;
+}
+
+test "derive maps outcome to dot colour and tag, newest-first order preserved" {
+    const s = history(&.{
+        .{ .char_len = 3, .outcome = .failed, .timestamp = 30 },
+        .{ .char_len = 2, .outcome = .degraded, .timestamp = 20 },
+        .{ .char_len = 1, .outcome = .ok, .timestamp = 10 },
+    });
+    const h = derive(s).history;
+    try std.testing.expectEqual(@as(usize, 3), h.count);
+    try std.testing.expectEqual(HistoryDot.failed, h.entries[0].dot);
+    try std.testing.expectEqual(HistoryTag.failed, h.entries[0].tag);
+    try std.testing.expectEqual(HistoryDot.degraded, h.entries[1].dot);
+    try std.testing.expectEqual(HistoryTag.degraded, h.entries[1].tag);
+    try std.testing.expectEqual(HistoryDot.ok, h.entries[2].dot);
+    try std.testing.expectEqual(HistoryTag.none, h.entries[2].tag); // a clean insertion gets no tag
+    try std.testing.expectEqual(@as(u16, 3), h.entries[0].char_len); // order == the ring's newest-first
+}
+
+test "an empty history derives to an empty view" {
+    try std.testing.expectEqual(@as(usize, 0), derive(snap(.{})).history.count);
+}
+
+test "project carries the history views through unchanged" {
+    var r = reads(.{});
+    r.history[0] = .{ .char_len = 7, .outcome = .failed, .timestamp = 5 };
+    r.history_count = 1;
+    const s = project(r);
+    try std.testing.expectEqual(@as(usize, 1), s.history_count);
+    try std.testing.expectEqual(coord.InsertResult.failed, s.history[0].outcome);
+}
+
+test "historyLabel masks the transcript: dot, capped bullet run, char count, app, time, tag" {
+    var buf: [256]u8 = undefined;
+    const entry = HistoryEntry{ .dot = .failed, .tag = .failed, .char_len = 39, .app = coord.AppIdentity.init("com.tinyspeck.slackmacgap", "Slack"), .timestamp = 0 };
+    const label = historyLabel(&buf, entry, 120_000); // 2 minutes later
+    try std.testing.expect(std.mem.indexOf(u8, label, "\xf0\x9f\x94\xb4") != null); // 🔴 failed dot
+    try std.testing.expect(std.mem.indexOf(u8, label, "\xe2\x80\xa2") != null); // a • masked run
+    try std.testing.expect(std.mem.indexOf(u8, label, "39 chars") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "Slack") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "2m ago") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "[failed]") != null);
+}
+
+test "historyLabel omits the app segment when no App Identity was captured" {
+    var buf: [256]u8 = undefined;
+    const entry = HistoryEntry{ .dot = .ok, .tag = .none, .char_len = 4, .app = null, .timestamp = 0 };
+    const label = historyLabel(&buf, entry, 0);
+    try std.testing.expect(std.mem.indexOf(u8, label, "4 chars") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "just now") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "[") == null); // an ok entry carries no tag
+}
+
+test "relativeTime buckets by magnitude" {
+    var buf: [24]u8 = undefined;
+    try std.testing.expectEqualStrings("just now", relativeTime(&buf, 5_000));
+    try std.testing.expectEqualStrings("2m ago", relativeTime(&buf, 120_000));
+    try std.testing.expectEqualStrings("3h ago", relativeTime(&buf, 3 * 3_600_000));
+    try std.testing.expectEqualStrings("2d ago", relativeTime(&buf, 2 * 86_400_000));
+    try std.testing.expectEqualStrings("just now", relativeTime(&buf, -10_000)); // clock skew floors to now
 }

@@ -982,6 +982,14 @@ const Daemon = struct {
                 }
             } else |_| {}
         }
+        // Project the Recent Insertions ring to its text-free view (spec §4.1): snapshot the
+        // authoritative records under the ring's leaf lock, then mask each to a
+        // `HistoryEntryView` so no transcript bytes ever enter the Snapshot.
+        var records: [recent_insertions.capacity]recent_insertions.Record = undefined;
+        const history_count = self.recent_insertions.snapshot(&records);
+        var history: [recent_insertions.capacity]status_item.HistoryEntryView = @splat(.{});
+        for (records[0..history_count], 0..) |*rec, i| history[i] = status_item.historyEntryView(rec);
+
         const recovery_state = self.provisioner.recoveryState();
         const observed: ?status_item.Observation = if (self.model_operation_runner.current()) |c| .{
             .active = c.active,
@@ -1001,6 +1009,8 @@ const Daemon = struct {
             .installation_identity = installation_identity,
             .provisioner_failure_detail = self.provisioner.failureDetail(),
             .observed = observed,
+            .history = history,
+            .history_count = history_count,
         });
     }
 
