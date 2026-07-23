@@ -63,6 +63,24 @@ Placing a Final Transcript at the cursor of the Focused Target. Every Insertion 
 a single trailing space, so consecutive Insertions don't run their words together.
 _Avoid_: typing, pasting (those name mechanisms, not the act)
 
+**Insertion Record**:
+The retained receipt of one Insertion, kept in the in-memory **Recent Insertions** ring
+(the last N, newest-first, surfaced under the Status Item menu). One record holds: the
+`inserted` text (the with-space bytes actually placed at the cursor — post-Rewrite when
+Backtrack ran, raw otherwise; its char count is what an Undo would delete); `raw`, the
+trimmed Final Transcript, present only when it differs from `inserted` (i.e. a Rewrite
+changed it); a capture `timestamp`; the `outcome` (`ok` / `degraded` / `failed`, known
+only at `onInserted`); and a best-effort **App Identity** hint (`focused_app` — bundle id
++ display name of the frontmost app, nullable, never load-bearing). The record is
+deliberately app-level only: the Accessibility field-level Focused Target capture is left
+to the future Undo effort.
+_Avoid_: history entry, log entry (vague); transcript (that's the Final Transcript, not the receipt)
+
+**App Identity**:
+The frontmost application at Insertion time as recorded in an Insertion Record's
+`focused_app` hint — bundle id plus display name, read best-effort from `NSWorkspace`. A
+hint, not the Focused Target: it names the app, never the text field.
+
 **Backtrack**:
 The opt-in rewrite pass between an Utterance's Final Transcript and its Insertion
 (docs/backtrack-spec.md): one OpenAI call applies spoken self-corrections ("at 20:00 no
