@@ -331,6 +331,12 @@ flake.nix            development shell pinning the Zig nightly
 - Research crib sheets live in [docs/research](./docs/research).
 - Work tracking conventions are in [docs/agents/issue-tracker.md](./docs/agents/issue-tracker.md).
 
+## Support
+
+type-wave is a single-maintainer side project. If it's useful to you and you'd
+like to support continued work, you can [sponsor me on GitHub](https://github.com/sponsors/dbgeek).
+Entirely optional — issues and small PRs are just as welcome.
+
 ## License
 
 type-wave is released under the [MIT License](./LICENSE), Copyright (c) 2026
