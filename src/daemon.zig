@@ -1081,8 +1081,8 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     first_snapshot.* = config.loadSettingsOnly(io, alloc);
     const settings = first_snapshot.*;
     const selected_backend = settings.transcription_backend;
-    std.debug.print("config: backend={s} talk_key={s} model=\"{s}\" language=\"{s}\" delay=\"{s}\" noise_reduction={s} insertion={s} pre_paste_ms={d} overlay={} backtrack={}\n", .{
-        @tagName(selected_backend), @tagName(settings.talk_key), settings.model, settings.language, settings.delay, @tagName(settings.noise_reduction), @tagName(settings.insertion), settings.pre_paste_ms, settings.overlay, settings.backtrack,
+    std.debug.print("config: backend={s} talk_key={s} model=\"{s}\" language=\"{s}\" delay=\"{s}\" noise_reduction={s} insertion={s} pre_paste_ms={d} overlay={} backtrack={} vocabulary={d} terms\n", .{
+        @tagName(selected_backend), @tagName(settings.talk_key), settings.model, settings.language, settings.delay, @tagName(settings.noise_reduction), @tagName(settings.insertion), settings.pre_paste_ms, settings.overlay, settings.backtrack, settings.vocabulary.len,
     });
 
     var daemon = Daemon{
