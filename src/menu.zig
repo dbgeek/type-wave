@@ -164,6 +164,42 @@ const NSControlStateOn: c_long = 1;
 const NSControlStateOff: c_long = 0;
 const NSAlertFirstButtonReturn: c_long = 1000;
 const NSStatusWindowLevel: c_long = 25; // floats above ordinary windows (matches hud.zig)
+const NSEventModifierFlagOption: c_long = 1 << 19; // ⌥ — the reveal chord's key-equivalent mask
+
+/// Ephemeral per-entry reveal state for the Recent Insertions submenu (spec §4): which entries
+/// the user has ⌥-clicked (or picked "Reveal text" for) to show inline. Keyed by the entry's
+/// capture `timestamp` — stable across menu reopens and safe under ring shift (an evicted
+/// entry's stamp simply stops matching), unlike the newest-first index, which slides as new
+/// Insertions arrive. Holds **no transcript text** — reveal only flips a flag; the bytes are
+/// fetched on demand via `Host.historyText`. At most `capacity` entries can be live at once.
+const RevealSet = struct {
+    stamps: [recent_insertions.capacity]i64 = @splat(0),
+    len: usize = 0,
+
+    fn contains(self: *const RevealSet, ts: i64) bool {
+        for (self.stamps[0..self.len]) |s| {
+            if (s == ts) return true;
+        }
+        return false;
+    }
+
+    /// Add `ts` if absent, remove it if present — the ⌥-click toggle. A full set (all
+    /// `capacity` slots taken) silently ignores a new add; every real ring has ≤ capacity
+    /// distinct stamps, so this only guards the degenerate case.
+    fn toggle(self: *RevealSet, ts: i64) void {
+        for (self.stamps[0..self.len], 0..) |s, i| {
+            if (s == ts) {
+                self.stamps[i] = self.stamps[self.len - 1]; // swap-remove; order is irrelevant
+                self.len -= 1;
+                return;
+            }
+        }
+        if (self.len < self.stamps.len) {
+            self.stamps[self.len] = ts;
+            self.len += 1;
+        }
+    }
+};
 
 // =====================================================================================
 // The daemon-facing seams.
@@ -206,6 +242,13 @@ pub const Host = struct {
     /// Store the API key (Keychain). Returns whether the store succeeded.
     storeApiKey: *const fn (ctx: *anyopaque, key: []const u8) bool,
     modelAction: *const fn (ctx: *anyopaque, action: ModelAction) void,
+    /// On-demand text fetch for one Recent Insertions entry (spec §4.1 / §5): copy the record
+    /// with capture `stamp`'s `inserted` bytes into `out` under the ring's leaf lock, returning
+    /// the byte count (0 if it was evicted). The reveal path reads the receipt's `inserted`
+    /// bytes straight from the authoritative daemon-owned ring — never from the text-free
+    /// `Snapshot` — so none of them ride the pure pipeline. Keyed by the stable `stamp`, the
+    /// same identity the reveal state uses, so a concurrent Insertion can't misalign text.
+    historyText: *const fn (ctx: *anyopaque, stamp: i64, out: []u8) usize,
     /// Menu Quit — begin the clean shutdown (ends in appkit.stop()).
     quit: *const fn (ctx: *anyopaque) void,
 };
@@ -488,6 +531,9 @@ pub const Menu = struct {
     history_parent: id = null, // the top-level "Recent Insertions ▸" item
     history_submenu: id = null, // its submenu; holds the fixed entry rows
     history_entries: [recent_insertions.capacity]id = @splat(null), // one masked-label row each
+    history_alt_entries: [recent_insertions.capacity]id = @splat(null), // the ⌥-alternate twin per row (fires reveal)
+    history_reveal_items: [recent_insertions.capacity]id = @splat(null), // the in-submenu "Reveal text" item per row
+    reveal: RevealSet = .{}, // which entries the user has toggled to show inline (spec §4)
 
     last_snapshot: ?status_item.Snapshot = null,
     timer_ctx: CFRunLoopTimerContext = .{},
@@ -646,10 +692,33 @@ pub const Menu = struct {
                 msgBool(it, "setEnabled:", false); // placeholder — wired in a later ticket
                 msg1v(row_sub, "addItem:", it);
             }
+            // "Reveal text" — the discoverable equivalent of the ⌥-click reveal (spec §4). Its
+            // title flips to "Hide text" while revealed; both fire the shared `onHistoryEntry:`
+            // toggle, tagged with this row's fixed newest-first index.
+            const reveal_it = makeItem("Reveal text", sel_registerName("onHistoryEntry:"));
+            msg1v(reveal_it, "setTarget:", self.target);
+            msgLong(reveal_it, "setTag:", @intCast(i));
+            msg1v(row_sub, "addItem:", reveal_it);
+            self.history_reveal_items[i] = reveal_it;
+
             msg1v(row, "setSubmenu:", row_sub);
             msgBool(row, "setHidden:", true);
             msg1v(sub, "addItem:", row);
             self.history_entries[i] = row;
+
+            // The Option-alternate twin, added immediately after its row with a matching (empty)
+            // key equivalent and the ⌥ modifier mask: AppKit hides it at rest and swaps it in
+            // for the row only while ⌥ is held, so a ⌥-click fires `onHistoryEntry:` (toggling
+            // just this entry) instead of opening the row's submenu (spec §4). It carries no
+            // submenu of its own precisely so the click dispatches the action.
+            const alt = makeItem("", sel_registerName("onHistoryEntry:"));
+            msg1v(alt, "setTarget:", self.target);
+            msgLong(alt, "setTag:", @intCast(i));
+            msgBool(alt, "setAlternate:", true);
+            msgLong(alt, "setKeyEquivalentModifierMask:", NSEventModifierFlagOption);
+            msgBool(alt, "setHidden:", true);
+            msg1v(sub, "addItem:", alt);
+            self.history_alt_entries[i] = alt;
         }
         const parent = makeItem("Recent Insertions", null);
         msg1v(parent, "setSubmenu:", sub);
@@ -678,6 +747,7 @@ pub const Menu = struct {
             msgBool(self.history_parent, "setEnabled:", false);
             msg1v(self.history_parent, "setSubmenu:", null); // drop the arrow while empty
             for (self.history_entries) |row| msgBool(row, "setHidden:", true);
+            for (self.history_alt_entries) |alt| msgBool(alt, "setHidden:", true);
             return;
         }
         msg1v(self.history_parent, "setTitle:", nsstr("Recent Insertions"));
@@ -685,15 +755,31 @@ pub const Menu = struct {
         msg1v(self.history_parent, "setSubmenu:", self.history_submenu);
 
         const now = feedback.nowMs();
-        var label_buf: [256]u8 = undefined;
+        var label_buf: [1024]u8 = undefined; // room for a revealed snippet + a long app name + metadata
         for (self.history_entries, 0..) |row, i| {
-            if (i < view.count) {
-                const label = status_item.historyLabel(&label_buf, view.entries[i], now);
-                msg1v(row, "setTitle:", nsstr(label.ptr));
-                msgBool(row, "setHidden:", false);
-            } else {
+            if (i >= view.count) {
                 msgBool(row, "setHidden:", true);
+                msgBool(self.history_alt_entries[i], "setHidden:", true);
+                continue;
             }
+            const entry = view.entries[i];
+            const revealed = self.reveal.contains(entry.timestamp);
+            const label = if (revealed) label: {
+                // On-demand text fetch (spec §4.1 / §5): the `inserted` bytes are read from the
+                // authoritative ring under its leaf lock — never from the projected Snapshot —
+                // keyed by the entry's stable timestamp so text can't misalign with its row.
+                var text_buf: [recent_insertions.max_bytes]u8 = undefined;
+                const n = self.host.historyText(self.host.ctx, entry.timestamp, &text_buf);
+                break :label status_item.historyRevealedLabel(&label_buf, entry, text_buf[0..n], now);
+            } else status_item.historyLabel(&label_buf, entry, now);
+
+            msg1v(row, "setTitle:", nsstr(label.ptr));
+            msgBool(row, "setHidden:", false);
+            // Keep the ⌥-alternate's title in lockstep so the row doesn't jump on ⌥-hold.
+            msg1v(self.history_alt_entries[i], "setTitle:", nsstr(label.ptr));
+            msgBool(self.history_alt_entries[i], "setHidden:", false);
+            // The in-submenu affordance mirrors the toggle state.
+            msg1v(self.history_reveal_items[i], "setTitle:", nsstr(if (revealed) "Hide text" else "Reveal text"));
         }
     }
 
@@ -958,6 +1044,23 @@ fn onModelAction(_: id, _: SEL, sender: id) callconv(.c) void {
     m.refreshChrome();
 }
 
+/// Reveal toggle for one Recent Insertions entry (spec §4): the shared selector behind both
+/// the ⌥-click alternate row and the in-submenu "Reveal text" item, dispatched with the row's
+/// newest-first index in the item `tag` (mirroring `onModelAction` + `setTag:`). It resolves
+/// the index to the entry's stable `timestamp` off the current view, flips its reveal flag, and
+/// re-renders so the next open shows (or re-masks) that one row's text — no transcript byte is
+/// touched here; `rebuildHistory` fetches it on demand only for a revealed row.
+fn onHistoryEntry(_: id, _: SEL, sender: id) callconv(.c) void {
+    const m = g_menu orelse return;
+    const raw = msgLongR(sender, "tag");
+    if (raw < 0) return;
+    const i: usize = @intCast(raw);
+    const view = status_item.derive(m.last_snapshot orelse m.host.status(m.host.ctx)).history;
+    if (i >= view.count) return;
+    m.reveal.toggle(view.entries[i].timestamp);
+    m.rebuildHistory();
+}
+
 const ModelActionConfirmation = struct {
     title: [*:0]const u8,
     detail: [*:0]const u8,
@@ -1158,6 +1261,34 @@ test "vocabularyInfoText always guides, and adds a soft hint only when near/over
     try std.testing.expect(std.mem.indexOf(u8, long, "tokens") != null);
 }
 
+test "RevealSet toggles one entry on and off, keyed by timestamp" {
+    var set = RevealSet{};
+    try std.testing.expect(!set.contains(100));
+    set.toggle(100);
+    try std.testing.expect(set.contains(100));
+    set.toggle(100); // second ⌥-click re-masks
+    try std.testing.expect(!set.contains(100));
+    try std.testing.expectEqual(@as(usize, 0), set.len);
+}
+
+test "RevealSet reveals entries independently — one row's toggle never flips another" {
+    var set = RevealSet{};
+    set.toggle(10);
+    set.toggle(20);
+    set.toggle(30);
+    try std.testing.expect(set.contains(10) and set.contains(20) and set.contains(30));
+    set.toggle(20); // hide only the middle one
+    try std.testing.expect(set.contains(10) and !set.contains(20) and set.contains(30));
+    try std.testing.expectEqual(@as(usize, 2), set.len);
+}
+
+test "RevealSet never overflows its capacity-bounded backing" {
+    var set = RevealSet{};
+    var ts: i64 = 1;
+    while (ts <= recent_insertions.capacity + 5) : (ts += 1) set.toggle(ts);
+    try std.testing.expectEqual(@as(usize, recent_insertions.capacity), set.len); // capped, no overrun
+}
+
 fn onOpenConfig(_: id, _: SEL, _: id) callconv(.c) void {
     const m = g_menu orelse return;
     var buf: [4096]u8 = undefined;
@@ -1323,6 +1454,7 @@ fn makeTarget() id {
     _ = class_addMethod(target_cls, sel_registerName("onRadio:"), @ptrCast(&onRadio), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onPrimary:"), @ptrCast(&onPrimary), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onModelAction:"), @ptrCast(&onModelAction), v_at);
+    _ = class_addMethod(target_cls, sel_registerName("onHistoryEntry:"), @ptrCast(&onHistoryEntry), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onOverlay:"), @ptrCast(&onOverlay), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onBacktrack:"), @ptrCast(&onBacktrack), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onPause:"), @ptrCast(&onPause), v_at);

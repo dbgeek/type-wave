@@ -411,41 +411,107 @@ fn relativeTime(buf: []u8, delta_ms_in: i64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}d ago", .{@divTrunc(hours, 24)}) catch "just now";
 }
 
-/// Format one masked entry label — **metadata only, never transcript text** (spec §4):
-/// `<dot> <masked run> · <n> chars · <App> · <time>  [<tag>]`. The dot colour rides an
-/// emoji glyph (green/amber/red) since a menu title carries no per-glyph colour; the `•`
-/// run is a capped stand-in for the hidden transcript, and `char_len` reports its length.
-/// Returns a sentinel-terminated slice for `NSString`; `now_ms` is the caller's clock.
-pub fn historyLabel(buf: []u8, entry: HistoryEntry, now_ms: i64) [:0]const u8 {
-    const dot: [:0]const u8 = switch (entry.dot) {
+/// The status-dot emoji glyph for an entry (a menu title carries no per-glyph colour, so the
+/// colour rides the glyph): green `ok`, amber `degraded`, red `failed`.
+fn historyDotGlyph(dot: HistoryDot) [:0]const u8 {
+    return switch (dot) {
         .ok => "\xf0\x9f\x9f\xa2", // 🟢
         .degraded => "\xf0\x9f\x9f\xa1", // 🟡
         .failed => "\xf0\x9f\x94\xb4", // 🔴
     };
-    const tag = switch (entry.tag) {
+}
+
+/// The trailing `[degraded]` / `[failed]` pill so a never-inserted (or degraded) entry is
+/// unmistakable (spec §2.4 / §4); empty for a clean `ok`.
+fn historyTagSuffix(tag: HistoryTag) []const u8 {
+    return switch (tag) {
         .none => "",
         .degraded => "  [degraded]",
         .failed => "  [failed]",
     };
+}
+
+/// Assemble one history row: `<dot> <body> · <App> · <time>  [<tag>]`, the shared shape of the
+/// masked and revealed labels — only `body` differs (the `•` run + char count vs the actual
+/// text). Keeping the dot/app/time/tag scaffolding single-homed means the row shape is edited
+/// in one place. Returns a sentinel-terminated slice for `NSString`; `now_ms` is the caller's
+/// clock.
+fn historyRowLabel(buf: []u8, entry: HistoryEntry, body: []const u8, now_ms: i64) [:0]const u8 {
+    const dot = historyDotGlyph(entry.dot);
+    const tag = historyTagSuffix(entry.tag);
+    var when: [24]u8 = undefined;
+    const ago = relativeTime(&when, now_ms - entry.timestamp);
+    const mid = " \xc2\xb7 "; // " · " (U+00B7)
+    if (entry.app) |app| {
+        if (app.displayName().len > 0)
+            return std.fmt.bufPrintSentinel(buf, "{s} {s}{s}{s}{s}{s}{s}", .{
+                dot, body, mid, app.displayName(), mid, ago, tag,
+            }, 0) catch dot;
+    }
+    return std.fmt.bufPrintSentinel(buf, "{s} {s}{s}{s}{s}", .{
+        dot, body, mid, ago, tag,
+    }, 0) catch dot;
+}
+
+/// Format one masked entry label — **metadata only, never the `inserted` text** (spec §4):
+/// `<dot> <masked run> · <n> chars · <App> · <time>  [<tag>]`. The `•` run is a capped stand-in
+/// for the hidden receipt, and `char_len` reports its length. Returns a sentinel-terminated
+/// slice for `NSString`; `now_ms` is the caller's clock.
+pub fn historyLabel(buf: []u8, entry: HistoryEntry, now_ms: i64) [:0]const u8 {
     var bullets: [8 * 3]u8 = undefined; // •, U+2022, is 3 bytes; capped at 8
     const runs: usize = @max(@as(usize, 1), @min(@as(usize, entry.char_len), 8));
     var bi: usize = 0;
     while (bi < runs * 3) : (bi += 3) @memcpy(bullets[bi..][0..3], "\xe2\x80\xa2");
     const run = bullets[0 .. runs * 3];
 
-    var when: [24]u8 = undefined;
-    const ago = relativeTime(&when, now_ms - entry.timestamp);
+    var body_buf: [8 * 3 + 4 + 16]u8 = undefined; // run + " · " + "65535 chars"
+    const body = std.fmt.bufPrint(&body_buf, "{s} \xc2\xb7 {d} chars", .{ run, entry.char_len }) catch run;
+    return historyRowLabel(buf, entry, body, now_ms);
+}
 
-    const mid = " \xc2\xb7 "; // " · " (U+00B7)
-    if (entry.app) |app| {
-        if (app.displayName().len > 0)
-            return std.fmt.bufPrintSentinel(buf, "{s} {s}{s}{d} chars{s}{s}{s}{s}{s}", .{
-                dot, run, mid, entry.char_len, mid, app.displayName(), mid, ago, tag,
-            }, 0) catch dot;
+/// The capped, trailing-space-trimmed `inserted` snippet a revealed row shows. `inserted`
+/// carries its single trailing space (the Insertion-chaining artifact); it is stripped for
+/// display. Long dictations are truncated at `reveal_snippet_cap` codepoints with an ellipsis
+/// so one entry can't blow the menu width. Codepoint-safe: an invalid-UTF-8 fallback caps by
+/// bytes. Writes into `out`; returns the written slice.
+const reveal_snippet_cap = 96;
+fn revealSnippet(out: []u8, text_in: []const u8) []const u8 {
+    const ell = "\xe2\x80\xa6"; // … (U+2026)
+    const text = std.mem.trimEnd(u8, text_in, " \t\r\n");
+    const view = std.unicode.Utf8View.init(text) catch {
+        // Not valid UTF-8 (shouldn't happen for a transcript): cap by bytes, no ellipsis.
+        const n = @min(text.len, out.len);
+        @memcpy(out[0..n], text[0..n]);
+        return out[0..n];
+    };
+    var iter = view.iterator();
+    var count: usize = 0;
+    while (count < reveal_snippet_cap) : (count += 1) {
+        if (iter.nextCodepointSlice() == null) break;
     }
-    return std.fmt.bufPrintSentinel(buf, "{s} {s}{s}{d} chars{s}{s}{s}", .{
-        dot, run, mid, entry.char_len, mid, ago, tag,
-    }, 0) catch dot;
+    const end = iter.i;
+    if (end >= text.len) {
+        const n = @min(text.len, out.len);
+        @memcpy(out[0..n], text[0..n]);
+        return out[0..n];
+    }
+    // Truncated: copy the first `end` bytes, then append the ellipsis.
+    const n = @min(end, out.len -| ell.len);
+    @memcpy(out[0..n], text[0..n]);
+    @memcpy(out[n..][0..ell.len], ell);
+    return out[0 .. n + ell.len];
+}
+
+/// Format one **revealed** entry label (spec §4 reveal): the same row as `historyLabel` but
+/// with the masked `•` run and char count replaced by the entry's actual `inserted` `text`,
+/// fetched on demand from the ring (never from the `Snapshot`). `text` is the with-space
+/// `inserted` bytes; `revealSnippet` trims and caps it. Dot, App Identity, relative time and
+/// the degraded/failed tag are unchanged. Returns a sentinel-terminated slice; `now_ms` is the
+/// caller's clock.
+pub fn historyRevealedLabel(buf: []u8, entry: HistoryEntry, text: []const u8, now_ms: i64) [:0]const u8 {
+    var snip_buf: [reveal_snippet_cap * 4 + 3]u8 = undefined;
+    const shown = revealSnippet(&snip_buf, text);
+    return historyRowLabel(buf, entry, shown, now_ms);
 }
 
 fn snap(fields: struct {
@@ -731,6 +797,53 @@ test "historyLabel omits the app segment when no App Identity was captured" {
     try std.testing.expect(std.mem.indexOf(u8, label, "4 chars") != null);
     try std.testing.expect(std.mem.indexOf(u8, label, "just now") != null);
     try std.testing.expect(std.mem.indexOf(u8, label, "[") == null); // an ok entry carries no tag
+}
+
+test "historyRevealedLabel shows the transcript text, trailing space trimmed, with metadata" {
+    var buf: [256]u8 = undefined;
+    const entry = HistoryEntry{ .dot = .failed, .tag = .failed, .char_len = 9, .app = coord.AppIdentity.init("com.tinyspeck.slackmacgap", "Slack"), .timestamp = 0 };
+    const label = historyRevealedLabel(&buf, entry, "At 18:00 ", 120_000);
+    try std.testing.expect(std.mem.indexOf(u8, label, "\xf0\x9f\x94\xb4") != null); // 🔴 failed dot
+    try std.testing.expect(std.mem.indexOf(u8, label, "At 18:00") != null); // the actual text
+    try std.testing.expect(std.mem.indexOf(u8, label, "At 18:00  \xc2\xb7") == null); // trailing space trimmed (no double space before the separator)
+    try std.testing.expect(std.mem.indexOf(u8, label, "\xe2\x80\xa2") == null); // no masked bullet run
+    try std.testing.expect(std.mem.indexOf(u8, label, "chars") == null); // char count replaced by text
+    try std.testing.expect(std.mem.indexOf(u8, label, "Slack") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "2m ago") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "[failed]") != null);
+}
+
+test "historyRevealedLabel omits the app segment when no App Identity was captured" {
+    var buf: [256]u8 = undefined;
+    const entry = HistoryEntry{ .dot = .ok, .tag = .none, .char_len = 6, .app = null, .timestamp = 0 };
+    const label = historyRevealedLabel(&buf, entry, "hello ", 0);
+    try std.testing.expect(std.mem.indexOf(u8, label, "hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "just now") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "[") == null);
+}
+
+test "revealSnippet caps a long transcript at the codepoint limit with an ellipsis" {
+    var out: [reveal_snippet_cap * 4 + 3]u8 = undefined;
+    var long: [200]u8 = @splat('a');
+    const snip = revealSnippet(&out, &long);
+    try std.testing.expect(std.mem.endsWith(u8, snip, "\xe2\x80\xa6")); // …
+    try std.testing.expectEqual(@as(usize, reveal_snippet_cap + 3), snip.len); // 96 'a' + 3-byte …
+}
+
+test "revealSnippet is codepoint-safe: it never truncates a multi-byte codepoint mid-way" {
+    var out: [reveal_snippet_cap * 4 + 3]u8 = undefined;
+    // 200 "é" (U+00E9, 2 bytes each) — capping at 96 codepoints must land on a boundary.
+    var many: [400]u8 = undefined;
+    var i: usize = 0;
+    while (i < 400) : (i += 2) @memcpy(many[i..][0..2], "\xc3\xa9");
+    const snip = revealSnippet(&out, &many);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(snip)); // no split codepoint
+    try std.testing.expect(std.mem.endsWith(u8, snip, "\xe2\x80\xa6"));
+}
+
+test "revealSnippet passes a short transcript through untruncated" {
+    var out: [reveal_snippet_cap * 4 + 3]u8 = undefined;
+    try std.testing.expectEqualStrings("hi there", revealSnippet(&out, "hi there "));
 }
 
 test "relativeTime buckets by magnitude" {
