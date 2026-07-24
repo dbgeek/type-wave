@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.1](https://github.com/dbgeek/type-wave/compare/v0.2.0...v0.2.1) (2026-07-24)
+
+
+### Features
+
+* **undo:** app-level focus gate — refuse when the frontmost app changed ([#224](https://github.com/dbgeek/type-wave/issues/224)) ([#232](https://github.com/dbgeek/type-wave/issues/232)) ([ea6ebe3](https://github.com/dbgeek/type-wave/commit/ea6ebe354d0981effa7ad08fa1afa20689dad0b4))
+* **undo:** capture the ⌃⌘⌫ recovery chord in the Talk Key tap ([#221](https://github.com/dbgeek/type-wave/issues/221)) ([#229](https://github.com/dbgeek/type-wave/issues/229)) ([fbdfa6f](https://github.com/dbgeek/type-wave/commit/fbdfa6f6462038c8f4740487947854331272bc1e))
+* **undo:** deleteChars primitive + undo_job adapter slot ([#222](https://github.com/dbgeek/type-wave/issues/222)) ([#230](https://github.com/dbgeek/type-wave/issues/230)) ([aa13139](https://github.com/dbgeek/type-wave/commit/aa131396c2267ce538a49771fe2390739f5b091d))
+* **undo:** grapheme-count deletion helper ([#220](https://github.com/dbgeek/type-wave/issues/220)) ([#227](https://github.com/dbgeek/type-wave/issues/227)) ([1169942](https://github.com/dbgeek/type-wave/commit/116994228bf5e70a9fae4906937b813196c87db5))
+* **undo:** HUD confirm/refuse cue — green bloom, red shake ([#226](https://github.com/dbgeek/type-wave/issues/226)) ([#234](https://github.com/dbgeek/type-wave/issues/234)) ([81c232a](https://github.com/dbgeek/type-wave/commit/81c232a2a5b4a9c75b51f15f70f38fd9384e2a60))
+* **undo:** single-shot model — undone flag, redo, refuse-on-undone ([#225](https://github.com/dbgeek/type-wave/issues/225)) ([#233](https://github.com/dbgeek/type-wave/issues/233)) ([11a3168](https://github.com/dbgeek/type-wave/commit/11a3168dca2deb557032c1f8ed8b65612874cd55))
+* **undo:** wire ⌃⌘⌫ to delete the newest Insertion ([#223](https://github.com/dbgeek/type-wave/issues/223)) ([#231](https://github.com/dbgeek/type-wave/issues/231)) ([7ac8ab9](https://github.com/dbgeek/type-wave/commit/7ac8ab904d4f398a179d32b7cbae688f41372235))
+
 ## [0.2.0](https://github.com/dbgeek/type-wave/compare/v0.1.4...v0.2.0) (2026-07-24)
 
 
