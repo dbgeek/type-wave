@@ -91,6 +91,7 @@ const whisper_process_helper = @import("whisper_process_helper.zig");
 const model_store = @import("model_store.zig");
 const local_provisioner = @import("local_provisioner.zig");
 const status_item = @import("status_item.zig");
+const secure_input_mod = @import("secure_input.zig");
 
 const Session = session_mod.Session(session_mod.WebsocketTransport);
 const LocalAdapter = local_backend.Adapter(whisper_process_helper.ProcessHelper);
@@ -209,6 +210,10 @@ fn drainOperationChannel(io: std.Io, stdout_value: std.Io.File, runner: *ModelOp
 /// Self-heal poll cadence. Fast enough that granting a permission / dropping in the key
 /// feels responsive, slow enough to be invisible in the log while waiting.
 const supervisor_tick_ms: usize = 3_000;
+/// Buffer for a libproc process name — the Secure Event Input holder's (#245). Comfortably
+/// over `MAXCOMLEN`; `procName` truncates rather than failing, and the Observer's narration
+/// falls back to its unnamed wording if the rendered line would not fit anyway.
+const max_proc_name: usize = 128;
 /// Release-anchored Insertion deadline (grilled for #19): armed when the Coordinator enters
 /// `awaiting_final`, so it bounds both the live wait and a reconnect-spanning wait. Past it
 /// the Utterance is dropped rather than inserting stale text or blocking new Utterances.
@@ -787,6 +792,15 @@ const Daemon = struct {
     /// It owns the three grant facts too — including the attempt-then-observe PostEvent
     /// latch (#129) the tap callback sets and the Undo Runner's gate reads (ADR-0010).
     grants: GrantObserver = GrantObserver.init(.{}),
+    /// Supervisor-thread-only: the Secure Input Observer's memory (#245), so a hold that
+    /// lasts an hour is announced once rather than once per ~3 s tick.
+    secure_input: secure_input_mod.Observer = .{},
+    /// The observed condition, published for the main thread's menu snapshot as **one** value
+    /// so the row can never render a half-updated pair. The holder's name is worth logging but
+    /// would mean sharing a buffer across threads; the menu only has to make the condition and
+    /// its remedy visible, which is exactly what `secure_input.State` carries.
+    secure_input_state: std.atomic.Value(u8) =
+        std.atomic.Value(u8).init(@intFromEnum(secure_input_mod.State.clear)),
     provisioner_deps: LocalProvisionerDeps = undefined,
     provisioner: LocalProvisioner = undefined,
 
@@ -969,7 +983,42 @@ const Daemon = struct {
             // disturbing dictation.
             if (acts.remove_superseded) self.provisioner.removeSuperseded();
             self.capture_enabled.store(acts.capture_enabled, .release);
+            self.observeSecureInput();
         }
+    }
+
+    /// One poll of Secure Event Input, narrated on transition (#245). The impure half of the
+    /// Secure Input Observer, and *only* that half: read the flag, the session's holder pid
+    /// and the holder's name, hand them over as `Facts`, then log and publish whatever the
+    /// Observer decides. Which readings are worth saying, the wording, and the collapse to a
+    /// published `State` are all its policy — this file carries no test blocks, so a rule
+    /// living here would be a rule no test could reach (ADR-0010's lesson).
+    ///
+    /// This exists because the condition is otherwise invisible from inside the daemon. While
+    /// Secure Event Input is held, the WindowServer withholds key events from every event tap,
+    /// so `⌃⌘⌫` never arrives — `onRecoveryChord` cannot fire and the Undo Runner's own
+    /// `secure_input` refusal has no press to refuse. Meanwhile modifier events keep flowing
+    /// and the Talk Key works perfectly, so every other sign says the tap is healthy.
+    ///
+    /// Cheap enough for the supervisor's ~3 s tick: a Carbon call plus, only while held, one
+    /// session-dictionary copy and a libproc lookup.
+    fn observeSecureInput(self: *Daemon) void {
+        const active = insertmod.secureInputActive();
+        // Only paid for while the condition holds: the session-dictionary copy and the libproc
+        // lookup both sit behind the flag, so a clear session costs one Carbon call per tick.
+        const pid = if (active) insertmod.secureInputHolderPid() else null;
+        var name_buf: [max_proc_name]u8 = undefined;
+        const name = if (pid) |p| insertmod.procName(p, &name_buf) else "";
+
+        const transition = self.secure_input.observe(.{
+            .active = active,
+            .holder_pid = pid,
+            .holder_name = name,
+        }) orelse return;
+
+        var line_buf: [secure_input_mod.max_line]u8 = undefined;
+        feedback.log("  {s}\n", .{secure_input_mod.narrate(transition, &line_buf)});
+        self.secure_input_state.store(@intFromEnum(secure_input_mod.state(transition)), .release);
     }
 
     /// Log the missing prerequisites once per distinct set (not every tick), with one error
@@ -1092,6 +1141,10 @@ const Daemon = struct {
             .operation_bytes = operation_bytes,
             .installation_identity = installation_identity,
             .provisioner_failure_detail = self.provisioner.failureDetail(),
+            // Published by the supervisor thread's Secure Input Observer (#245) — read here
+            // rather than re-probed, so the menu never pays for a session-dictionary copy on
+            // the main thread and never disagrees with what the log said.
+            .secure_input = @enumFromInt(self.secure_input_state.load(.acquire)),
             .observed = observed,
             .history = history,
             .history_count = history_count,

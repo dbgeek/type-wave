@@ -311,6 +311,23 @@ the Supervisor, and the Undo Runner; lives in `src/grants.zig`. Distinct from th
 whose own facts the daemon still gathers (ADR-0005).
 _Avoid_: permissions manager, TCC helper, grant sequence (that names only the pure half)
 
+**Secure Input Observer**:
+The daemon's owner of one session-wide fact: whether **Secure Event Input** is held, and by
+whom (#245). While it is held the WindowServer withholds key events from every event tap, so
+the recovery chord never reaches the daemon at all — the Undo Runner's own secure-input
+refusal covers the case where a press *arrives* and cannot be acted on, and this covers the
+strictly upstream case where no press arrives. What makes it worth a module is the asymmetry
+it explains: modifier events keep flowing, so the Talk Key keeps working and every other sign
+says the tap is healthy while `⌃⌘⌫` is silently dead. Pure, in the Supervisor / Grant Observer
+idiom: the daemon polls the flag, the session's holder pid and the holder's name on the
+supervisor's existing facts pass, and this decides only *when a reading is worth saying* —
+once per hold, again if the holder or its kind changes, once on release. It distinguishes a
+**named** holder (quit it) from a **stale** one whose process is gone (only a re-login clears
+it) and from an unattributable hold. It observes and narrates; it gates nothing. Lives in
+`src/secure_input.zig`; its transitions reach the log with the holder named, and the Status
+Item as a row while the condition holds.
+_Avoid_: secure input guard/gate (it blocks nothing), keyboard lock
+
 **Configuration Phase**:
 The daemon's setup-readiness state for the selected Transcription Backend. `configured`
 requires the common macOS grants and live Talk Key tap plus that backend's durable

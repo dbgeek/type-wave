@@ -30,6 +30,7 @@ const appkit = @import("appkit.zig");
 const config = @import("config.zig");
 const readiness = @import("readiness.zig");
 const status_item = @import("status_item.zig");
+const secure_input = @import("secure_input.zig");
 const backend = @import("transcription_backend.zig");
 const tapmod = @import("tap.zig");
 const insertmod = @import("insert.zig");
@@ -408,6 +409,19 @@ fn backtrackLine2(s: *const config.Settings) [*:0]const u8 {
     return "Needs internet; unavailable on the Local backend";
 }
 
+/// The Secure Event Input row's wording (#245), one string per published state. The two held
+/// states are worded apart because the remedy is: a live holder can be quit, while a hold
+/// whose holder is gone can only be cleared by logging out. Both say what is actually lost —
+/// dictation is unaffected, the recovery chord is not. `.clear` hides the row, so its string
+/// is never shown; it exists so this stays a total switch.
+fn secureInputText(state: secure_input.State) [*:0]const u8 {
+    return switch (state) {
+        .clear => "",
+        .held => "Secure Input on \xe2\x80\x94 undo (\xe2\x8c\x83\xe2\x8c\x98\xe2\x8c\xab) unavailable",
+        .stuck => "Secure Input stuck on \xe2\x80\x94 undo (\xe2\x8c\x83\xe2\x8c\x98\xe2\x8c\xab) needs a log out",
+    };
+}
+
 fn primaryText(action: status_item.PrimaryAction, operation: status_item.Operation) [*:0]const u8 {
     return switch (action) {
         .none => "",
@@ -531,6 +545,9 @@ pub const Menu = struct {
     status_line: id = null, // the disabled first item
     primary_item: id = null,
     privacy_item: id = null,
+    /// The Secure Event Input disclosure row (#245): shown only while the condition holds,
+    /// because it is the one state that stops `⌃⌘⌫` reaching the daemon at all.
+    secure_input_item: id = null,
     network_item: id = null,
     set_api_key_item: id = null,
     pause_item: id = null, // title flips Pause/Resume
@@ -607,6 +624,9 @@ pub const Menu = struct {
         self.primary_item = self.addAction(menu, "", "onPrimary:");
         self.privacy_item = self.addDisabled(menu, "Audio stays on this Mac");
         self.network_item = self.addDisabled(menu, "Network used only for this model operation");
+        // Hidden unless Secure Event Input is held (#245); wording filled by refresh, since
+        // the two cases send the user to different remedies.
+        self.secure_input_item = self.addDisabled(menu, "");
         addSeparator(menu);
         for (1..groups.len) |gi| self.addRadioGroup(menu, gi, snap);
         self.addLocalModel(menu);
@@ -900,6 +920,8 @@ pub const Menu = struct {
         msgBool(self.primary_item, "setEnabled:", presentation.primary_action != .operation_progress);
         msgBool(self.privacy_item, "setHidden:", !presentation.audio_stays_on_mac);
         msgBool(self.network_item, "setHidden:", !presentation.model_operation_uses_network);
+        msg1v(self.secure_input_item, "setTitle:", nsstr(secureInputText(presentation.secure_input)));
+        msgBool(self.secure_input_item, "setHidden:", presentation.secure_input == .clear);
 
         const installation_title: [*:0]const u8 = switch (snapshot.installation) {
             .absent => "Whisper Large v3 Turbo — not installed",
@@ -1262,6 +1284,21 @@ test "backtrackLine2 sharpens to not-applying only on Local with Backtrack on" {
     // Only Local + on sharpens — the opted-in preference is kept, not erased.
     var on_local = config.Settings{ .transcription_backend = .local, .backtrack = true };
     try std.testing.expect(std.mem.indexOf(u8, std.mem.span(backtrackLine2(&on_local)), sharpened) != null);
+}
+
+test "the Secure Event Input row names what is lost, and only the stuck case asks for a log out" {
+    // The row's whole job is to correct the impression the rest of the menu gives: dictation
+    // is fine, so the wording has to say which half is actually gone (#245).
+    const held = std.mem.span(secureInputText(.held));
+    try std.testing.expect(std.mem.indexOf(u8, held, "undo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, held, "log out") == null); // the holder can be quit
+
+    const stuck = std.mem.span(secureInputText(.stuck));
+    try std.testing.expect(std.mem.indexOf(u8, stuck, "undo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stuck, "log out") != null); // nothing else clears it
+
+    // `.clear` hides the row, so its string is never rendered.
+    try std.testing.expectEqualStrings("", std.mem.span(secureInputText(.clear)));
 }
 
 // ---- vocabulary editing pure halves (spec §3/§4) --------------------------------------

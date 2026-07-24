@@ -9,6 +9,7 @@ const installation_identity = @import("installation_identity.zig");
 const readiness = @import("readiness.zig");
 const coord = @import("coordinator.zig");
 const recent_insertions = @import("recent_insertions.zig");
+const secure_input = @import("secure_input.zig");
 
 pub const Installation = enum {
     absent,
@@ -104,6 +105,12 @@ pub fn historyEntryView(rec: *const recent_insertions.Record) HistoryEntryView {
 pub const Snapshot = struct {
     selected_backend: backend.Backend,
     health: readiness.Health,
+    /// Secure Event Input, as the Secure Input Observer published it on the supervisor's facts
+    /// pass (#245). Not part of `health`: it gates nothing and dims nothing — dictation is
+    /// unaffected — it is a capability the user needs told about, not a prerequisite the
+    /// daemon is waiting on. The holder's *name* stays in the log; a plain enum keeps the
+    /// whole `Snapshot` `std.meta.eql`-comparable and free of cross-thread string sharing.
+    secure_input: secure_input.State = .clear,
     terminal_backend_failure: bool = false,
     local_runtime_failure: bool = false,
     installation: Installation = .absent,
@@ -201,6 +208,10 @@ pub const Presentation = struct {
     model_actions: std.EnumSet(ModelAction),
     model_failure: ModelFailure,
     history: HistoryView,
+    /// The Secure Event Input row's state (#245). Passed through rather than folded into the
+    /// headline: the headline answers "can dictation fire", and this does not change that
+    /// answer.
+    secure_input: secure_input.State,
 
     pub fn allowsModelAction(self: Presentation, action: ModelAction) bool {
         return self.model_actions.contains(action);
@@ -242,6 +253,7 @@ pub fn derive(s: Snapshot) Presentation {
         // headline into one field, so the menu no longer re-ORs two modules' terms.
         .icon_tier = if (s.health.needsAttention() or hl == .backend_failure) .dimmed else .normal,
         .primary_action = primaryAction(s),
+        .secure_input = s.secure_input,
         .show_openai_controls = s.selected_backend == .openai,
         .audio_stays_on_mac = s.selected_backend == .local and
             s.health.status == .ready_offline,
@@ -287,6 +299,9 @@ pub const Readings = struct {
     installation_identity: ?InstallationIdentity = null,
     provisioner_failure_detail: ?FailureDetail = null,
     observed: ?Observation = null,
+    /// The Secure Input Observer's published state (#245), read off the daemon's atomic at
+    /// snapshot time.
+    secure_input: secure_input.State = .clear,
     /// The daemon's text-free projection of the Recent Insertions ring, newest-first
     /// (spec §4.1). `[0..history_count]` is live.
     history: [recent_insertions.capacity]HistoryEntryView = @splat(.{}),
@@ -318,6 +333,7 @@ pub fn project(r: Readings) Snapshot {
     return .{
         .selected_backend = r.selected_backend,
         .health = r.health,
+        .secure_input = r.secure_input,
         .terminal_backend_failure = r.terminal_backend_failure,
         .local_runtime_failure = r.local_runtime_failure,
         .installation = installation,
@@ -541,6 +557,7 @@ fn snap(fields: struct {
     local_runtime_failure: bool = false,
     installation: Installation = .ready,
     operation: Operation = .idle,
+    secure_input: secure_input.State = .clear,
 }) Snapshot {
     return .{
         .selected_backend = fields.selected_backend,
@@ -549,7 +566,41 @@ fn snap(fields: struct {
         .local_runtime_failure = fields.local_runtime_failure,
         .installation = fields.installation,
         .operation = fields.operation,
+        .secure_input = fields.secure_input,
     };
+}
+
+test "a held Secure Event Input reaches the menu without changing the headline or the icon (#245)" {
+    // It is surfaced, not folded into readiness: dictation is unaffected — the Talk Key rides
+    // on modifier events, which keep flowing — so dimming the icon would say something false.
+    const ready = derive(snap(.{ .health = .{ .paused = false, .status = .ready } }));
+    const held = derive(snap(.{
+        .health = .{ .paused = false, .status = .ready },
+        .secure_input = .held,
+    }));
+
+    try std.testing.expectEqual(secure_input.State.held, held.secure_input);
+    try std.testing.expectEqual(ready.headline, held.headline);
+    try std.testing.expectEqual(ready.icon_tier, held.icon_tier);
+    try std.testing.expectEqual(ready.primary_action, held.primary_action);
+}
+
+test "a stale hold is carried through distinctly — the remedy differs (#245)" {
+    const p = derive(snap(.{ .secure_input = .stuck }));
+    try std.testing.expectEqual(secure_input.State.stuck, p.secure_input);
+}
+
+test "no hold means no row" {
+    try std.testing.expectEqual(secure_input.State.clear, derive(snap(.{})).secure_input);
+}
+
+test "project carries the observed hold from the daemon's readings to the snapshot" {
+    const s = project(.{
+        .selected_backend = .local,
+        .health = .{ .paused = false, .status = .ready_offline },
+        .secure_input = .stuck,
+    });
+    try std.testing.expectEqual(secure_input.State.stuck, s.secure_input);
 }
 
 test "compact headline follows pause, common prerequisite, selected prerequisite, failure, preparation, ready priority" {
