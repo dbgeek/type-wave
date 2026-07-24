@@ -58,7 +58,7 @@ pub const Runtime = struct {
         // The C ABI takes a NUL-terminated glossary next to `language`; a sentinel-terminated
         // copy is borrowed across the synchronous inference and freed here (spec §5). An empty
         // prompt sentinel-terminates to "", which the bridge maps to a null initial_prompt.
-        const prompt_z = try allocator.dupeZ(u8, prompt);
+        const prompt_z = try allocator.dupeSentinel(u8, prompt, 0);
         defer allocator.free(prompt_z);
         var text: ?[*]const u8 = null;
         var text_len: usize = 0;
