@@ -493,6 +493,20 @@ const RealInsertionDeps = struct {
 };
 const InsertionAdapter = insertion_adapter.InsertionAdapter(RealInsertionDeps);
 
+/// The HUD pump bound to its production Chrome, and the Feedback Surface bound to both
+/// halves it arbitrates. Both are generic so the pump's composition rules and the
+/// arbitration are exercised against fakes under `zig build test`; the daemon is where the
+/// real adapters get named.
+const Hud = hud_mod.Hud(hud_mod.AppKitChrome);
+const Surface = surface.Surface(Hud, feedback.Cues);
+
+/// The Chrome's render timer fires here on the main thread with the clock it read, and the
+/// pump does the rest. The one reverse edge the HUD needs.
+fn hudRenderTramp(ctx: *anyopaque, now: f64) void {
+    const self: *Daemon = @ptrCast(@alignCast(ctx));
+    self.hud.render(now);
+}
+
 /// Real dependencies for the **Undo Runner** (undo.zig, ADR-0008). The Runner owns the whole
 /// deletion sequence on the insert worker; daemon.zig supplies only what the OS owns — the
 /// pause/grant gate, the frontmost read, the CGEvent deletion mechanism, and the two HUD cue
@@ -503,7 +517,7 @@ const RealUndoDeps = struct {
     inserter: *insertmod.Inserter,
     /// The Feedback Surface, for the Undo confirm/refuse HUD cue (ADR-0007, #226). A stable
     /// pointer into the daemon struct, wired at construction below.
-    surface: *surface.Surface,
+    surface: *Surface,
 
     /// Undo's own prerequisites (ADR-0008) — deliberately *not* the Configuration Phase and
     /// *not* the Supervisor's capture-enable gate. `⌃⌘⌫` is a system-wide chord and
@@ -614,7 +628,7 @@ const RealDeps = struct {
     rewrite: *RewriteAdapter,
     insertion: *InsertionAdapter,
     deadline: *DeadlineAdapter,
-    feedback: *surface.Surface,
+    feedback: *Surface,
     recorder: *recent_insertions.Ring,
 };
 const Coord = coord.Coordinator(RealDeps);
@@ -660,7 +674,11 @@ const Daemon = struct {
     capture: cap.Capture = .{},
     inserter: insertmod.Inserter = .{},
     cues: feedback.Cues = .{},
-    hud: hud_mod.Hud = .{},
+    /// The HUD's production Chrome (hud.zig): the panel, the CALayers, the CFRunLoopTimer
+    /// pump. Owned by the daemon rather than by the pump so `run()` and the Overlay toggle
+    /// can build it and read whether it built — the pump itself only ever hands it frames.
+    hud_chrome: hud_mod.AppKitChrome = .{},
+    hud: Hud = undefined,
     menu: menu_mod.Menu = .{},
     tap: tapmod.Tap = undefined, // built in run()
 
@@ -685,7 +703,7 @@ const Daemon = struct {
     /// concretely and reaches the OS through `RealUndoDeps`.
     undo: UndoRunner = undefined,
     deadline: DeadlineAdapter = .{},
-    feedback_surface: surface.Surface = undefined,
+    feedback_surface: Surface = undefined,
     coordinator: Coord = undefined,
 
     /// The Model Operation Runner (model_operation.zig, wayfinder #94) + its real Deps: the
@@ -1152,13 +1170,15 @@ const Daemon = struct {
     /// the built HUD and just stops showing it.
     fn menuSetOverlay(ctx: *anyopaque, on: bool) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
-        if (on and !self.hud.active) {
-            if (self.hud.init())
-                self.hud.startRenderPump()
+        if (on and !self.hud_chrome.isBuilt()) {
+            if (self.hud_chrome.init())
+                self.hud_chrome.startPump(self, hudRenderTramp)
             else
                 feedback.log("  overlay HUD: enabled but no display detected — sound-only feedback\n", .{});
         }
-        self.hud.setEnabled(on);
+        // A Chrome that never built cannot carry feedback, so the pump stays off and `isOn`
+        // keeps reporting the truth to the Feedback Surface.
+        self.hud.setEnabled(on and self.hud_chrome.isBuilt());
     }
 
     fn menuSetPaused(ctx: *anyopaque, paused: bool) void {
@@ -1262,17 +1282,24 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     daemon.inserter.init();
     daemon.cues.init();
 
-    // ---- overlay HUD (wayfinder #22): built on the main thread so its CFRunLoopTimer render
-    //      pump joins the SAME run loop the tap will block on. Off by config, or headless
-    //      with no display, both degrade to the sound cues without failing startup. ----
+    // ---- overlay HUD (wayfinder #22): the Chrome is built on the main thread so its
+    //      CFRunLoopTimer pump joins the SAME run loop the tap will block on. Off by config,
+    //      or headless with no display, both degrade to the sound cues without failing
+    //      startup. The pump is constructed FIRST: the Chrome's timer trampolines into it,
+    //      and both arms below publish into it. ----
+    daemon.hud = Hud.init(&daemon.hud_chrome);
     if (settings.overlay) {
-        if (daemon.hud.init()) {
-            daemon.hud.startRenderPump();
+        if (daemon.hud_chrome.init()) {
+            daemon.hud_chrome.startPump(&daemon, hudRenderTramp);
             feedback.log("  overlay HUD: on — the waveform pill carries start/processing feedback; the error cue is kept\n", .{});
         } else {
+            // No display: leave the pump disabled so `isOn` reports honestly and the
+            // Feedback Surface falls back to the sound cues, exactly like overlay=false.
+            daemon.hud.setEnabled(false);
             feedback.log("  overlay HUD: enabled but no display detected — sound-only feedback\n", .{});
         }
     } else {
+        daemon.hud.setEnabled(false);
         feedback.log("  overlay HUD: off (config.overlay=false) — sound-only feedback\n", .{});
     }
 

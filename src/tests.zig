@@ -19,6 +19,7 @@ test {
     _ = @import("vocab.zig"); // the pure vocabulary helpers: buildPrompt glossary + budget estimation
     _ = @import("session.zig");
     _ = @import("hud.zig");
+    _ = @import("surface.zig"); // the Feedback Surface: HUD-vs-cue arbitration, driven off fakes
     _ = @import("tap.zig"); // the recovery-chord classifier: ⌃⌘⌫ fed-event tests (#221)
     _ = @import("insert.zig"); // ensureTrailingSpace (the Insertion separator)
     _ = @import("grapheme.zig"); // the Undo deletion-count rule: grapheme clusters per ⌫ (#220)
