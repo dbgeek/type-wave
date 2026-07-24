@@ -275,10 +275,25 @@ pub fn InsertionAdapter(comptime Deps: type) type {
             const fresh = self.deps.focusedApp();
             if (undo_gate.evaluate(self.undo_expected_app, fresh)) |reason| {
                 feedback.log("  undo refused: {s} — nothing posted\n", .{@tagName(reason)});
+                // Refuse cue (ADR-0007, #226): the gate's app-changed / focus-null refusals
+                // collapse to the one red-shake cue; the specific reason is logged only (#213).
+                self.deps.undoRefused();
                 return;
             }
             self.deps.deleteChars(n);
             feedback.log("  undo: posted {d} backspaces to delete the last Insertion\n", .{n});
+            // Confirm cue (ADR-0007, #226): the backspaces posted — a green single-bloom.
+            self.deps.undoConfirmed();
+        }
+
+        /// Signal the Undo **refuse** cue for a trigger-side refusal (ADR-0007, #226): the
+        /// no-target (empty ring) and already-undone (#225) cases the trigger resolves before
+        /// any `submitUndo`, so it pokes the cue through this same sink rather than reaching
+        /// the HUD itself. A thin pass-through to the deps' HUD-refuse verb — the gate refusals
+        /// in `runUndo` above call `deps.undoRefused()` directly; this gives the trigger the
+        /// same single collapsed cue without coupling it to the feedback surface.
+        pub fn refuseUndo(self: *Self) void {
+            self.deps.undoRefused();
         }
 
         /// Process jobs until the owning daemon is quitting. Idle behavior stays with the
@@ -317,6 +332,9 @@ const FakeDeps = struct {
     /// Undo deletion tracking (#222): how many times `deleteChars` was called and the last N.
     deletes: usize = 0,
     last_delete_n: usize = 0,
+    /// Undo cue tracking (#226): how many confirm / refuse cues the adapter signalled.
+    undo_confirms: usize = 0,
+    undo_refuses: usize = 0,
     quit: bool = false,
     idles: usize = 0,
 
@@ -365,6 +383,14 @@ const FakeDeps = struct {
     fn deleteChars(self: *FakeDeps, n: usize) void {
         self.deletes += 1;
         self.last_delete_n = n;
+    }
+
+    fn undoConfirmed(self: *FakeDeps) void {
+        self.undo_confirms += 1;
+    }
+
+    fn undoRefused(self: *FakeDeps) void {
+        self.undo_refuses += 1;
     }
 
     fn shouldQuit(self: *FakeDeps) bool {
@@ -618,6 +644,9 @@ test "an undo job posts one backspace per grapheme cluster and never reports bac
     try std.testing.expectEqual(@as(usize, 0), adapter.deps.copies);
     // No paste on this path, so no deferred restore to drain — it stays out of finishInsert.
     try std.testing.expectEqual(@as(usize, 0), adapter.deps.finishes);
+    // A gated post confirms (green single-bloom), never refuses (ADR-0007, #226).
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.undo_confirms);
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.undo_refuses);
 }
 
 test "an undo job counts grapheme clusters, not bytes or UTF-16 units" {
@@ -640,6 +669,9 @@ test "an undo job with empty text is a silent no-op (N = 0) that never reads the
     try std.testing.expectEqual(@as(usize, 0), adapter.deps.completions);
     // Nothing would post, so the gate — and its cross-process NSWorkspace read — is skipped.
     try std.testing.expectEqual(@as(usize, 0), adapter.deps.focus_reads);
+    // N == 0 is a degenerate no-op, not one of the four refuse reasons — no cue either way.
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.undo_confirms);
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.undo_refuses);
 }
 
 test "an undo job is serialized against — never clobbers — a pending dictation job" {
@@ -678,6 +710,9 @@ test "the gate reads a fresh frontmost app at post time, not one captured at sub
     try std.testing.expect(adapter.runOnce());
     try std.testing.expectEqual(@as(usize, 1), adapter.deps.focus_reads); // read during runUndo
     try std.testing.expectEqual(@as(usize, 0), adapter.deps.deletes);
+    // A gate refusal shows the red-shake cue, never the green bloom (ADR-0007, #226).
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.undo_refuses);
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.undo_confirms);
 }
 
 test "a changed bundle id refuses — zero deletes posted" {
@@ -688,6 +723,9 @@ test "a changed bundle id refuses — zero deletes posted" {
     adapter.submitUndo("abc ", slack); // same display name, different bundle id
     try std.testing.expect(adapter.runOnce()); // the slot still drained this tick
     try std.testing.expectEqual(@as(usize, 0), adapter.deps.deletes);
+    // app_changed collapses to the single refuse cue (#213/#226).
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.undo_refuses);
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.undo_confirms);
 }
 
 test "a changed display name refuses — zero deletes posted" {
@@ -729,4 +767,18 @@ test "a fresh undo submit clears the expected identity of a prior job" {
     adapter.submitUndo("def ", null);
     try std.testing.expect(adapter.runOnce());
     try std.testing.expectEqual(@as(usize, 1), adapter.deps.deletes);
+    // Each refuse posts one cue: the second job's fail-closed refusal (#226).
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.undo_refuses);
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.undo_confirms);
+}
+
+test "refuseUndo signals the refuse cue directly — the trigger's no-target / already-undone path (#226)" {
+    // The trigger resolves those refusals before any submit, so it pokes the cue through the
+    // sink's refuseUndo rather than reaching the HUD itself. No deletion, no confirm.
+    var adapter = InsertionAdapter(FakeDeps).init(.{});
+
+    adapter.refuseUndo();
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.undo_refuses);
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.undo_confirms);
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.deletes);
 }

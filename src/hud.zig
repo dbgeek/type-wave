@@ -246,6 +246,14 @@ const dot_gap: f64 = dot_size * (10.0 / 12.0);
 const dot_bounce: f64 = @min(11.0, (pill_h - dot_size) / 2.0 - 1.0);
 const dots_row_w: f64 = 3 * dot_size + 2 * dot_gap; // the three-dot row, centred in the pill
 
+// The Undo confirm/refuse cue's single centred mark (ADR-0007, #216/#226): a ~6×14 pt
+// rounded bar, deliberately unlike the 26 recording bars and the 3 processing dots so an
+// Undo outcome never reads as recording/thinking. Its own net-new layer family — the pill
+// is `hidden` when it plays, so the distinct single-mark shape is what makes the cue
+// unmistakable. Green still-bloom = confirmed, red bloom + horizontal shake = refused.
+const mark_w: f64 = 6;
+const mark_h: f64 = 14;
+
 /// How many bars fit the pill. Also how much history it shows: at one level per
 /// 50 ms Capture buffer, n_bars/20 seconds scroll across it (26 bars ≈ 1.3 s).
 const n_bars: usize = @intFromFloat(@floor((pill_w - 2 * pad_x + bar_gap) / (bar_w + bar_gap)));
@@ -270,13 +278,53 @@ const cross_dur: f64 = 0.22 * motion_speed;
 /// wall-clock duration so a rare, soundless downgrade reliably registers.
 const pulse_dur: f64 = 0.30;
 
+/// A front-loaded easeOut ramp of a 0..1 fraction (the pulse/cue bloom shape): `1−(1−f)²`,
+/// clamped. Shared by the degraded pulse and the Undo cue bloom so both blooms read the
+/// same. Pure, unit-tested below.
+fn easeOut01(fraction: f64) f32 {
+    const f = std.math.clamp(fraction, 0.0, 1.0);
+    return @floatCast(1.0 - (1.0 - f) * (1.0 - f));
+}
+
 /// Amber intensity (0..1) of the degraded pulse `elapsed` seconds in: an easeOut ramp
 /// to full systemOrangeColor, which the following hide fade then removes, so the whole
 /// event reads as one amber bloom. Pure — the one place pulse-time becomes color weight,
 /// unit-tested below.
 fn pulseEnvelope(elapsed: f64) f32 {
-    const f = std.math.clamp(elapsed / pulse_dur, 0.0, 1.0);
-    return @floatCast(1.0 - (1.0 - f) * (1.0 - f));
+    return easeOut01(elapsed / pulse_dur);
+}
+
+// ---- the Undo confirm/refuse cue envelopes (ADR-0007, #226) ------------------
+// The cue is driven from `hidden` and owns its own show→bloom→hold→hide window (unlike the
+// amber pulse, which piggybacks an in-flight processing pill). These pure functions turn
+// cue-time into the mark's bloom weight and horizontal shake offset; the Sequencer below
+// orchestrates the window and the render pump paints the mark. Unit-tested below.
+
+/// How long the mark blooms in / the shake plays — reuses the ~300 ms pulse feel.
+const cue_bloom_dur: f64 = 0.30;
+/// From cue start until the hide fade begins: the ~300 ms bloom plus a brief hold so a
+/// deliberate user action reliably registers before it fades. Deliberately wall-clock
+/// (not motion_speed-scaled), like the amber pulse.
+const cue_shown_dur: f64 = 0.52;
+/// Peak horizontal shake amplitude (± pt) of the refuse cue — the "denied" gesture.
+const cue_shake_amp: f64 = 6.0;
+/// Oscillations of the refuse shake over `cue_bloom_dur` (~3 over ~300 ms).
+const cue_shake_osc: f64 = 3.0;
+
+/// Bloom weight (0 none .. 1 full systemGreen/systemRed) of the cue mark `elapsed` seconds
+/// in — the same easeOut ramp the amber pulse uses, so confirm and refuse both bloom once.
+fn cueBloom(elapsed: f64) f32 {
+    return easeOut01(elapsed / cue_bloom_dur);
+}
+
+/// Horizontal offset (pt) of the refuse shake `elapsed` seconds in: a decaying sine — ~3
+/// oscillations that settle to 0 by `cue_bloom_dur`, so the refuse reads as motion (the
+/// colorblind-safe half of the signal, ADR-0007), not hue alone. Zero outside the window.
+fn cueShake(elapsed: f64) f64 {
+    if (elapsed <= 0.0 or elapsed >= cue_bloom_dur) return 0.0;
+    const p = elapsed / cue_bloom_dur; // 0..1 across the shake
+    const decay = 1.0 - p; // linear settle to rest
+    return cue_shake_amp * decay * @sin(2.0 * std.math.pi * cue_shake_osc * p);
 }
 
 /// The PURE decision half of the pill's motion (the #47 prototype shape,
@@ -296,6 +344,17 @@ pub const Sequencer = struct {
     /// by `startPulse` and stepped by `pulseStep`. Orthogonal to the window lifecycle —
     /// the pump resolves the pill to `.hidden` when it elapses and the normal fade takes over.
     pulse_at: ?f64 = null,
+
+    /// The Undo cue's own window lifecycle (ADR-0007, #226), kept separate from `shown` /
+    /// `hide_at` because the cue is driven from `hidden` and owns the pill end-to-end: it
+    /// brings the pill up (show-fade), blooms + holds the mark, then hides it. While a cue
+    /// is in progress the pump takes the `cueStep` path and skips `step` entirely.
+    /// `cue_at` is the cue's start time (null = no cue armed); `cue_kind` its outcome;
+    /// `cue_shown` guards the one-shot show fade; `cue_hide_at` the deferred order-out.
+    cue_at: ?f64 = null,
+    cue_kind: CueKind = .confirm,
+    cue_shown: bool = false,
+    cue_hide_at: ?f64 = null,
 
     /// What happens to the panel window this tick.
     pub const WindowFx = enum {
@@ -378,6 +437,88 @@ pub const Sequencer = struct {
         self.pulse_at = null;
         return .{ .amber = 1.0, .ended = true };
     }
+
+    // ---- the Undo confirm/refuse cue (ADR-0007, #226) -----------------------
+
+    /// The two Undo outcomes the cue distinguishes. Both bloom the single mark once; only
+    /// the refuse also shakes (motion carries the outcome, so it survives colorblindness —
+    /// ADR-0007). All refuse reasons (app-changed, focus null, no-target, already-undone)
+    /// collapse to `.refuse`; the specific reason is logged only (#213).
+    pub const CueKind = enum { confirm, refuse };
+
+    /// One tick of the Undo cue. `owns` is true whenever a cue is in progress — the pump
+    /// takes this path and skips `step` — through the trailing order-out. `paint` marks the
+    /// visible phase (show / bloom / hold): the pump paints the mark with `bloom` weight and,
+    /// for a refuse, `shake_px` horizontal offset. During the hide fade `owns` stays true but
+    /// `paint` is false — the mark freezes and rides the panel fade out, like the dots do.
+    pub const Cue = struct {
+        owns: bool = false,
+        kind: CueKind = .confirm,
+        window: WindowFx = .none,
+        paint: bool = false,
+        bloom: f32 = 0,
+        shake_px: f64 = 0,
+    };
+
+    /// Arm the one-shot Undo cue of `kind`, played from `now`. The caller (render pump) only
+    /// arms it while the pill is `.hidden` and no cue is already in progress; `cueStep` then
+    /// owns the window until it orders out.
+    pub fn startCue(self: *Sequencer, now: f64, kind: CueKind) void {
+        self.cue_at = now;
+        self.cue_kind = kind;
+        self.cue_shown = false;
+        self.cue_hide_at = null;
+    }
+
+    /// Abandon an in-flight cue without ordering out. The pump calls this when a real
+    /// recording/processing pill preempts a playing cue (a Talk Key press right after the
+    /// recovery chord): the normal `step` path takes over the pill this same tick, so the
+    /// cue must not resume on a later hidden tick. Idempotent.
+    pub fn cancelCue(self: *Sequencer) void {
+        self.cue_at = null;
+        self.cue_hide_at = null;
+        self.cue_shown = false;
+    }
+
+    /// Drive the armed cue for `now`. Idle (`.{}`, `owns == false`) when none is armed. The
+    /// lifecycle: show-fade in around the first bloom tick → bloom the mark over
+    /// `cue_bloom_dur` (+ shake if refuse) → hold to `cue_shown_dur` → hide-fade → order out
+    /// once past the deadline, clearing itself so it fires exactly once.
+    pub fn cueStep(self: *Sequencer, now: f64) Cue {
+        const start = self.cue_at orelse return .{};
+        var out = Cue{ .owns = true, .kind = self.cue_kind };
+
+        // Hiding phase: the hold has ended, the panel is fading out. Order out once past the
+        // deadline (clearing the cue), else a frozen no-paint tick while CA plays the fade.
+        if (self.cue_hide_at) |deadline| {
+            if (now >= deadline) {
+                self.cue_at = null;
+                self.cue_hide_at = null;
+                self.cue_shown = false;
+                out.window = .order_out;
+            }
+            return out;
+        }
+
+        // Visible phase: bring the pill up on the first tick, then bloom + hold.
+        if (!self.cue_shown) {
+            self.cue_shown = true;
+            out.window = .show_fade;
+        }
+        const t = now - start;
+        if (t >= cue_shown_dur) {
+            // Hold done → start the hide fade. No paint: the mark is already at full bloom from
+            // the hold ticks, so — like the dots on a resolution — it freezes in place and the
+            // panel fade carries it out (ADR-0007's "the ordinary hide fade carries it out").
+            self.cue_hide_at = now + hide_dur;
+            out.window = .hide_fade;
+            return out;
+        }
+        out.paint = true;
+        out.bloom = cueBloom(t);
+        out.shake_px = if (self.cue_kind == .refuse) cueShake(t) else 0.0;
+        return out;
+    }
 };
 
 // ---- level → bar mapping (the seam carries raw linear RMS; mapping is render-side) ----
@@ -407,6 +548,7 @@ pub const Hud = struct {
     panel: id = null,
     bars: [n_bars]id = @splat(null), // the waveform — heights poked per tick
     dots: [3]id = @splat(null), // the processing animation
+    mark: id = null, // the Undo confirm/refuse single mark (ADR-0007, #226)
 
     /// False until `init` succeeds; false forever on a headless start. Every public
     /// method no-ops while false, so the daemon can call them unconditionally.
@@ -424,6 +566,11 @@ pub const Hud = struct {
     /// the resolution thread, consumed by the render pump (which arms the Sequencer's
     /// pulse and drives the amber envelope + self-hide). Guarded by `mu` like `pending_state`.
     pulse_pending: bool = false,
+    /// One-shot Undo confirm/refuse cue request (ADR-0007, #226). Set by `undoConfirm` /
+    /// `undoRefuse` from the trigger's run-loop thread or the insert worker, consumed by the
+    /// render pump (which arms the Sequencer's cue and drives the bloom/shake + self-hide).
+    /// `null` = none pending. Guarded by `mu` like `pending_state`.
+    cue_pending: ?Sequencer.CueKind = null,
     q: [level_queue_cap]f32 = @splat(0), // raw linear RMS, one sample per Capture buffer
     qlen: usize = 0,
 
@@ -524,6 +671,16 @@ pub const Hud = struct {
             msg1v(layer, "addSublayer:", dot.*);
         }
 
+        // The Undo cue's single centred mark (ADR-0007, #226): one more plain CALayer, built
+        // hidden alongside the bars/dots. Geometry is fixed here (a 6×14 pt rounded bar,
+        // centred); its color is semantic (systemGreen/systemRed), resolved at paint time in
+        // applyCueMark so it tracks light/dark like every other mark, no accent-refresh wiring.
+        self.mark = msg(cls("CALayer"), "layer");
+        msgBool(self.mark, "setHidden:", true);
+        msgDouble(self.mark, "setCornerRadius:", mark_w / 2.0);
+        msgRect(self.mark, "setFrame:", markFrame(0.0));
+        msg1v(layer, "addSublayer:", self.mark);
+
         // Built hidden — the daemon orders it in on the first Talk Key press.
         self.active = true;
         return true;
@@ -610,6 +767,32 @@ pub const Hud = struct {
         self.pulse_pending = true;
     }
 
+    /// Fire the Undo **confirm** cue (ADR-0007, #226): the single mark blooms systemGreen once,
+    /// holds, then self-hides. Called from the insert worker after a gated Undo posted its
+    /// backspaces (#222/#224). Thread-safe, no AppKit — the render pump does the bloom + fade.
+    /// No-op while inactive (headless) or overlay-disabled, and dropped by the pump unless the
+    /// pill is `.hidden` (an Undo only fires between Utterances), so it never fights a live pill.
+    pub fn undoConfirm(self: *Hud) void {
+        self.requestCue(.confirm);
+    }
+
+    /// Fire the Undo **refuse** cue (ADR-0007, #226): the single mark blooms systemRed and
+    /// shakes horizontally once, then self-hides. All refuse reasons (app-changed, focus null,
+    /// no-target, already-undone) collapse to this one cue; the reason is logged only (#213).
+    /// Called from the focus gate (#224) and the trigger's no-target / already-undone refusals
+    /// (#225). Thread-safe, no AppKit. Same inactive/disabled/non-hidden no-op as `undoConfirm`.
+    pub fn undoRefuse(self: *Hud) void {
+        self.requestCue(.refuse);
+    }
+
+    fn requestCue(self: *Hud, kind: Sequencer.CueKind) void {
+        if (!self.active) return;
+        os_unfair_lock_lock(&self.mu);
+        defer os_unfair_lock_unlock(&self.mu);
+        if (!self.enabled) return; // overlay off — no visual surface for the cue
+        self.cue_pending = kind;
+    }
+
     /// Queue one raw linear RMS sample (0..1 of full scale) — one Capture buffer's
     /// loudness, i.e. one new bar. Called from the audio queue's thread; no AppKit.
     /// Dropped unless the published state is `.recording`, so a straggler buffer
@@ -635,12 +818,35 @@ pub const Hud = struct {
         var st = self.pending_state;
         const pulse_req = self.pulse_pending;
         self.pulse_pending = false;
+        const cue_req = self.cue_pending;
+        self.cue_pending = null;
         const n = self.qlen;
         @memcpy(drained[0..n], self.q[0..n]);
         self.qlen = 0;
         os_unfair_lock_unlock(&self.mu);
 
         const now = CFAbsoluteTimeGetCurrent();
+
+        // Undo confirm/refuse cue (ADR-0007, #226): armed only from a `.hidden` pill (an Undo
+        // fires between Utterances) and only when no cue is already in progress, so it never
+        // fights a live recording/processing pill. While it owns the pill the pump paints the
+        // single mark and drives its own show→bloom→hold→hide window, skipping the normal
+        // step/marks path — the cue is a self-contained HUD path, not a reuse of the amber one.
+        if (st == .hidden) {
+            if (cue_req) |kind| {
+                if (self.seq.cue_at == null) self.seq.startCue(now, kind);
+            }
+            const cue = self.seq.cueStep(now);
+            if (cue.owns) {
+                self.renderCue(cue);
+                return;
+            }
+        } else if (self.seq.cue_at != null) {
+            // A recording/processing pill preempts an in-flight cue: drop it and fall through
+            // to the normal path so the new pill shows this tick. `applyMarks` hides the mark
+            // as it flips to bars/dots, so the abandoned mark never lingers under the waveform.
+            self.seq.cancelCue();
+        }
 
         // Degraded-insertion pulse (ADR-0004): arm on request while a processing pill is
         // up, tint the dots amber over ~300 ms, then resolve to `.hidden` so the ordinary
@@ -773,6 +979,11 @@ pub const Hud = struct {
     /// transaction so CA interpolates the opacities in the render server. Steady-state
     /// ticks (`keep`) skip every visibility poke.
     fn applyMarks(self: *Hud, fx: Sequencer.MarksFx) void {
+        // The Undo cue mark only ever shows during a cue (which owns the pill on its own path).
+        // Any family flip to the recording/processing marks means the pill is now carrying an
+        // Utterance, so the mark must be down — this also clears an abandoned mark if a Talk Key
+        // press preempted an in-flight cue (ADR-0007, #226).
+        if (fx != .keep) msgBool(self.mark, "setHidden:", true);
         switch (fx) {
             .keep => {},
             .bars => {
@@ -804,6 +1015,71 @@ pub const Hud = struct {
             },
         }
     }
+
+    /// Execute one tick of the Undo cue (ADR-0007, #226). Mirrors `render`'s two shapes: a
+    /// window-only tick during the hide fade / order-out (mark frozen, riding the panel fade
+    /// out — like the dots do), and a paint tick during the visible show/bloom/hold phase
+    /// that repaints the single mark inside its own disabled-actions transaction, nesting the
+    /// show-fade grouping when the pill first comes up. The cue owns the pill end-to-end, so
+    /// the bars/dots are forced hidden here — a prior Utterance may have left them visible.
+    fn renderCue(self: *Hud, cue: Sequencer.Cue) void {
+        if (!cue.paint) {
+            const pool = objc_autoreleasePoolPush();
+            defer objc_autoreleasePoolPop(pool);
+            switch (cue.window) {
+                .hide_fade => {
+                    animBegin(hide_dur);
+                    defer animEnd();
+                    msgDouble(msg(self.panel, "animator"), "setAlphaValue:", 0.0);
+                },
+                .order_out => {
+                    msgv(self.panel, "orderOut:");
+                    msgDouble(self.panel, "setAlphaValue:", 1.0);
+                    // Reset the mark for the next cue: hidden, full opacity, un-shaken.
+                    msgBool(self.mark, "setHidden:", true);
+                    msgFloat(self.mark, "setOpacity:", 1.0);
+                    msgRect(self.mark, "setFrame:", markFrame(0.0));
+                },
+                .none, .show_fade, .cancel_hide => {}, // mid-fade: CA is playing it
+            }
+            return;
+        }
+
+        const pool = objc_autoreleasePoolPush();
+        defer objc_autoreleasePoolPop(pool);
+
+        // Actions off for the raw layer pokes (same as `render`); the show-fade nests its own
+        // actions-enabled window grouping.
+        msgv(cls("CATransaction"), "begin");
+        msgBool(cls("CATransaction"), "setDisableActions:", true);
+        defer msgv(cls("CATransaction"), "commit");
+
+        self.applyCueMark(cue);
+
+        if (cue.window == .show_fade) {
+            // Content is already painted, so nothing stale flashes as it fades in.
+            msgDouble(self.panel, "setAlphaValue:", 0.0);
+            msgv(self.panel, "orderFrontRegardless"); // never makeKey — #20's recipe
+            animBegin(show_dur);
+            defer animEnd();
+            msgDouble(msg(self.panel, "animator"), "setAlphaValue:", 1.0);
+        }
+    }
+
+    /// Paint the Undo cue's single mark this tick: force the bars/dots hidden, resolve the
+    /// semantic outcome color at paint time (systemGreen confirmed / systemRed refused — so
+    /// it tracks light/dark with no accent-refresh machinery, the property ADR-0002/0004
+    /// protect), bloom it in via the layer opacity, and offset it horizontally for the refuse
+    /// shake. Runs inside `renderCue`'s disabled-actions transaction.
+    fn applyCueMark(self: *Hud, cue: Sequencer.Cue) void {
+        for (self.bars) |bar| msgBool(bar, "setHidden:", true);
+        for (self.dots) |dot| msgBool(dot, "setHidden:", true);
+        const color = systemColor(if (cue.kind == .confirm) "systemGreenColor" else "systemRedColor");
+        msg1v(self.mark, "setBackgroundColor:", cgColor(color));
+        msgFloat(self.mark, "setOpacity:", cue.bloom);
+        msgRect(self.mark, "setFrame:", markFrame(cue.shake_px));
+        msgBool(self.mark, "setHidden:", false);
+    }
 };
 
 /// The frame of bar `i` at height `h`, vertically centred. Bars never move in x/w —
@@ -815,6 +1091,17 @@ fn barFrame(i: usize, h: f64, x0: f64) NSRect {
         .y = (pill_h - h) / 2.0,
         .w = bar_w,
         .h = h,
+    };
+}
+
+/// The Undo cue mark's frame (ADR-0007, #226): a fixed 6×14 pt bar centred in the pill,
+/// shifted `dx` points horizontally for the refuse shake (0 for confirm and at rest).
+fn markFrame(dx: f64) NSRect {
+    return .{
+        .x = (pill_w - mark_w) / 2.0 + dx,
+        .y = (pill_h - mark_h) / 2.0,
+        .w = mark_w,
+        .h = mark_h,
     };
 }
 
@@ -838,6 +1125,17 @@ test "bare-marks geometry: dots never clip the 22 pt pill" {
     try std.testing.expect(top <= pill_h);
     // The three-dot row fits the pill width.
     try std.testing.expect(dots_row_w <= pill_w);
+}
+
+test "Undo cue mark: fits the pill and clears the shake without escaping it" {
+    // The 6×14 pt mark is centred and never clips the 22 pt pill vertically…
+    try std.testing.expect(mark_h <= pill_h);
+    try std.testing.expect((pill_h - mark_h) / 2.0 >= 0.0);
+    // …and even at peak shake amplitude the mark stays inside the pill horizontally.
+    const left = (pill_w - mark_w) / 2.0 - cue_shake_amp;
+    const right = (pill_w - mark_w) / 2.0 + cue_shake_amp + mark_w;
+    try std.testing.expect(left >= 0.0);
+    try std.testing.expect(right <= pill_w);
 }
 
 test "levelToNorm: floor and below read flat" {
@@ -1002,4 +1300,130 @@ test "pulse 2: the pump's pulse→hide composition freezes amber and fades out" 
         seq.step(.hidden, 100.05 + pulse_dur),
     );
     try std.testing.expectEqual(@as(?f64, 100.05 + pulse_dur + hide_dur), seq.hide_at);
+}
+
+// ---- the Undo confirm/refuse cue (ADR-0007, #226) ---------------------------
+
+test "cueBloom: ramps 0 → full and clamps at both ends" {
+    try std.testing.expectEqual(@as(f32, 0.0), cueBloom(0.0));
+    try std.testing.expectEqual(@as(f32, 1.0), cueBloom(cue_bloom_dur));
+    try std.testing.expectEqual(@as(f32, 1.0), cueBloom(cue_bloom_dur * 2.0)); // clamped
+    try std.testing.expectEqual(@as(f32, 0.0), cueBloom(-1.0)); // clamped
+    // Monotonic non-decreasing across the ramp (easeOut is front-loaded, never dips).
+    var prev: f32 = -1.0;
+    var i: usize = 0;
+    while (i <= 10) : (i += 1) {
+        const v = cueBloom(cue_bloom_dur * @as(f64, @floatFromInt(i)) / 10.0);
+        try std.testing.expect(v >= prev);
+        prev = v;
+    }
+}
+
+test "cueShake: bounded, ~3 oscillations, and settled to rest by the bloom's end" {
+    // At rest at both ends: no offset before the shake starts or once it has settled.
+    try std.testing.expectEqual(@as(f64, 0.0), cueShake(0.0));
+    try std.testing.expectEqual(@as(f64, 0.0), cueShake(cue_bloom_dur));
+    try std.testing.expectEqual(@as(f64, 0.0), cueShake(cue_bloom_dur + 0.1));
+    // Bounded by the amplitude the whole way through, and it actually moves off centre.
+    var moved = false;
+    var crossings: usize = 0;
+    var prev: f64 = 0.0;
+    var i: usize = 1;
+    while (i < 60) : (i += 1) {
+        const t = cue_bloom_dur * @as(f64, @floatFromInt(i)) / 60.0;
+        const x = cueShake(t);
+        try std.testing.expect(@abs(x) <= cue_shake_amp + 0.0001);
+        if (@abs(x) > 0.5) moved = true;
+        if ((x > 0.0) != (prev > 0.0) and prev != 0.0) crossings += 1;
+        prev = x;
+    }
+    try std.testing.expect(moved);
+    // ~3 oscillations ⇒ several zero-crossings (a pure ±swing back and forth) — the motion
+    // half of the refuse signal, so it reads without depending on the red hue (ADR-0007).
+    try std.testing.expect(crossings >= 4);
+}
+
+test "cue 1: a confirm cue shows, blooms, holds, then self-hides exactly once" {
+    var seq = Sequencer{};
+    // Nothing armed → idle, the pump takes the normal path.
+    try std.testing.expectEqual(Sequencer.Cue{}, seq.cueStep(100.0));
+
+    seq.startCue(100.0, .confirm);
+    // First tick brings the pill up around the mark at bloom 0 (easeOut(0) == 0).
+    const a = seq.cueStep(100.0);
+    try std.testing.expect(a.owns and a.paint and a.window == .show_fade);
+    try std.testing.expectEqual(Sequencer.CueKind.confirm, a.kind);
+    try std.testing.expectEqual(@as(f32, 0.0), a.bloom);
+    try std.testing.expectEqual(@as(f64, 0.0), a.shake_px); // confirm never shakes
+
+    // Mid-bloom: the mark paints with a rising weight, the show fade is not re-issued.
+    const b = seq.cueStep(100.0 + cue_bloom_dur / 2.0);
+    try std.testing.expect(b.owns and b.paint and b.window == .none);
+    try std.testing.expect(b.bloom > a.bloom);
+
+    // Held after the bloom completes — still painting at full, no window change.
+    const c = seq.cueStep(100.0 + cue_bloom_dur + 0.05);
+    try std.testing.expect(c.owns and c.paint and c.window == .none);
+    try std.testing.expectEqual(@as(f32, 1.0), c.bloom);
+
+    // The hold elapses → the hide fade starts and arms the order-out. The tick is NOT a paint
+    // tick: the mark froze at full bloom during the hold, so `renderCue` takes its window-only
+    // (`!paint`) branch and actually issues the panel fade — a paint tick here would repaint
+    // the mark and skip the fade, snapping the pill out (the ADR-0007 hide-fade regression).
+    // A tick safely past the hold boundary (the wall clock crosses it within a tick or two).
+    const hide_start = 100.0 + cue_shown_dur + 0.01;
+    const d = seq.cueStep(hide_start);
+    try std.testing.expect(d.owns and !d.paint and d.window == .hide_fade);
+    try std.testing.expectEqual(@as(?f64, hide_start + hide_dur), seq.cue_hide_at);
+
+    // Mid hide-fade: still owned, but frozen (no paint) — the mark rides the panel fade out.
+    const e = seq.cueStep(hide_start + hide_dur / 2.0);
+    try std.testing.expect(e.owns and !e.paint and e.window == .none);
+
+    // Past the deadline: order out exactly once, clearing the cue…
+    const f = seq.cueStep(hide_start + hide_dur);
+    try std.testing.expect(f.owns and !f.paint and f.window == .order_out);
+    try std.testing.expectEqual(@as(?f64, null), seq.cue_at);
+    // …and from here the pump is back on the normal path.
+    try std.testing.expectEqual(Sequencer.Cue{}, seq.cueStep(hide_start + hide_dur + 0.05));
+}
+
+test "cue 2: a refuse cue carries a horizontal shake where a confirm does not" {
+    var refuse = Sequencer{};
+    refuse.startCue(200.0, .refuse);
+    _ = refuse.cueStep(200.0); // show tick (shake starts at 0)
+    const r = refuse.cueStep(200.0 + cue_bloom_dur / 4.0);
+    try std.testing.expectEqual(Sequencer.CueKind.refuse, r.kind);
+    try std.testing.expect(r.paint and r.shake_px != 0.0); // motion carries the outcome
+
+    var confirm = Sequencer{};
+    confirm.startCue(200.0, .confirm);
+    _ = confirm.cueStep(200.0);
+    const g = confirm.cueStep(200.0 + cue_bloom_dur / 4.0);
+    try std.testing.expectEqual(@as(f64, 0.0), g.shake_px); // green still-bloom, no shake
+}
+
+test "cue: cancelCue abandons an in-flight cue so it never resumes on a later hidden tick" {
+    // Models a Talk Key press right after the recovery chord: the pump cancels the cue and
+    // hands the pill to the normal path. A subsequent hidden tick must NOT resume the cue.
+    var seq = Sequencer{};
+    seq.startCue(400.0, .refuse);
+    try std.testing.expect(seq.cueStep(400.0).owns); // cue is live
+    seq.cancelCue();
+    try std.testing.expectEqual(@as(?f64, null), seq.cue_at);
+    // Back on a hidden tick, the cue stays gone — the pump takes the normal path.
+    try std.testing.expectEqual(Sequencer.Cue{}, seq.cueStep(400.10));
+}
+
+test "cue: a request while a cue is already in progress is ignored by the pump guard" {
+    // The pump only calls startCue when cue_at == null, so an overlapping request can't
+    // restart a playing cue. Model that here: the second startCue is simply not issued.
+    var seq = Sequencer{};
+    seq.startCue(300.0, .confirm);
+    const first = seq.cueStep(300.0);
+    try std.testing.expect(first.owns and first.window == .show_fade);
+    // A second tick without a fresh startCue keeps blooming the SAME confirm cue.
+    const second = seq.cueStep(300.0 + 0.05);
+    try std.testing.expect(second.owns and second.window == .none);
+    try std.testing.expectEqual(Sequencer.CueKind.confirm, second.kind);
 }

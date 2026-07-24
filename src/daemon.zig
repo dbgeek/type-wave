@@ -454,6 +454,10 @@ const LocalProvisioner = local_provisioner.LocalProvisioner(LocalProvisionerDeps
 const RealInsertionDeps = struct {
     inserter: *insertmod.Inserter,
     store: *config.Store,
+    /// The Feedback Surface, for the Undo confirm/refuse HUD cue (ADR-0007, #226): the insert
+    /// worker's `runUndo` pokes it on a gated post (confirm) or a gate refusal (refuse). A
+    /// stable pointer into the daemon struct, wired at construction below.
+    surface: *surface.Surface,
 
     co_ctx: *anyopaque = undefined,
     on_done: *const fn (*anyopaque, coord.UtteranceId, coord.InsertResult, ?coord.AppIdentity) void = undefined,
@@ -487,6 +491,18 @@ const RealInsertionDeps = struct {
     /// adapter's `runUndo` has a concrete mechanism to call once the trigger lands.
     pub fn deleteChars(self: *RealInsertionDeps, n: usize) void {
         self.inserter.deleteChars(n);
+    }
+    /// The Undo confirm cue (ADR-0007, #226): a green single-bloom on the HUD after a gated
+    /// Undo posted its backspaces. Routed through the Feedback Surface so all HUD arbitration
+    /// stays in one place; HUD-only, so a disabled/headless overlay just shows nothing.
+    pub fn undoConfirmed(self: *RealInsertionDeps) void {
+        self.surface.undoConfirmed();
+    }
+    /// The Undo refuse cue (ADR-0007, #226): a red bloom + shake on the HUD when the gate
+    /// refuses (worker) — the trigger's no-target / already-undone refusals reach it via the
+    /// same Surface verb through `refuseUndo`.
+    pub fn undoRefused(self: *RealInsertionDeps) void {
+        self.surface.undoRefused();
     }
     pub fn shouldQuit(_: *RealInsertionDeps) bool {
         return g_quit.load(.acquire);
@@ -765,8 +781,10 @@ const Daemon = struct {
     /// Insertions record (#212 — single newest, no stack) and hands its with-space bytes plus its
     /// stored App Identity to the insert worker's undo slot (#222), which evaluates the app-level
     /// focus gate against a fresh frontmost read and backspaces only on a match (#224). Empty ring
-    /// → nothing posted. Still to graduate: the `undone` flag and the HUD confirm/refuse feedback
-    /// (#226). Runs on the run-loop thread; the resolution is a bounded ring read + a slot copy,
+    /// → nothing posted. Each outcome shows a glanceable HUD cue (ADR-0007, #226): a green
+    /// single-bloom on a posted delete, a red bloom + shake on any refusal (the trigger's
+    /// no-target / already-undone here, the gate's on the worker), driven from the hidden pill.
+    /// Runs on the run-loop thread; the resolution is a bounded ring read + a slot copy,
     /// both fast (a slow tap callback makes the OS disable the tap) — the gate's cross-process
     /// NSWorkspace read deliberately happens on the worker, never here.
     fn onRecoveryChord(ctx: ?*anyopaque) void {
@@ -1232,7 +1250,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     daemon.deadline.io = io;
     daemon.rewrite_http = .{ .allocator = alloc, .io = io };
     daemon.rewrite = RewriteAdapter.init(.{ .daemon = &daemon });
-    daemon.insertion = InsertionAdapter.init(.{ .inserter = &daemon.inserter, .store = &daemon.store });
+    daemon.insertion = InsertionAdapter.init(.{ .inserter = &daemon.inserter, .store = &daemon.store, .surface = &daemon.feedback_surface });
     daemon.coordinator = Coord.init(.{
         .audio = &daemon.capture,
         .backends = &daemon.transcription,
