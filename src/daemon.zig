@@ -1085,6 +1085,9 @@ const Daemon = struct {
         const n = self.recent_insertions.textForStamp(stamp, &buf);
         if (n == 0) return; // evicted since the projection was taken — nothing to re-insert
         self.insertion.submitBypass(buf[0..n]);
+        // Redo edge (#225): re-inserting an undone entry restores its text, so clear the flag
+        // and the row stops rendering dimmed. A no-op on an entry that was never undone.
+        self.recent_insertions.clearUndone(stamp);
     }
 
     /// A session-shaped setting changed: nudge the Session to cycle when idle. Before

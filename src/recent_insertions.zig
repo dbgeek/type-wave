@@ -49,6 +49,12 @@ pub const Record = struct {
     timestamp: i64 = 0,
     outcome: coord.InsertResult = .ok,
     focused_app: ?coord.AppIdentity = null,
+    /// Set true by `markUndone` after a committed Undo (#225, single-shot model): the record
+    /// is **kept and flagged**, not removed, so a second `⌃⌘⌫` on an already-undone newest
+    /// record refuses instead of eating earlier text, and the masked View renders it dimmed
+    /// where a re-insert acts as a redo. Explicitly reset in `record` on slot reuse so an
+    /// evicted-then-reused slot never inherits a stale flag.
+    undone: bool = false,
 
     /// The with-space bytes that hit the cursor.
     pub fn inserted(self: *const Record) []const u8 {
@@ -76,10 +82,15 @@ extern "c" fn os_unfair_lock_lock(lock: *OsUnfairLock) void;
 extern "c" fn os_unfair_lock_unlock(lock: *OsUnfairLock) void;
 
 /// What `newestForUndo` hands the Undo trigger: how many `inserted` bytes were copied into
-/// the caller's buffer, plus the record's stored App Identity for the focus gate (#224).
+/// the caller's buffer, the record's stored App Identity for the focus gate (#224), and — for
+/// the single-shot model (#225) — its stable `timestamp` (so a committed Undo can flag *this*
+/// record via `markUndone`) and whether it is `undone` already (so a second `⌃⌘⌫` on an
+/// already-undone newest record refuses instead of eating earlier text).
 pub const UndoTarget = struct {
     len: usize,
     focused_app: ?coord.AppIdentity,
+    timestamp: i64,
+    undone: bool,
 };
 
 pub const Ring = struct {
@@ -111,6 +122,10 @@ pub const Ring = struct {
         slot.timestamp = rec.timestamp;
         slot.outcome = rec.outcome;
         slot.focused_app = rec.focused_app;
+        // Prefactor (#225): `record` does not reset every field on slot reuse, so a reused
+        // slot could otherwise inherit a stale `undone` from the evicted record it overwrites.
+        // Reset it explicitly — a fresh Insertion is never pre-undone.
+        slot.undone = false;
         self.head = (self.head + 1) % capacity;
         if (self.count < capacity) self.count += 1;
     }
@@ -127,17 +142,26 @@ pub const Ring = struct {
     pub fn textForStamp(self: *Ring, stamp: i64, out: []u8) usize {
         self.mu.lock();
         defer self.mu.unlock();
+        const idx = self.indexForStamp(stamp) orelse return 0;
+        const rec = &self.buf[idx];
+        const n = @min(rec.inserted_len, out.len);
+        @memcpy(out[0..n], rec.inserted_bytes[0..n]);
+        return n;
+    }
+
+    /// The circular-buffer index of the live record with capture `stamp`, walking newest-first,
+    /// or null when none matches (empty ring or the entry was evicted). The single home of the
+    /// stamp→slot lookup shared by `textForStamp` and `setUndone`. **Assumes the leaf lock is
+    /// already held** — every caller takes `self.mu` for its own bounded critical section, so
+    /// this reads `head`/`count`/`buf` without locking (it must not, or it would deadlock the
+    /// non-re-entrant `os_unfair_lock`).
+    fn indexForStamp(self: *Ring, stamp: i64) ?usize {
         var i: usize = 0;
         while (i < self.count) : (i += 1) {
             const idx = (self.head + capacity - 1 - i) % capacity;
-            const rec = &self.buf[idx];
-            if (rec.timestamp == stamp) {
-                const n = @min(rec.inserted_len, out.len);
-                @memcpy(out[0..n], rec.inserted_bytes[0..n]);
-                return n;
-            }
+            if (self.buf[idx].timestamp == stamp) return idx;
         }
-        return 0;
+        return null;
     }
 
     /// The number of live records.
@@ -164,7 +188,32 @@ pub const Ring = struct {
         const rec = &self.buf[idx];
         const n = @min(rec.inserted_len, out.len);
         @memcpy(out[0..n], rec.inserted_bytes[0..n]);
-        return .{ .len = n, .focused_app = rec.focused_app };
+        return .{ .len = n, .focused_app = rec.focused_app, .timestamp = rec.timestamp, .undone = rec.undone };
+    }
+
+    /// Flag the record with capture `stamp` as undone, walking newest-first under the leaf
+    /// lock (#225). The Undo trigger path calls this on a committed Undo — the deletion
+    /// mechanism (#222) deliberately never touches the ring, so the `undone` bookkeeping is
+    /// the trigger's. Keyed by the stable `timestamp` (the same identity `textForStamp` and
+    /// the menu's reveal use) so a concurrent Insertion shifting the newest-first order can
+    /// never flag a neighbouring record; a stale stamp is a silent no-op. Undo pushes **no**
+    /// new ring entry — the record is kept and flagged, never removed.
+    pub fn markUndone(self: *Ring, stamp: i64) void {
+        self.setUndone(stamp, true);
+    }
+
+    /// Clear the undone flag on the record with capture `stamp` — the redo edge (#225): a
+    /// re-insert of an undone entry restores its text, so the masked View must stop rendering
+    /// it dimmed. Same newest-first, stamp-keyed, leaf-locked walk as `markUndone`; a stamp
+    /// that is missing or already un-undone is a silent no-op.
+    pub fn clearUndone(self: *Ring, stamp: i64) void {
+        self.setUndone(stamp, false);
+    }
+
+    fn setUndone(self: *Ring, stamp: i64, value: bool) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.indexForStamp(stamp)) |idx| self.buf[idx].undone = value;
     }
 
     /// Snapshot-copy the live records **newest-first** into `out`, returning the count. The
@@ -398,6 +447,70 @@ test "newestForUndo truncates to the caller's buffer without overrun" {
     const target = ring.newestForUndo(&small).?;
     try expectEqual(@as(usize, 3), target.len);
     try expectEqualStrings("abc", small[0..3]);
+}
+
+test "a fresh record starts un-undone (default false)" {
+    var ring = Ring{};
+    ring.record(stamped("hello ", 1));
+    var out: [max_bytes]u8 = undefined;
+    try expect(!ring.newestForUndo(&out).?.undone);
+}
+
+test "markUndone flips the flag on the matching stamp only, leaving the others untouched" {
+    var ring = Ring{};
+    ring.record(stamped("first ", 100));
+    ring.record(stamped("second ", 200));
+    ring.record(stamped("third ", 300));
+
+    ring.markUndone(200);
+
+    var out: [capacity]Record = undefined;
+    _ = ring.snapshot(&out); // newest-first: third(300), second(200), first(100)
+    try expect(!out[0].undone); // 300 untouched
+    try expect(out[1].undone); //  200 flipped
+    try expect(!out[2].undone); // 100 untouched
+}
+
+test "markUndone on an unknown or evicted stamp is a silent no-op" {
+    var ring = Ring{};
+    ring.record(stamped("only ", 100));
+    ring.markUndone(999); // never recorded
+    var out: [capacity]Record = undefined;
+    _ = ring.snapshot(&out);
+    try expect(!out[0].undone);
+}
+
+test "newestForUndo reports the newest record's undone flag (the trigger's refuse input)" {
+    var ring = Ring{};
+    ring.record(stamped("target ", 7));
+    var out: [max_bytes]u8 = undefined;
+    try expect(!ring.newestForUndo(&out).?.undone);
+    ring.markUndone(7);
+    try expect(ring.newestForUndo(&out).?.undone);
+    try expectEqual(@as(i64, 7), ring.newestForUndo(&out).?.timestamp);
+}
+
+test "clearUndone un-flags a record (the redo edge) so it stops rendering dimmed" {
+    var ring = Ring{};
+    ring.record(stamped("redo me ", 42));
+    ring.markUndone(42);
+    var out: [max_bytes]u8 = undefined;
+    try expect(ring.newestForUndo(&out).?.undone);
+    ring.clearUndone(42);
+    try expect(!ring.newestForUndo(&out).?.undone);
+}
+
+test "a reused slot starts un-undone — no stale flag inherited on eviction (#225 prefactor)" {
+    var ring = Ring{};
+    // Fill the ring, flag the oldest live slot, then push enough records to evict and reuse it.
+    var i: usize = 0;
+    while (i < capacity) : (i += 1) ring.record(stamped("x ", @intCast(i))); // stamps 0..19
+    ring.markUndone(0); // flag the oldest
+    // One more write reuses slot 0 (the evicted stamp-0 record's slot) for a fresh Insertion.
+    ring.record(stamped("fresh ", 100));
+    var out: [max_bytes]u8 = undefined;
+    // The newest (stamp 100) landed in the reused slot and must not inherit stamp 0's flag.
+    try expect(!ring.newestForUndo(&out).?.undone);
 }
 
 test "record then snapshot on the same ring does not self-deadlock (leaf lock is not re-entrant)" {

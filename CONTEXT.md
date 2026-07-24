@@ -85,8 +85,9 @@ hint, not the Focused Target: it names the app, never the text field.
 **Recent Insertions View**:
 The **text-free, masked projection** of the Recent Insertions ring that rides through the
 pure Status Item pipeline (`status_item.project` / `derive`) for rendering — one
-`HistoryEntryView` per entry: `{ char_len, app: AppIdentity, timestamp, outcome }`, no
-transcript bytes. It is fixed-size and `std.meta.eql`-comparable so the menu's snapshot
+`HistoryEntryView` per entry: `{ char_len, app: AppIdentity, timestamp, outcome, undone }`, no
+transcript bytes (`undone` marks a record undone by `⌃⌘⌫`, rendered dimmed where a re-insert
+redoes it). It is fixed-size and `std.meta.eql`-comparable so the menu's snapshot
 early-out keeps working, and it keeps transcript text out of the projected `Snapshot`
 entirely (privacy by construction): the actual `inserted` / `raw` text is fetched from the
 authoritative ring on demand only at reveal / copy / re-insert. Distinct from the Insertion

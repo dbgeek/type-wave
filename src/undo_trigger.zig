@@ -35,7 +35,20 @@ pub fn trigger(ring: *recent_insertions.Ring, sink: anytype) void {
         feedback.log("  undo refused: {s} — the ring holds no Insertion to delete\n", .{@tagName(undo_gate.RefuseReason.no_target)});
         return;
     };
+    // Single-shot (#225): the newest record is undone already, so a second `⌃⌘⌫` on it would
+    // eat the *earlier* text. Refuse instead — the record stays flagged, re-insert redoes it.
+    if (target.undone) {
+        feedback.log("  undo refused: {s} — the newest Insertion is already undone\n", .{@tagName(undo_gate.RefuseReason.already_undone)});
+        return;
+    }
     sink.submitUndo(buf[0..target.len], target.focused_app);
+    // Flag the record undone (#225): Undo is single-shot and pushes no new ring entry, so the
+    // record is kept and flagged in place. This is the trigger path's job on a committed Undo —
+    // the deletion mechanism (#222) deliberately never touches the ring. Keyed by the record's
+    // stable `timestamp` so a concurrent Insertion can't flag a neighbour. The worker-side focus
+    // gate (#224) may still refuse to post the backspaces; a misfire in the wrong app dims the
+    // record without deleting, an accepted edge of the app-level model (#209/#212).
+    ring.markUndone(target.timestamp);
 }
 
 // ============================================================================
@@ -138,4 +151,40 @@ test "trigger submits the with-space inserted, never the pre-Rewrite raw" {
     trigger(&ring, &sink);
 
     try expectEqualStrings("At 18:00 ", sink.lastText());
+}
+
+test "trigger flags the newest record undone after submitting it (#225)" {
+    var ring = recent_insertions.Ring{};
+    ring.record(.{ .inserted = "undo me ", .raw = null, .timestamp = 55, .outcome = .ok, .focused_app = null });
+    var sink = FakeSink{};
+
+    trigger(&ring, &sink);
+
+    try expectEqual(@as(usize, 1), sink.submits);
+    var out: [recent_insertions.max_bytes]u8 = undefined;
+    try expect(ring.newestForUndo(&out).?.undone); // kept and flagged, not removed
+}
+
+test "a second fire on an already-undone newest record refuses — no submit (#225)" {
+    var ring = recent_insertions.Ring{};
+    ring.record(.{ .inserted = "older ", .raw = null, .timestamp = 10, .outcome = .ok, .focused_app = null });
+    ring.record(.{ .inserted = "newest ", .raw = null, .timestamp = 20, .outcome = .ok, .focused_app = null });
+    var sink = FakeSink{};
+
+    trigger(&ring, &sink); // first fire: submits the newest and flags it undone
+    trigger(&ring, &sink); // second fire: newest is undone → refuse, don't eat "older "
+
+    // Exactly one submit total: the second fire posted nothing rather than deleting earlier text.
+    try expectEqual(@as(usize, 1), sink.submits);
+    try expectEqualStrings("newest ", sink.lastText());
+}
+
+test "trigger adds no new ring entry — the record is kept and flagged, count unchanged (#225)" {
+    var ring = recent_insertions.Ring{};
+    ring.record(.{ .inserted = "solo ", .raw = null, .timestamp = 1, .outcome = .ok, .focused_app = null });
+    var sink = FakeSink{};
+
+    trigger(&ring, &sink);
+
+    try expectEqual(@as(usize, 1), ring.len()); // still one record; Undo pushes nothing
 }
