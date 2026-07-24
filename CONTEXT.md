@@ -67,7 +67,8 @@ _Avoid_: typing, pasting (those name mechanisms, not the act)
 The retained receipt of one Insertion, kept in the in-memory **Recent Insertions** ring
 (the last N, newest-first, surfaced under the Status Item menu). One record holds: the
 `inserted` text (the with-space bytes actually placed at the cursor — post-Rewrite when
-Backtrack ran, raw otherwise; its char count is what an Undo would delete); `raw`, the
+Backtrack ran, raw otherwise; its grapheme-cluster count — `graphemeCount`, per #211 —
+is what an Undo would delete); `raw`, the
 trimmed Final Transcript, present only when it differs from `inserted` (i.e. a Rewrite
 changed it); a capture `timestamp`; the `outcome` (`ok` / `degraded` / `failed`, known
 only at `onInserted`); and a best-effort **App Identity** hint (`focused_app` — bundle id

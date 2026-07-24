@@ -20,6 +20,7 @@ test {
     _ = @import("session.zig");
     _ = @import("hud.zig");
     _ = @import("insert.zig"); // ensureTrailingSpace (the Insertion separator)
+    _ = @import("grapheme.zig"); // the Undo deletion-count rule: grapheme clusters per ⌫ (#220)
     _ = @import("insertion_adapter.zig");
     _ = @import("recent_insertions.zig"); // the daemon-owned Recent Insertions ring (ADR-0006)
     _ = @import("app_focus.zig"); // the best-effort App Identity reader (NSWorkspace boundary)
