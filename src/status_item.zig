@@ -82,6 +82,9 @@ pub const HistoryEntryView = struct {
     app: ?coord.AppIdentity = null,
     timestamp: i64 = 0,
     outcome: coord.InsertResult = .ok,
+    /// The record was undone by `⌃⌘⌫` (#225, single-shot model): the row renders dimmed and a
+    /// re-insert of it acts as a redo. Masked like every other field — no transcript bytes.
+    undone: bool = false,
 };
 
 /// Project one authoritative Insertion Record to its text-free view. Reads the record's
@@ -94,6 +97,7 @@ pub fn historyEntryView(rec: *const recent_insertions.Record) HistoryEntryView {
         .app = rec.focused_app,
         .timestamp = rec.timestamp,
         .outcome = rec.outcome,
+        .undone = rec.undone,
     };
 }
 
@@ -177,6 +181,8 @@ pub const HistoryEntry = struct {
     char_len: u16 = 0,
     app: ?coord.AppIdentity = null,
     timestamp: i64 = 0,
+    /// Undone by `⌃⌘⌫` (#225): the row renders dimmed with an `[undone]` marker; re-insert redoes.
+    undone: bool = false,
 };
 
 /// The rendered Recent Insertions View: newest-first entries, `[0..count]` live.
@@ -220,6 +226,7 @@ fn deriveHistory(s: Snapshot) HistoryView {
             .char_len = entry.char_len,
             .app = entry.app,
             .timestamp = entry.timestamp,
+            .undone = entry.undone,
         };
     }
     return view;
@@ -431,25 +438,38 @@ fn historyTagSuffix(tag: HistoryTag) []const u8 {
     };
 }
 
-/// Assemble one history row: `<dot> <body> · <App> · <time>  [<tag>]`, the shared shape of the
-/// masked and revealed labels — only `body` differs (the `•` run + char count vs the actual
-/// text). Keeping the dot/app/time/tag scaffolding single-homed means the row shape is edited
-/// in one place. Returns a sentinel-terminated slice for `NSString`; `now_ms` is the caller's
-/// clock.
+/// The dimmed leading glyph for an undone row (#225): a hollow white circle replaces the
+/// outcome dot so the entry visually reads as de-emphasized (a menu title carries no per-glyph
+/// colour, so the "dim" rides the glyph, exactly as the outcome colour does). The trailing
+/// `[undone]` marker keeps the state unmistakable — and the degraded/failed tag still shows.
+fn historyLeadGlyph(entry: HistoryEntry) [:0]const u8 {
+    // ⚪ (U+26AA) when undone, else the outcome dot.
+    return if (entry.undone) "\xe2\x9a\xaa" else historyDotGlyph(entry.dot);
+}
+fn historyUndoneSuffix(entry: HistoryEntry) []const u8 {
+    return if (entry.undone) "  [undone]" else "";
+}
+
+/// Assemble one history row: `<dot> <body> · <App> · <time>  [<tag>]  [undone]`, the shared
+/// shape of the masked and revealed labels — only `body` differs (the `•` run + char count vs
+/// the actual text). An undone entry (#225) leads with a dimmed glyph and trails with an
+/// `[undone]` marker. Keeping the scaffolding single-homed means the row shape is edited in one
+/// place. Returns a sentinel-terminated slice for `NSString`; `now_ms` is the caller's clock.
 fn historyRowLabel(buf: []u8, entry: HistoryEntry, body: []const u8, now_ms: i64) [:0]const u8 {
-    const dot = historyDotGlyph(entry.dot);
+    const dot = historyLeadGlyph(entry);
     const tag = historyTagSuffix(entry.tag);
+    const undone = historyUndoneSuffix(entry);
     var when: [24]u8 = undefined;
     const ago = relativeTime(&when, now_ms - entry.timestamp);
     const mid = " \xc2\xb7 "; // " · " (U+00B7)
     if (entry.app) |app| {
         if (app.displayName().len > 0)
-            return std.fmt.bufPrintSentinel(buf, "{s} {s}{s}{s}{s}{s}{s}", .{
-                dot, body, mid, app.displayName(), mid, ago, tag,
+            return std.fmt.bufPrintSentinel(buf, "{s} {s}{s}{s}{s}{s}{s}{s}", .{
+                dot, body, mid, app.displayName(), mid, ago, tag, undone,
             }, 0) catch dot;
     }
-    return std.fmt.bufPrintSentinel(buf, "{s} {s}{s}{s}{s}", .{
-        dot, body, mid, ago, tag,
+    return std.fmt.bufPrintSentinel(buf, "{s} {s}{s}{s}{s}{s}", .{
+        dot, body, mid, ago, tag, undone,
     }, 0) catch dot;
 }
 
@@ -741,6 +761,13 @@ test "historyEntryView counts UTF-8 codepoints, not bytes" {
     try std.testing.expectEqual(@as(u16, 5), historyEntryView(&rec).char_len);
 }
 
+test "historyEntryView carries the record's undone flag into the masked view (#225)" {
+    var rec = record("undone one ", .ok, null);
+    try std.testing.expect(!historyEntryView(&rec).undone); // default: not undone
+    rec.undone = true;
+    try std.testing.expect(historyEntryView(&rec).undone);
+}
+
 fn history(views: []const HistoryEntryView) Snapshot {
     var s = snap(.{});
     for (views, 0..) |v, i| s.history[i] = v;
@@ -763,6 +790,16 @@ test "derive maps outcome to dot colour and tag, newest-first order preserved" {
     try std.testing.expectEqual(HistoryDot.ok, h.entries[2].dot);
     try std.testing.expectEqual(HistoryTag.none, h.entries[2].tag); // a clean insertion gets no tag
     try std.testing.expectEqual(@as(u16, 3), h.entries[0].char_len); // order == the ring's newest-first
+}
+
+test "derive carries the undone flag through to the rendered entry (#225)" {
+    const s = history(&.{
+        .{ .char_len = 3, .outcome = .ok, .timestamp = 30, .undone = true },
+        .{ .char_len = 2, .outcome = .ok, .timestamp = 20, .undone = false },
+    });
+    const h = derive(s).history;
+    try std.testing.expect(h.entries[0].undone);
+    try std.testing.expect(!h.entries[1].undone);
 }
 
 test "an empty history derives to an empty view" {
@@ -788,6 +825,41 @@ test "historyLabel masks the transcript: dot, capped bullet run, char count, app
     try std.testing.expect(std.mem.indexOf(u8, label, "Slack") != null);
     try std.testing.expect(std.mem.indexOf(u8, label, "2m ago") != null);
     try std.testing.expect(std.mem.indexOf(u8, label, "[failed]") != null);
+}
+
+test "historyLabel renders an undone entry dimmed: white circle glyph + [undone] marker (#225)" {
+    var buf: [256]u8 = undefined;
+    const entry = HistoryEntry{ .dot = .ok, .tag = .none, .char_len = 4, .app = null, .timestamp = 0, .undone = true };
+    const label = historyLabel(&buf, entry, 0);
+    try std.testing.expect(std.mem.indexOf(u8, label, "\xe2\x9a\xaa") != null); // ⚪ dimmed lead glyph
+    try std.testing.expect(std.mem.indexOf(u8, label, "\xf0\x9f\x9f\xa2") == null); // 🟢 ok dot suppressed
+    try std.testing.expect(std.mem.indexOf(u8, label, "[undone]") != null);
+}
+
+test "historyLabel leaves a live (non-undone) entry with its outcome dot and no marker (#225)" {
+    var buf: [256]u8 = undefined;
+    const entry = HistoryEntry{ .dot = .ok, .tag = .none, .char_len = 4, .app = null, .timestamp = 0, .undone = false };
+    const label = historyLabel(&buf, entry, 0);
+    try std.testing.expect(std.mem.indexOf(u8, label, "\xf0\x9f\x9f\xa2") != null); // 🟢 ok dot present
+    try std.testing.expect(std.mem.indexOf(u8, label, "\xe2\x9a\xaa") == null); // no dimmed glyph
+    try std.testing.expect(std.mem.indexOf(u8, label, "[undone]") == null);
+}
+
+test "historyLabel keeps the degraded tag alongside the undone marker (#225)" {
+    var buf: [256]u8 = undefined;
+    const entry = HistoryEntry{ .dot = .degraded, .tag = .degraded, .char_len = 4, .app = null, .timestamp = 0, .undone = true };
+    const label = historyLabel(&buf, entry, 0);
+    try std.testing.expect(std.mem.indexOf(u8, label, "[degraded]") != null); // outcome still surfaced
+    try std.testing.expect(std.mem.indexOf(u8, label, "[undone]") != null);
+}
+
+test "historyRevealedLabel also dims an undone entry (#225)" {
+    var buf: [256]u8 = undefined;
+    const entry = HistoryEntry{ .dot = .ok, .tag = .none, .char_len = 6, .app = null, .timestamp = 0, .undone = true };
+    const label = historyRevealedLabel(&buf, entry, "hello ", 0);
+    try std.testing.expect(std.mem.indexOf(u8, label, "hello") != null); // the redo text still shows
+    try std.testing.expect(std.mem.indexOf(u8, label, "\xe2\x9a\xaa") != null); // ⚪ dimmed lead glyph
+    try std.testing.expect(std.mem.indexOf(u8, label, "[undone]") != null);
 }
 
 test "historyLabel omits the app segment when no App Identity was captured" {

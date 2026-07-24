@@ -23,11 +23,15 @@ const coord = @import("coordinator.zig");
 
 /// Why an Undo refused — captured for the feedback layer (#226 renders; today the reason is
 /// written to the log only, per #213: all reasons collapse to one refuse cue on the HUD).
-/// `no_target` is produced by the trigger (empty ring — nothing to select); the other two by
-/// `evaluate` below.
+/// `no_target` and `already_undone` are produced by the trigger (nothing to select, or the
+/// newest record is already undone — #225's single-shot refuse); the other two by `evaluate`
+/// below.
 pub const RefuseReason = enum {
     /// The ring holds no Insertion to delete (trigger-side; never returned by `evaluate`).
     no_target,
+    /// The newest record is already undone — a second `⌃⌘⌫` on it refuses rather than eating
+    /// earlier text (trigger-side, #225's single-shot model; never returned by `evaluate`).
+    already_undone,
     /// Missing evidence — the record has no stored `focused_app`, or `frontmost()` returned
     /// null (fail-closed, #213's null-evidence rule).
     focus_null,
