@@ -140,6 +140,23 @@ pub const Ring = struct {
         return self.count;
     }
 
+    /// Copy the **with-space `inserted` bytes** of the newest live record into `out` under the
+    /// leaf lock, returning the number of bytes written (0 when the ring is empty). The Undo
+    /// trigger's newest-record resolution (undo-spec, #223): the recovery chord targets the
+    /// single newest Insertion only (#212), so this reads the head-1 entry straight from the
+    /// authoritative ring rather than snapshotting all N and taking `[0]`. Truncates to
+    /// `out.len`; the caller sizes `out` to `max_bytes` so no loss occurs.
+    pub fn newestInserted(self: *Ring, out: []u8) usize {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.count == 0) return 0;
+        const idx = (self.head + capacity - 1) % capacity;
+        const rec = &self.buf[idx];
+        const n = @min(rec.inserted_len, out.len);
+        @memcpy(out[0..n], rec.inserted_bytes[0..n]);
+        return n;
+    }
+
     /// Snapshot-copy the live records **newest-first** into `out`, returning the count. The
     /// menu's sole read path — taken under the leaf lock alone, never while `coordinator.mu`
     /// is held (ADR-0006). `out` is a fixed `[capacity]Record`; only `[0..count]` is written.
@@ -289,6 +306,55 @@ test "textForStamp returns the with-space inserted, not the pre-Rewrite raw" {
     });
     var out: [max_bytes]u8 = undefined;
     try expectEqualStrings("At 18:00 ", out[0..ring.textForStamp(1, &out)]);
+}
+
+test "newestInserted returns the with-space bytes of the newest record" {
+    var ring = Ring{};
+    ring.record(plain("first ", .ok));
+    ring.record(plain("second ", .ok));
+    ring.record(plain("newest ", .ok));
+    var out: [max_bytes]u8 = undefined;
+    try expectEqual(@as(usize, 7), ring.newestInserted(&out)); // "newest " incl. trailing space
+    try expectEqualStrings("newest ", out[0..7]);
+}
+
+test "newestInserted returns 0 on an empty ring (the Undo trigger's no-op case)" {
+    var ring = Ring{};
+    var out: [max_bytes]u8 = undefined;
+    try expectEqual(@as(usize, 0), ring.newestInserted(&out));
+}
+
+test "newestInserted follows the newest across an eviction" {
+    var ring = Ring{};
+    var i: usize = 0;
+    while (i < capacity + 1) : (i += 1) { // 21 records: e0 (evicted) … e20 (newest)
+        var buf: [16]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "e{d} ", .{i}) catch unreachable;
+        ring.record(plain(text, .ok));
+    }
+    var out: [max_bytes]u8 = undefined;
+    try expectEqualStrings("e20 ", out[0..ring.newestInserted(&out)]);
+}
+
+test "newestInserted returns the with-space inserted, not the pre-Rewrite raw" {
+    var ring = Ring{};
+    ring.record(.{
+        .inserted = "At 18:00 ",
+        .raw = "at 20:00 no 18:00",
+        .timestamp = 1,
+        .outcome = .degraded,
+        .focused_app = null,
+    });
+    var out: [max_bytes]u8 = undefined;
+    try expectEqualStrings("At 18:00 ", out[0..ring.newestInserted(&out)]);
+}
+
+test "newestInserted truncates to the caller's buffer without overrun" {
+    var ring = Ring{};
+    ring.record(plain("abcdefgh ", .ok));
+    var small: [3]u8 = undefined;
+    try expectEqual(@as(usize, 3), ring.newestInserted(&small));
+    try expectEqualStrings("abc", small[0..3]);
 }
 
 test "record then snapshot on the same ring does not self-deadlock (leaf lock is not re-entrant)" {
