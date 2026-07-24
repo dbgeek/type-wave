@@ -59,4 +59,20 @@ pub const Surface = struct {
         self.hud.hide();
         self.cues.err();
     }
+
+    /// An Undo posted its backspaces (ADR-0007, #226): the HUD blooms a green single mark,
+    /// then self-hides. Unlike the Coordinator's lifecycle verbs this rides no Utterance — it
+    /// is driven from the recovery chord's worker/trigger — and it is HUD-only (no sound cue),
+    /// so a disabled/headless overlay simply shows nothing (`undoConfirm` no-ops there).
+    pub fn undoConfirmed(self: *Surface) void {
+        self.hud.undoConfirm();
+    }
+
+    /// An Undo was refused (ADR-0007, #226): the HUD blooms a red mark and shakes it, then
+    /// self-hides. All refuse reasons (app-changed, focus null, no-target, already-undone)
+    /// collapse to this one cue; the specific reason is logged only (#213). HUD-only, same as
+    /// `undoConfirmed`.
+    pub fn undoRefused(self: *Surface) void {
+        self.hud.undoRefuse();
+    }
 };
