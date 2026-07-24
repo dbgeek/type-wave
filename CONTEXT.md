@@ -145,13 +145,17 @@ sequence — pause/grant gate, newest-record resolution, grapheme count, the fre
 on the Insert Worker** (ADR-0008): the gate's read must be fresh and is cross-process, so it
 cannot live on the tap's run-loop thread, and everything else therefore sits beside it — the
 chord callback only bumps a saturating press counter, one press to one verdict to one cue.
-The record is resolved at post time and flagged only *after* a deletion posts, so no refusal
-can dim a record nothing deleted, and every exit — including a degenerate record with no
-grapheme clusters — fires its cue rather than swallowing the press. It gates on its own
-prerequisites — not paused, plus the Grant Observer's PostEvent fact — never on the
-Configuration Phase or the Supervisor's capture-enable gate. It holds
+The record is resolved at post time and flagged only *after* a deletion **actually posts**, so
+no refusal can dim a record nothing deleted, and every exit — including a degenerate record
+with no grapheme clusters — fires its cue rather than swallowing the press. The deletion
+mechanism reports how many Backspaces went out and Secure Event Input is probed beside the
+frontmost read, so a post of none is a refusal that leaves the record retryable rather than a
+green cue over unchanged text, while a burst that stopped partway commits (its Backspaces
+already landed, and a retry would eat earlier text) (#244). It gates on its own prerequisites —
+not paused, plus the Grant Observer's PostEvent fact — never on the Configuration Phase or the
+Supervisor's capture-enable gate. It holds
 the Recent Insertions ring concretely (ADR-0006 keeps ownership with the daemon) and reaches
-every effect through a five-method seam it is handed, so the whole sequence is exercised by
+every effect through a six-method seam it is handed, so the whole sequence is exercised by
 fed values rather than by a live tap. Lives in `src/undo.zig`; drained last by the Insert
 Worker, which is what serializes a deletion against dictation. Sibling of the Insertion
 Runner, which owns the other three cursor paths under the same rule (ADR-0009).

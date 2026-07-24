@@ -552,11 +552,18 @@ const RealUndoDeps = struct {
     pub fn focusedApp(_: *RealUndoDeps) ?coord.AppIdentity {
         return app_focus.frontmost();
     }
+    /// Secure Event Input, probed fresh beside the frontmost read (#244): while it is held —
+    /// a password field, Terminal's Secure Keyboard Entry — the OS suppresses posted events,
+    /// so the Backspaces would vanish and the confirm cue would lie about it.
+    pub fn secureInputActive(_: *RealUndoDeps) bool {
+        return insertmod.secureInputActive();
+    }
     /// The Undo deletion mechanism (undo-spec / #214, issue #222): post `n` self-tagged
     /// Backspaces through the CGEvent path. The self tag is what stops our own deletes from
-    /// re-firing the chord (`tap.isRecoveryChordPress`).
-    pub fn deleteChars(self: *RealUndoDeps, n: usize) void {
-        self.inserter.deleteChars(n);
+    /// re-firing the chord (`tap.isRecoveryChordPress`). Returns how many pairs went out — the
+    /// Runner refuses on `0` and commits on anything above it (#244).
+    pub fn deleteChars(self: *RealUndoDeps, n: usize) usize {
+        return self.inserter.deleteChars(n);
     }
     /// The Undo confirm cue (ADR-0007, #226): a green single-bloom on the HUD after a gated
     /// Undo posted its backspaces. Routed through the Feedback Surface so all HUD arbitration

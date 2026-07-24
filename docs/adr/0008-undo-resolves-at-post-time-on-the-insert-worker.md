@@ -1,6 +1,8 @@
 # ADR 0008 — Undo resolves at post time, on the insert worker
 
 - Status: accepted (2026-07-24; candidate 1 of the 2026-07-24 architecture review)
+- Amended: 2026-07-25 (#244) — `Deps` is **6** methods, not 5, and `deleteChars` returns a
+  result. See [Amendment](#amendment-2026-07-25-244--a-post-is-a-result-not-an-assumption).
 - Supersedes: the trigger-side resolution and commit rationale recorded in
   `src/undo_trigger.zig`'s module doc (#223/#225), and the "dim without deleting" edge it
   declared accepted
@@ -87,7 +89,8 @@ Also decided, and load-bearing for the shape:
   governs it; the Runner only drives it. It is heap-free and test-constructible, so a fake
   would mean re-implementing eviction and stamp-keying rather than exercising them.
 - **`Deps` is 5 methods** — `enabled`, `focusedApp`, `deleteChars`, `undoConfirmed`,
-  `undoRefused` — everything the OS owns and nothing else. `grapheme.graphemeCount` is
+  `undoRefused` — everything the OS owns and nothing else. (Amended by #244: 6, with
+  `secureInputActive`.) `grapheme.graphemeCount` is
   called directly; it already runs against real CoreFoundation under `zig build test`.
 - **`assertDeps` is invoked by `Undo(Deps)` itself.** The existing `local_backend.assertHelper`
   and `session.assertTransport` are never called by the generic types they protect, which is
@@ -141,6 +144,41 @@ Also decided, and load-bearing for the shape:
   drain shifts which record the Undo deletes. It requires dictation to resolve inside a
   worker tick of the chord, and the outcome — deleting the genuinely newest Insertion — is
   the one the Recent Insertions submenu would show as newest at that instant.
+
+## Amendment (2026-07-25, #244) — a post is a result, not an assumption
+
+This record moved the `undone` flag to *after* `deleteChars` so no refusal could dim a record
+nothing deleted. #244 showed that "after" was not enough: `deleteChars` returned `void`, so
+"after the call" was being read as "after a deletion". The primitive synthesized its
+Backspaces on a combined-session-state event source and never set the flags, so CoreGraphics
+stamped each one with the modifiers the user was *still physically holding* — the recovery
+chord itself. Apps received `⌃⌘⌫`, which is unbound in AppKit and Chromium, and deleted
+nothing; the Runner flagged the record and fired the green cue anyway, and single-shot then
+refused every retry. A one-shot mechanism failure became a permanent one.
+
+Three things change, and none disturbs the sequence above:
+
+- **Flags are set explicitly on every synthesized key event**, on both the down and the up.
+  Un-modified means `flags = 0`, never "omit the call" — omitting it inherits live hardware
+  state. `⌘V` and the Backspaces now share one `KeyPoster(Sink)` helper in `insert.zig` so a
+  third primitive cannot repeat the omission; `keystroke`, which posts to a different tap with
+  a Unicode payload and so builds its own pair, sets the flags explicitly for the same reason.
+- **`deleteChars` returns how many Backspace pairs it posted**, and the `undone` flag and the
+  confirm cue hang off that count. Zero refuses (`post_failed`) and leaves the record
+  retryable. A *short* count does not: those Backspaces are already in the target app, and
+  re-running the full `n` on the next press would eat text that preceded the Insertion — the
+  very thing single-shot (#225) exists to prevent — so a partial burst commits like a whole
+  one and the shortfall goes to the log.
+- **`Deps` gains `secureInputActive`, making it 6 methods.** Secure Event Input silently
+  suppresses posted events, which produced the same false-confirm outcome by a different
+  route; it is probed at post time, just before the frontmost read (cheap and in-process,
+  so it precedes the cross-process query), and refuses with `secure_input`.
+
+The seam widened for the same reason the ADR gave for moving the sequence: the defect was
+structurally invisible to tests. `deleteChars(n)` is a *count*, so the shape of the posted
+events — keycode, flags, pairing — could not be observed by any fake. `KeyPoster` is generic
+over its event sink, and the fake sink stamps created events with simulated held modifiers,
+so the regression is pinned by a test that watches what the target app would receive.
 
 A future review should not "restore" trigger-time resolution without re-reading this record:
 resolving on the run-loop thread was the original design and was traded away on purpose,
