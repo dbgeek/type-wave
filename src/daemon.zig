@@ -752,6 +752,16 @@ const Daemon = struct {
         self.post_event_observed.store(true, .release);
     }
 
+    /// The recovery chord ⌃⌘⌫ was pressed: the user wants to undo the last Insertion (#210,
+    /// undo-spec). The tap has already de-duped auto-repeat and skipped our own posted
+    /// deletes, so this fires once per discrete press. This ticket (#221) only lands the
+    /// capture + this wire-through; the Insertion-deleting action hangs off this seam in a
+    /// downstream Undo ticket. Runs on the run-loop thread — surface the signal and return.
+    fn onRecoveryChord(ctx: ?*anyopaque) void {
+        _ = ctx;
+        feedback.log("  recovery chord ⌃⌘⌫ observed — undo requested\n", .{});
+    }
+
     // ---- supervisor thread: the self-heal / not-configured → configured engine ----
 
     /// Input Monitoring fact. The preflight is stale in-process after a live grant
@@ -1242,6 +1252,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
         .on_release = Daemon.tapRelease,
         .on_disabled = Daemon.onTapDisabled,
         .on_self_event = Daemon.onSelfEvent,
+        .on_recovery_chord = Daemon.onRecoveryChord,
     } };
     const tap_live = daemon.tap.install() catch |e| switch (e) {
         error.TapCreateFailed => {

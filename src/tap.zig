@@ -24,12 +24,20 @@ const kCGSessionEventTap: u32 = 1;
 const kCGHeadInsertEventTap: u32 = 0;
 const kCGEventTapOptionListenOnly: u32 = 1;
 
+const kCGEventKeyDown: u32 = 10;
 const kCGEventFlagsChanged: u32 = 12;
 const kCGEventTapDisabledByTimeout: u32 = 0xFFFFFFFE;
 const kCGEventTapDisabledByUserInput: u32 = 0xFFFFFFFF;
 
 const kCGKeyboardEventKeycode: u32 = 9;
+const kCGKeyboardEventAutorepeat: u32 = 8; // CGEventField: 1 on an auto-repeat keydown
 const kCGEventSourceUserData: u32 = 42; // CGEventField
+
+// Device-independent modifier flags (CGEventTypes.h). Unlike the L/R Option device bits
+// above, the recovery chord matches on Command+Control without caring which side.
+const kCGEventFlagMaskShift: u64 = 0x20000;
+const kCGEventFlagMaskControl: u64 = 0x40000;
+const kCGEventFlagMaskCommand: u64 = 0x100000;
 
 // Device-dependent modifier bits (IOKit/hidsystem/IOLLEvent.h). The
 // device-independent kCGEventFlagMaskAlternate (0x80000) can't tell L from R.
@@ -43,6 +51,10 @@ const kCGEventFlagMaskSecondaryFn: u64 = 0x800000;
 // Virtual keycodes for the two Option keys (Events.h).
 const kVK_Option: i64 = 0x3A; // left
 const kVK_RightOption: i64 = 0x3D;
+
+// Backspace (⌫). Events.h names it kVK_Delete; kVK_ForwardDelete (0x75) is the other key.
+// The recovery chord ⌃⌘⌫ deletes the last Insertion's graphemes (undo-spec / #210).
+const kVK_Delete: i64 = 0x33;
 
 /// Our Insertion posts carry this in kCGEventSourceUserData so we can skip them
 /// (belt-and-braces; the Talk Key ≠ the keys we post, so no real collision).
@@ -103,6 +115,13 @@ pub const Callbacks = struct {
     /// is live, where `CGPreflightPostEventAccess` can stay stale-`false` for the process
     /// lifetime (#129). Optional; runs on the run-loop thread, so keep it fast.
     on_self_event: ?*const fn (ctx: ?*anyopaque) void = null,
+    /// The recovery chord ⌃⌘⌫ (Control-Command-Delete) was pressed — the user is asking to
+    /// undo the last Insertion (#210, undo-spec). Fires once per discrete press: the widened
+    /// keydown mask sees auto-repeat, which is suppressed here. Listen-only, so the chord
+    /// still passes through to the OS (its pass-through is benign — why it was chosen). Our
+    /// own posted deletes (`self_event_tag`) never fire it. Optional; runs on the run-loop
+    /// thread, so keep it fast.
+    on_recovery_chord: ?*const fn (ctx: ?*anyopaque) void = null,
 };
 
 pub const Tap = struct {
@@ -154,6 +173,22 @@ pub const Tap = struct {
                 cb(self.cbs.ctx, etype == kCGEventTapDisabledByTimeout, took);
             return event;
         }
+
+        // Recovery chord (⌃⌘⌫): the widened keydown mask now sees every keydown. Match the
+        // chord non-consuming (always return the event), fire once per discrete press, and
+        // drop every non-matching keydown with no logging or retention. This branch is
+        // separate from the flagsChanged Talk Key path below, which is left untouched.
+        if (etype == kCGEventKeyDown) {
+            const user_data = CGEventGetIntegerValueField(event, kCGEventSourceUserData);
+            const keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+            const flags = CGEventGetFlags(event);
+            const autorepeat = CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat);
+            if (isRecoveryChordPress(keycode, flags, autorepeat, user_data)) {
+                if (self.cbs.on_recovery_chord) |cb| cb(self.cbs.ctx);
+            }
+            return event;
+        }
+
         if (etype != kCGEventFlagsChanged) return event;
 
         // Our own synthetic events: report the round-trip (the #129 PostEvent probe),
@@ -175,6 +210,23 @@ pub const Tap = struct {
         // bit (wayfinder #6). Edge-tracked, so the option branches above never spoof it.
         self.edge(.globe, &self.fn_down, (flags & kCGEventFlagMaskSecondaryFn) != 0, keycode, flags);
         return event;
+    }
+
+    /// Pure classifier for a keydown seen by the widened tap: is this the discrete press of
+    /// the recovery chord ⌃⌘⌫? Extracted from `callback` so the four fed-event cases (chord
+    /// fires, auto-repeat suppressed, self-tagged delete ignored, unrelated keydown dropped)
+    /// are testable without a real CGEventRef. Order matters only for clarity — all four
+    /// conditions must hold:
+    ///   - not one of our own posted deletes (`self_event_tag` in the source user-data);
+    ///   - the key is Backspace (⌫);
+    ///   - it is the first keydown, not an auto-repeat (the OS sets autorepeat=1 on repeats);
+    ///   - both Command and Control are held (device-independent, either side).
+    fn isRecoveryChordPress(keycode: i64, flags: u64, autorepeat: i64, user_data: i64) bool {
+        if (user_data == self_event_tag) return false;
+        if (keycode != kVK_Delete) return false;
+        if (autorepeat != 0) return false;
+        const need = kCGEventFlagMaskCommand | kCGEventFlagMaskControl;
+        return (flags & need) == need;
     }
 
     fn edge(self: *Tap, key: TalkKey, state: *bool, down: bool, keycode: i64, flags: u64) void {
@@ -203,7 +255,10 @@ pub const Tap = struct {
     /// The shared create body: fresh CGEventTapCreate + run-loop source + enable, with
     /// the `live` mirror updated. Run-loop thread only (install, and recreate's block).
     fn create(self: *Tap) error{TapCreateFailed}!bool {
-        const mask: CGEventMask = 1 << 12; // CGEventMaskBit(kCGEventFlagsChanged)
+        // flagsChanged carries the Talk Key modifier edges; keyDown carries the recovery
+        // chord (#210). The widened mask now sees every keydown — the callback drops the
+        // non-matching ones without logging or retaining them.
+        const mask: CGEventMask = (1 << kCGEventFlagsChanged) | (1 << kCGEventKeyDown);
         const port = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly, mask, callback, self);
         if (port == null) {
             self.live.store(false, .release);
@@ -274,3 +329,42 @@ pub const Tap = struct {
         CFRunLoopRun();
     }
 };
+
+// ---- Recovery-chord classifier: fed-event tests (#221) ----
+// The live callback pulls (keycode, flags, autorepeat, user_data) off a real CGEventRef;
+// these feed the same tuples straight into the pure `isRecoveryChordPress` so the chord's
+// discrete-press / auto-repeat / self-tag / non-match behaviour is exercised without a tap.
+
+const expect = std.testing.expect;
+const both_mods = kCGEventFlagMaskCommand | kCGEventFlagMaskControl;
+
+test "recovery chord: ⌃⌘⌫ discrete press fires" {
+    try expect(Tap.isRecoveryChordPress(kVK_Delete, both_mods, 0, 0));
+    // Extra held modifiers (e.g. Shift) don't disqualify it — we require Cmd+Ctrl, not exactly them.
+    try expect(Tap.isRecoveryChordPress(kVK_Delete, both_mods | kCGEventFlagMaskShift, 0, 0));
+}
+
+test "recovery chord: auto-repeat is suppressed — one fire per discrete press" {
+    // A held ⌃⌘⌫: the first keydown (autorepeat 0) then a run of OS auto-repeats (autorepeat 1).
+    const autorepeats = [_]i64{ 0, 1, 1, 1, 1 };
+    var fires: usize = 0;
+    for (autorepeats) |ar| {
+        if (Tap.isRecoveryChordPress(kVK_Delete, both_mods, ar, 0)) fires += 1;
+    }
+    try expect(fires == 1);
+}
+
+test "recovery chord: our own posted delete (self_event_tag) is ignored" {
+    // The undo's own backspacing posts ⌃⌘⌫-shaped deletes tagged as ours — must not re-fire.
+    try expect(!Tap.isRecoveryChordPress(kVK_Delete, both_mods, 0, self_event_tag));
+}
+
+test "recovery chord: unrelated keydowns are dropped" {
+    // Wrong key, even with both modifiers held.
+    try expect(!Tap.isRecoveryChordPress(kVK_Option, both_mods, 0, 0));
+    // ⌫ with only one modifier — guards the collision rationale (bare ⌫, ⌘⌫, ⌃⌫ all pass through).
+    try expect(!Tap.isRecoveryChordPress(kVK_Delete, kCGEventFlagMaskCommand, 0, 0));
+    try expect(!Tap.isRecoveryChordPress(kVK_Delete, kCGEventFlagMaskControl, 0, 0));
+    // ⌫ with no modifiers at all.
+    try expect(!Tap.isRecoveryChordPress(kVK_Delete, 0, 0, 0));
+}
