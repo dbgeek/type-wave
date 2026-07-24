@@ -75,6 +75,13 @@ const OsUnfairLock = extern struct { _opaque: u32 = 0 };
 extern "c" fn os_unfair_lock_lock(lock: *OsUnfairLock) void;
 extern "c" fn os_unfair_lock_unlock(lock: *OsUnfairLock) void;
 
+/// What `newestForUndo` hands the Undo trigger: how many `inserted` bytes were copied into
+/// the caller's buffer, plus the record's stored App Identity for the focus gate (#224).
+pub const UndoTarget = struct {
+    len: usize,
+    focused_app: ?coord.AppIdentity,
+};
+
 pub const Ring = struct {
     mu: Mutex = .{},
     /// A circular buffer: writes advance `head`; the newest live entry is at `head - 1`.
@@ -140,21 +147,24 @@ pub const Ring = struct {
         return self.count;
     }
 
-    /// Copy the **with-space `inserted` bytes** of the newest live record into `out` under the
-    /// leaf lock, returning the number of bytes written (0 when the ring is empty). The Undo
-    /// trigger's newest-record resolution (undo-spec, #223): the recovery chord targets the
-    /// single newest Insertion only (#212), so this reads the head-1 entry straight from the
-    /// authoritative ring rather than snapshotting all N and taking `[0]`. Truncates to
-    /// `out.len`; the caller sizes `out` to `max_bytes` so no loss occurs.
-    pub fn newestInserted(self: *Ring, out: []u8) usize {
+    /// Copy the newest live record's **with-space `inserted` bytes** into `out` and return
+    /// them together with its stored `focused_app`, all under one hold of the leaf lock —
+    /// null when the ring is empty. The Undo trigger's newest-record resolution (undo-spec,
+    /// #223): the recovery chord targets the single newest Insertion only (#212), so this
+    /// reads the head-1 entry straight from the authoritative ring rather than snapshotting
+    /// all N and taking `[0]`. Bytes and identity come from the same record atomically — a
+    /// concurrent Insertion between two separate reads could otherwise pair one record's
+    /// text with another's app, defeating the focus gate (#224). Truncates to `out.len`;
+    /// the caller sizes `out` to `max_bytes` so no loss occurs.
+    pub fn newestForUndo(self: *Ring, out: []u8) ?UndoTarget {
         self.mu.lock();
         defer self.mu.unlock();
-        if (self.count == 0) return 0;
+        if (self.count == 0) return null;
         const idx = (self.head + capacity - 1) % capacity;
         const rec = &self.buf[idx];
         const n = @min(rec.inserted_len, out.len);
         @memcpy(out[0..n], rec.inserted_bytes[0..n]);
-        return n;
+        return .{ .len = n, .focused_app = rec.focused_app };
     }
 
     /// Snapshot-copy the live records **newest-first** into `out`, returning the count. The
@@ -308,23 +318,55 @@ test "textForStamp returns the with-space inserted, not the pre-Rewrite raw" {
     try expectEqualStrings("At 18:00 ", out[0..ring.textForStamp(1, &out)]);
 }
 
-test "newestInserted returns the with-space bytes of the newest record" {
+test "newestForUndo returns the with-space bytes of the newest record" {
     var ring = Ring{};
     ring.record(plain("first ", .ok));
     ring.record(plain("second ", .ok));
     ring.record(plain("newest ", .ok));
     var out: [max_bytes]u8 = undefined;
-    try expectEqual(@as(usize, 7), ring.newestInserted(&out)); // "newest " incl. trailing space
+    const target = ring.newestForUndo(&out).?;
+    try expectEqual(@as(usize, 7), target.len); // "newest " incl. trailing space
     try expectEqualStrings("newest ", out[0..7]);
 }
 
-test "newestInserted returns 0 on an empty ring (the Undo trigger's no-op case)" {
+test "newestForUndo returns null on an empty ring (the Undo trigger's no-target case)" {
     var ring = Ring{};
     var out: [max_bytes]u8 = undefined;
-    try expectEqual(@as(usize, 0), ring.newestInserted(&out));
+    try expect(ring.newestForUndo(&out) == null);
 }
 
-test "newestInserted follows the newest across an eviction" {
+test "newestForUndo carries the newest record's stored App Identity for the focus gate" {
+    var ring = Ring{};
+    ring.record(.{
+        .inserted = "older ",
+        .raw = null,
+        .timestamp = 0,
+        .outcome = .ok,
+        .focused_app = coord.AppIdentity.init("com.apple.Notes", "Notes"),
+    });
+    ring.record(.{
+        .inserted = "newest ",
+        .raw = null,
+        .timestamp = 0,
+        .outcome = .ok,
+        .focused_app = coord.AppIdentity.init("com.tinyspeck.slackmacgap", "Slack"),
+    });
+    var out: [max_bytes]u8 = undefined;
+    const target = ring.newestForUndo(&out).?;
+    // The identity and the bytes come from the same (newest) record, read atomically.
+    try expectEqualStrings("newest ", out[0..target.len]);
+    try expectEqualStrings("com.tinyspeck.slackmacgap", target.focused_app.?.bundleId());
+    try expectEqualStrings("Slack", target.focused_app.?.displayName());
+}
+
+test "newestForUndo passes a record's null App Identity through as null (fail-closed input)" {
+    var ring = Ring{};
+    ring.record(plain("no hint ", .ok)); // plain() stores focused_app = null
+    var out: [max_bytes]u8 = undefined;
+    try expect(ring.newestForUndo(&out).?.focused_app == null);
+}
+
+test "newestForUndo follows the newest across an eviction" {
     var ring = Ring{};
     var i: usize = 0;
     while (i < capacity + 1) : (i += 1) { // 21 records: e0 (evicted) … e20 (newest)
@@ -333,10 +375,10 @@ test "newestInserted follows the newest across an eviction" {
         ring.record(plain(text, .ok));
     }
     var out: [max_bytes]u8 = undefined;
-    try expectEqualStrings("e20 ", out[0..ring.newestInserted(&out)]);
+    try expectEqualStrings("e20 ", out[0..ring.newestForUndo(&out).?.len]);
 }
 
-test "newestInserted returns the with-space inserted, not the pre-Rewrite raw" {
+test "newestForUndo returns the with-space inserted, not the pre-Rewrite raw" {
     var ring = Ring{};
     ring.record(.{
         .inserted = "At 18:00 ",
@@ -346,14 +388,15 @@ test "newestInserted returns the with-space inserted, not the pre-Rewrite raw" {
         .focused_app = null,
     });
     var out: [max_bytes]u8 = undefined;
-    try expectEqualStrings("At 18:00 ", out[0..ring.newestInserted(&out)]);
+    try expectEqualStrings("At 18:00 ", out[0..ring.newestForUndo(&out).?.len]);
 }
 
-test "newestInserted truncates to the caller's buffer without overrun" {
+test "newestForUndo truncates to the caller's buffer without overrun" {
     var ring = Ring{};
     ring.record(plain("abcdefgh ", .ok));
     var small: [3]u8 = undefined;
-    try expectEqual(@as(usize, 3), ring.newestInserted(&small));
+    const target = ring.newestForUndo(&small).?;
+    try expectEqual(@as(usize, 3), target.len);
     try expectEqualStrings("abc", small[0..3]);
 }
 

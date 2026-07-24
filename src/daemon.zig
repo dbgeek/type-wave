@@ -761,12 +761,14 @@ const Daemon = struct {
 
     /// The recovery chord ⌃⌘⌫ was pressed: the user wants to undo the last Insertion (#210,
     /// undo-spec). The tap has already de-duped auto-repeat and skipped our own posted deletes,
-    /// so this fires once per discrete press. The walking skeleton (#223) resolves the **newest**
-    /// Recent Insertions record (#212 — single newest, no stack) and hands its with-space bytes to
-    /// the insert worker's undo slot (#222), which backspaces them out. Deliberately **unguarded**
-    /// here: no focus gate, no `undone` flag, no HUD — those are the next three tickets. Empty ring
-    /// → nothing posted. Runs on the run-loop thread; the resolution is a bounded ring read + a slot
-    /// copy, both fast (a slow tap callback makes the OS disable the tap).
+    /// so this fires once per discrete press. The trigger (#223) resolves the **newest** Recent
+    /// Insertions record (#212 — single newest, no stack) and hands its with-space bytes plus its
+    /// stored App Identity to the insert worker's undo slot (#222), which evaluates the app-level
+    /// focus gate against a fresh frontmost read and backspaces only on a match (#224). Empty ring
+    /// → nothing posted. Still to graduate: the `undone` flag and the HUD confirm/refuse feedback
+    /// (#226). Runs on the run-loop thread; the resolution is a bounded ring read + a slot copy,
+    /// both fast (a slow tap callback makes the OS disable the tap) — the gate's cross-process
+    /// NSWorkspace read deliberately happens on the worker, never here.
     fn onRecoveryChord(ctx: ?*anyopaque) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
         feedback.log("  recovery chord ⌃⌘⌫ observed — undo requested\n", .{});
