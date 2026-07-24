@@ -26,29 +26,43 @@ foreground while developing, or as a signed per-user LaunchAgent for daily use.
 ```mermaid
 flowchart TD
     TK([Hold Talk Key, speak, release]) --> CAP[CoreAudio Capture]
-    CAP --> ROUTER{Backend Router}
+    CAP --> ROUTER{Backend Router<br/>pins backend + settings<br/>for this Utterance}
     ROUTER -->|OpenAI, default| OA[OpenAI Realtime<br/>Transcription Session]
-    ROUTER -->|Local, offline| LW[Local Whisper Backend<br/>Segmenter cuts at silences]
+    ROUTER -->|Local, offline| LW[Local Whisper Backend<br/>Segmenter cuts at silences<br/>Whisper Helper transcribes<br/>Vocabulary biases spelling]
     OA --> FT[Final Transcript]
     LW --> FT
     FT --> BT{Backtrack on?<br/>OpenAI only}
     BT -->|yes| RW[OpenAI Rewrite<br/>corrections + fillers removed]
-    BT -->|no / Local, or on failure| INS
-    RW --> INS([Insertion at Focused Target cursor])
+    BT -->|no / Local, or on failure| IR
+    RW --> IR
+
+    subgraph IW ["Insert Worker — one thread: dictation, then menu actions, then Undo"]
+        IR[Insertion Runner]
+        UR[Undo Runner]
+    end
+
+    IR --> CUR([Text at the Focused Target cursor])
+    UR --> DEL([Backspaces at the Focused Target cursor])
+    CUR --> RING[(Recent Insertions ring<br/>last 20 Insertion Records)]
+    RING -.->|menu: Copy / Re-insert here| IR
+    RING -.->|recovery chord ⌃⌘⌫| UR
 ```
 
 The default **Talk Key** is Right Option. Holding it opens one **Utterance**; while it
-is held, type-wave captures mic audio and routes it through the **Backend Router** to
-the selected **Transcription Backend**. On release it commits the Utterance and waits
-for the **Final Transcript** — the only text ever inserted — then places it at the
-**Focused Target** cursor through either a clipboard-swap paste or synthetic keystrokes.
+is held, type-wave captures mic audio and routes it through the **Backend Router**, which
+pins that Utterance to the selected **Transcription Backend** and to the settings in force
+at press time. On release it commits the Utterance and waits for the **Final Transcript** —
+the only text ever inserted — then the **Insertion Runner** places it at the **Focused
+Target** cursor through either a clipboard-swap paste or synthetic keystrokes.
 
 The two backends reach that same Final Transcript by different routes. **OpenAI**
 streams: it emits revisable **Partial Transcripts** live, then commits the Final
 Transcript on release. **Local Whisper** runs offline: its **Segmenter** cuts a long
-Utterance into **Segments** at silences and transcribes them in the background, and the
-ordered **Segment Transcripts** concatenate into the Final Transcript. In local mode the
-audio never leaves the Mac.
+Utterance into **Segments** at silences and hands each to the warm **Whisper Helper**
+child process in the background, and the ordered **Segment Transcripts** concatenate into
+the Final Transcript. In local mode the audio never leaves the Mac. An optional
+**Vocabulary** — a hand-curated list of names, jargon, and identifiers edited from the menu
+bar — biases local Whisper's spelling toward your terms.
 
 With the opt-in **Backtrack** setting on and OpenAI selected, one more stage sits between
 the Final Transcript and Insertion: a single OpenAI **Rewrite** pass applies spoken
@@ -59,12 +73,28 @@ inserting the raw transcript — dictation never breaks. Backtrack sends the tra
 **text** to OpenAI and needs internet; it does not apply on the Local backend, where the
 raw transcript inserts unchanged.
 
+What landed at the cursor is kept: each Insertion leaves an **Insertion Record** — the
+bytes actually inserted, the raw transcript when a Rewrite changed it, a timestamp, the
+outcome, and a best-effort hint at which app was frontmost — in an in-memory **Recent
+Insertions** ring of the last 20, reachable under the menu bar for reveal, **Copy**, or
+**Re-insert here**. The recovery chord `⌃⌘⌫` triggers **Undo**: one Backspace per extended
+grapheme cluster of the newest record, so the pre-Insertion state is restored. Undo is
+gated app-level — it proceeds only on positive evidence that the frontmost app is unchanged
+since the Insertion — and is single-shot, so a second chord refuses rather than eating
+earlier text. Every cursor path, dictation and menu action and Undo alike, is drained on
+one **Insert Worker** thread (dictation first, Undo last), which is what keeps a deletion
+from landing in the middle of an Insertion. Nothing here is ever written to disk; the ring
+is cleared when the daemon quits.
+
 Across the whole lifecycle the **Utterance Coordinator** owns the state machine from
 Talk Key press to a resolved Insertion. The floating **HUD** is silent visual feedback
-only — a red waveform while recording, then green processing dots until the Utterance
-resolves; it never shows transcript text. A menu-bar **Status Item** derives readiness
-for the selected backend, exposes the OpenAI/local chooser, and keeps full **Model
-Installation** management reachable under either selection.
+only — a red waveform while recording, green processing dots until the Utterance resolves,
+an amber tint on a degraded Insertion, and a green or red mark for an Undo's confirm or
+refuse; it never shows transcript text. A menu-bar **Status Item** derives readiness for
+the selected backend, exposes the OpenAI/local chooser, and keeps full **Model
+Installation** management reachable under either selection. A **Grant Observer** owns the
+three macOS permission facts and the serialized cold-start request ladder that asks for
+them — and its PostEvent fact is what authorizes Undo to post destructive Backspaces.
 
 The project vocabulary is kept in [CONTEXT.md](./CONTEXT.md).
 
@@ -226,14 +256,22 @@ Several state machines run outside the Coordinator: configuration readiness
 (`src/configuration_phase.zig`), OpenAI link state (`src/session.zig`), backend selection
 (`src/backend_router.zig`), local load-failure classification
 (`src/local_model_recovery.zig`), the local Whisper helper lifecycle
-(`src/whisper_supervisor.zig`), and the cold-start permission-grant sequence
-(`src/grant_sequence.zig`).
+(`src/whisper_supervisor.zig`), and the TCC grant facts plus their cold-start request
+ladder (`src/grants.zig`).
+
+Everything that touches the cursor is serialized on one **Insert Worker** thread
+(`insertion_runner.workerLoop`), which drains two runners in priority order: dictation
+Insertions and the menu's Copy / Re-insert jobs (`src/insertion_runner.zig`), then Undo
+(`src/undo.zig`). Both follow one rule — every cursor job resolves at drain time, beside
+the effect it authorizes, and the bookkeeping in the Recent Insertions ring
+(`src/recent_insertions.zig`) flips only after that effect landed (ADR-0006, ADR-0008,
+ADR-0009).
 
 **Core pipeline**
 
 | Module | Role |
 | --- | --- |
-| `src/main.zig` | CLI entry point and `--set-key` subcommand |
+| `src/main.zig` | CLI entry point: `--set-key` and the `*-model` subcommands |
 | `src/daemon.zig` | Long-running daemon wiring, threads, supervisor, menu seams |
 | `src/coordinator.zig` | Utterance lifecycle state machine |
 | `src/supervisor.zig` | Pure per-tick self-heal decider and capture-enable gate |
@@ -248,6 +286,7 @@ Several state machines run outside the Coordinator: configuration readiness
 | `src/session.zig` | Warm OpenAI Realtime transcription session and reconnect logic |
 | `src/local_backend.zig` | Segmenting local Whisper transcription backend adapter |
 | `src/segmenter.zig` | Pure silence-cut segment policy |
+| `src/vocab.zig` | Pure vocabulary glossary construction and token-budget hint |
 
 **Local Whisper runtime**
 
@@ -281,7 +320,7 @@ Several state machines run outside the Coordinator: configuration readiness
 | `src/config.zig` | ZON settings, key loading, immutable settings snapshots, config writes |
 | `src/configuration_phase.zig` | Setup readiness transitions and reporting |
 | `src/readiness.zig` | Pure readiness/status policy |
-| `src/grant_sequence.zig` | Serialized cold-start TCC grant request sequence |
+| `src/grants.zig` | Grant Observer: the three TCC grant facts and their serialized cold-start request sequence |
 | `src/failure_observation.zig` | Cross-thread failure snapshot the status item reads |
 
 **Audio, insertion & input**
@@ -289,9 +328,18 @@ Several state machines run outside the Coordinator: configuration readiness
 | Module | Role |
 | --- | --- |
 | `src/capture.zig` | CoreAudio capture |
-| `src/tap.zig` | Global Talk Key observation |
+| `src/tap.zig` | Global Talk Key observation and the `⌃⌘⌫` recovery chord |
 | `src/insert.zig` | Clipboard paste and synthetic keystroke insertion |
-| `src/insertion_adapter.zig` | Async insertion worker around the Coordinator |
+| `src/insertion_runner.zig` | Insertion Runner: dictation and menu cursor jobs, and the Insert Worker loop |
+| `src/app_focus.zig` | Best-effort App Identity read at insertion time |
+
+**Recent Insertions & Undo**
+
+| Module | Role |
+| --- | --- |
+| `src/recent_insertions.zig` | Daemon-owned, leaf-locked ring of the last 20 Insertion Records |
+| `src/undo.zig` | Undo Runner: app-level focus gate, deletion, single-shot `undone` flag, cue |
+| `src/grapheme.zig` | Extended-grapheme-cluster count — how many Backspaces an Undo posts |
 
 **Backtrack rewrite**
 
