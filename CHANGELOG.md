@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/dbgeek/type-wave/compare/v0.3.0...v0.3.1) (2026-07-24)
+
+
+### Features
+
+* **undo:** collapse the Undo path into one worker-side Runner (ADR-0008) ([83e30eb](https://github.com/dbgeek/type-wave/commit/83e30eb05e53c0d7c0f775185b9f70fbd61219e0))
+
 ## [0.3.0](https://github.com/dbgeek/type-wave/compare/v0.2.0...v0.3.0) (2026-07-24)
 
 
