@@ -108,6 +108,15 @@ inline fn statusItemVariable(bar: id) id {
     const f: *const fn (id, SEL, f64) callconv(.c) id = @ptrCast(&objc_msgSend);
     return f(bar, sel_registerName("statusItemWithLength:"), -1.0); // NSVariableStatusItemLength
 }
+/// `-[NSObject performSelector:withObject:afterDelay:]` — schedules `aSelector` on the current
+/// run loop in the **default** mode. Used by Re-insert (spec §5.1.5) to defer the replay until
+/// the Status Item menu's modal tracking loop ends: a `delay: 0` timer will not fire while the
+/// run loop is in event-tracking mode, so it fires only once the menu has closed and the prior
+/// app is key again.
+inline fn performAfter(self: id, aSelector: SEL, arg: id, delay: f64) void {
+    const f: *const fn (id, SEL, SEL, id, f64) callconv(.c) void = @ptrCast(&objc_msgSend);
+    f(self, sel_registerName("performSelector:withObject:afterDelay:"), aSelector, arg, delay);
+}
 inline fn makeItem(title: [*:0]const u8, action: SEL) id {
     const allocd = msg(cls("NSMenuItem"), "alloc");
     const f: *const fn (id, SEL, id, SEL, id) callconv(.c) id = @ptrCast(&objc_msgSend);
@@ -256,6 +265,14 @@ pub const Host = struct {
     /// first; a stamp that was evicted since the projection is a no-op. Keyed by the same stable
     /// `stamp` as `historyText`, so a concurrent Insertion can't misalign the copied text.
     copy: *const fn (ctx: *anyopaque, stamp: i64) void,
+    /// Re-insert one Recent Insertions entry at the current frontmost cursor (spec §5.1): resolve
+    /// the record with capture `stamp` against the authoritative ring and replay its **verbatim**
+    /// `inserted` bytes (trailing space and all, never re-running Backtrack) as a Coordinator-less
+    /// bypass job on the insert worker — no Utterance identity, so it never writes the ring on
+    /// success or failure. The menu defers this call until the Status Item menu has closed, so the
+    /// replay lands at whatever Focused Target is frontmost then (unconditional, no target guard).
+    /// An evicted stamp is a no-op. Keyed by the same stable `stamp` as `historyText` / `copy`.
+    reinsert: *const fn (ctx: *anyopaque, stamp: i64) void,
     /// Menu Quit — begin the clean shutdown (ends in appkit.stop()).
     quit: *const fn (ctx: *anyopaque) void,
 };
@@ -541,6 +558,10 @@ pub const Menu = struct {
     history_alt_entries: [recent_insertions.capacity]id = @splat(null), // the ⌥-alternate twin per row (fires reveal)
     history_reveal_items: [recent_insertions.capacity]id = @splat(null), // the in-submenu "Reveal text" item per row
     reveal: RevealSet = .{}, // which entries the user has toggled to show inline (spec §4)
+    /// The entry stamp a "Re-insert here" click stashed, awaiting the deferred fire once the menu
+    /// closes (spec §5.1.5). At most one is pending — the menu closes on the click, so a second
+    /// re-insert can only start after this one has fired and cleared it.
+    pending_reinsert: ?i64 = null,
 
     last_snapshot: ?status_item.Snapshot = null,
     timer_ctx: CFRunLoopTimerContext = .{},
@@ -696,14 +717,18 @@ pub const Menu = struct {
             msgBool(row_sub, "setAutoenablesItems:", false);
             // Copy (spec §5.2): fires the shared `onHistoryCopy:` selector, tagged with this
             // row's fixed newest-first index — the daemon resolves it to the entry's stamp,
-            // copies the trimmed `inserted` on the insert worker. Re-insert stays a disabled
-            // placeholder until its own ticket wires it.
+            // copies the trimmed `inserted` on the insert worker.
             const copy_it = makeItem("Copy", sel_registerName("onHistoryCopy:"));
             msg1v(copy_it, "setTarget:", self.target);
             msgLong(copy_it, "setTag:", @intCast(i));
             msg1v(row_sub, "addItem:", copy_it);
-            const reinsert_it = makeItem("Re-insert here", null);
-            msgBool(reinsert_it, "setEnabled:", false); // placeholder — wired in a later ticket
+            // Re-insert here (spec §5.1): fires the shared `onHistoryReinsert:` selector, tagged
+            // with this row's fixed newest-first index. The handler defers the actual replay until
+            // the menu closes (so it lands at the then-frontmost Focused Target, §5.1.5); the
+            // daemon then submits the verbatim `inserted` bytes as a Coordinator-less bypass job.
+            const reinsert_it = makeItem("Re-insert here", sel_registerName("onHistoryReinsert:"));
+            msg1v(reinsert_it, "setTarget:", self.target);
+            msgLong(reinsert_it, "setTag:", @intCast(i));
             msg1v(row_sub, "addItem:", reinsert_it);
             // "Reveal text" — the discoverable equivalent of the ⌥-click reveal (spec §4). Its
             // title flips to "Hide text" while revealed; both fire the shared `onHistoryEntry:`
@@ -1087,6 +1112,40 @@ fn onHistoryCopy(_: id, _: SEL, sender: id) callconv(.c) void {
     const view = status_item.derive(m.last_snapshot orelse m.host.status(m.host.ctx)).history;
     if (i >= view.count) return;
     m.host.copy(m.host.ctx, view.entries[i].timestamp);
+}
+
+/// Re-insert one Recent Insertions entry at the current frontmost cursor (spec §5.1): the
+/// per-entry "Re-insert here" item's selector, dispatched with the row's newest-first index in
+/// the item `tag` (mirroring `onHistoryCopy:`). It resolves the index to the entry's stable
+/// `timestamp` off the current view, **stashes** it, and defers the actual replay to
+/// `onReinsertFire:` — the Status Item menu's modal tracking holds key focus until it closes, so
+/// firing now would land the insert in the menu, not the user's target. No transcript byte is
+/// touched here; the daemon fetches the verbatim bytes on the deferred fire.
+fn onHistoryReinsert(_: id, _: SEL, sender: id) callconv(.c) void {
+    const m = g_menu orelse return;
+    const raw = msgLongR(sender, "tag");
+    if (raw < 0) return;
+    const i: usize = @intCast(raw);
+    const view = status_item.derive(m.last_snapshot orelse m.host.status(m.host.ctx)).history;
+    if (i >= view.count) return;
+    m.pending_reinsert = view.entries[i].timestamp;
+    // Defer until the menu's modal loop unwinds: an afterDelay:0 timer fires in the default
+    // run-loop mode, i.e. only once NSMenu tracking has ended and the prior app is key again
+    // (spec §5.1.5). The replay then lands at whatever Focused Target is frontmost — unconditional.
+    performAfter(m.target, sel_registerName("onReinsertFire:"), null, 0.0);
+}
+
+/// Fires one run-loop turn after a "Re-insert here" click, by which point the Status Item menu
+/// has closed and the prior app is key again (spec §5.1.5). Hands the stashed entry's stamp to
+/// `host.reinsert`, which replays the verbatim `inserted` bytes on the insert worker as a
+/// Coordinator-less bypass job — landing at the now-frontmost Focused Target, unconditional, and
+/// never recorded into the ring (§5.1.4). A null stash (already fired, or the menu was dismissed
+/// without a click) is a no-op.
+fn onReinsertFire(_: id, _: SEL, _: id) callconv(.c) void {
+    const m = g_menu orelse return;
+    const stamp = m.pending_reinsert orelse return;
+    m.pending_reinsert = null;
+    m.host.reinsert(m.host.ctx, stamp);
 }
 
 const ModelActionConfirmation = struct {
@@ -1484,6 +1543,8 @@ fn makeTarget() id {
     _ = class_addMethod(target_cls, sel_registerName("onModelAction:"), @ptrCast(&onModelAction), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onHistoryEntry:"), @ptrCast(&onHistoryEntry), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onHistoryCopy:"), @ptrCast(&onHistoryCopy), v_at);
+    _ = class_addMethod(target_cls, sel_registerName("onHistoryReinsert:"), @ptrCast(&onHistoryReinsert), v_at);
+    _ = class_addMethod(target_cls, sel_registerName("onReinsertFire:"), @ptrCast(&onReinsertFire), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onOverlay:"), @ptrCast(&onOverlay), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onBacktrack:"), @ptrCast(&onBacktrack), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onPause:"), @ptrCast(&onPause), v_at);

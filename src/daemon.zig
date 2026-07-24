@@ -1047,6 +1047,23 @@ const Daemon = struct {
         self.insertion.submitCopy(text);
     }
 
+    /// Re-insert one Recent Insertions entry at the current frontmost cursor (spec §5.1): resolve
+    /// the record with capture `stamp` against the authoritative ring and hand its **verbatim**
+    /// `inserted` bytes — trailing space and all, never re-running Backtrack (§5.1.2/3) — to the
+    /// insert worker as a Coordinator-less bypass job (`submitBypass`). Unlike `menuCopy` the
+    /// bytes are passed as-is: the row lands identically to the original dictation. The bypass
+    /// job carries no Utterance identity, so it never reaches `onInserted` and never writes the
+    /// ring, on success *or* failure (§5.1.4). An evicted stamp yields 0 bytes → nothing to do.
+    /// The menu defers this call until the Status Item menu has closed, so the replay lands at
+    /// whatever Focused Target is frontmost then — unconditional, no target-changed guard (§5.1.5).
+    fn menuReinsert(ctx: *anyopaque, stamp: i64) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        var buf: [recent_insertions.max_bytes]u8 = undefined;
+        const n = self.recent_insertions.textForStamp(stamp, &buf);
+        if (n == 0) return; // evicted since the projection was taken — nothing to re-insert
+        self.insertion.submitBypass(buf[0..n]);
+    }
+
     /// A session-shaped setting changed: nudge the Session to cycle when idle. Before
     /// the first connect there is nothing to mark — that connect reads the snapshot.
     fn menuMarkSessionDirty(ctx: *anyopaque) void {
@@ -1247,6 +1264,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
         .modelAction = Daemon.menuModelAction,
         .historyText = Daemon.menuHistoryText,
         .copy = Daemon.menuCopy,
+        .reinsert = Daemon.menuReinsert,
         .quit = Daemon.menuQuit,
     });
     feedback.log("  menu bar: {s}\n", .{if (menu_up)
