@@ -47,6 +47,7 @@ const kCGSessionEventTap: u32 = 1;
 const kCGEventSourceStateCombinedSessionState: i32 = 0; // Maccy's choice
 const kCGEventFlagMaskCommand: CGEventFlags = 0x100000; // CGEventTypes.h
 const kVK_ANSI_V: u16 = 0x09; // layout note: Dvorak-QWERTY-⌘ would need a keycode map
+const kVK_Delete: u16 = 0x33; // Backspace / delete-backwards (Carbon HIToolbox Events.h)
 
 extern "c" fn CGEventSourceCreate(state: i32) CGEventSourceRef;
 extern "c" fn CGEventSourceSetUserData(src: CGEventSourceRef, data: i64) void;
@@ -348,6 +349,29 @@ pub const Inserter = struct {
         CGEventPost(kCGSessionEventTap, up);
         CFRelease(@ptrCast(down));
         CFRelease(@ptrCast(up));
+    }
+
+    /// The Undo deletion primitive (backspace-posting mechanism, #214/#222): post `n`
+    /// discrete Backspace (⌫) key down/up pairs on this Inserter's **self-tagged** source
+    /// — so the Talk Key tap recognises them as our own and skips them (#210) — to
+    /// `kCGSessionEventTap`, ~1 ms paced, **no cap**. `n` is the record's grapheme count,
+    /// computed by the caller (`graphemeCount`, #220); `n == 0` posts nothing. Each pair is
+    /// an un-modified single-key post (like `postCmdV`, minus the ⌘ flag), paced ~1 ms
+    /// down-to-up and ~1 ms between pairs like `keystroke`'s chunks. Blind best-effort: a
+    /// post-paste transform (autocorrect, smart quotes) can make N over- or under-delete
+    /// by a bounded amount — accepted silently, no AX readback (#214).
+    pub fn deleteChars(self: *Inserter, n: usize) void {
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const down = CGEventCreateKeyboardEvent(self.src, kVK_Delete, true);
+            const up = CGEventCreateKeyboardEvent(self.src, kVK_Delete, false);
+            CGEventPost(kCGSessionEventTap, down);
+            sleepMs(1);
+            CGEventPost(kCGSessionEventTap, up);
+            sleepMs(1);
+            CFRelease(@ptrCast(down));
+            CFRelease(@ptrCast(up));
+        }
     }
 
     /// Fallback: post `utf16` as synthetic keystrokes in ≤20-unit chunks, never
