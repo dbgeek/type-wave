@@ -13,6 +13,7 @@ test {
     _ = @import("whisper_process_helper.zig"); // the parent-side ProcessHelper + its acceptance tests
     _ = @import("whisper_ipc.zig");
     _ = @import("whisper_helper_core.zig");
+    _ = @import("whisper_runtime_test.zig"); // the real C-ABI runtime wrapper, driven via a fake bridge (#207)
     _ = @import("whisper_supervisor.zig");
     _ = @import("config.zig");
     _ = @import("vocab.zig"); // the pure vocabulary helpers: buildPrompt glossary + budget estimation
