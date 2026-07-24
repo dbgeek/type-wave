@@ -475,6 +475,12 @@ const RealInsertionDeps = struct {
     pub fn finishInsert(self: *RealInsertionDeps) void {
         self.inserter.drainDeferredRestore();
     }
+    /// The clipboard-copy mechanism (recent-insertions spec §5.2): a permanent, non-transient
+    /// pasteboard write. The worker drains the deferred restore (via `finishInsert`) before it
+    /// calls this, so a late restore can't clobber the copy.
+    pub fn copyToClipboard(self: *RealInsertionDeps, text: [*:0]const u8) void {
+        self.inserter.copyToClipboard(text);
+    }
     pub fn shouldQuit(_: *RealInsertionDeps) bool {
         return g_quit.load(.acquire);
     }
@@ -1024,6 +1030,23 @@ const Daemon = struct {
         return self.recent_insertions.textForStamp(stamp, out);
     }
 
+    /// Copy one Recent Insertions entry to the clipboard (spec §5.2): resolve the record with
+    /// capture `stamp` against the authoritative ring, strip the single trailing Insertion space
+    /// (§5.2.6 — the copied text is the resolved `inserted` the row shows, **not** `raw`), then
+    /// hand it to the insert worker for the permanent, drain-first pasteboard write (§5.2.7).
+    /// An evicted stamp yields 0 bytes → nothing to copy. Runs on the main thread (menu action);
+    /// the actual pasteboard write happens on the insert worker so it can drain safely.
+    fn menuCopy(ctx: *anyopaque, stamp: i64) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        var buf: [recent_insertions.max_bytes]u8 = undefined;
+        const n = self.recent_insertions.textForStamp(stamp, &buf);
+        if (n == 0) return; // evicted since the projection was taken — nothing to copy
+        // Strip the single trailing Insertion space (the chaining artifact), so Copy yields the
+        // text the row shows rather than the with-space bytes that hit the cursor.
+        const text = if (buf[n - 1] == ' ') buf[0 .. n - 1] else buf[0..n];
+        self.insertion.submitCopy(text);
+    }
+
     /// A session-shaped setting changed: nudge the Session to cycle when idle. Before
     /// the first connect there is nothing to mark — that connect reads the snapshot.
     fn menuMarkSessionDirty(ctx: *anyopaque) void {
@@ -1223,6 +1246,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
         .storeApiKey = Daemon.menuStoreApiKey,
         .modelAction = Daemon.menuModelAction,
         .historyText = Daemon.menuHistoryText,
+        .copy = Daemon.menuCopy,
         .quit = Daemon.menuQuit,
     });
     feedback.log("  menu bar: {s}\n", .{if (menu_up)

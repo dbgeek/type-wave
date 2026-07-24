@@ -312,6 +312,32 @@ pub const Inserter = struct {
         }
     }
 
+    /// A permanent, **non-transient** clipboard write for a user-initiated Copy
+    /// (recent-insertions spec §5.2). Unlike `paste`, this is an honest clipboard write with
+    /// **no save-and-restore**: the copied text is meant to stay. It does a plain
+    /// `clearContents` + `setString` and deliberately does **not** set the
+    /// `org.nspasteboard.TransientType` / `ConcealedType` markers `paste` uses: those tell
+    /// clipboard managers to skip the write, and a Copy the user asked for should be a
+    /// **normal, visible** pasteboard entry they pick up. `utf8` must be NUL-terminated
+    /// (→ NSString).
+    ///
+    /// **Caller contract (spec §5.2.7):** the insert worker drains any pending deferred
+    /// Insertion restore (`drainDeferredRestore`, via the adapter's `runCopy`) *before* calling
+    /// this — so a late restore can't silently clobber the copied text — and this runs on that
+    /// worker's serialization so the drain can't race a live insert. This write itself leaves
+    /// nothing deferred, so there is no post-write restore to drain.
+    pub fn copyToClipboard(self: *Inserter, utf8: [*:0]const u8) void {
+        _ = self;
+        const pool = objc_autoreleasePoolPush();
+        defer objc_autoreleasePoolPop(pool);
+
+        const pb = sendId(objc_getClass("NSPasteboard"), "generalPasteboard");
+        _ = sendLong(pb, "clearContents");
+        setStringForType(pb, nsString(utf8), nsString(pb_type_utf8));
+        // No Transient/Concealed markers — a user Copy is a normal, visible entry (§5.2.7).
+        feedback.log("  [copy] recorded insertion copied to the clipboard\n", .{});
+    }
+
     fn postCmdV(self: *Inserter) void {
         const down = CGEventCreateKeyboardEvent(self.src, kVK_ANSI_V, true);
         const up = CGEventCreateKeyboardEvent(self.src, kVK_ANSI_V, false);

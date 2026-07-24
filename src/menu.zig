@@ -249,6 +249,13 @@ pub const Host = struct {
     /// `Snapshot` — so none of them ride the pure pipeline. Keyed by the stable `stamp`, the
     /// same identity the reveal state uses, so a concurrent Insertion can't misalign text.
     historyText: *const fn (ctx: *anyopaque, stamp: i64, out: []u8) usize,
+    /// Copy one Recent Insertions entry to the clipboard (spec §5.2): resolve the record with
+    /// capture `stamp` against the authoritative ring, strip the single trailing Insertion
+    /// space, and put the result on the pasteboard as a permanent, normal (non-transient)
+    /// entry. Runs on the insert-worker serialization so it drains any pending deferred restore
+    /// first; a stamp that was evicted since the projection is a no-op. Keyed by the same stable
+    /// `stamp` as `historyText`, so a concurrent Insertion can't misalign the copied text.
+    copy: *const fn (ctx: *anyopaque, stamp: i64) void,
     /// Menu Quit — begin the clean shutdown (ends in appkit.stop()).
     quit: *const fn (ctx: *anyopaque) void,
 };
@@ -687,11 +694,17 @@ pub const Menu = struct {
             const row = makeItem("", null);
             const row_sub = newMenu();
             msgBool(row_sub, "setAutoenablesItems:", false);
-            for ([_][*:0]const u8{ "Copy", "Re-insert here" }) |title| {
-                const it = makeItem(title, null);
-                msgBool(it, "setEnabled:", false); // placeholder — wired in a later ticket
-                msg1v(row_sub, "addItem:", it);
-            }
+            // Copy (spec §5.2): fires the shared `onHistoryCopy:` selector, tagged with this
+            // row's fixed newest-first index — the daemon resolves it to the entry's stamp,
+            // copies the trimmed `inserted` on the insert worker. Re-insert stays a disabled
+            // placeholder until its own ticket wires it.
+            const copy_it = makeItem("Copy", sel_registerName("onHistoryCopy:"));
+            msg1v(copy_it, "setTarget:", self.target);
+            msgLong(copy_it, "setTag:", @intCast(i));
+            msg1v(row_sub, "addItem:", copy_it);
+            const reinsert_it = makeItem("Re-insert here", null);
+            msgBool(reinsert_it, "setEnabled:", false); // placeholder — wired in a later ticket
+            msg1v(row_sub, "addItem:", reinsert_it);
             // "Reveal text" — the discoverable equivalent of the ⌥-click reveal (spec §4). Its
             // title flips to "Hide text" while revealed; both fire the shared `onHistoryEntry:`
             // toggle, tagged with this row's fixed newest-first index.
@@ -1059,6 +1072,21 @@ fn onHistoryEntry(_: id, _: SEL, sender: id) callconv(.c) void {
     if (i >= view.count) return;
     m.reveal.toggle(view.entries[i].timestamp);
     m.rebuildHistory();
+}
+
+/// Copy one Recent Insertions entry to the clipboard (spec §5.2): the per-entry Copy item's
+/// selector, dispatched with the row's newest-first index in the item `tag` (mirroring
+/// `onHistoryEntry:`). It resolves the index to the entry's stable `timestamp` off the current
+/// view and hands it to `host.copy`; the daemon fetches + trims the text and does the pasteboard
+/// write on the insert worker. No transcript byte is touched here — the menu only dispatches.
+fn onHistoryCopy(_: id, _: SEL, sender: id) callconv(.c) void {
+    const m = g_menu orelse return;
+    const raw = msgLongR(sender, "tag");
+    if (raw < 0) return;
+    const i: usize = @intCast(raw);
+    const view = status_item.derive(m.last_snapshot orelse m.host.status(m.host.ctx)).history;
+    if (i >= view.count) return;
+    m.host.copy(m.host.ctx, view.entries[i].timestamp);
 }
 
 const ModelActionConfirmation = struct {
@@ -1455,6 +1483,7 @@ fn makeTarget() id {
     _ = class_addMethod(target_cls, sel_registerName("onPrimary:"), @ptrCast(&onPrimary), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onModelAction:"), @ptrCast(&onModelAction), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onHistoryEntry:"), @ptrCast(&onHistoryEntry), v_at);
+    _ = class_addMethod(target_cls, sel_registerName("onHistoryCopy:"), @ptrCast(&onHistoryCopy), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onOverlay:"), @ptrCast(&onOverlay), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onBacktrack:"), @ptrCast(&onBacktrack), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onPause:"), @ptrCast(&onPause), v_at);

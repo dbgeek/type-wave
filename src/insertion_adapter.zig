@@ -61,6 +61,18 @@ pub fn InsertionAdapter(comptime Deps: type) type {
         bypass_job: [job_buf_len]u8 = undefined,
         bypass_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+        /// A third, **clipboard-copy** job slot (recent-insertions spec §5.2, issue #197). The
+        /// menu's per-entry Copy dispatches the trimmed `inserted` text through here so the
+        /// permanent, non-transient pasteboard write runs on this same single worker — the
+        /// serialization that lets it drain any pending deferred Insertion restore without
+        /// racing a live dictation insert (§5.2.7). Like `bypass_job` it carries no Utterance
+        /// identity and never reports back. A dedicated slot (not `job` / `bypass_job`) so the
+        /// menu producer never clobbers a Coordinator or a replay job. NUL-terminated for the
+        /// pasteboard NSString, ordered across threads by `copy_pending` exactly like `job` by
+        /// `pending`.
+        copy_job: [job_buf_len]u8 = undefined,
+        copy_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
         pub fn init(deps: Deps) Self {
             return .{ .deps = deps };
         }
@@ -90,6 +102,20 @@ pub fn InsertionAdapter(comptime Deps: type) type {
             self.bypass_pending.store(true, .release);
         }
 
+        /// Clipboard-copy seam (recent-insertions spec §5.2, issue #197). Hands the worker the
+        /// exact bytes to put on the clipboard — the caller (`daemon.menuCopy`) has already
+        /// resolved the entry against the ring and stripped the single trailing Insertion space
+        /// (§5.2.6), so this stores `text` **verbatim** (no `ensureTrailingSpace`) and only adds
+        /// the NUL terminator the pasteboard NSString cast needs. Runs off the menu thread; the
+        /// caller must not submit while a copy job is still pending (mirrors `submit`'s
+        /// single-producer contract). An over-long `text` is capped to the job buffer.
+        pub fn submitCopy(self: *Self, text: []const u8) void {
+            const n = @min(text.len, self.copy_job.len - 1);
+            @memcpy(self.copy_job[0..n], text[0..n]);
+            self.copy_job[n] = 0;
+            self.copy_pending.store(true, .release);
+        }
+
         /// One worker tick. Exposed so tests can drive the adapter without spawning a
         /// thread or sleeping. Returns whether a job was drained. Dictation jobs take
         /// priority (time-sensitive); the Coordinator-less replay defers to them and, being
@@ -101,6 +127,10 @@ pub fn InsertionAdapter(comptime Deps: type) type {
             }
             if (self.bypass_pending.swap(false, .acquire)) {
                 self.runBypass();
+                return true;
+            }
+            if (self.copy_pending.swap(false, .acquire)) {
+                self.runCopy();
                 return true;
             }
             return false;
@@ -160,6 +190,19 @@ pub fn InsertionAdapter(comptime Deps: type) type {
             self.deps.finishInsert();
         }
 
+        /// Drain the one pending clipboard-copy job (spec §5.2): **drain any deferred Insertion
+        /// restore first** (`finishInsert` — the same drain the dictation path runs, a no-op
+        /// once the worker already drained the prior job) so a late restore can't clobber the
+        /// copy, then write the stored bytes to the clipboard as a permanent, non-transient
+        /// entry. No `complete` / `focusedApp`: a Copy carries no Utterance identity, so it never
+        /// reaches `onInserted` and never writes the ring — the pasteboard write is its only
+        /// effect. Running on this worker is what lets the drain happen without racing an insert.
+        fn runCopy(self: *Self) void {
+            self.deps.finishInsert();
+            const z: [*:0]const u8 = @ptrCast(&self.copy_job);
+            self.deps.copyToClipboard(z);
+        }
+
         /// Process jobs until the owning daemon is quitting. Idle behavior stays with the
         /// dependency set so tests do not inherit wall-clock sleeps.
         pub fn workerLoop(self: *Self) void {
@@ -184,6 +227,12 @@ const FakeDeps = struct {
     focused_app: ?coord.AppIdentity = null,
     finishes: usize = 0,
     completions_at_finish: usize = 0,
+    copies: usize = 0,
+    last_copy: [256]u8 = undefined,
+    last_copy_len: usize = 0,
+    /// `finishes` seen at the moment `copyToClipboard` ran — proves the drain preceded the
+    /// write (spec §5.2.7: the copy drains any deferred restore before it writes).
+    finishes_at_copy: usize = 0,
     quit: bool = false,
     idles: usize = 0,
 
@@ -214,6 +263,18 @@ const FakeDeps = struct {
     fn finishInsert(self: *FakeDeps) void {
         self.finishes += 1;
         self.completions_at_finish = self.completions;
+    }
+
+    fn copyToClipboard(self: *FakeDeps, text: [*:0]const u8) void {
+        self.copies += 1;
+        self.finishes_at_copy = self.finishes;
+        const s = std.mem.span(text);
+        @memcpy(self.last_copy[0..s.len], s);
+        self.last_copy_len = s.len;
+    }
+
+    fn lastCopy(self: *FakeDeps) []const u8 {
+        return self.last_copy[0..self.last_copy_len];
     }
 
     fn shouldQuit(self: *FakeDeps) bool {
@@ -391,6 +452,55 @@ test "a bypass job is serialized against — never clobbers — a pending dictat
     // The bypass job drains on the next tick — serialized, never interleaved, no report.
     try std.testing.expect(adapter.runOnce());
     try std.testing.expectEqualStrings("replay ", adapter.deps.lastText());
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.completions);
+
+    try std.testing.expect(!adapter.runOnce());
+}
+
+// --- Clipboard-copy (Copy) jobs — recent-insertions spec §5.2, issue #197 ---
+
+test "a copy job writes the exact bytes to the clipboard and never reports back" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{});
+
+    // The caller has already resolved + trimmed the row; the seam copies it verbatim.
+    adapter.submitCopy("At 18:00");
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.copies);
+    try std.testing.expectEqualStrings("At 18:00", adapter.deps.lastCopy());
+    // A Copy carries no Utterance identity: nothing reaches onInserted / the ring, and it is
+    // not an insert (spec §5.2 — the pasteboard write is its only effect).
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.completions);
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.calls);
+}
+
+test "a copy job drains any deferred Insertion restore before it writes (spec §5.2.7)" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{});
+
+    adapter.submitCopy("recovered");
+    try std.testing.expect(adapter.runOnce());
+    // The drain (finishInsert) must run, and must precede the pasteboard write so a late
+    // restore can't clobber the copy: finishes was already 1 when copyToClipboard ran.
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.finishes);
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.finishes_at_copy);
+}
+
+test "a copy job is serialized against — never clobbers — a pending dictation job" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{});
+
+    // Both sources hand off before the worker runs; the separate slots must not clobber.
+    adapter.submit(7, "dictation", .normal);
+    adapter.submitCopy("copied");
+
+    // The dictation job drains first, faithfully, and reports to the Coordinator.
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqualStrings("dictation ", adapter.deps.lastText());
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.completions);
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.copies);
+
+    // The copy job drains on the next tick — serialized, never interleaved, no report.
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqualStrings("copied", adapter.deps.lastCopy());
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.copies);
     try std.testing.expectEqual(@as(usize, 1), adapter.deps.completions);
 
     try std.testing.expect(!adapter.runOnce());
