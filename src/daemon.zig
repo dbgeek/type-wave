@@ -28,7 +28,7 @@
 //!    prerequisites do NOT crash the daemon (the LaunchAgent's KeepAlive would crash-loop);
 //!    the supervisor polls (~3 s), executes the phase module's actions, and reserves
 //!    `exit(0)` for a clean SIGTERM/bootout. On a cold start the supervisor also runs
-//!    #130's serialized TCC request sequence (grant_sequence.zig) and the two live
+//!    #130's serialized TCC request sequence (grants.zig) and the two live
 //!    pickup mechanisms #127/#129 confirmed: fresh-create tap re-arm for Input
 //!    Monitoring, tagged-probe attempt-then-observe for PostEvent — zero restarts.
 //! 2. **Link state** (owned by session.zig): connecting / ready / reconnecting / closed.
@@ -40,10 +40,12 @@
 //!                        trampolines press/release into the Coordinator (kept fast — a
 //!                        slow tap callback makes the OS disable the tap). All AppKit
 //!                        happens here, menu actions included.
-//!   - insert worker    : the InsertionAdapter — drains one insert job, performs the slow
-//!                        Insertion off the Coordinator's mutex, then reports `.inserted`.
-//!                        Also drains the Undo Runner (undo.zig, ADR-0008) last, which is
-//!                        what serializes a deletion against dictation.
+//!   - Insert Worker    : the Insertion Runner (insertion_runner.zig, ADR-0009) — drains one
+//!                        dictation job or one queued Recent Insertions action, performs the
+//!                        slow Insertion off the Coordinator's mutex, then reports `.inserted`
+//!                        with the bytes it landed. Also drains the Undo Runner (undo.zig,
+//!                        ADR-0008) last, which is what serializes a deletion against
+//!                        dictation.
 //!   - rewrite worker   : the RewriteAdapter (docs/backtrack-spec.md) — drains one
 //!                        Backtrack rewrite job, makes the OpenAI Responses call off the
 //!                        Coordinator's mutex, then reports `.rewritten`.
@@ -70,7 +72,7 @@ const coord = @import("coordinator.zig");
 const menu_mod = @import("menu.zig");
 const appkit = @import("appkit.zig");
 const keychain = @import("keychain.zig");
-const insertion_adapter = @import("insertion_adapter.zig");
+const insertion_runner = @import("insertion_runner.zig");
 const recent_insertions = @import("recent_insertions.zig");
 const undo_mod = @import("undo.zig");
 const app_focus = @import("app_focus.zig");
@@ -79,7 +81,7 @@ const openai_rewrite = @import("openai_rewrite.zig");
 const readiness = @import("readiness.zig");
 const configuration_phase = @import("configuration_phase.zig");
 const supervisor = @import("supervisor.zig");
-const grant_sequence = @import("grant_sequence.zig");
+const grants_mod = @import("grants.zig");
 const backend = @import("transcription_backend.zig");
 const backend_router = @import("backend_router.zig");
 const operation_channel = @import("operation_channel.zig");
@@ -450,15 +452,20 @@ const LocalProvisionerDeps = struct {
 };
 const LocalProvisioner = local_provisioner.LocalProvisioner(LocalProvisionerDeps);
 
-/// Real dependencies for insertion_adapter.zig. The adapter owns the asynchronous
-/// Insertion policy; daemon.zig supplies the concrete macOS mechanism, Settings Snapshot,
-/// process quit flag, and reverse edge into the Coordinator.
+/// Real dependencies for insertion_runner.zig. The **Insertion Runner** owns the cursor
+/// policy for dictation, Re-insert and Copy (ADR-0009); daemon.zig supplies the concrete
+/// macOS mechanism, Settings Snapshot, process quit flag, the refuse cue, and the reverse
+/// edge into the Coordinator. The Recent Insertions ring is *not* here: like the Undo
+/// Runner's, it is daemon-owned and handed over concretely (ADR-0006).
 const RealInsertionDeps = struct {
     inserter: *insertmod.Inserter,
     store: *config.Store,
+    /// The Feedback Surface, for the refuse cue on a menu action that did nothing. A stable
+    /// pointer into the daemon struct, wired at construction below.
+    surface: *Surface,
 
     co_ctx: *anyopaque = undefined,
-    on_done: *const fn (*anyopaque, coord.UtteranceId, coord.InsertResult, ?coord.AppIdentity) void = undefined,
+    on_done: *const fn (*anyopaque, coord.UtteranceId, coord.InsertResult, ?coord.AppIdentity, []const u8) void = undefined,
 
     pub fn insertionPlan(self: *RealInsertionDeps) insertmod.Plan {
         const s = self.store.current(); // one snapshot: method + settle stay coherent
@@ -472,8 +479,16 @@ const RealInsertionDeps = struct {
     pub fn focusedApp(_: *RealInsertionDeps) ?coord.AppIdentity {
         return app_focus.frontmost();
     }
-    pub fn complete(self: *RealInsertionDeps, id: coord.UtteranceId, result: coord.InsertResult, focused_app: ?coord.AppIdentity) void {
-        self.on_done(self.co_ctx, id, result, focused_app);
+    pub fn complete(self: *RealInsertionDeps, id: coord.UtteranceId, result: coord.InsertResult, focused_app: ?coord.AppIdentity, inserted: []const u8) void {
+        self.on_done(self.co_ctx, id, result, focused_app, inserted);
+    }
+    /// The refuse cue for a Recent Insertions action that did nothing (ADR-0009): a failed
+    /// replay, a stamp evicted before the worker reached it, or a click past the queue's
+    /// depth. The same red bloom + shake an Undo refusal shows (ADR-0007) — one visual
+    /// vocabulary for "that cursor action did not happen" — routed through the Feedback
+    /// Surface so all HUD arbitration stays in one place.
+    pub fn actionRefused(self: *RealInsertionDeps) void {
+        self.surface.undoRefused();
     }
     pub fn finishInsert(self: *RealInsertionDeps) void {
         self.inserter.drainDeferredRestore();
@@ -491,7 +506,7 @@ const RealInsertionDeps = struct {
         _ = usleep(2_000);
     }
 };
-const InsertionAdapter = insertion_adapter.InsertionAdapter(RealInsertionDeps);
+const InsertionRunner = insertion_runner.InsertionRunner(RealInsertionDeps);
 
 /// The HUD pump bound to its production Chrome, and the Feedback Surface bound to both
 /// halves it arbitrates. Both are generic so the pump's composition rules and the
@@ -524,9 +539,12 @@ const RealUndoDeps = struct {
     /// Backspaces are destructive, so a paused daemon must stay inert; and without the
     /// PostEvent grant `deleteChars` would post nothing while the confirm cue claimed a
     /// deletion had happened. An OpenAI key or a Model Installation is irrelevant to deleting
-    /// text that already landed, so `configured` is not consulted.
+    /// text that already landed, so `configured` is not consulted. The grant half is the
+    /// Grant Observer's composed fact — the observe latch ORed with the preflight (#129) —
+    /// so this predicate, which authorizes a burst of destructive Backspaces, is exercised
+    /// by fed probe values rather than by a live daemon (ADR-0010).
     pub fn enabled(self: *RealUndoDeps) bool {
-        return !self.daemon.paused.load(.acquire) and self.daemon.postEventFact();
+        return !self.daemon.paused.load(.acquire) and self.daemon.grants.granted(.post_event);
     }
     /// The gate's fresh side (#224): a cross-process NSWorkspace query, read on the insert
     /// worker immediately before posting — never on the tap's run-loop thread, which the OS
@@ -553,6 +571,45 @@ const RealUndoDeps = struct {
     }
 };
 const UndoRunner = undo_mod.Undo(RealUndoDeps);
+
+/// Real probes for grants.zig (ADR-0010). Every one is a direct TCC call or the wall clock —
+/// the six things the **Grant Observer** cannot decide for itself. The two *composed* facts
+/// (Input Monitoring's stale-preflight OR, PostEvent's observe latch) are the Observer's, not
+/// this adapter's: it answers questions, it does not reconcile them.
+///
+/// `tapEnabled` is the one probe that needs daemon state — the live Talk Key tap — so this
+/// carries a `*Daemon`; the rest are free functions on their own modules.
+const RealGrantProbes = struct {
+    daemon: *Daemon = undefined,
+
+    pub fn micGranted(_: *RealGrantProbes) bool {
+        return cap.microphoneGranted();
+    }
+    pub fn listenGranted(_: *RealGrantProbes) bool {
+        return tapmod.Tap.listenGranted();
+    }
+    /// The live tap, brought up by the fresh-create re-arm — the truth the Input Monitoring
+    /// preflight goes stale against in-process after a grant (#127).
+    pub fn tapEnabled(self: *RealGrantProbes) bool {
+        return self.daemon.tap.isEnabled();
+    }
+    pub fn postEventGranted(_: *RealGrantProbes) bool {
+        return insertmod.postEventGranted();
+    }
+    /// Fire one TCC request. Serialized by the Observer's pure `Sequence`: firing a CG
+    /// request while an earlier prompt is pending is what produced the #128 restart loop.
+    pub fn request(_: *RealGrantProbes, grant: grants_mod.Grant) void {
+        switch (grant) {
+            .microphone => cap.requestMicrophoneAccess(),
+            .input_monitoring => _ = tapmod.Tap.requestListenAccess(),
+            .post_event => _ = insertmod.requestPostEventAccess(),
+        }
+    }
+    pub fn nowMs(_: *RealGrantProbes) i64 {
+        return feedback.nowMs();
+    }
+};
+const GrantObserver = grants_mod.Observer(RealGrantProbes);
 
 /// Real dependencies for rewrite_adapter.zig (docs/backtrack-spec.md). The adapter owns
 /// the asynchronous Rewrite policy; daemon.zig supplies the OpenAI mechanism — the
@@ -626,7 +683,7 @@ const RealDeps = struct {
     audio: *cap.Capture,
     backends: *BackendRouter,
     rewrite: *RewriteAdapter,
-    insertion: *InsertionAdapter,
+    insertion: *InsertionRunner,
     deadline: *DeadlineAdapter,
     feedback: *Surface,
     recorder: *recent_insertions.Ring,
@@ -635,9 +692,9 @@ const Coord = coord.Coordinator(RealDeps);
 
 // Reverse-edge trampolines: the adapters' worker/timer threads carry the Coordinator as an
 // opaque pointer and re-enter it here (its concrete type is known at this wiring site).
-fn insertDoneTramp(ctx: *anyopaque, id: coord.UtteranceId, result: coord.InsertResult, focused_app: ?coord.AppIdentity) void {
+fn insertDoneTramp(ctx: *anyopaque, id: coord.UtteranceId, result: coord.InsertResult, focused_app: ?coord.AppIdentity, inserted: []const u8) void {
     const co: *Coord = @ptrCast(@alignCast(ctx));
-    co.handle(.{ .inserted = .{ .id = id, .result = result, .focused_app = focused_app } });
+    co.handle(.{ .inserted = .{ .id = id, .result = result, .focused_app = focused_app, .inserted = inserted } });
 }
 fn rewriteDoneTramp(ctx: *anyopaque, id: coord.UtteranceId, text: []const u8, result: coord.RewriteResult) void {
     const co: *Coord = @ptrCast(@alignCast(ctx));
@@ -692,7 +749,7 @@ const Daemon = struct {
     /// the Session).
     rewrite_http: std.http.Client = undefined,
     rewrite: RewriteAdapter = undefined,
-    insertion: InsertionAdapter = undefined,
+    insertion: InsertionRunner = undefined,
     /// The daemon-owned Recent Insertions ring (ADR-0006): written through the Coordinator's
     /// recorder seam at `onInserted`, read by the menu (later work) under its own leaf lock.
     /// Heap-free and zero-initializable, so it lives inline on the daemon.
@@ -720,15 +777,9 @@ const Daemon = struct {
     /// Supervisor-thread-only: #130's serialized cold-start TCC request sequence —
     /// Microphone → Input Monitoring → PostEvent, one request in flight at a time,
     /// advancing on grant or a 60 s per-grant timeout. Never restarts anything.
-    grants: grant_sequence.Sequence = .{},
-    /// Supervisor-thread-only: prints the sequence header once, right before its
-    /// first `[N/3]` line, so the block stays contiguous in the log.
-    grants_header_printed: bool = false,
-    /// Attempt-then-observe latch for the PostEvent grant (#129): set by the tap
-    /// callback when a self-tagged Insertion probe round-trips the event stream.
-    /// `CGPreflightPostEventAccess` can stay stale-`false` for the process lifetime
-    /// after a live grant, so this latch is the only trustworthy in-process signal.
-    post_event_observed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// It owns the three grant facts too — including the attempt-then-observe PostEvent
+    /// latch (#129) the tap callback sets and the Undo Runner's gate reads (ADR-0010).
+    grants: GrantObserver = GrantObserver.init(.{}),
     provisioner_deps: LocalProvisionerDeps = undefined,
     provisioner: LocalProvisioner = undefined,
 
@@ -822,7 +873,7 @@ const Daemon = struct {
     /// PostEvent grant is provably live (#129). Runs on the run-loop thread; one store.
     fn onSelfEvent(ctx: ?*anyopaque) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
-        self.post_event_observed.store(true, .release);
+        self.grants.observePostEvent();
     }
 
     /// The recovery chord ⌃⌘⌫ was pressed: the user wants to undo the last Insertion (#210,
@@ -844,19 +895,6 @@ const Daemon = struct {
 
     // ---- supervisor thread: the self-heal / not-configured → configured engine ----
 
-    /// Input Monitoring fact. The preflight is stale in-process after a live grant
-    /// (#127), so the live tap — brought up by the fresh-create re-arm — is the truth;
-    /// the preflight only adds the created-but-momentarily-disabled window at startup.
-    fn inputMonitoringFact(self: *Daemon) bool {
-        return self.tap.isEnabled() or tapmod.Tap.listenGranted();
-    }
-
-    /// PostEvent fact: the observe latch (#129) ORed with the preflight, which is
-    /// trustworthy when `true` but can lie `false` for the process lifetime.
-    fn postEventFact(self: *Daemon) bool {
-        return self.post_event_observed.load(.acquire) or insertmod.postEventGranted();
-    }
-
     /// One facts pass: probe grants/key/installation, tick the Configuration Phase, and
     /// park the freshly loaded key (if any) for DaemonDeps.connectOpenai. Called by the
     /// Backend Router mid-tick (DaemonDeps.wants) and again after self-heal effects.
@@ -868,8 +906,8 @@ const Daemon = struct {
         else
             null;
         self.router_deps.pending_key = key;
-        const im = self.inputMonitoringFact();
-        const pe = self.postEventFact();
+        const im = self.grants.granted(.input_monitoring);
+        const pe = self.grants.granted(.post_event);
         return self.configuration.tick(self.configurationFacts(im, pe, key != null, local_installation));
     }
 
@@ -881,7 +919,7 @@ const Daemon = struct {
         return .{
             .tap_enabled = self.tap.isEnabled(),
             .grants_reached_post_event = self.grants.reached(.post_event),
-            .post_event_granted = self.postEventFact(),
+            .post_event_granted = self.grants.granted(.post_event),
             .no_utterance_in_flight = self.transcription.activeId() == 0,
             .backend_available = self.transcription.available(),
             .paused = self.paused.load(.acquire),
@@ -896,7 +934,7 @@ const Daemon = struct {
             if (g_quit.load(.acquire)) return;
 
             // #130's serialized cold-start requests + all [N/3] narration.
-            self.tickGrantSequence();
+            self.grants.tick();
 
             // The Backend Router reconciles (selection, staleness, drain-gated teardown),
             // gathers the Configuration Phase outcome via DaemonDeps.wants at the right
@@ -925,63 +963,6 @@ const Daemon = struct {
             if (acts.remove_superseded) self.provisioner.removeSuperseded();
             self.capture_enabled.store(acts.capture_enabled, .release);
         }
-    }
-
-    /// One tick of #130's serialized TCC request sequence: gather the three grant facts,
-    /// let the pure policy decide, then fire the requests and print the [N/3] lines. The
-    /// grant facts keep being polled here forever — a grant landing minutes after its
-    /// step timed out still gets its granted line and its live pickup.
-    fn tickGrantSequence(self: *Daemon) void {
-        const facts = grant_sequence.Facts{
-            cap.microphoneGranted(),
-            self.inputMonitoringFact(),
-            self.postEventFact(),
-        };
-        const actions = self.grants.tick(feedback.nowMs(), facts);
-        if (actions.count > 0 and !self.grants_header_printed) {
-            self.grants_header_printed = true;
-            feedback.log("TCC grants for the type-wave daemon (requesting one at a time):\n", .{});
-        }
-        for (actions.slice()) |action| switch (action) {
-            .request => |grant| {
-                switch (grant) {
-                    .microphone => cap.requestMicrophoneAccess(),
-                    .input_monitoring => _ = tapmod.Tap.requestListenAccess(),
-                    .post_event => _ = insertmod.requestPostEventAccess(),
-                }
-                feedback.log("  [{d}/3] {s}: requesting{s}\n", .{ stepNo(grant), grantName(grant), requestHint(grant) });
-            },
-            .granted => |grant| feedback.log("  [{d}/3] {s}: granted — {s}\n", .{ stepNo(grant), grantName(grant), grantedNote(grant) }),
-            .timed_out => |grant| feedback.log("  [{d}/3] {s}: still waiting after 60s — moving on to the next grant; will keep polling in the background\n", .{ stepNo(grant), grantName(grant) }),
-        };
-    }
-
-    fn stepNo(grant: grant_sequence.Grant) usize {
-        return @intFromEnum(grant) + 1;
-    }
-
-    fn grantName(grant: grant_sequence.Grant) []const u8 {
-        return switch (grant) {
-            .microphone => "Microphone",
-            .input_monitoring => "Input Monitoring",
-            .post_event => "PostEvent (Accessibility)",
-        };
-    }
-
-    fn requestHint(grant: grant_sequence.Grant) []const u8 {
-        return switch (grant) {
-            .microphone => "…",
-            .input_monitoring => " — check System Settings > Privacy & Security > Input Monitoring",
-            .post_event => " — check System Settings > Privacy & Security > Accessibility",
-        };
-    }
-
-    fn grantedNote(grant: grant_sequence.Grant) []const u8 {
-        return switch (grant) {
-            .microphone => "Capture is live",
-            .input_monitoring => "Talk Key tap is live",
-            .post_event => "Insertion is live",
-        };
     }
 
     /// Log the missing prerequisites once per distinct set (not every tick), with one error
@@ -1038,8 +1019,8 @@ const Daemon = struct {
     fn menuStatus(ctx: *anyopaque) status_item.Snapshot {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
         const h = configuration_phase.health(self.configurationFacts(
-            self.inputMonitoringFact(),
-            self.postEventFact(),
+            self.grants.granted(.input_monitoring),
+            self.grants.granted(.post_event),
             false,
             self.provisioner.installationPresent(),
         ));
@@ -1120,41 +1101,27 @@ const Daemon = struct {
         return self.recent_insertions.textForStamp(stamp, out);
     }
 
-    /// Copy one Recent Insertions entry to the clipboard (spec §5.2): resolve the record with
-    /// capture `stamp` against the authoritative ring, strip the single trailing Insertion space
-    /// (§5.2.6 — the copied text is the resolved `inserted` the row shows, **not** `raw`), then
-    /// hand it to the insert worker for the permanent, drain-first pasteboard write (§5.2.7).
-    /// An evicted stamp yields 0 bytes → nothing to copy. Runs on the main thread (menu action);
-    /// the actual pasteboard write happens on the insert worker so it can drain safely.
+    /// Copy one Recent Insertions entry to the clipboard (spec §5.2). Queues the capture
+    /// `stamp` on the Insertion Runner and returns: resolution, the trailing-separator strip
+    /// (§5.2.6) and the permanent drain-first pasteboard write (§5.2.7) all happen on the
+    /// Insert Worker, beside the effect (ADR-0009). Runs on the main thread (menu action).
     fn menuCopy(ctx: *anyopaque, stamp: i64) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
-        var buf: [recent_insertions.max_bytes]u8 = undefined;
-        const n = self.recent_insertions.textForStamp(stamp, &buf);
-        if (n == 0) return; // evicted since the projection was taken — nothing to copy
-        // Strip the single trailing Insertion space (the chaining artifact), so Copy yields the
-        // text the row shows rather than the with-space bytes that hit the cursor.
-        const text = if (buf[n - 1] == ' ') buf[0 .. n - 1] else buf[0..n];
-        self.insertion.submitCopy(text);
+        self.insertion.submitMenu(.copy, stamp);
     }
 
-    /// Re-insert one Recent Insertions entry at the current frontmost cursor (spec §5.1): resolve
-    /// the record with capture `stamp` against the authoritative ring and hand its **verbatim**
-    /// `inserted` bytes — trailing space and all, never re-running Backtrack (§5.1.2/3) — to the
-    /// insert worker as a Coordinator-less bypass job (`submitBypass`). Unlike `menuCopy` the
-    /// bytes are passed as-is: the row lands identically to the original dictation. The bypass
-    /// job carries no Utterance identity, so it never reaches `onInserted` and never writes the
-    /// ring, on success *or* failure (§5.1.4). An evicted stamp yields 0 bytes → nothing to do.
-    /// The menu defers this call until the Status Item menu has closed, so the replay lands at
-    /// whatever Focused Target is frontmost then — unconditional, no target-changed guard (§5.1.5).
+    /// Re-insert one Recent Insertions entry at the current frontmost cursor (spec §5.1).
+    /// Queues the capture `stamp` on the Insertion Runner and returns: the Insert Worker
+    /// resolves the record, lands its **verbatim** `inserted` bytes — trailing space and all,
+    /// never re-running Backtrack (§5.1.2/3) — and only then clears the `undone` flag, so a
+    /// failed replay can never un-dim a row whose text did not come back (ADR-0009). The job
+    /// carries no Utterance identity, so it never reaches `onInserted` and never pushes a ring
+    /// entry, on success *or* failure (§5.1.4). The menu defers this call until the Status Item
+    /// menu has closed, so the replay lands at whatever Focused Target is frontmost then —
+    /// unconditional, no target-changed guard (§5.1.5). Runs on the main thread (menu action).
     fn menuReinsert(ctx: *anyopaque, stamp: i64) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
-        var buf: [recent_insertions.max_bytes]u8 = undefined;
-        const n = self.recent_insertions.textForStamp(stamp, &buf);
-        if (n == 0) return; // evicted since the projection was taken — nothing to re-insert
-        self.insertion.submitBypass(buf[0..n]);
-        // Redo edge (#225): re-inserting an undone entry restores its text, so clear the flag
-        // and the row stops rendering dimmed. A no-op on an entry that was never undone.
-        self.recent_insertions.clearUndone(stamp);
+        self.insertion.submitMenu(.reinsert, stamp);
     }
 
     /// A session-shaped setting changed: nudge the Session to cycle when idle. Before
@@ -1305,10 +1272,19 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
 
     // ---- wire the real adapters, then the Coordinator that drives them ----
     daemon.feedback_surface = .{ .cues = &daemon.cues, .hud = &daemon.hud };
+    // The Grant Observer's one stateful probe is the live Talk Key tap (ADR-0010); the rest
+    // are free functions. Wired before the supervisor thread ticks it.
+    daemon.grants.probes.daemon = &daemon;
     daemon.deadline.io = io;
     daemon.rewrite_http = .{ .allocator = alloc, .io = io };
     daemon.rewrite = RewriteAdapter.init(.{ .daemon = &daemon });
-    daemon.insertion = InsertionAdapter.init(.{ .inserter = &daemon.inserter, .store = &daemon.store });
+    // The Insertion Runner (ADR-0009). Holds the ring concretely, like the Undo Runner: the
+    // menu hands it a capture stamp and the Insert Worker resolves it at drain time.
+    daemon.insertion = InsertionRunner.init(&daemon.recent_insertions, .{
+        .inserter = &daemon.inserter,
+        .store = &daemon.store,
+        .surface = &daemon.feedback_surface,
+    });
     // The Undo Runner (ADR-0008). Holds the ring concretely; the chord callback only bumps
     // its counter, and the insert worker below drains it after every insert-side job.
     daemon.undo = UndoRunner.init(&daemon.recent_insertions, .{
@@ -1383,7 +1359,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
         "no display — running headless (no status item)"});
 
     // ---- threads ----
-    const worker = try std.Thread.spawn(.{}, InsertionAdapter.workerLoop, .{ &daemon.insertion, &daemon.undo });
+    const worker = try std.Thread.spawn(.{}, InsertionRunner.workerLoop, .{ &daemon.insertion, &daemon.undo });
     worker.detach();
     const rewrite_worker = try std.Thread.spawn(.{}, RewriteAdapter.workerLoop, .{&daemon.rewrite});
     rewrite_worker.detach();

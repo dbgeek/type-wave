@@ -96,6 +96,10 @@ pub fn assertHelper(comptime Helper: type) void {
 }
 
 pub fn Adapter(comptime Helper: type) type {
+    // Invoked here, by the generic itself, so every Helper is checked on the way in — not
+    // just the ones that opt in from a test block (`ProcessHelper` asserts itself at
+    // whisper_process_helper.zig:19, `FakeHelper` from its own test).
+    assertHelper(Helper);
     return struct {
         const Self = @This();
 

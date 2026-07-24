@@ -39,7 +39,6 @@
 const std = @import("std");
 const feedback = @import("feedback.zig");
 const backend = @import("transcription_backend.zig");
-const insert = @import("insert.zig");
 
 pub const UtteranceId = backend.UtteranceId;
 
@@ -87,14 +86,15 @@ pub const AppIdentity = struct {
 };
 
 /// The write payload handed across the recorder seam at `onInserted` (ADR-0006). The
-/// `inserted` / `raw` slices borrow Coordinator-local buffers and are valid **only for the
-/// duration of the `record` call** — the daemon-owned ring copies them into its own inline
-/// buffers under its leaf lock (exactly the memcpy discipline the rest of the seams use).
-/// Assembled once per resolved Insertion, whatever the outcome.
+/// `inserted` slice borrows the Insertion Runner's job buffer and `raw` a Coordinator-local
+/// one; both are valid **only for the duration of the `record` call** — the daemon-owned ring
+/// copies them into its own inline buffers under its leaf lock (exactly the memcpy discipline
+/// the rest of the seams use). Assembled once per resolved Insertion, whatever the outcome.
 pub const InsertionRecord = struct {
     /// The with-space bytes that hit the cursor (post-Rewrite when Backtrack ran, raw
-    /// otherwise) — byte-identical to the insert because the Coordinator buffers it through
-    /// the same `ensureTrailingSpace` the Insertion adapter applies.
+    /// otherwise) — byte-identical to the insert because they *are* the insert: the Insertion
+    /// Runner applies the separator and reports the bytes it landed back through the
+    /// `.inserted` edge, so nothing re-derives them (ADR-0009).
     inserted: []const u8,
     /// The trimmed Final Transcript, present only on the Backtrack detour (its pre-Rewrite
     /// form); `null` for non-Backtrack Utterances, where it would equal `inserted`.
@@ -140,10 +140,14 @@ pub const Event = union(enum) {
     /// the `text` slice borrows the worker's buffer and is valid only for the
     /// duration of the `handle` call — the insertion seam copies synchronously.
     rewritten: struct { id: UtteranceId, text: []const u8, result: RewriteResult },
-    /// The insert worker's reverse edge. `focused_app` is the App Identity hint read
-    /// off-mutex the moment the text landed (ADR-0006), stamped into the Insertion Record
-    /// here under the lock; defaulted so the Coordinator's own tests can omit it.
-    inserted: struct { id: UtteranceId, result: InsertResult, focused_app: ?AppIdentity = null },
+    /// The Insert Worker's reverse edge. `focused_app` is the App Identity hint read
+    /// off-mutex the moment the text landed (ADR-0006), and `inserted` is the exact
+    /// with-space slice that hit the cursor — the Insertion Runner is the sole applier of
+    /// the Insertion separator, so the Coordinator stamps what it is handed rather than
+    /// re-deriving it (ADR-0009). Like `final`, `inserted` borrows the Runner's job buffer
+    /// and is valid only for the duration of the `handle` call; the ring memcpys it
+    /// synchronously. Both are defaulted so the Coordinator's own tests can omit them.
+    inserted: struct { id: UtteranceId, result: InsertResult, focused_app: ?AppIdentity = null, inserted: []const u8 = "" },
 };
 
 const Phase = enum { idle, capturing, awaiting_final, rewriting, inserting };
@@ -180,23 +184,8 @@ pub fn Coordinator(comptime Deps: type) type {
         /// to the Transcription Session's accumulator, so the whole transcript fits.
         raw: [8192]u8 = undefined,
         raw_len: usize = 0,
-        /// The **with-space** Insertion text, buffered from the submit sites so the Insertion
-        /// Record committed at `onInserted` holds bytes byte-identical to what hit the cursor
-        /// (ADR-0006 §capture). Sized like the Insertion adapter's job buffer so
-        /// `ensureTrailingSpace` produces the same result the adapter does.
-        pending: [8193]u8 = undefined,
-        pending_len: usize = 0,
-
         pub fn init(deps: Deps) Self {
             return .{ .deps = deps };
-        }
-
-        /// Stash the with-space form of the text this Utterance is inserting, applying the
-        /// same `ensureTrailingSpace` the Insertion adapter applies at `submit` — so the
-        /// buffered `inserted` bytes match the cursor exactly. Called at every submit site.
-        fn bufferPending(self: *Self, text: []const u8) void {
-            const s = insert.ensureTrailingSpace(&self.pending, text);
-            self.pending_len = s.len;
         }
 
         /// The one entry point. Serializes every inbound edge onto the state machine.
@@ -211,7 +200,7 @@ pub fn Coordinator(comptime Deps: type) type {
                 .cooperative_cancel => |id| self.onCooperativeCancel(id),
                 .deadline => |e| self.onDeadline(e.id, e.kind),
                 .rewritten => |e| self.onRewritten(e.id, e.text, e.result),
-                .inserted => |e| self.onInserted(e.id, e.result, e.focused_app),
+                .inserted => |e| self.onInserted(e.id, e.result, e.focused_app, e.inserted),
             }
         }
 
@@ -314,7 +303,6 @@ pub fn Coordinator(comptime Deps: type) type {
                 self.phase = .rewriting; // blocking, exactly like .inserting (ADR-0001)
                 return;
             }
-            self.bufferPending(text); // stash the with-space form for the Insertion Record
             self.deps.insertion.submit(id, text, .normal); // copies text; worker inserts, then .inserted
             self.phase = .inserting; // blocking: next hold waits (ADR-0001)
         }
@@ -326,7 +314,6 @@ pub fn Coordinator(comptime Deps: type) type {
             // dictation never breaks; the worker logged the downgrade. The `.raw_fallback`
             // kind rides the insert so `.inserted` earns the amber pulse (spec §UX 4, ADR-0004).
             const kind: InsertKind = if (r == .failed) .raw_fallback else .normal;
-            self.bufferPending(text); // stash the with-space form for the Insertion Record
             self.deps.insertion.submit(id, text, kind); // copies text; worker inserts, then .inserted
             self.phase = .inserting;
         }
@@ -339,7 +326,6 @@ pub fn Coordinator(comptime Deps: type) type {
                 // error cue — text still lands. The abandoned call's late `.rewritten`
                 // is stale-rejected by the phase guard.
                 feedback.log("  Backtrack rewrite exceeded {d} ms — inserting the raw Final Transcript\n", .{rewrite_deadline.final_ms});
-                self.bufferPending(self.raw[0..self.raw_len]); // stash the with-space form for the Insertion Record
                 self.deps.insertion.submit(id, self.raw[0..self.raw_len], .raw_fallback); // earns the amber pulse
                 self.phase = .inserting;
                 return;
@@ -379,15 +365,17 @@ pub fn Coordinator(comptime Deps: type) type {
             }
         }
 
-        fn onInserted(self: *Self, id: UtteranceId, r: InsertResult, focused_app: ?AppIdentity) void {
+        fn onInserted(self: *Self, id: UtteranceId, r: InsertResult, focused_app: ?AppIdentity, inserted: []const u8) void {
             if (!self.matches(id, .inserting)) return;
-            // Commit the Insertion Record (ADR-0006): buffer-then-commit realizes §2.2's
-            // retention rule for free — only Utterances that reach here are recorded, and
-            // `.failed` reaches here (the primary recovery case). `raw` is present only on
-            // the Backtrack detour (the Lease's pinned flag), where the pre-Rewrite transcript
-            // was copied at `onFinal`; a non-Backtrack `raw` would just equal `inserted`.
+            // Commit the Insertion Record (ADR-0006): only Utterances that reach here are
+            // recorded, which realizes §2.2's retention rule for free — and `.failed` reaches
+            // here (the primary recovery case). `inserted` is the Insert Worker's own bytes,
+            // reported back rather than re-derived (ADR-0009), so the record can never
+            // disagree with what hit the cursor. `raw` is present only on the Backtrack detour
+            // (the Lease's pinned flag), where the pre-Rewrite transcript was copied at
+            // `onFinal`; a non-Backtrack `raw` would just equal `inserted`.
             self.deps.recorder.record(.{
-                .inserted = self.pending[0..self.pending_len],
+                .inserted = inserted,
                 .raw = if (self.active.?.backtrack) self.raw[0..self.raw_len] else null,
                 .timestamp = feedback.nowMs(),
                 .outcome = r,
@@ -1209,16 +1197,18 @@ test "27 a stale release-anchored deadline cannot fire the rewrite fallback earl
 
 // ---- Recent Insertions: the write-only recorder seam (ADR-0006, spec §1–§3) ------
 
-test "28 a completed dictation records exactly one Insertion Record with the with-space text" {
+test "28 a completed dictation records exactly one Insertion Record with the bytes that landed" {
     var h = Harness{};
     const co = h.wire();
     co.handle(.press);
     co.handle(.release);
     co.handle(.{ .final = .{ .id = 1, .text = "hello world" } });
     try expectEqual(@as(usize, 0), h.recorder.records); // not until the insert resolves
-    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
+    // The Insert Worker reports the with-space bytes it actually placed; the Coordinator
+    // stamps them rather than re-deriving them (ADR-0009). The separator rule itself is
+    // exercised where it lives, in insertion_runner.zig.
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok, .inserted = "hello world " } });
     try expectEqual(@as(usize, 1), h.recorder.records);
-    // `inserted` carries the single trailing space that actually hit the cursor.
     try expectEqualStrings("hello world ", h.recorder.lastInserted());
     try expectEqual(InsertResult.ok, h.recorder.last_outcome);
     try expect(!h.recorder.last_has_raw); // no Rewrite ran → raw absent
@@ -1231,7 +1221,8 @@ test "29 a .failed insertion is still recorded (the primary recovery case)" {
     co.handle(.press);
     co.handle(.release);
     co.handle(.{ .final = .{ .id = 1, .text = "lost text" } });
-    co.handle(.{ .inserted = .{ .id = 1, .result = .failed } });
+    // The worker reports the bytes it tried to land, so a `.failed` record still holds them.
+    co.handle(.{ .inserted = .{ .id = 1, .result = .failed, .inserted = "lost text " } });
     try expectEqual(@as(usize, 1), h.recorder.records);
     try expectEqualStrings("lost text ", h.recorder.lastInserted());
     try expectEqual(InsertResult.failed, h.recorder.last_outcome);
@@ -1271,9 +1262,9 @@ test "31 a Backtrack Utterance records the resolved text plus the pre-Rewrite ra
     co.handle(.release);
     co.handle(.{ .final = .{ .id = 1, .text = "at 20:00 no 18:00" } });
     co.handle(.{ .rewritten = .{ .id = 1, .text = "At 18:00", .result = .ok } });
-    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok, .inserted = "At 18:00 " } });
     try expectEqual(@as(usize, 1), h.recorder.records);
-    try expectEqualStrings("At 18:00 ", h.recorder.lastInserted()); // the with-space rewrite
+    try expectEqualStrings("At 18:00 ", h.recorder.lastInserted()); // the post-Rewrite bytes
     try expect(h.recorder.last_has_raw);
     try expectEqualStrings("at 20:00 no 18:00", h.recorder.lastRaw()); // trimmed, pre-Rewrite
     try expectEqual(InsertResult.ok, h.recorder.last_outcome);
@@ -1287,7 +1278,7 @@ test "32 a rewrite-timeout fallback is recorded degraded with the raw Final Tran
     co.handle(.release);
     co.handle(.{ .final = .{ .id = 1, .text = "um the raw one" } });
     co.handle(.{ .deadline = .{ .id = 1, .kind = .rewrite } }); // budget fires → raw fallback inserts
-    co.handle(.{ .inserted = .{ .id = 1, .result = .degraded } });
+    co.handle(.{ .inserted = .{ .id = 1, .result = .degraded, .inserted = "um the raw one " } });
     try expectEqual(@as(usize, 1), h.recorder.records);
     try expectEqualStrings("um the raw one ", h.recorder.lastInserted());
     try expect(h.recorder.last_has_raw);

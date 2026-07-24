@@ -23,7 +23,7 @@
 //! and the two HUD cue verbs (ADR-0007) — so the whole sequence is driven from tests by fed
 //! values, including the joins that were previously unreachable.
 //!
-//! Serialization against dictation stays the insert worker's: `insertion_adapter.workerLoop`
+//! Serialization against dictation stays the Insert Worker's: `insertion_runner.workerLoop`
 //! drains this last, after the dictation / replay / copy slots, so a deletion can never
 //! interleave with an Insertion's clipboard-swap dance.
 
@@ -193,10 +193,12 @@ pub fn Undo(comptime Deps: type) type {
             // included (#214 — restore the pre-Insertion state).
             const n = grapheme.graphemeCount(buf[0..target.len]);
             if (n == 0) {
-                // A degenerate record: empty bytes, or a segmentation failure. Not one of
-                // the refuse reasons — nothing to delete and nothing to warn about — so it
-                // stays a silent no-op, and the gate's cross-process read is skipped.
-                feedback.log("  undo: nothing to delete (empty or unsegmentable record)\n", .{});
+                // A degenerate record: empty bytes, or a segmentation failure. There is
+                // nothing to delete, so the gate's cross-process read is skipped — but the
+                // press still earns its verdict. `.no_target` is the honest reason (this
+                // record cannot be a target) and every reason collapses to the one red cue
+                // anyway (ADR-0007), so it needs no variant of its own.
+                self.refuse(.no_target, "the newest Insertion is empty or unsegmentable");
                 return;
             }
 
@@ -343,7 +345,7 @@ test "undo on an empty ring posts nothing (no_target) and fires the refuse cue (
     try expectEqual(@as(usize, 0), runner.deps.focus_reads);
 }
 
-test "a record with zero grapheme clusters is a silent no-op that never reads the frontmost app" {
+test "a record with zero grapheme clusters refuses without reading the frontmost app" {
     var ring = recent_insertions.Ring{};
     ring.record(rec("", 1, slack));
     var runner = Runner.init(&ring, .{ .focused_app = slack });
@@ -352,10 +354,12 @@ test "a record with zero grapheme clusters is a silent no-op that never reads th
     try expect(runner.runOnce());
 
     try expectEqual(@as(usize, 0), runner.deps.deletes);
+    // Nothing would post, so the gate's cross-process read is still skipped.
     try expectEqual(@as(usize, 0), runner.deps.focus_reads);
-    // N == 0 is degenerate, not one of the refuse reasons — no cue either way.
+    // But the press earns a verdict: one press, one cue, with no exception for a
+    // degenerate record (ADR-0009 closed this hole).
     try expectEqual(@as(usize, 0), runner.deps.undo_confirms);
-    try expectEqual(@as(usize, 0), runner.deps.undo_refuses);
+    try expectEqual(@as(usize, 1), runner.deps.undo_refuses);
 }
 
 // --- the app-level focus gate — undo-spec / #213, issue #224 ---
