@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.5](https://github.com/dbgeek/type-wave/compare/v0.1.4...v0.1.5) (2026-07-24)
+
+
+### Features
+
+* **recent-insertions:** capture Insertion Records into the daemon-owned ring ([#193](https://github.com/dbgeek/type-wave/issues/193)) ([#200](https://github.com/dbgeek/type-wave/issues/200)) ([7fe31e0](https://github.com/dbgeek/type-wave/commit/7fe31e097c3600e737b4d449dffc6e55274e39e6))
+* **recent-insertions:** copy a recorded Insertion to the clipboard ([#197](https://github.com/dbgeek/type-wave/issues/197)) ([#205](https://github.com/dbgeek/type-wave/issues/205)) ([f51f752](https://github.com/dbgeek/type-wave/commit/f51f752fafb40b7e625839efb9569bf35234d1b2))
+* **recent-insertions:** masked Recent Insertions submenu via the pure split ([#195](https://github.com/dbgeek/type-wave/issues/195)) ([#203](https://github.com/dbgeek/type-wave/issues/203)) ([4ca3b90](https://github.com/dbgeek/type-wave/commit/4ca3b90dedc0552a1dc1d0e1e28d1e44aad5895f))
+* **recent-insertions:** re-insert a recorded Insertion at the frontmost cursor ([#198](https://github.com/dbgeek/type-wave/issues/198)) ([#206](https://github.com/dbgeek/type-wave/issues/206)) ([639c3fa](https://github.com/dbgeek/type-wave/commit/639c3fa0915fba47369e7a7322e968766ed3f824))
+* **recent-insertions:** reveal a single entry's text on ⌥-click ([#196](https://github.com/dbgeek/type-wave/issues/196)) ([#204](https://github.com/dbgeek/type-wave/issues/204)) ([d0dfc1e](https://github.com/dbgeek/type-wave/commit/d0dfc1ef03c381acbc68b920620286bc360b9134))
+* **recent-insertions:** widen insert worker to accept a Coordinator-less job ([#194](https://github.com/dbgeek/type-wave/issues/194)) ([#202](https://github.com/dbgeek/type-wave/issues/202)) ([c6427fb](https://github.com/dbgeek/type-wave/commit/c6427fb302d23e75b5f7bd728c83cbbdb932fa36))
+
+
+### Bug Fixes
+
+* **whisper:** use dupeSentinel for the C-ABI prompt copy ([#207](https://github.com/dbgeek/type-wave/issues/207)) ([#208](https://github.com/dbgeek/type-wave/issues/208)) ([61f6bdd](https://github.com/dbgeek/type-wave/commit/61f6bdd232adf6a1a4f9d0cf11d8f8fc169b6ede))
+
 ## [0.1.4](https://github.com/dbgeek/type-wave/compare/v0.1.3...v0.1.4) (2026-07-23)
 
 
