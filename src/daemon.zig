@@ -1014,6 +1014,16 @@ const Daemon = struct {
         });
     }
 
+    /// On-demand text fetch for a revealed Recent Insertions entry (spec §4.1 / §5): read the
+    /// record with capture `stamp`'s `inserted` bytes straight from the authoritative ring under
+    /// its leaf lock, into the menu's buffer. The `inserted` bytes never ride the `Snapshot`, so
+    /// this is the only path by which one reaches the menu — and it stays behind the ring's
+    /// lock. Runs on the main thread (menu action), same as the other callbacks.
+    fn menuHistoryText(ctx: *anyopaque, stamp: i64, out: []u8) usize {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        return self.recent_insertions.textForStamp(stamp, out);
+    }
+
     /// A session-shaped setting changed: nudge the Session to cycle when idle. Before
     /// the first connect there is nothing to mark — that connect reads the snapshot.
     fn menuMarkSessionDirty(ctx: *anyopaque) void {
@@ -1212,6 +1222,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
         .setPaused = Daemon.menuSetPaused,
         .storeApiKey = Daemon.menuStoreApiKey,
         .modelAction = Daemon.menuModelAction,
+        .historyText = Daemon.menuHistoryText,
         .quit = Daemon.menuQuit,
     });
     feedback.log("  menu bar: {s}\n", .{if (menu_up)

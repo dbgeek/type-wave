@@ -27,6 +27,12 @@ const coord = @import("coordinator.zig");
 /// N = 20, fixed (spec §2.3): the ring keeps the newest 20 and evicts the oldest on the 21st.
 pub const capacity = 20;
 
+/// The inline capacity of each record's `inserted` / `raw` byte buffer — single-homed so the
+/// menu's on-demand fetch buffer (`textForStamp`'s caller) can size itself to match and never
+/// truncate. The trimmed `raw` is capped here at the source (`coordinator.raw`), and the
+/// with-space `inserted` reaches at most this many bytes too (see `Record`).
+pub const max_bytes = 8192;
+
 /// One stored Insertion Record — the authoritative, text-bearing entry the ring owns. Unlike
 /// `coord.InsertionRecord` (borrowed slices crossing the seam) this holds its own inline
 /// copies. Both buffers are `[8192]` and hold the whole transcript with no loss: the trimmed
@@ -35,9 +41,9 @@ pub const capacity = 20;
 /// `[8193]` only to give `ensureTrailingSpace` room for content + space + a NUL it doesn't
 /// store, so the returned slice never exceeds 8192.
 pub const Record = struct {
-    inserted_bytes: [8192]u8 = undefined,
+    inserted_bytes: [max_bytes]u8 = undefined,
     inserted_len: usize = 0,
-    raw_bytes: [8192]u8 = undefined,
+    raw_bytes: [max_bytes]u8 = undefined,
     raw_len: usize = 0,
     has_raw: bool = false,
     timestamp: i64 = 0,
@@ -102,6 +108,31 @@ pub const Ring = struct {
         if (self.count < capacity) self.count += 1;
     }
 
+    /// Copy the **with-space `inserted` bytes** of the record whose capture `stamp` matches into
+    /// `out`, under the leaf lock, returning the number of bytes written (0 when no live record
+    /// has that stamp — e.g. it was evicted since the menu's projection was taken). This is the
+    /// on-demand text fetch (spec §4.1 / §5): the menu's reveal path reads the `inserted` bytes
+    /// straight from the authoritative ring under its lock, never from the text-free projected
+    /// `Snapshot`. Keyed by the stable `timestamp` — the same identity the menu's reveal state
+    /// uses — so a concurrent Insertion shifting the newest-first order can never return a
+    /// neighbouring entry's text against this row's metadata; a stale stamp just yields 0.
+    /// Truncates to `out.len`; the caller sizes `out` to `max_bytes` so no loss occurs.
+    pub fn textForStamp(self: *Ring, stamp: i64, out: []u8) usize {
+        self.mu.lock();
+        defer self.mu.unlock();
+        var i: usize = 0;
+        while (i < self.count) : (i += 1) {
+            const idx = (self.head + capacity - 1 - i) % capacity;
+            const rec = &self.buf[idx];
+            if (rec.timestamp == stamp) {
+                const n = @min(rec.inserted_len, out.len);
+                @memcpy(out[0..n], rec.inserted_bytes[0..n]);
+                return n;
+            }
+        }
+        return 0;
+    }
+
     /// The number of live records.
     pub fn len(self: *Ring) usize {
         self.mu.lock();
@@ -135,6 +166,10 @@ const expectEqualStrings = std.testing.expectEqualStrings;
 
 fn plain(text: []const u8, outcome: coord.InsertResult) coord.InsertionRecord {
     return .{ .inserted = text, .raw = null, .timestamp = 0, .outcome = outcome, .focused_app = null };
+}
+
+fn stamped(text: []const u8, ts: i64) coord.InsertionRecord {
+    return .{ .inserted = text, .raw = null, .timestamp = ts, .outcome = .ok, .focused_app = null };
 }
 
 test "an empty ring reports zero and snapshots nothing" {
@@ -203,6 +238,57 @@ test "the ring is heap-free: a fixed, bounded inline footprint" {
     // No allocator is threaded anywhere in the API — the buffers are inline arrays. The
     // footprint is a compile-time constant, bounded near the spec's ~330 KB estimate.
     try expect(@sizeOf(Ring) <= capacity * 20 * 1024);
+}
+
+test "textForStamp fetches the matching entry's inserted bytes by timestamp" {
+    var ring = Ring{};
+    ring.record(stamped("first ", 100));
+    ring.record(stamped("second ", 200));
+    ring.record(stamped("third ", 300));
+    var out: [max_bytes]u8 = undefined;
+    try expectEqual(@as(usize, 6), ring.textForStamp(300, &out)); // "third "
+    try expectEqualStrings("third ", out[0..6]);
+    try expectEqualStrings("second ", out[0..ring.textForStamp(200, &out)]);
+    try expectEqualStrings("first ", out[0..ring.textForStamp(100, &out)]);
+}
+
+test "textForStamp returns 0 when no live record carries that stamp (empty or evicted)" {
+    var ring = Ring{};
+    var out: [max_bytes]u8 = undefined;
+    try expectEqual(@as(usize, 0), ring.textForStamp(100, &out)); // empty ring
+    ring.record(stamped("only ", 100));
+    try expectEqual(@as(usize, 0), ring.textForStamp(999, &out)); // unknown stamp
+    try expectEqual(@as(usize, 5), ring.textForStamp(100, &out));
+}
+
+test "textForStamp does not return an evicted entry's bytes after the oldest rolls off" {
+    var ring = Ring{};
+    var i: usize = 0;
+    while (i < capacity + 1) : (i += 1) ring.record(stamped("x ", @intCast(i))); // stamps 0..20; 0 evicted
+    var out: [max_bytes]u8 = undefined;
+    try expectEqual(@as(usize, 0), ring.textForStamp(0, &out)); // evicted → no text
+    try expectEqual(@as(usize, 2), ring.textForStamp(20, &out)); // newest still resolves
+}
+
+test "textForStamp truncates to the caller's buffer without overrun" {
+    var ring = Ring{};
+    ring.record(stamped("abcdefgh", 7));
+    var small: [3]u8 = undefined;
+    try expectEqual(@as(usize, 3), ring.textForStamp(7, &small));
+    try expectEqualStrings("abc", small[0..3]);
+}
+
+test "textForStamp returns the with-space inserted, not the pre-Rewrite raw" {
+    var ring = Ring{};
+    ring.record(.{
+        .inserted = "At 18:00 ",
+        .raw = "at 20:00 no 18:00",
+        .timestamp = 1,
+        .outcome = .degraded,
+        .focused_app = null,
+    });
+    var out: [max_bytes]u8 = undefined;
+    try expectEqualStrings("At 18:00 ", out[0..ring.textForStamp(1, &out)]);
 }
 
 test "record then snapshot on the same ring does not self-deadlock (leaf lock is not re-entrant)" {
