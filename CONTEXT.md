@@ -73,8 +73,9 @@ trimmed Final Transcript, present only when it differs from `inserted` (i.e. a R
 changed it); a capture `timestamp`; the `outcome` (`ok` / `degraded` / `failed`, known
 only at `onInserted`); and a best-effort **App Identity** hint (`focused_app` — bundle id
 + display name of the frontmost app, nullable, never load-bearing). The record is
-deliberately app-level only: the Accessibility field-level Focused Target capture is left
-to the future Undo effort.
+deliberately app-level only: the Undo effort (#209) ruled Accessibility field-level
+Focused Target capture out of scope and gates on `focused_app` instead, so a record never
+names the text field it landed in.
 _Avoid_: history entry, log entry (vague); transcript (that's the Final Transcript, not the receipt)
 
 **App Identity**:
