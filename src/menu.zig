@@ -36,6 +36,7 @@ const insertmod = @import("insert.zig");
 const keychain = @import("keychain.zig");
 const feedback = @import("feedback.zig");
 const vocab = @import("vocab.zig");
+const recent_insertions = @import("recent_insertions.zig");
 
 // ---- ObjC runtime primitives (same pattern as hud.zig / the #31 spike) -------
 const id = ?*anyopaque;
@@ -483,6 +484,11 @@ pub const Menu = struct {
     local_failure_status: id = null,
     model_actions: [std.meta.fieldNames(ModelAction).len]id = @splat(null),
 
+    // ---- Recent Insertions (spec §4): fixed items, retitled/toggled per open ----
+    history_parent: id = null, // the top-level "Recent Insertions ▸" item
+    history_submenu: id = null, // its submenu; holds the fixed entry rows
+    history_entries: [recent_insertions.capacity]id = @splat(null), // one masked-label row each
+
     last_snapshot: ?status_item.Snapshot = null,
     timer_ctx: CFRunLoopTimerContext = .{},
 
@@ -538,6 +544,8 @@ pub const Menu = struct {
         self.vocabulary_item = self.addAction(menu, "Vocabulary (off)", "onVocabulary:");
         self.syncVocabulary(); // title from the current list count + backend
         _ = self.addAction(menu, "Open config file", "onOpenConfig:");
+        addSeparator(menu);
+        self.addRecentInsertions(menu);
         addSeparator(menu);
         _ = self.addAction(menu, "Quit type-wave", "onQuit:");
 
@@ -617,6 +625,76 @@ pub const Menu = struct {
         msg1v(parent, "setSubmenu:", sub);
         msg1v(menu, "addItem:", parent);
         self.local_model_parent = parent;
+    }
+
+    /// The **Recent Insertions ▸** submenu (spec §4). Built once with a fixed pool of
+    /// `capacity` entry rows — each row is itself a submenu carrying placeholder **Copy** and
+    /// **Re-insert here** items (behaviour lands in a later ticket; they stay disabled for
+    /// now). Rows are retitled and shown/hidden per open by `rebuildHistory`, mirroring the
+    /// codebase's "build once, toggle" idiom (no per-open allocation, no leak). Autoenable is
+    /// turned off so an enabled row can carry a submenu of disabled placeholders and still
+    /// open.
+    fn addRecentInsertions(self: *Menu, menu: id) void {
+        const sub = newMenu();
+        msgBool(sub, "setAutoenablesItems:", false);
+        for (0..recent_insertions.capacity) |i| {
+            const row = makeItem("", null);
+            const row_sub = newMenu();
+            msgBool(row_sub, "setAutoenablesItems:", false);
+            for ([_][*:0]const u8{ "Copy", "Re-insert here" }) |title| {
+                const it = makeItem(title, null);
+                msgBool(it, "setEnabled:", false); // placeholder — wired in a later ticket
+                msg1v(row_sub, "addItem:", it);
+            }
+            msg1v(row, "setSubmenu:", row_sub);
+            msgBool(row, "setHidden:", true);
+            msg1v(sub, "addItem:", row);
+            self.history_entries[i] = row;
+        }
+        const parent = makeItem("Recent Insertions", null);
+        msg1v(parent, "setSubmenu:", sub);
+        msg1v(menu, "addItem:", parent);
+        self.history_parent = parent;
+        self.history_submenu = sub;
+        self.rebuildHistory(); // start life reading "No recent insertions"
+    }
+
+    /// Repopulate the Recent Insertions rows from the pure `Presentation.history` (spec §4.1):
+    /// masked, newest-first, dot colour + failed/degraded tag already decided by `derive`.
+    /// Called at `menuWillOpen` so relative times stay fresh — the only impure input,
+    /// `feedback.nowMs()`, is read here, never in the value-compared `Snapshot`. Reuses the
+    /// `Snapshot` `refreshChrome` just cached (both run on open) rather than re-reading
+    /// `host.status`, which does model_store I/O; the `orelse` fetch covers the init-time
+    /// resting build before the first `refreshChrome`.
+    fn rebuildHistory(self: *Menu) void {
+        if (self.history_parent == null) return;
+        const pool = objc_autoreleasePoolPush();
+        defer objc_autoreleasePoolPop(pool);
+
+        const view = status_item.derive(self.last_snapshot orelse self.host.status(self.host.ctx)).history;
+        if (view.count == 0) {
+            // Empty ring: the parent itself reads disabled "No recent insertions" (spec §4).
+            msg1v(self.history_parent, "setTitle:", nsstr("No recent insertions"));
+            msgBool(self.history_parent, "setEnabled:", false);
+            msg1v(self.history_parent, "setSubmenu:", null); // drop the arrow while empty
+            for (self.history_entries) |row| msgBool(row, "setHidden:", true);
+            return;
+        }
+        msg1v(self.history_parent, "setTitle:", nsstr("Recent Insertions"));
+        msgBool(self.history_parent, "setEnabled:", true);
+        msg1v(self.history_parent, "setSubmenu:", self.history_submenu);
+
+        const now = feedback.nowMs();
+        var label_buf: [256]u8 = undefined;
+        for (self.history_entries, 0..) |row, i| {
+            if (i < view.count) {
+                const label = status_item.historyLabel(&label_buf, view.entries[i], now);
+                msg1v(row, "setTitle:", nsstr(label.ptr));
+                msgBool(row, "setHidden:", false);
+            } else {
+                msgBool(row, "setHidden:", true);
+            }
+        }
     }
 
     // ---- UI sync -------------------------------------------------------------------
@@ -1229,6 +1307,7 @@ fn onMenuWillOpen(_: id, _: SEL, _: id) callconv(.c) void {
     m.syncVocabulary(); // pick up a hand-edited vocabulary list (count) + backend suffix
     m.last_snapshot = null; // force refresh after settings or external model-state changes
     m.refreshChrome();
+    m.rebuildHistory(); // (re)populate Recent Insertions with fresh masked labels (spec §4.1)
 }
 
 /// twStop: — runs on the main thread via requestStop(); unwinds [NSApp run].
