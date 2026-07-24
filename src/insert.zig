@@ -16,7 +16,7 @@ pub const InsertError = error{
     /// mechanisms below no longer raise this themselves: post-grant the preflight can
     /// stay stale-`false` for the process lifetime (#129), so gating on it would refuse
     /// Insertion forever after a live grant. The error stays in the seam's contract (and
-    /// the InsertionAdapter's failure path) for mechanism-level failures.
+    /// the Insertion Runner's failure path) for mechanism-level failures.
     PostEventDenied,
 };
 
@@ -212,6 +212,17 @@ pub fn ensureTrailingSpace(dst: []u8, text: []const u8) [:0]const u8 {
     return dst[0..n :0];
 }
 
+/// The inverse of `ensureTrailingSpace`, and its neighbour so the two halves of the Insertion
+/// separator rule stay in one place (ADR-0009). Drops the single trailing separator byte —
+/// exactly the byte `ensureTrailingSpace` would have added — so a caller yields the text a
+/// Recent Insertions row shows rather than the with-space bytes that hit the cursor
+/// (recent-insertions spec §5.2.6). Only a literal space is stripped: a transcript that ends
+/// in a newline already separated itself and keeps it. Empty in, empty out. Borrows `text`.
+pub fn stripTrailingSpace(text: []const u8) []const u8 {
+    if (text.len == 0) return text;
+    return if (text[text.len - 1] == ' ') text[0 .. text.len - 1] else text;
+}
+
 pub const Inserter = struct {
     /// A tagged event source so our observer can recognise our own posts (§4).
     src: CGEventSourceRef = null,
@@ -322,7 +333,7 @@ pub const Inserter = struct {
     /// **normal, visible** pasteboard entry they pick up. `utf8` must be NUL-terminated
     /// (→ NSString).
     ///
-    /// **Caller contract (spec §5.2.7):** the insert worker drains any pending deferred
+    /// **Caller contract (spec §5.2.7):** the Insert Worker drains any pending deferred
     /// Insertion restore (`drainDeferredRestore`, via the adapter's `runCopy`) *before* calling
     /// this — so a late restore can't silently clobber the copied text — and this runs on that
     /// worker's serialization so the drain can't race a live insert. This write itself leaves
@@ -361,6 +372,11 @@ pub const Inserter = struct {
     /// post-paste transform (autocorrect, smart quotes) can make N over- or under-delete
     /// by a bounded amount — accepted silently, no AX readback (#214).
     pub fn deleteChars(self: *Inserter, n: usize) void {
+        // Ordering guard, as in `paste`: never let posted Backspaces land while a previous
+        // Insertion's clipboard restore is still pending. The Insert Worker drains the Undo
+        // Runner last, which makes this a no-op in practice; this keeps the mechanism correct
+        // on its own rather than by the worker's drain order (ADR-0009).
+        self.drainDeferredRestore();
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const down = CGEventCreateKeyboardEvent(self.src, kVK_Delete, true);
@@ -434,6 +450,29 @@ test "ensureTrailingSpace keeps content within dst so keystroke's UTF-16 dest ca
     try std.testing.expect(out.len <= buf.len - 1);
     try std.testing.expectEqual(@as(u8, ' '), out[out.len - 1]); // still ends with the separator
     try std.testing.expectEqual(@as(u8, 0), buf[out.len]);
+}
+
+test "stripTrailingSpace removes exactly the separator ensureTrailingSpace added" {
+    var buf: [64]u8 = undefined;
+    // The round trip the Copy path relies on: the row's with-space bytes back to the text
+    // the row shows (recent-insertions spec §5.2.6).
+    try expectEqualStrings("hello world", stripTrailingSpace(ensureTrailingSpace(&buf, "hello world")));
+    try expectEqualStrings("At 18:00", stripTrailingSpace("At 18:00 "));
+}
+
+test "stripTrailingSpace keeps a separator the transcript brought itself" {
+    // ensureTrailingSpace appends nothing after a newline, so there is nothing to strip —
+    // taking the byte anyway would eat the transcript's own formatting.
+    try expectEqualStrings("line\n", stripTrailingSpace("line\n"));
+    try expectEqualStrings("bare", stripTrailingSpace("bare"));
+}
+
+test "stripTrailingSpace leaves empty in as empty out and takes only one byte" {
+    try expectEqualStrings("", stripTrailingSpace(""));
+    try expectEqualStrings("", stripTrailingSpace(" "));
+    // Only the single separator goes: deliberate padding survives, so a re-insert of the
+    // stripped text still round-trips through ensureTrailingSpace to the same bytes.
+    try expectEqualStrings("two  ", stripTrailingSpace("two   "));
 }
 
 test "drainDeferredRestore with nothing pending is a no-op" {

@@ -390,6 +390,11 @@ pub const WebsocketTransport = struct {
 };
 
 pub fn Session(comptime Transport: type) type {
+    // Invoked here, by the generic itself, so the *production* adapter is checked and not
+    // only the fake — the shape `undo.zig` and `hud.zig` already use. Asserting it from the
+    // fake's own test block, as this seam used to, checked the one adapter that could not
+    // drift and left `WebsocketTransport` unchecked.
+    assertTransport(Transport);
     return struct {
         const Self = @This();
 

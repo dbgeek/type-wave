@@ -63,11 +63,40 @@ Placing a Final Transcript at the cursor of the Focused Target. Every Insertion 
 a single trailing space, so consecutive Insertions don't run their words together.
 _Avoid_: typing, pasting (those name mechanisms, not the act)
 
+**Insertion Runner**:
+The daemon's one route from a Final Transcript — or a Recent Insertions action — to bytes at
+the cursor, and the owner of the cursor policy for all three: the Insertion separator in both
+directions, drain-time resolution, and the ring bookkeeping that follows an effect. Its rule
+(ADR-0009): **every cursor job resolves on the Insert Worker, beside the effect it authorizes,
+and any flag flips only after that effect landed** — ADR-0008's Undo rule, generalized. A
+dictation job carries text and reports the bytes it *landed* back through the `.inserted`
+reverse edge, which makes the Runner the sole applier of the separator: the Utterance
+Coordinator stamps those bytes into the Insertion Record rather than re-deriving them. A menu
+job carries only a capture stamp, queued on one bounded single-producer ring (the main thread
+in, the worker out), so a second click during a ~300 ms drain queues rather than silently
+overwriting the first. Anything that did nothing — a failed replay, an evicted stamp, a click
+past the queue — earns the same red refuse cue an Undo refusal shows (ADR-0007). Holds the
+Recent Insertions ring concretely, as the Undo Runner does. Lives in `src/insertion_runner.zig`;
+`insert.zig` remains the macOS mechanism module.
+_Avoid_: insertion adapter (it is the policy owner behind a seam, not an adapter at one),
+paste worker, insert queue
+
+**Insert Worker**:
+The single thread the Insertion Runner and the Undo Runner are both drained on
+(`insertion_runner.workerLoop`), and the priority between them: dictation first (it is
+time-sensitive), then queued Recent Insertions actions, then Undo last. Its
+single-threadedness is the whole serialization story for the cursor — it is what keeps a
+deletion from landing between an Insertion's paste and its deferred clipboard restore, and
+what lets a Copy drain that restore without racing a live dictation. It owns only the
+priority; each Runner owns its own policy.
+_Avoid_: insert thread, paste worker (mechanism); insertion worker
+
 **Insertion Record**:
 The retained receipt of one Insertion, kept in the in-memory **Recent Insertions** ring
 (the last N, newest-first, surfaced under the Status Item menu). One record holds: the
-`inserted` text (the with-space bytes actually placed at the cursor — post-Rewrite when
-Backtrack ran, raw otherwise; its grapheme-cluster count — `graphemeCount`, per #211 —
+`inserted` text (the with-space bytes actually placed at the cursor, as reported back by the
+Insertion Runner that placed them rather than re-derived — post-Rewrite when Backtrack ran,
+raw otherwise; its grapheme-cluster count — `graphemeCount`, per #211 —
 is what an Undo would delete); `raw`, the
 trimmed Final Transcript, present only when it differs from `inserted` (i.e. a Rewrite
 changed it); a capture `timestamp`; the `outcome` (`ok` / `degraded` / `failed`, known
@@ -113,16 +142,19 @@ not the act); revert
 The daemon's one route from the recovery chord to an Undo, and the owner of the whole
 sequence — pause/grant gate, newest-record resolution, grapheme count, the fresh
 `frontmost()` read, the focus gate, the post, the `undone` flag, the cue. It runs **entirely
-on the insert worker** (ADR-0008): the gate's read must be fresh and is cross-process, so it
+on the Insert Worker** (ADR-0008): the gate's read must be fresh and is cross-process, so it
 cannot live on the tap's run-loop thread, and everything else therefore sits beside it — the
 chord callback only bumps a saturating press counter, one press to one verdict to one cue.
 The record is resolved at post time and flagged only *after* a deletion posts, so no refusal
-can dim a record nothing deleted. It gates on its own prerequisites — not paused, PostEvent
-granted — never on the Configuration Phase or the Supervisor's capture-enable gate. It holds
+can dim a record nothing deleted, and every exit — including a degenerate record with no
+grapheme clusters — fires its cue rather than swallowing the press. It gates on its own
+prerequisites — not paused, plus the Grant Observer's PostEvent fact — never on the
+Configuration Phase or the Supervisor's capture-enable gate. It holds
 the Recent Insertions ring concretely (ADR-0006 keeps ownership with the daemon) and reaches
 every effect through a five-method seam it is handed, so the whole sequence is exercised by
-fed values rather than by a live tap. Lives in `src/undo.zig`; drained last by the insert
-worker, which is what serializes a deletion against dictation.
+fed values rather than by a live tap. Lives in `src/undo.zig`; drained last by the Insert
+Worker, which is what serializes a deletion against dictation. Sibling of the Insertion
+Runner, which owns the other three cursor paths under the same rule (ADR-0009).
 _Avoid_: undo manager, deletion engine, trigger (that named only the discarded run-loop half)
 
 **Backtrack**:
@@ -258,6 +290,22 @@ acquire-load once and see a coherent whole. Old snapshots leak by design, so a h
 (e.g. a connected Transcription Session) is never invalidated. `config.zon` stays the
 canonical hand-editable form of the same settings.
 _Avoid_: mutable config, live config object
+
+**Grant Observer**:
+The daemon's one owner of the three macOS TCC grant facts — Microphone, Input Monitoring,
+PostEvent — and of the serialized cold-start request ladder that asks for them (#130,
+ADR-0010). It wraps a pure `Sequence` (which decides only *when to ask*: one request in
+flight at a time, each step advancing on its grant or a 60 s timeout) and adds everything
+between that decider and the OS: the six probes behind its seam, the narration, and the two
+facts that are **compositions** rather than single reads. Both compositions exist because a
+preflight alone lies — Input Monitoring trusts the live Talk Key tap over its stale-after-grant
+preflight (#127), and PostEvent latches true on an observed self-tagged post because its
+preflight can report `false` for the whole process lifetime (#129). That second fact is what
+authorizes an Undo to post destructive Backspaces, which is why it lives behind a seam and is
+exercised by fed probe values rather than by a live daemon. Read by the Configuration Phase,
+the Supervisor, and the Undo Runner; lives in `src/grants.zig`. Distinct from the Supervisor,
+whose own facts the daemon still gathers (ADR-0005).
+_Avoid_: permissions manager, TCC helper, grant sequence (that names only the pure half)
 
 **Configuration Phase**:
 The daemon's setup-readiness state for the selected Transcription Backend. `configured`

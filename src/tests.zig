@@ -23,7 +23,7 @@ test {
     _ = @import("tap.zig"); // the recovery-chord classifier: ⌃⌘⌫ fed-event tests (#221)
     _ = @import("insert.zig"); // ensureTrailingSpace (the Insertion separator)
     _ = @import("grapheme.zig"); // the Undo deletion-count rule: grapheme clusters per ⌫ (#220)
-    _ = @import("insertion_adapter.zig");
+    _ = @import("insertion_runner.zig");
     _ = @import("recent_insertions.zig"); // the daemon-owned Recent Insertions ring (ADR-0006)
     _ = @import("undo.zig"); // the Undo Runner: the whole chord → deletion sequence (ADR-0008)
     _ = @import("app_focus.zig"); // the best-effort App Identity reader (NSWorkspace boundary)
@@ -32,7 +32,7 @@ test {
     _ = @import("readiness.zig");
     _ = @import("configuration_phase.zig");
     _ = @import("supervisor.zig"); // the Supervisor: self-heal nudges + the capture-enable gate, fed facts
-    _ = @import("grant_sequence.zig"); // the serialized cold-start TCC request sequence (#130)
+    _ = @import("grants.zig"); // the Grant Observer + its pure cold-start request sequence (#130)
     _ = @import("receipt.zig"); // the Installation Receipt codec (active.receipt / MODEL_MANIFEST / partial.meta)
     _ = @import("layout.zig"); // the Models Layout: the on-disk path grammar of the models root
     _ = @import("model_store.zig");

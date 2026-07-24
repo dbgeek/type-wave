@@ -13,7 +13,7 @@
 //! # What the Supervisor owns, and what it does not
 //!
 //! It owns only the residual self-heal *decisions*. It does NOT subsume the Configuration
-//! Phase (configuration_phase.zig) or the grant sequence (grant_sequence.zig): those stay
+//! Phase (configuration_phase.zig) or the grant sequence (grants.zig): those stay
 //! peer machines the daemon drives. The Supervisor merely *reads* the Configuration Phase
 //! `Outcome` — forwarding its `announce_ready` / `report_missing` and gating capture on its
 //! `configured` — and reads whether the grant sequence has `reached` the PostEvent step.
