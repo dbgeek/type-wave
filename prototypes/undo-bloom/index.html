@@ -1,0 +1,428 @@
+<title>Undo bloom — HUD confirm/refuse treatments</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    /* chrome neutrals — cool graphite biased toward the pill's monochrome marks */
+    --bg: #14151a;
+    --panel: #1b1d23;
+    --panel-2: #23262e;
+    --line: #2f333d;
+    --ink: #eceef2;
+    --ink-dim: #9aa0ad;
+    --ink-faint: #6b7280;
+    --accent: #7f9cf5;
+    /* macOS system color references (dark-appearance values used on the dark chrome) */
+    --sys-green: #30d158;
+    --sys-red: #ff453a;
+    --sys-orange: #ff9f0a;
+    --radius: 12px;
+    --mono: ui-monospace, "SF Mono", Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #eceef2; --panel: #ffffff; --panel-2: #f4f5f8; --line: #dde0e6;
+      --ink: #1a1c22; --ink-dim: #565d6b; --ink-faint: #8b93a1; --accent: #3b5bdb;
+      --sys-green: #34c759; --sys-red: #ff3b30; --sys-orange: #ff9500;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14151a; --panel: #1b1d23; --panel-2: #23262e; --line: #2f333d;
+    --ink: #eceef2; --ink-dim: #9aa0ad; --ink-faint: #6b7280; --accent: #7f9cf5;
+    --sys-green: #30d158; --sys-red: #ff453a; --sys-orange: #ff9f0a;
+  }
+  :root[data-theme="light"] {
+    --bg: #eceef2; --panel: #ffffff; --panel-2: #f4f5f8; --line: #dde0e6;
+    --ink: #1a1c22; --ink-dim: #565d6b; --ink-faint: #8b93a1; --accent: #3b5bdb;
+    --sys-green: #34c759; --sys-red: #ff3b30; --sys-orange: #ff9500;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 940px; margin: 0 auto; padding: 40px 24px 80px; }
+
+  header { margin-bottom: 8px; }
+  .eyebrow {
+    font: 600 12px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase;
+    color: var(--ink-faint); margin: 0 0 12px;
+  }
+  h1 { font-size: 30px; font-weight: 640; letter-spacing: -.02em; margin: 0 0 10px; text-wrap: balance; }
+  .lede { color: var(--ink-dim); max-width: 62ch; margin: 0; font-size: 15.5px; }
+  .lede code { font-family: var(--mono); font-size: .88em; color: var(--ink); background: var(--panel-2); padding: 1px 5px; border-radius: 5px; }
+
+  /* control strip */
+  .controls {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+    margin: 28px 0 24px; padding: 12px; border: 1px solid var(--line);
+    border-radius: var(--radius); background: color-mix(in srgb, var(--panel) 88%, transparent);
+    backdrop-filter: blur(8px);
+  }
+  .controls .spacer { flex: 1; }
+  .controls .hint { font: 500 12.5px var(--mono); color: var(--ink-faint); }
+  button {
+    font-family: var(--sans); font-size: 13.5px; font-weight: 550;
+    color: var(--ink); background: var(--panel-2); border: 1px solid var(--line);
+    padding: 7px 13px; border-radius: 9px; cursor: pointer; transition: border-color .12s, background .12s;
+  }
+  button:hover { border-color: var(--accent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; background: transparent; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+
+  /* treatment card */
+  .card {
+    display: grid; grid-template-columns: 300px 1fr; gap: 0;
+    border: 1px solid var(--line); border-radius: var(--radius);
+    background: var(--panel); overflow: hidden; margin-bottom: 20px;
+  }
+  .card.ref { border-style: dashed; opacity: .96; }
+  .meta { padding: 22px; border-right: 1px solid var(--line); }
+  .tag {
+    display: inline-block; font: 600 11px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase;
+    padding: 4px 8px; border-radius: 6px; margin-bottom: 12px;
+  }
+  .tag.rec { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+  .tag.alt { background: var(--panel-2); color: var(--ink-dim); }
+  .tag.ref { background: color-mix(in srgb, var(--sys-orange) 20%, transparent); color: var(--sys-orange); }
+  .meta h2 { font-size: 18px; font-weight: 620; margin: 0 0 6px; letter-spacing: -.01em; }
+  .meta p { font-size: 13.5px; color: var(--ink-dim); margin: 0 0 14px; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; margin: 0; font-size: 12.5px; }
+  dt { color: var(--ink-faint); font: 500 11.5px var(--mono); text-transform: uppercase; letter-spacing: .04em; align-self: baseline; }
+  dd { margin: 0; color: var(--ink); }
+  .swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px; vertical-align: baseline; margin-right: 4px; transform: translateY(1px); }
+
+  /* stage: the transparent panel the pill floats on */
+  .stage-wrap { display: flex; flex-direction: column; }
+  .stage {
+    flex: 1; min-height: 168px; display: grid; place-items: center;
+    background:
+      radial-gradient(120% 140% at 30% 20%, rgba(255,255,255,.04), transparent 60%),
+      repeating-linear-gradient(135deg, rgba(255,255,255,.02) 0 14px, transparent 14px 28px),
+      var(--stage-bg, #2a2d34);
+    transition: background-color .2s;
+  }
+  .stage[data-stage="light"] { --stage-bg: #d7dae1; }
+  .stage[data-stage="dark"]  { --stage-bg: #24262c; }
+  /* the 300×22 pill, shown at 2.4× */
+  .pill {
+    position: relative; width: 720px; max-width: 88%; height: 53px;
+    display: grid; place-items: center; opacity: 0;
+  }
+  .mark, .dot { position: absolute; will-change: transform, opacity, background-color; }
+  /* single centred mark — a 6×14 rounded bar (≠ 26 recording bars, ≠ 3 dots) shown at 2.4× */
+  .mark { width: 15px; height: 34px; border-radius: 8px; background: var(--mark-neutral); }
+  /* three processing dots — dot_size 8.8 → 21px at 2.4×, gap 17.6 → 42px pitch */
+  .dot { width: 21px; height: 21px; border-radius: 50%; background: var(--mark-neutral); }
+  .dot.d0 { transform: translateX(-42px); }
+  .dot.d1 { transform: translateX(0); }
+  .dot.d2 { transform: translateX(42px); }
+  .stage[data-stage="light"] .pill { --mark-neutral: rgba(0,0,0,.85); --mark-neutral-2: rgba(0,0,0,.5); }
+  .stage[data-stage="dark"]  .pill { --mark-neutral: rgba(255,255,255,.85); --mark-neutral-2: rgba(255,255,255,.55); }
+  .dot { background: var(--mark-neutral-2); }
+
+  .triggers {
+    display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line);
+    background: var(--panel-2); align-items: center;
+  }
+  .triggers .lbl { font: 500 12px var(--mono); color: var(--ink-faint); margin-right: 2px; }
+  button.confirm { border-color: color-mix(in srgb, var(--sys-green) 55%, var(--line)); }
+  button.confirm:hover { border-color: var(--sys-green); }
+  button.refuse { border-color: color-mix(in srgb, var(--sys-red) 55%, var(--line)); }
+  button.refuse:hover { border-color: var(--sys-red); }
+
+  .note { font-size: 13px; color: var(--ink-dim); }
+  .decide {
+    margin-top: 34px; padding: 22px; border: 1px solid var(--line);
+    border-radius: var(--radius); background: var(--panel);
+  }
+  .decide h2 { margin: 0 0 12px; font-size: 17px; }
+  .decide ul { margin: 0; padding-left: 18px; }
+  .decide li { margin-bottom: 8px; font-size: 14px; color: var(--ink); }
+  .decide li b { font-weight: 620; }
+  .decide .q { font: 600 12px var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--ink-faint); }
+  footer { margin-top: 40px; font-size: 12.5px; color: var(--ink-faint); font-family: var(--mono); }
+
+  @media (max-width: 720px) {
+    .card { grid-template-columns: 1fr; }
+    .meta { border-right: 0; border-bottom: 1px solid var(--line); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .controls { position: static; }
+  }
+</style>
+
+<div class="wrap">
+  <header>
+    <p class="eyebrow">type-wave · wayfinder #216 · prototype</p>
+    <h1>Undo bloom — confirm &amp; refuse HUD treatments</h1>
+    <p class="lede">
+      The Undo-last-Insertion hotkey (<code>⌃⌘⌫</code>) needs a HUD cue with <b>two outcomes</b>: a
+      <b>confirmed</b> deletion and a <b>refused</b> one. Unlike the amber degraded pulse, at Undo time
+      nothing is recording or processing — the pill is <code>hidden</code>, so a cue must bloom up from
+      nothing, then fade. Trigger each treatment below and pick a direction. The pill is the real
+      <code>300×22</code> geometry, shown at 2.4×, on the real <code>0.7×</code> motion timings.
+    </p>
+  </header>
+
+  <div class="controls" role="group" aria-label="Stage controls">
+    <span class="hint">Stage backdrop</span>
+    <div class="seg" id="stageSeg">
+      <button data-stage="dark" aria-pressed="true">Dark</button>
+      <button data-stage="light" aria-pressed="false">Light</button>
+    </div>
+    <div class="spacer"></div>
+    <button id="playAll">▶ Play all confirms</button>
+    <button id="playAllR">✕ Play all refuses</button>
+  </div>
+
+  <!-- Treatment A -->
+  <section class="card" data-treatment="A">
+    <div class="meta">
+      <span class="tag rec">Recommended</span>
+      <h2>A · Single mark, shake-refuse</h2>
+      <p>One centred mark blooms — deliberately unlike the 26 recording bars and the 3 processing dots, so an Undo never reads as "recording" or "thinking."</p>
+      <dl>
+        <dt>Content</dt><dd>single 6×14 mark</dd>
+        <dt>Confirm</dt><dd><span class="swatch" style="background:var(--sys-green)"></span>systemGreen · one bloom</dd>
+        <dt>Refuse</dt><dd><span class="swatch" style="background:var(--sys-red)"></span>systemRed · horizontal shake</dd>
+        <dt>Colorblind</dt><dd>motion carries the outcome, not just hue</dd>
+      </dl>
+    </div>
+    <div class="stage-wrap">
+      <div class="stage" data-stage="dark">
+        <div class="pill"><div class="mark"></div></div>
+      </div>
+      <div class="triggers">
+        <span class="lbl">Trigger</span>
+        <button class="confirm" data-fire="A-confirm">✓ Confirm</button>
+        <button class="refuse" data-fire="A-refuse">✕ Refuse</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Treatment B -->
+  <section class="card" data-treatment="B">
+    <div class="meta">
+      <span class="tag alt">Alternative</span>
+      <h2>B · Reused dots, double-blink refuse</h2>
+      <p>Reuses the existing three processing-dot layers verbatim — cheapest to build — and blooms them. Trades some semantic clarity (dots also mean "thinking") for reuse.</p>
+      <dl>
+        <dt>Content</dt><dd>three processing dots</dd>
+        <dt>Confirm</dt><dd><span class="swatch" style="background:var(--sys-green)"></span>systemGreen · one bloom</dd>
+        <dt>Refuse</dt><dd><span class="swatch" style="background:var(--sys-red)"></span>systemRed · double blink</dd>
+        <dt>Colorblind</dt><dd>blink count differs; hue-leaning</dd>
+      </dl>
+    </div>
+    <div class="stage-wrap">
+      <div class="stage" data-stage="dark">
+        <div class="pill"><div class="dot d0"></div><div class="dot d1"></div><div class="dot d2"></div></div>
+      </div>
+      <div class="triggers">
+        <span class="lbl">Trigger</span>
+        <button class="confirm" data-fire="B-confirm">✓ Confirm</button>
+        <button class="refuse" data-fire="B-refuse">✕ Refuse</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Treatment C -->
+  <section class="card" data-treatment="C">
+    <div class="meta">
+      <span class="tag alt">Purist</span>
+      <h2>C · Monochrome, motion-only</h2>
+      <p>No accent at all — a single <code>labelColor</code> mark, outcome carried purely by motion. Keeps ADR-0002 pristine (<b>no</b> second accent exception, no ADR amendment). The minimal pole.</p>
+      <dl>
+        <dt>Content</dt><dd>single mark, labelColor</dd>
+        <dt>Confirm</dt><dd>settle bloom (down-ease)</dd>
+        <dt>Refuse</dt><dd>horizontal shake</dd>
+        <dt>ADR-0002</dt><dd>untouched — accent-free</dd>
+      </dl>
+    </div>
+    <div class="stage-wrap">
+      <div class="stage" data-stage="dark">
+        <div class="pill"><div class="mark"></div></div>
+      </div>
+      <div class="triggers">
+        <span class="lbl">Trigger</span>
+        <button class="confirm" data-fire="C-confirm">✓ Confirm</button>
+        <button class="refuse" data-fire="C-refuse">✕ Refuse</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Reference: amber degraded pulse -->
+  <section class="card ref" data-treatment="R">
+    <div class="meta">
+      <span class="tag ref">Reference · shipped</span>
+      <h2>R · Degraded amber pulse</h2>
+      <p>The existing ADR-0004 pulse — the <b>first</b> accent exception. Shown only so the new confirm/refuse hues can be checked for collision against it. Do not reuse orange.</p>
+      <dl>
+        <dt>Content</dt><dd>three processing dots</dd>
+        <dt>Pulse</dt><dd><span class="swatch" style="background:var(--sys-orange)"></span>systemOrange · ~300 ms</dd>
+        <dt>Trigger</dt><dd>degraded insertion (rewrite timeout)</dd>
+      </dl>
+    </div>
+    <div class="stage-wrap">
+      <div class="stage" data-stage="dark">
+        <div class="pill"><div class="dot d0"></div><div class="dot d1"></div><div class="dot d2"></div></div>
+      </div>
+      <div class="triggers">
+        <span class="lbl">Trigger</span>
+        <button data-fire="R-pulse">● Amber pulse</button>
+      </div>
+    </div>
+  </section>
+
+  <div class="decide">
+    <h2>What this ticket must lock</h2>
+    <ul>
+      <li><span class="q">Hue / motion</span> — which treatment, and the exact confirm vs refuse look, distinct from each other and non-colliding with the amber pulse (R).</li>
+      <li><span class="q">Pill content</span> — <b>single mark</b> (A/C) or <b>reused dots</b> (B), given nothing is in flight at Undo time.</li>
+      <li><span class="q">ADR-0002</span> — if the pick uses an accent (A or B), it is the <b>second</b> sanctioned accent exception → warrants an ADR amendment (extend ADR-0004 or a new ADR) for the spec to cite. Pick C and ADR-0002 stays as-is.</li>
+    </ul>
+  </div>
+
+  <footer>
+    Geometry &amp; timings mirror <code>src/hud.zig</code>: pill 300×22, dot Ø8.8, easeOut cubic-bezier(0.17,0.7,0.3,1),
+    show 140 ms / hide 112 ms, pulse 300 ms fixed. Colors are macOS semantic system colors (light/dark adaptive).
+  </footer>
+</div>
+
+<script>
+  const EASE = "cubic-bezier(0.17,0.7,0.3,1)";
+  const GREEN = () => getComputedStyle(document.documentElement).getPropertyValue("--sys-green").trim();
+  const RED   = () => getComputedStyle(document.documentElement).getPropertyValue("--sys-red").trim();
+  const ORANGE= () => getComputedStyle(document.documentElement).getPropertyValue("--sys-orange").trim();
+
+  // neutral mark color resolved from the pill's stage (light/dark)
+  function neutral(pill, dim) {
+    return getComputedStyle(pill).getPropertyValue(dim ? "--mark-neutral-2" : "--mark-neutral").trim();
+  }
+
+  // A running animation guard per pill so re-triggers restart cleanly
+  const busy = new WeakSet();
+  function guard(pill, fn) {
+    if (busy.has(pill)) return;
+    busy.add(pill);
+    const done = fn();
+    done.finally(() => busy.delete(pill));
+  }
+
+  // fade the whole pill up (show) — returns the Animation
+  function showPill(pill, dur = 140) {
+    return pill.animate([{ opacity: 0 }, { opacity: 1 }], { duration: dur, easing: EASE, fill: "forwards" });
+  }
+  function hidePill(pill, dur = 112) {
+    return pill.animate([{ opacity: 1 }, { opacity: 0 }], { duration: dur, easing: EASE, fill: "forwards" });
+  }
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+
+  // one-shot color bloom on a set of marks: neutral -> color over ~300ms easeOut, then held
+  function bloomColor(marks, color, dur = 300) {
+    marks.forEach(m => m.animate(
+      [{ backgroundColor: getComputedStyle(m).backgroundColor }, { backgroundColor: color }],
+      { duration: dur, easing: EASE, fill: "forwards" }
+    ));
+  }
+  function setColor(marks, color) { marks.forEach(m => m.style.backgroundColor = color); }
+  function clearColor(marks) { marks.forEach(m => m.style.removeProperty("background-color")); }
+
+  // horizontal shake on the pill (the "denied" gesture) — ±6px, 3 cycles over ~300ms
+  function shake(pill, dur = 320) {
+    return pill.animate([
+      { transform: "translateX(0)" }, { transform: "translateX(-6px)" },
+      { transform: "translateX(6px)" }, { transform: "translateX(-5px)" },
+      { transform: "translateX(4px)" }, { transform: "translateX(0)" }
+    ], { duration: dur, easing: "ease-in-out", fill: "none" });
+  }
+
+  async function fire(id) {
+    const [t, kind] = id.split("-");
+    const card = document.querySelector(`.card[data-treatment="${t}"]`);
+    const pill = card.querySelector(".pill");
+    const marks = [...pill.querySelectorAll(".mark, .dot")];
+
+    guard(pill, () => (async () => {
+      // reset
+      pill.getAnimations().forEach(a => a.cancel());
+      marks.forEach(m => m.getAnimations().forEach(a => a.cancel()));
+      clearColor(marks);
+      pill.style.transform = "translateX(0)";
+
+      if (id === "A-confirm" || id === "C-confirm") {
+        const col = (t === "A") ? GREEN() : neutral(pill, false);
+        setColor(marks, col);
+        showPill(pill);
+        if (t === "A") bloomColor(marks, col); // green ramps in on A
+        await wait(430);
+        await hidePill(pill).finished;
+      }
+      else if (id === "A-refuse" || id === "C-refuse") {
+        const col = (t === "A") ? RED() : neutral(pill, false);
+        setColor(marks, col);
+        showPill(pill);
+        if (t === "A") bloomColor(marks, col);
+        await wait(90);
+        await shake(pill).finished;
+        await wait(80);
+        await hidePill(pill).finished;
+      }
+      else if (id === "B-confirm") {
+        setColor(marks, GREEN());
+        showPill(pill);
+        bloomColor(marks, GREEN());
+        await wait(430);
+        await hidePill(pill).finished;
+      }
+      else if (id === "B-refuse") {
+        // double-blink in red
+        setColor(marks, RED());
+        await showPill(pill).finished;
+        await wait(70);
+        await hidePill(pill, 90).finished;
+        await wait(70);
+        await showPill(pill, 90).finished;
+        await wait(150);
+        await hidePill(pill).finished;
+      }
+      else if (id === "R-pulse") {
+        // amber pulse: dots already "up" (processing), tint orange once ~300ms, then hide
+        setColor(marks, neutral(pill, true));
+        showPill(pill);
+        await wait(120);
+        bloomColor(marks, ORANGE(), 300);
+        await wait(340);
+        await hidePill(pill).finished;
+      }
+      clearColor(marks);
+      pill.style.opacity = 0;
+      pill.style.transform = "translateX(0)";
+    })());
+  }
+
+  document.querySelectorAll("[data-fire]").forEach(b =>
+    b.addEventListener("click", () => fire(b.dataset.fire)));
+
+  // stage backdrop toggle (all stages together)
+  document.getElementById("stageSeg").addEventListener("click", e => {
+    const b = e.target.closest("button"); if (!b) return;
+    const s = b.dataset.stage;
+    document.querySelectorAll("#stageSeg button").forEach(x => x.setAttribute("aria-pressed", x === b));
+    document.querySelectorAll(".stage").forEach(st => st.dataset.stage = s);
+  });
+
+  async function playAll(kind) {
+    for (const t of ["A", "B", "C"]) {
+      fire(`${t}-${kind}`);
+      await wait(1100);
+    }
+  }
+  document.getElementById("playAll").addEventListener("click", () => playAll("confirm"));
+  document.getElementById("playAllR").addEventListener("click", () => playAll("refuse"));
+</script>
