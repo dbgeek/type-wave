@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/dbgeek/type-wave/compare/v0.3.1...v0.3.2) (2026-07-24)
+
+
+### Features
+
+* **insertion:** every cursor job resolves at drain time (ADR-0009) ([#241](https://github.com/dbgeek/type-wave/issues/241)) ([95c62d2](https://github.com/dbgeek/type-wave/commit/95c62d2ebfe5b416ebbe969d94674eaacec80bc1))
+
 ## [0.3.1](https://github.com/dbgeek/type-wave/compare/v0.3.0...v0.3.1) (2026-07-24)
 
 
