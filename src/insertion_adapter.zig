@@ -16,6 +16,7 @@ const coord = @import("coordinator.zig");
 const feedback = @import("feedback.zig");
 const insertmod = @import("insert.zig");
 const grapheme = @import("grapheme.zig");
+const undo_gate = @import("undo_gate.zig");
 
 fn explainInsert(e: insertmod.InsertError) []const u8 {
     return switch (e) {
@@ -75,7 +76,7 @@ pub fn InsertionAdapter(comptime Deps: type) type {
         copy_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
         /// A fourth, **Undo** job slot (undo-spec / #214, issue #222). The Undo trigger
-        /// (a later ticket) dispatches the last Insertion's stored `inserted` bytes through
+        /// (undo_trigger.zig) dispatches the last Insertion's stored `inserted` bytes through
         /// here so the deletion — N Backspaces, N = the grapheme count of those bytes — runs
         /// on this same single worker, serialized against every insert/replay/copy. Like
         /// `bypass_job`/`copy_job` it carries no Utterance identity and never reports back:
@@ -84,10 +85,13 @@ pub fn InsertionAdapter(comptime Deps: type) type {
         /// (not `job`/`bypass_job`/`copy_job`) so its producer never clobbers another job.
         /// Stored **verbatim** with an explicit length (no NUL, no trailing-space fixup): the
         /// `inserted` bytes already carry their separator and the count must delete it too
-        /// (#214 — restore the pre-Insertion state). Ordered across threads by `undo_pending`
-        /// exactly like `job` by `pending`.
+        /// (#214 — restore the pre-Insertion state). `undo_expected_app` is the record's
+        /// stored App Identity, the focus gate's expected side (#224) — `runUndo` refuses
+        /// unless a fresh `focusedApp()` read matches it. Ordered across threads by
+        /// `undo_pending` exactly like `job` by `pending`.
         undo_job: [job_buf_len]u8 = undefined,
         undo_job_len: usize = 0,
+        undo_expected_app: ?coord.AppIdentity = null,
         undo_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
         pub fn init(deps: Deps) Self {
@@ -135,16 +139,20 @@ pub fn InsertionAdapter(comptime Deps: type) type {
 
         /// Undo seam (undo-spec / #214, issue #222). Hands the worker the last Insertion's
         /// stored `inserted` bytes to delete — `runUndo` counts their grapheme clusters and
-        /// posts that many Backspaces. Stored **verbatim** with an explicit length: the count
-        /// must match exactly what was inserted (trailing space included, #214), so unlike
-        /// `submitBypass` there is no `ensureTrailingSpace`, and unlike `submitCopy` no NUL
-        /// terminator — `runUndo` reads a byte slice, never an NSString. Runs off the trigger
-        /// thread; the caller must not submit while an undo job is still pending (mirrors
-        /// `submit`'s single-producer contract). An over-long `text` is capped to the buffer.
-        pub fn submitUndo(self: *Self, text: []const u8) void {
+        /// posts that many Backspaces — plus the record's stored App Identity, the expected
+        /// side of the focus gate `runUndo` evaluates before posting (#224; null is legal
+        /// and refuses there, fail-closed). Bytes stored **verbatim** with an explicit
+        /// length: the count must match exactly what was inserted (trailing space included,
+        /// #214), so unlike `submitBypass` there is no `ensureTrailingSpace`, and unlike
+        /// `submitCopy` no NUL terminator — `runUndo` reads a byte slice, never an NSString.
+        /// Runs off the trigger thread; the caller must not submit while an undo job is
+        /// still pending (mirrors `submit`'s single-producer contract). An over-long `text`
+        /// is capped to the buffer.
+        pub fn submitUndo(self: *Self, text: []const u8, expected_app: ?coord.AppIdentity) void {
             const n = @min(text.len, self.undo_job.len);
             @memcpy(self.undo_job[0..n], text[0..n]);
             self.undo_job_len = n;
+            self.undo_expected_app = expected_app;
             self.undo_pending.store(true, .release);
         }
 
@@ -241,20 +249,32 @@ pub fn InsertionAdapter(comptime Deps: type) type {
 
         /// Drain the one pending Undo job (undo-spec / #214): count the stored bytes'
         /// grapheme clusters (#220 — one `⌫` per extended grapheme cluster, trailing space
-        /// included) and post that many Backspaces through `deleteChars`. N = 0 (empty bytes
-        /// or a segmentation failure) → no-op, silent but for the log, exactly like a failed
-        /// `runBypass`. Touches **only the OS event stream**: deliberately no ring write, no
-        /// `complete`, no `focusedApp` (mirrors bypass), and no `finishInsert` — a prior
-        /// job's deferred restore is already drained within its own tick by worker
+        /// included), evaluate the **app-level focus gate** (#224/#213), and only then post
+        /// the Backspaces through `deleteChars`. The gate reads a **fresh** `focusedApp()`
+        /// here, immediately before posting — never a value captured at trigger or record
+        /// time — and refuses unless bundle id AND display name both match the record's
+        /// stored identity, fail-closed on either side null (undo_gate.zig). On refuse:
+        /// nothing posted, the specific reason written to the log for the feedback layer
+        /// (#226 renders the single refuse cue). N = 0 (empty bytes or a segmentation
+        /// failure) → no-op before the gate even runs, exactly like a failed `runBypass`.
+        /// Touches **only the OS event stream**: deliberately no ring write, no `complete`
+        /// (the `focusedApp` read feeds the gate, not a report), and no `finishInsert` — a
+        /// prior job's deferred restore is already drained within its own tick by worker
         /// serialization, and this path pastes nothing, so it leaves no restore of its own.
         /// The `undone` flag is the trigger path's job on commit, a later ticket — never here.
         /// Post-paste transforms can make N over- or under-delete by a bounded amount;
-        /// accepted silently, blind best-effort (#214).
+        /// accepted silently, blind best-effort (#214). The gate is app-level only — the
+        /// "user kept typing in the same app" hazard is a known, accepted residual (#209).
         fn runUndo(self: *Self) void {
             const bytes = self.undo_job[0..self.undo_job_len];
             const n = grapheme.graphemeCount(bytes);
             if (n == 0) {
                 feedback.log("  undo: nothing to delete (empty or unsegmentable record)\n", .{});
+                return;
+            }
+            const fresh = self.deps.focusedApp();
+            if (undo_gate.evaluate(self.undo_expected_app, fresh)) |reason| {
+                feedback.log("  undo refused: {s} — nothing posted\n", .{@tagName(reason)});
                 return;
             }
             self.deps.deleteChars(n);
@@ -283,6 +303,9 @@ const FakeDeps = struct {
     last_completion: coord.InsertResult = .ok,
     last_focused_app: ?coord.AppIdentity = null,
     focused_app: ?coord.AppIdentity = null,
+    /// How many times the worker read the frontmost app — lets the gate tests prove the
+    /// read is fresh (taken during runUndo) and skipped when nothing would post (#224).
+    focus_reads: usize = 0,
     finishes: usize = 0,
     completions_at_finish: usize = 0,
     copies: usize = 0,
@@ -318,6 +341,7 @@ const FakeDeps = struct {
     }
 
     fn focusedApp(self: *FakeDeps) ?coord.AppIdentity {
+        self.focus_reads += 1;
         return self.focused_app;
     }
 
@@ -572,14 +596,18 @@ test "a copy job is serialized against — never clobbers — a pending dictatio
     try std.testing.expect(!adapter.runOnce());
 }
 
-// --- Undo (deletion) jobs — undo-spec / #214, issue #222 ---
+// --- Undo (deletion) jobs — undo-spec / #214, issue #222; focus gate #224 ---
+
+/// The App Identity most gate tests store on the record and set as the fake frontmost.
+const slack = coord.AppIdentity.init("com.tinyspeck.slackmacgap", "Slack");
 
 test "an undo job posts one backspace per grapheme cluster and never reports back" {
-    var adapter = InsertionAdapter(FakeDeps).init(.{});
+    var adapter = InsertionAdapter(FakeDeps).init(.{ .focused_app = slack });
 
     // The stored `inserted` bytes carry their trailing space; Undo deletes it too (#214),
-    // so "abc " is 4 clusters → 4 backspaces.
-    adapter.submitUndo("abc ");
+    // so "abc " is 4 clusters → 4 backspaces. The frontmost app matches the record's, so
+    // the focus gate passes (#224).
+    adapter.submitUndo("abc ", slack);
     try std.testing.expect(adapter.runOnce());
     try std.testing.expectEqual(@as(usize, 1), adapter.deps.deletes);
     try std.testing.expectEqual(@as(usize, 4), adapter.deps.last_delete_n);
@@ -593,31 +621,33 @@ test "an undo job posts one backspace per grapheme cluster and never reports bac
 }
 
 test "an undo job counts grapheme clusters, not bytes or UTF-16 units" {
-    var adapter = InsertionAdapter(FakeDeps).init(.{});
+    var adapter = InsertionAdapter(FakeDeps).init(.{ .focused_app = slack });
 
     // A ZWJ family emoji + a space: 25 + 1 bytes, 11 + 1 UTF-16 units, but 2 clusters → 2 ⌫.
-    adapter.submitUndo("👨\u{200D}👩\u{200D}👧\u{200D}👦 ");
+    adapter.submitUndo("👨\u{200D}👩\u{200D}👧\u{200D}👦 ", slack);
     try std.testing.expect(adapter.runOnce());
     try std.testing.expectEqual(@as(usize, 2), adapter.deps.last_delete_n);
 }
 
-test "an undo job with empty text is a silent no-op (N = 0)" {
-    var adapter = InsertionAdapter(FakeDeps).init(.{});
+test "an undo job with empty text is a silent no-op (N = 0) that never reads the frontmost app" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{ .focused_app = slack });
 
     // A zero-length record (or a segmentation failure) yields N = 0 — refuse/no-op, no post.
-    adapter.submitUndo("");
+    adapter.submitUndo("", slack);
     try std.testing.expect(adapter.runOnce()); // the slot still drained this tick
     try std.testing.expectEqual(@as(usize, 0), adapter.deps.deletes);
     try std.testing.expectEqual(@as(usize, 0), adapter.deps.calls);
     try std.testing.expectEqual(@as(usize, 0), adapter.deps.completions);
+    // Nothing would post, so the gate — and its cross-process NSWorkspace read — is skipped.
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.focus_reads);
 }
 
 test "an undo job is serialized against — never clobbers — a pending dictation job" {
-    var adapter = InsertionAdapter(FakeDeps).init(.{});
+    var adapter = InsertionAdapter(FakeDeps).init(.{ .focused_app = slack });
 
     // Both sources hand off before the worker runs; the separate slots must not clobber.
     adapter.submit(7, "dictation", .normal);
-    adapter.submitUndo("undo me ");
+    adapter.submitUndo("undo me ", slack);
 
     // The dictation job drains first, faithfully, and reports to the Coordinator.
     try std.testing.expect(adapter.runOnce());
@@ -632,4 +662,71 @@ test "an undo job is serialized against — never clobbers — a pending dictati
     try std.testing.expectEqual(@as(usize, 1), adapter.deps.completions);
 
     try std.testing.expect(!adapter.runOnce());
+}
+
+// --- The app-level focus gate — undo-spec / #213, issue #224 ---
+
+test "the gate reads a fresh frontmost app at post time, not one captured at submit time" {
+    // At submit time the frontmost app still matches the record; by the time the worker
+    // drains the job the user has switched away. Only a fresh read refuses here — a value
+    // captured at submit (or record) time would wrongly pass and eat the other app's text.
+    var adapter = InsertionAdapter(FakeDeps).init(.{ .focused_app = slack });
+
+    adapter.submitUndo("abc ", slack);
+    adapter.deps.focused_app = coord.AppIdentity.init("com.apple.Notes", "Notes");
+
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.focus_reads); // read during runUndo
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.deletes);
+}
+
+test "a changed bundle id refuses — zero deletes posted" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{
+        .focused_app = coord.AppIdentity.init("com.example.slack-beta", "Slack"),
+    });
+
+    adapter.submitUndo("abc ", slack); // same display name, different bundle id
+    try std.testing.expect(adapter.runOnce()); // the slot still drained this tick
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.deletes);
+}
+
+test "a changed display name refuses — zero deletes posted" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{
+        .focused_app = coord.AppIdentity.init("com.tinyspeck.slackmacgap", "Slack Canary"),
+    });
+
+    adapter.submitUndo("abc ", slack); // same bundle id, different display name
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.deletes);
+}
+
+test "a null frontmost app refuses (fail-closed) — zero deletes posted" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{}); // focused_app defaults to null
+
+    adapter.submitUndo("abc ", slack);
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.deletes);
+}
+
+test "a record with no stored App Identity refuses (fail-closed) — zero deletes posted" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{ .focused_app = slack });
+
+    adapter.submitUndo("abc ", null); // the best-effort hint was never captured
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.deletes);
+}
+
+test "a fresh undo submit clears the expected identity of a prior job" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{ .focused_app = slack });
+
+    // First job passes the gate against Slack.
+    adapter.submitUndo("abc ", slack);
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.deletes);
+
+    // The next job's record carries no identity — it must not inherit the prior Slack
+    // expectation and pass; fail-closed refuses it.
+    adapter.submitUndo("def ", null);
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.deletes);
 }

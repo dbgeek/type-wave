@@ -25,6 +25,7 @@ test {
     _ = @import("insertion_adapter.zig");
     _ = @import("recent_insertions.zig"); // the daemon-owned Recent Insertions ring (ADR-0006)
     _ = @import("undo_trigger.zig"); // the recovery-chord Undo trigger: newest-record resolution → submitUndo (#223)
+    _ = @import("undo_gate.zig"); // the app-level focus gate's evaluation rule (#224)
     _ = @import("app_focus.zig"); // the best-effort App Identity reader (NSWorkspace boundary)
     _ = @import("rewrite_adapter.zig"); // the Backtrack Rewrite seam (docs/backtrack-spec.md)
     _ = @import("openai_rewrite.zig"); // the locked Responses call: request build + output extraction
