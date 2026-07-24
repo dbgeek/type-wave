@@ -481,6 +481,12 @@ const RealInsertionDeps = struct {
     pub fn copyToClipboard(self: *RealInsertionDeps, text: [*:0]const u8) void {
         self.inserter.copyToClipboard(text);
     }
+    /// The Undo deletion mechanism (undo-spec / #214, issue #222): post `n` self-tagged
+    /// Backspaces through the CGEvent path. No trigger is wired yet — this exists so the
+    /// adapter's `runUndo` has a concrete mechanism to call once the trigger lands.
+    pub fn deleteChars(self: *RealInsertionDeps, n: usize) void {
+        self.inserter.deleteChars(n);
+    }
     pub fn shouldQuit(_: *RealInsertionDeps) bool {
         return g_quit.load(.acquire);
     }

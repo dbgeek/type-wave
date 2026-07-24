@@ -15,6 +15,7 @@ const std = @import("std");
 const coord = @import("coordinator.zig");
 const feedback = @import("feedback.zig");
 const insertmod = @import("insert.zig");
+const grapheme = @import("grapheme.zig");
 
 fn explainInsert(e: insertmod.InsertError) []const u8 {
     return switch (e) {
@@ -73,6 +74,22 @@ pub fn InsertionAdapter(comptime Deps: type) type {
         copy_job: [job_buf_len]u8 = undefined,
         copy_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+        /// A fourth, **Undo** job slot (undo-spec / #214, issue #222). The Undo trigger
+        /// (a later ticket) dispatches the last Insertion's stored `inserted` bytes through
+        /// here so the deletion — N Backspaces, N = the grapheme count of those bytes — runs
+        /// on this same single worker, serialized against every insert/replay/copy. Like
+        /// `bypass_job`/`copy_job` it carries no Utterance identity and never reports back:
+        /// `runUndo` touches **only the OS event stream** (`deleteChars`), never the ring —
+        /// the `undone` flag is set by the trigger path on commit, not here. A dedicated slot
+        /// (not `job`/`bypass_job`/`copy_job`) so its producer never clobbers another job.
+        /// Stored **verbatim** with an explicit length (no NUL, no trailing-space fixup): the
+        /// `inserted` bytes already carry their separator and the count must delete it too
+        /// (#214 — restore the pre-Insertion state). Ordered across threads by `undo_pending`
+        /// exactly like `job` by `pending`.
+        undo_job: [job_buf_len]u8 = undefined,
+        undo_job_len: usize = 0,
+        undo_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
         pub fn init(deps: Deps) Self {
             return .{ .deps = deps };
         }
@@ -116,6 +133,21 @@ pub fn InsertionAdapter(comptime Deps: type) type {
             self.copy_pending.store(true, .release);
         }
 
+        /// Undo seam (undo-spec / #214, issue #222). Hands the worker the last Insertion's
+        /// stored `inserted` bytes to delete — `runUndo` counts their grapheme clusters and
+        /// posts that many Backspaces. Stored **verbatim** with an explicit length: the count
+        /// must match exactly what was inserted (trailing space included, #214), so unlike
+        /// `submitBypass` there is no `ensureTrailingSpace`, and unlike `submitCopy` no NUL
+        /// terminator — `runUndo` reads a byte slice, never an NSString. Runs off the trigger
+        /// thread; the caller must not submit while an undo job is still pending (mirrors
+        /// `submit`'s single-producer contract). An over-long `text` is capped to the buffer.
+        pub fn submitUndo(self: *Self, text: []const u8) void {
+            const n = @min(text.len, self.undo_job.len);
+            @memcpy(self.undo_job[0..n], text[0..n]);
+            self.undo_job_len = n;
+            self.undo_pending.store(true, .release);
+        }
+
         /// One worker tick. Exposed so tests can drive the adapter without spawning a
         /// thread or sleeping. Returns whether a job was drained. Dictation jobs take
         /// priority (time-sensitive); the Coordinator-less replay defers to them and, being
@@ -131,6 +163,10 @@ pub fn InsertionAdapter(comptime Deps: type) type {
             }
             if (self.copy_pending.swap(false, .acquire)) {
                 self.runCopy();
+                return true;
+            }
+            if (self.undo_pending.swap(false, .acquire)) {
+                self.runUndo();
                 return true;
             }
             return false;
@@ -203,6 +239,28 @@ pub fn InsertionAdapter(comptime Deps: type) type {
             self.deps.copyToClipboard(z);
         }
 
+        /// Drain the one pending Undo job (undo-spec / #214): count the stored bytes'
+        /// grapheme clusters (#220 — one `⌫` per extended grapheme cluster, trailing space
+        /// included) and post that many Backspaces through `deleteChars`. N = 0 (empty bytes
+        /// or a segmentation failure) → no-op, silent but for the log, exactly like a failed
+        /// `runBypass`. Touches **only the OS event stream**: deliberately no ring write, no
+        /// `complete`, no `focusedApp` (mirrors bypass), and no `finishInsert` — a prior
+        /// job's deferred restore is already drained within its own tick by worker
+        /// serialization, and this path pastes nothing, so it leaves no restore of its own.
+        /// The `undone` flag is the trigger path's job on commit, a later ticket — never here.
+        /// Post-paste transforms can make N over- or under-delete by a bounded amount;
+        /// accepted silently, blind best-effort (#214).
+        fn runUndo(self: *Self) void {
+            const bytes = self.undo_job[0..self.undo_job_len];
+            const n = grapheme.graphemeCount(bytes);
+            if (n == 0) {
+                feedback.log("  undo: nothing to delete (empty or unsegmentable record)\n", .{});
+                return;
+            }
+            self.deps.deleteChars(n);
+            feedback.log("  undo: posted {d} backspaces to delete the last Insertion\n", .{n});
+        }
+
         /// Process jobs until the owning daemon is quitting. Idle behavior stays with the
         /// dependency set so tests do not inherit wall-clock sleeps.
         pub fn workerLoop(self: *Self) void {
@@ -233,6 +291,9 @@ const FakeDeps = struct {
     /// `finishes` seen at the moment `copyToClipboard` ran — proves the drain preceded the
     /// write (spec §5.2.7: the copy drains any deferred restore before it writes).
     finishes_at_copy: usize = 0,
+    /// Undo deletion tracking (#222): how many times `deleteChars` was called and the last N.
+    deletes: usize = 0,
+    last_delete_n: usize = 0,
     quit: bool = false,
     idles: usize = 0,
 
@@ -275,6 +336,11 @@ const FakeDeps = struct {
 
     fn lastCopy(self: *FakeDeps) []const u8 {
         return self.last_copy[0..self.last_copy_len];
+    }
+
+    fn deleteChars(self: *FakeDeps, n: usize) void {
+        self.deletes += 1;
+        self.last_delete_n = n;
     }
 
     fn shouldQuit(self: *FakeDeps) bool {
@@ -501,6 +567,68 @@ test "a copy job is serialized against — never clobbers — a pending dictatio
     try std.testing.expect(adapter.runOnce());
     try std.testing.expectEqualStrings("copied", adapter.deps.lastCopy());
     try std.testing.expectEqual(@as(usize, 1), adapter.deps.copies);
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.completions);
+
+    try std.testing.expect(!adapter.runOnce());
+}
+
+// --- Undo (deletion) jobs — undo-spec / #214, issue #222 ---
+
+test "an undo job posts one backspace per grapheme cluster and never reports back" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{});
+
+    // The stored `inserted` bytes carry their trailing space; Undo deletes it too (#214),
+    // so "abc " is 4 clusters → 4 backspaces.
+    adapter.submitUndo("abc ");
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.deletes);
+    try std.testing.expectEqual(@as(usize, 4), adapter.deps.last_delete_n);
+    // Touches only the OS event stream: no insert, no clipboard, and — no Utterance identity —
+    // nothing reaches onInserted / the ring, on the undo path (#222).
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.calls);
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.completions);
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.copies);
+    // No paste on this path, so no deferred restore to drain — it stays out of finishInsert.
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.finishes);
+}
+
+test "an undo job counts grapheme clusters, not bytes or UTF-16 units" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{});
+
+    // A ZWJ family emoji + a space: 25 + 1 bytes, 11 + 1 UTF-16 units, but 2 clusters → 2 ⌫.
+    adapter.submitUndo("👨\u{200D}👩\u{200D}👧\u{200D}👦 ");
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(@as(usize, 2), adapter.deps.last_delete_n);
+}
+
+test "an undo job with empty text is a silent no-op (N = 0)" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{});
+
+    // A zero-length record (or a segmentation failure) yields N = 0 — refuse/no-op, no post.
+    adapter.submitUndo("");
+    try std.testing.expect(adapter.runOnce()); // the slot still drained this tick
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.deletes);
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.calls);
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.completions);
+}
+
+test "an undo job is serialized against — never clobbers — a pending dictation job" {
+    var adapter = InsertionAdapter(FakeDeps).init(.{});
+
+    // Both sources hand off before the worker runs; the separate slots must not clobber.
+    adapter.submit(7, "dictation", .normal);
+    adapter.submitUndo("undo me ");
+
+    // The dictation job drains first, faithfully, and reports to the Coordinator.
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqualStrings("dictation ", adapter.deps.lastText());
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.completions);
+    try std.testing.expectEqual(@as(usize, 0), adapter.deps.deletes);
+
+    // The undo job drains on the next tick — serialized, never interleaved, no report.
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(@as(usize, 1), adapter.deps.deletes);
+    try std.testing.expectEqual(@as(usize, 8), adapter.deps.last_delete_n); // "undo me " = 8 clusters
     try std.testing.expectEqual(@as(usize, 1), adapter.deps.completions);
 
     try std.testing.expect(!adapter.runOnce());
