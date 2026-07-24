@@ -70,6 +70,7 @@ const appkit = @import("appkit.zig");
 const keychain = @import("keychain.zig");
 const insertion_adapter = @import("insertion_adapter.zig");
 const recent_insertions = @import("recent_insertions.zig");
+const undo_trigger = @import("undo_trigger.zig");
 const app_focus = @import("app_focus.zig");
 const rewrite_adapter = @import("rewrite_adapter.zig");
 const openai_rewrite = @import("openai_rewrite.zig");
@@ -759,13 +760,17 @@ const Daemon = struct {
     }
 
     /// The recovery chord ⌃⌘⌫ was pressed: the user wants to undo the last Insertion (#210,
-    /// undo-spec). The tap has already de-duped auto-repeat and skipped our own posted
-    /// deletes, so this fires once per discrete press. This ticket (#221) only lands the
-    /// capture + this wire-through; the Insertion-deleting action hangs off this seam in a
-    /// downstream Undo ticket. Runs on the run-loop thread — surface the signal and return.
+    /// undo-spec). The tap has already de-duped auto-repeat and skipped our own posted deletes,
+    /// so this fires once per discrete press. The walking skeleton (#223) resolves the **newest**
+    /// Recent Insertions record (#212 — single newest, no stack) and hands its with-space bytes to
+    /// the insert worker's undo slot (#222), which backspaces them out. Deliberately **unguarded**
+    /// here: no focus gate, no `undone` flag, no HUD — those are the next three tickets. Empty ring
+    /// → nothing posted. Runs on the run-loop thread; the resolution is a bounded ring read + a slot
+    /// copy, both fast (a slow tap callback makes the OS disable the tap).
     fn onRecoveryChord(ctx: ?*anyopaque) void {
-        _ = ctx;
+        const self: *Daemon = @ptrCast(@alignCast(ctx.?));
         feedback.log("  recovery chord ⌃⌘⌫ observed — undo requested\n", .{});
+        undo_trigger.trigger(&self.recent_insertions, &self.insertion);
     }
 
     // ---- supervisor thread: the self-heal / not-configured → configured engine ----
