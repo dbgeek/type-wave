@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.1.5](https://github.com/dbgeek/type-wave/compare/v0.1.4...v0.1.5) (2026-07-24)
+## [0.2.0](https://github.com/dbgeek/type-wave/compare/v0.1.4...v0.2.0) (2026-07-24)
 
 
 ### Features
