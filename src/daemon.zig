@@ -42,6 +42,8 @@
 //!                        happens here, menu actions included.
 //!   - insert worker    : the InsertionAdapter — drains one insert job, performs the slow
 //!                        Insertion off the Coordinator's mutex, then reports `.inserted`.
+//!                        Also drains the Undo Runner (undo.zig, ADR-0008) last, which is
+//!                        what serializes a deletion against dictation.
 //!   - rewrite worker   : the RewriteAdapter (docs/backtrack-spec.md) — drains one
 //!                        Backtrack rewrite job, makes the OpenAI Responses call off the
 //!                        Coordinator's mutex, then reports `.rewritten`.
@@ -70,7 +72,7 @@ const appkit = @import("appkit.zig");
 const keychain = @import("keychain.zig");
 const insertion_adapter = @import("insertion_adapter.zig");
 const recent_insertions = @import("recent_insertions.zig");
-const undo_trigger = @import("undo_trigger.zig");
+const undo_mod = @import("undo.zig");
 const app_focus = @import("app_focus.zig");
 const rewrite_adapter = @import("rewrite_adapter.zig");
 const openai_rewrite = @import("openai_rewrite.zig");
@@ -454,10 +456,6 @@ const LocalProvisioner = local_provisioner.LocalProvisioner(LocalProvisionerDeps
 const RealInsertionDeps = struct {
     inserter: *insertmod.Inserter,
     store: *config.Store,
-    /// The Feedback Surface, for the Undo confirm/refuse HUD cue (ADR-0007, #226): the insert
-    /// worker's `runUndo` pokes it on a gated post (confirm) or a gate refusal (refuse). A
-    /// stable pointer into the daemon struct, wired at construction below.
-    surface: *surface.Surface,
 
     co_ctx: *anyopaque = undefined,
     on_done: *const fn (*anyopaque, coord.UtteranceId, coord.InsertResult, ?coord.AppIdentity) void = undefined,
@@ -486,24 +484,6 @@ const RealInsertionDeps = struct {
     pub fn copyToClipboard(self: *RealInsertionDeps, text: [*:0]const u8) void {
         self.inserter.copyToClipboard(text);
     }
-    /// The Undo deletion mechanism (undo-spec / #214, issue #222): post `n` self-tagged
-    /// Backspaces through the CGEvent path. No trigger is wired yet — this exists so the
-    /// adapter's `runUndo` has a concrete mechanism to call once the trigger lands.
-    pub fn deleteChars(self: *RealInsertionDeps, n: usize) void {
-        self.inserter.deleteChars(n);
-    }
-    /// The Undo confirm cue (ADR-0007, #226): a green single-bloom on the HUD after a gated
-    /// Undo posted its backspaces. Routed through the Feedback Surface so all HUD arbitration
-    /// stays in one place; HUD-only, so a disabled/headless overlay just shows nothing.
-    pub fn undoConfirmed(self: *RealInsertionDeps) void {
-        self.surface.undoConfirmed();
-    }
-    /// The Undo refuse cue (ADR-0007, #226): a red bloom + shake on the HUD when the gate
-    /// refuses (worker) — the trigger's no-target / already-undone refusals reach it via the
-    /// same Surface verb through `refuseUndo`.
-    pub fn undoRefused(self: *RealInsertionDeps) void {
-        self.surface.undoRefused();
-    }
     pub fn shouldQuit(_: *RealInsertionDeps) bool {
         return g_quit.load(.acquire);
     }
@@ -512,6 +492,53 @@ const RealInsertionDeps = struct {
     }
 };
 const InsertionAdapter = insertion_adapter.InsertionAdapter(RealInsertionDeps);
+
+/// Real dependencies for the **Undo Runner** (undo.zig, ADR-0008). The Runner owns the whole
+/// deletion sequence on the insert worker; daemon.zig supplies only what the OS owns — the
+/// pause/grant gate, the frontmost read, the CGEvent deletion mechanism, and the two HUD cue
+/// verbs. The Recent Insertions ring is *not* here: it is daemon-owned and handed to the
+/// Runner concretely (ADR-0006), since it is heap-free and needs no substitute.
+const RealUndoDeps = struct {
+    daemon: *Daemon,
+    inserter: *insertmod.Inserter,
+    /// The Feedback Surface, for the Undo confirm/refuse HUD cue (ADR-0007, #226). A stable
+    /// pointer into the daemon struct, wired at construction below.
+    surface: *surface.Surface,
+
+    /// Undo's own prerequisites (ADR-0008) — deliberately *not* the Configuration Phase and
+    /// *not* the Supervisor's capture-enable gate. `⌃⌘⌫` is a system-wide chord and
+    /// Backspaces are destructive, so a paused daemon must stay inert; and without the
+    /// PostEvent grant `deleteChars` would post nothing while the confirm cue claimed a
+    /// deletion had happened. An OpenAI key or a Model Installation is irrelevant to deleting
+    /// text that already landed, so `configured` is not consulted.
+    pub fn enabled(self: *RealUndoDeps) bool {
+        return !self.daemon.paused.load(.acquire) and self.daemon.postEventFact();
+    }
+    /// The gate's fresh side (#224): a cross-process NSWorkspace query, read on the insert
+    /// worker immediately before posting — never on the tap's run-loop thread, which the OS
+    /// disables if a callback runs slow.
+    pub fn focusedApp(_: *RealUndoDeps) ?coord.AppIdentity {
+        return app_focus.frontmost();
+    }
+    /// The Undo deletion mechanism (undo-spec / #214, issue #222): post `n` self-tagged
+    /// Backspaces through the CGEvent path. The self tag is what stops our own deletes from
+    /// re-firing the chord (`tap.isRecoveryChordPress`).
+    pub fn deleteChars(self: *RealUndoDeps, n: usize) void {
+        self.inserter.deleteChars(n);
+    }
+    /// The Undo confirm cue (ADR-0007, #226): a green single-bloom on the HUD after a gated
+    /// Undo posted its backspaces. Routed through the Feedback Surface so all HUD arbitration
+    /// stays in one place; HUD-only, so a disabled/headless overlay just shows nothing.
+    pub fn undoConfirmed(self: *RealUndoDeps) void {
+        self.surface.undoConfirmed();
+    }
+    /// The Undo refuse cue (ADR-0007, #226): a red bloom + shake on the HUD. Every refuse
+    /// reason — paused, no-target, already-undone, and the gate's two — collapses here.
+    pub fn undoRefused(self: *RealUndoDeps) void {
+        self.surface.undoRefused();
+    }
+};
+const UndoRunner = undo_mod.Undo(RealUndoDeps);
 
 /// Real dependencies for rewrite_adapter.zig (docs/backtrack-spec.md). The adapter owns
 /// the asynchronous Rewrite policy; daemon.zig supplies the OpenAI mechanism — the
@@ -652,6 +679,11 @@ const Daemon = struct {
     /// recorder seam at `onInserted`, read by the menu (later work) under its own leaf lock.
     /// Heap-free and zero-initializable, so it lives inline on the daemon.
     recent_insertions: recent_insertions.Ring = .{},
+    /// The Undo Runner (undo.zig, ADR-0008): the daemon's one route from the recovery chord
+    /// `⌃⌘⌫` to a deletion. Driven on the insert worker after every insert-side job, so a
+    /// deletion never interleaves with an Insertion's clipboard-swap dance. Holds the ring
+    /// concretely and reaches the OS through `RealUndoDeps`.
+    undo: UndoRunner = undefined,
     deadline: DeadlineAdapter = .{},
     feedback_surface: surface.Surface = undefined,
     coordinator: Coord = undefined,
@@ -777,20 +809,19 @@ const Daemon = struct {
 
     /// The recovery chord ⌃⌘⌫ was pressed: the user wants to undo the last Insertion (#210,
     /// undo-spec). The tap has already de-duped auto-repeat and skipped our own posted deletes,
-    /// so this fires once per discrete press. The trigger (#223) resolves the **newest** Recent
-    /// Insertions record (#212 — single newest, no stack) and hands its with-space bytes plus its
-    /// stored App Identity to the insert worker's undo slot (#222), which evaluates the app-level
-    /// focus gate against a fresh frontmost read and backspaces only on a match (#224). Empty ring
-    /// → nothing posted. Each outcome shows a glanceable HUD cue (ADR-0007, #226): a green
-    /// single-bloom on a posted delete, a red bloom + shake on any refusal (the trigger's
-    /// no-target / already-undone here, the gate's on the worker), driven from the hidden pill.
-    /// Runs on the run-loop thread; the resolution is a bounded ring read + a slot copy,
-    /// both fast (a slow tap callback makes the OS disable the tap) — the gate's cross-process
-    /// NSWorkspace read deliberately happens on the worker, never here.
+    /// so this fires once per discrete press.
+    ///
+    /// This callback does exactly one thing — bump the Undo Runner's press counter (ADR-0008).
+    /// Everything else (resolving the newest record, counting grapheme clusters, the fresh
+    /// frontmost read, the focus gate, the post, the `undone` flag, the cue) happens on the
+    /// insert worker, where the gate's cross-process NSWorkspace read has to live anyway: a
+    /// slow tap callback makes the OS disable the tap. One press yields one verdict and one
+    /// glanceable HUD cue (ADR-0007, #226) — green single-bloom on a posted delete, red bloom
+    /// + shake on any refusal.
     fn onRecoveryChord(ctx: ?*anyopaque) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
         feedback.log("  recovery chord ⌃⌘⌫ observed — undo requested\n", .{});
-        undo_trigger.trigger(&self.recent_insertions, &self.insertion);
+        self.undo.request();
     }
 
     // ---- supervisor thread: the self-heal / not-configured → configured engine ----
@@ -1250,7 +1281,14 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     daemon.deadline.io = io;
     daemon.rewrite_http = .{ .allocator = alloc, .io = io };
     daemon.rewrite = RewriteAdapter.init(.{ .daemon = &daemon });
-    daemon.insertion = InsertionAdapter.init(.{ .inserter = &daemon.inserter, .store = &daemon.store, .surface = &daemon.feedback_surface });
+    daemon.insertion = InsertionAdapter.init(.{ .inserter = &daemon.inserter, .store = &daemon.store });
+    // The Undo Runner (ADR-0008). Holds the ring concretely; the chord callback only bumps
+    // its counter, and the insert worker below drains it after every insert-side job.
+    daemon.undo = UndoRunner.init(&daemon.recent_insertions, .{
+        .daemon = &daemon,
+        .inserter = &daemon.inserter,
+        .surface = &daemon.feedback_surface,
+    });
     daemon.coordinator = Coord.init(.{
         .audio = &daemon.capture,
         .backends = &daemon.transcription,
@@ -1318,7 +1356,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
         "no display — running headless (no status item)"});
 
     // ---- threads ----
-    const worker = try std.Thread.spawn(.{}, InsertionAdapter.workerLoop, .{&daemon.insertion});
+    const worker = try std.Thread.spawn(.{}, InsertionAdapter.workerLoop, .{ &daemon.insertion, &daemon.undo });
     worker.detach();
     const rewrite_worker = try std.Thread.spawn(.{}, RewriteAdapter.workerLoop, .{&daemon.rewrite});
     rewrite_worker.detach();

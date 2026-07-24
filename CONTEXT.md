@@ -94,6 +94,36 @@ authoritative ring on demand only at reveal / copy / re-insert. Distinct from th
 Record, which is the authoritative, text-bearing entry the ring owns.
 _Avoid_: history model, menu record (vague); Insertion Record (that's the text-bearing entry, not this masked view)
 
+**Undo**:
+Removing the newest Insertion's text from the Focused Target on the recovery chord `⌃⌘⌫` —
+N Backspaces, one per extended grapheme cluster of the Insertion Record's `inserted` bytes,
+trailing Insertion space included, so the pre-Insertion state is restored. Gated app-level:
+it proceeds only on positive evidence that the frontmost app is unchanged since the
+Insertion (bundle id **and** display name both match), fail-closed on either side missing.
+**Single-shot**: a committed Undo flags its record `undone` and a second chord on that record
+refuses rather than eating earlier text; re-inserting it redoes it. Blind and best-effort —
+post-Insertion edits can make N over- or under-delete, an accepted limit of the app-level
+model. Every outcome shows one HUD cue (ADR-0007): green bloom on a posted deletion, red
+bloom + shake on any refusal.
+_Avoid_: delete, backspace (those name the mechanism); recovery chord (that names the input,
+not the act); revert
+
+**Undo Runner**:
+The daemon's one route from the recovery chord to an Undo, and the owner of the whole
+sequence — pause/grant gate, newest-record resolution, grapheme count, the fresh
+`frontmost()` read, the focus gate, the post, the `undone` flag, the cue. It runs **entirely
+on the insert worker** (ADR-0008): the gate's read must be fresh and is cross-process, so it
+cannot live on the tap's run-loop thread, and everything else therefore sits beside it — the
+chord callback only bumps a saturating press counter, one press to one verdict to one cue.
+The record is resolved at post time and flagged only *after* a deletion posts, so no refusal
+can dim a record nothing deleted. It gates on its own prerequisites — not paused, PostEvent
+granted — never on the Configuration Phase or the Supervisor's capture-enable gate. It holds
+the Recent Insertions ring concretely (ADR-0006 keeps ownership with the daemon) and reaches
+every effect through a five-method seam it is handed, so the whole sequence is exercised by
+fed values rather than by a live tap. Lives in `src/undo.zig`; drained last by the insert
+worker, which is what serializes a deletion against dictation.
+_Avoid_: undo manager, deletion engine, trigger (that named only the discarded run-loop half)
+
 **Backtrack**:
 The opt-in rewrite pass between an Utterance's Final Transcript and its Insertion
 (docs/backtrack-spec.md): one OpenAI call applies spoken self-corrections ("at 20:00 no
