@@ -1198,17 +1198,74 @@ pub fn removeInactiveInstallations(io: std.Io, root: []const u8) !usize {
     return removed;
 }
 
+/// Where a Model Operation download is allowed to *start*: the exact pinned origin, which
+/// is ours to write and so never needs the latitude a redirect hop does.
 pub fn isHuggingFaceOrigin(url: []const u8) bool {
     const uri = std.Uri.parse(url) catch return false;
     return isHuggingFaceUri(uri);
 }
 
 fn isHuggingFaceUri(uri: std.Uri) bool {
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return false;
-    if (uri.port != null and uri.port.? != 443) return false;
+    if (!isArtifactTransport(uri)) return false;
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
     const host = uri.getHost(&host_buffer) catch return false;
     return std.ascii.eqlIgnoreCase(host.bytes, "huggingface.co");
+}
+
+/// TLS on the default port, on every hop — not just the first. A `Location` naming
+/// `http://` or an off-port service is a downgrade, whatever host it carries.
+fn isArtifactTransport(uri: std.Uri) bool {
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return false;
+    return uri.port == null or uri.port.? == 443;
+}
+
+/// Hugging Face's own DNS zones. The pinned artifact URL names `huggingface.co`, but
+/// fetching it is a two-hop affair: the origin 302s to a signed, expiring CDN URL, and
+/// that redirect is load-bearing — refusing it would break every Model Installation.
+/// Observed 2026-07-25 for the pinned artifact:
+///
+///     GET https://huggingface.co/ggerganov/whisper.cpp/resolve/<revision>/ggml-large-v3-turbo.bin
+///     302 → https://us.aws.cdn.hf.co/xet-bridge-us/<hash>?…&Signature=…&Key-Pair-Id=…
+///     206 (the body)
+///
+/// The CDN hostname is not stable enough to pin: it has been `cdn-lfs.huggingface.co`,
+/// then `cdn-lfs.hf.co`, then region-sharded names under `*.cdn.hf.co`, and it varies by
+/// the caller's region. So the rule trusts the *zones* instead — a hop must land on one of
+/// these names or a subdomain of one, which a CDN rename survives while an arbitrary host
+/// still cannot pass. Both zones are Hugging Face-operated end to end: user-controlled
+/// content lives on paths under `huggingface.co` and on the separate `hf.space` domain,
+/// so no third party is handed a name inside them.
+const huggingface_zones = [_][]const u8{ "huggingface.co", "hf.co" };
+
+/// Re-proves the trusted origin for a hop the origin sent us to. Wider than
+/// `isHuggingFaceUri` by exactly the CDN zone above, and no wider.
+fn isHuggingFaceRedirectTarget(uri: std.Uri) bool {
+    if (!isArtifactTransport(uri)) return false;
+    var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = uri.getHost(&host_buffer) catch return false;
+    for (huggingface_zones) |zone| if (hostInZone(host.bytes, zone)) return true;
+    return false;
+}
+
+/// `host` is `zone` itself or a subdomain of it. The boundary dot is what makes this a
+/// zone test rather than a suffix test: `hf.co.evil.example` and `evilhf.co` both end in a
+/// zone name and neither is inside one.
+fn hostInZone(host: []const u8, zone: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(host, zone)) return true;
+    if (host.len <= zone.len + 1) return false;
+    const label_end = host.len - zone.len - 1;
+    return host[label_end] == '.' and std.ascii.eqlIgnoreCase(host[label_end + 1 ..], zone);
+}
+
+/// Resolve a redirect's `Location` against the hop it arrived on, and prove the result is
+/// still a trusted origin before it is fetched from. `buffer` backs the returned URI.
+fn resolveRedirect(current: std.Uri, location: []const u8, buffer: []u8) !std.Uri {
+    if (location.len > buffer.len) return error.ModelDownloadRedirectTooLong;
+    @memcpy(buffer[0..location.len], location);
+    var resolve_slice = buffer;
+    const next = try current.resolveInPlace(location.len, &resolve_slice);
+    if (!isHuggingFaceRedirectTarget(next)) return error.UntrustedArtifactOrigin;
+    return next;
 }
 
 pub const HttpTransport = struct {
@@ -1227,6 +1284,12 @@ pub const HttpTransport = struct {
         while (redirect_count <= 5) : (redirect_count += 1) {
             if (download_request.cancel.isRequested()) return error.ModelOperationCancelled;
             const uri = try std.Uri.parse(current_url);
+            // The invariant at the socket: every hop this loop requests — hop 0, and the
+            // last one, whose body is read — has proven the trusted origin. Hop 0 has
+            // already passed the stricter exact-origin gate above; a redirect target was
+            // proven when it was resolved and is proven again here, on the far side of the
+            // round trip through text that carries it between iterations.
+            if (!isHuggingFaceRedirectTarget(uri)) return error.UntrustedArtifactOrigin;
             var range_headers: [2]std.http.Header = undefined;
             range_headers[0] = .{ .name = "Range", .value = range };
             var range_header_count: usize = 1;
@@ -1246,10 +1309,9 @@ pub const HttpTransport = struct {
             if (response.head.status.class() == .redirect) {
                 const location = response.head.location orelse return error.ModelDownloadRedirectMissing;
                 var resolve_buffer: [16 * 1024]u8 = undefined;
-                if (location.len > resolve_buffer.len) return error.ModelDownloadRedirectTooLong;
-                @memcpy(resolve_buffer[0..location.len], location);
-                var resolve_slice: []u8 = &resolve_buffer;
-                const next_uri = try uri.resolveInPlace(location.len, &resolve_slice);
+                // Before anything else — including draining this response — so an
+                // untrusted hop costs exactly one refusal and no further traffic.
+                const next_uri = try resolveRedirect(uri, location, &resolve_buffer);
                 var discard_buffer: [1024]u8 = undefined;
                 _ = try response.reader(&discard_buffer).discardRemaining();
                 const next_url = try std.fmt.allocPrint(allocator, "{f}", .{next_uri});
@@ -1778,9 +1840,50 @@ test "confirmed removal rejects new local Utterances, drains the helper, and rem
 test "acquisition starts only at the exact trusted artifact origin" {
     try std.testing.expect(isHuggingFaceOrigin(test_manifest.url));
     try std.testing.expect(isHuggingFaceOrigin(pinned_manifest.url));
+    // A CDN host is a legitimate redirect *target* (see the next test) and still not a
+    // legitimate place for an operation to start.
     try std.testing.expect(!isHuggingFaceOrigin("https://cdn-lfs.hf.co/signed?secret=value"));
+    try std.testing.expect(!isHuggingFaceOrigin("https://us.aws.cdn.hf.co/xet-bridge-us/5a4b"));
     try std.testing.expect(!isHuggingFaceOrigin("https://huggingface.co.evil.example/model"));
     try std.testing.expect(!isHuggingFaceOrigin("http://huggingface.co/model"));
+}
+
+test "a download follows a redirect only back into Hugging Face's own DNS" {
+    const origin = try std.Uri.parse(pinned_manifest.url);
+    var buffer: [4096]u8 = undefined;
+
+    // The live chain observed 2026-07-25: the pinned origin 302s to a signed CDN URL, and
+    // that hop has to be followed or no Model Installation can be acquired at all.
+    const cdn = try resolveRedirect(origin, "https://us.aws.cdn.hf.co/xet-bridge-us/5a4b?Signature=sig&Key-Pair-Id=key", &buffer);
+    var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    try std.testing.expectEqualStrings("us.aws.cdn.hf.co", (try cdn.getHost(&host_buffer)).bytes);
+
+    // Names Hugging Face has served this artifact from before, and may return to.
+    _ = try resolveRedirect(origin, "https://cdn-lfs.huggingface.co/repos/artifact", &buffer);
+    _ = try resolveRedirect(origin, "https://cdn-lfs-us-1.hf.co/repos/artifact", &buffer);
+    _ = try resolveRedirect(origin, "https://transfer.xethub.hf.co/xorbs/artifact", &buffer);
+    // A relative Location stays on the hop it came from, so it stays trusted.
+    _ = try resolveRedirect(origin, "/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin", &buffer);
+
+    // A cleartext hop is a silent TLS downgrade…
+    try std.testing.expectError(error.UntrustedArtifactOrigin, resolveRedirect(origin, "http://us.aws.cdn.hf.co/xet-bridge-us/5a4b", &buffer));
+    // …an off-port hop is the same downgrade wearing an https scheme…
+    try std.testing.expectError(error.UntrustedArtifactOrigin, resolveRedirect(origin, "https://us.aws.cdn.hf.co:8443/xet-bridge-us/5a4b", &buffer));
+    // …and a host outside the zones is refused however it dresses itself up as one.
+    try std.testing.expectError(error.UntrustedArtifactOrigin, resolveRedirect(origin, "https://evil.example/ggml-large-v3-turbo.bin", &buffer));
+    try std.testing.expectError(error.UntrustedArtifactOrigin, resolveRedirect(origin, "https://hf.co.evil.example/ggml-large-v3-turbo.bin", &buffer));
+    try std.testing.expectError(error.UntrustedArtifactOrigin, resolveRedirect(origin, "https://evilhf.co/ggml-large-v3-turbo.bin", &buffer));
+    // A protocol-relative Location inherits the trusted scheme, not the trusted host.
+    try std.testing.expectError(error.UntrustedArtifactOrigin, resolveRedirect(origin, "//evil.example/ggml-large-v3-turbo.bin", &buffer));
+    // A zone name parked in userinfo is not the host, whatever it reads like.
+    try std.testing.expect(std.meta.isError(resolveRedirect(origin, "https://huggingface.co@evil.example/ggml-large-v3-turbo.bin", &buffer)));
+
+    // A Location too long to resolve is refused rather than truncated into some other URL.
+    var cramped: [16]u8 = undefined;
+    try std.testing.expectError(
+        error.ModelDownloadRedirectTooLong,
+        resolveRedirect(origin, "https://us.aws.cdn.hf.co/xet-bridge-us/5a4b", &cramped),
+    );
 }
 
 test "restart exposes a validator-bound partial as paused without network activity" {
@@ -2135,7 +2238,7 @@ const CountingTransport = struct {
 const AlwaysTransientTransport = struct {
     requests: usize = 0,
 
-    pub fn download(self: *AlwaysTransientTransport, _: []const u8,_: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
+    pub fn download(self: *AlwaysTransientTransport, _: []const u8, _: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
         self.requests += 1;
         return error.ModelDownloadFailed;
     }
@@ -2144,7 +2247,7 @@ const AlwaysTransientTransport = struct {
 const IntermittentTransport = struct {
     requests: usize = 0,
 
-    pub fn download(self: *IntermittentTransport, _: []const u8,request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+    pub fn download(self: *IntermittentTransport, _: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
         self.requests += 1;
         if (self.requests % 2 == 1) return error.ModelDownloadFailed;
         try writer.writeAll(test_bytes[@intCast(request.offset)..@intCast(request.end + 1)]);
@@ -2155,7 +2258,7 @@ const IntermittentTransport = struct {
 const TruncatedThenSuccessTransport = struct {
     requests: usize = 0,
 
-    pub fn download(self: *TruncatedThenSuccessTransport, _: []const u8,request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+    pub fn download(self: *TruncatedThenSuccessTransport, _: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
         self.requests += 1;
         if (self.requests == 1) return error.ModelDownloadTruncated;
         try writer.writeAll(test_bytes[@intCast(request.offset)..@intCast(request.end + 1)]);
@@ -2164,7 +2267,7 @@ const TruncatedThenSuccessTransport = struct {
 };
 
 const CancellingTransport = struct {
-    pub fn download(_: *CancellingTransport, _: []const u8,request: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
+    pub fn download(_: *CancellingTransport, _: []const u8, request: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
         request.cancel.request();
         return error.ModelOperationCancelled;
     }
@@ -2232,7 +2335,7 @@ const ResumingTransport = struct {
     first_offset: ?u64 = null,
     if_range: ?Validator = null,
 
-    pub fn download(self: *ResumingTransport, _: []const u8,request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+    pub fn download(self: *ResumingTransport, _: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
         if (self.first_offset == null) {
             self.first_offset = request.offset;
             self.if_range = request.validator.?;
@@ -2243,20 +2346,20 @@ const ResumingTransport = struct {
 };
 
 const MismatchedResumeTransport = struct {
-    pub fn download(_: *MismatchedResumeTransport, _: []const u8,request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+    pub fn download(_: *MismatchedResumeTransport, _: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
         try writer.writeAll(test_bytes[@intCast(request.offset)..@intCast(request.end + 1)]);
         return DownloadResult.fromValidator(.etag, "\"different\"");
     }
 };
 
 const IncompatibleRangeTransport = struct {
-    pub fn download(_: *IncompatibleRangeTransport, _: []const u8,_: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
+    pub fn download(_: *IncompatibleRangeTransport, _: []const u8, _: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
         return error.ModelDownloadRangeMismatch;
     }
 };
 
 const MalformedValidatorTransport = struct {
-    pub fn download(_: *MalformedValidatorTransport, _: []const u8,_: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
+    pub fn download(_: *MalformedValidatorTransport, _: []const u8, _: DownloadRequest, _: *std.Io.Writer) !DownloadResult {
         return error.InvalidModelValidator;
     }
 };
@@ -2292,7 +2395,7 @@ const FakeSmoke = struct {
 };
 
 const BadTransport = struct {
-    pub fn download(_: *BadTransport, _: []const u8,request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+    pub fn download(_: *BadTransport, _: []const u8, request: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
         const bad_bytes = "tinned test model";
         try writer.writeAll(bad_bytes[@intCast(request.offset)..@intCast(request.end + 1)]);
         return DownloadResult.fromValidator(.etag, "\"immutable-test\"");
@@ -2300,7 +2403,7 @@ const BadTransport = struct {
 };
 
 const ShortTransport = struct {
-    pub fn download(_: *ShortTransport, _: []const u8,_: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
+    pub fn download(_: *ShortTransport, _: []const u8, _: DownloadRequest, writer: *std.Io.Writer) !DownloadResult {
         try writer.writeAll("wrong");
         return DownloadResult.fromValidator(.etag, "\"immutable-test\"");
     }

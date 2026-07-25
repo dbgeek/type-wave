@@ -193,8 +193,9 @@ Explicitly start the Model Operation:
 ~/.local/bin/type-wave --install-model
 ```
 
-The operation starts only at the exact pinned `huggingface.co` coordinates and
-checkpoints only exact validator-matched byte ranges. A cancelled or interrupted operation
+The operation starts only at the exact pinned `huggingface.co` coordinates, follows the
+CDN redirect only back into Hugging Face's own DNS over TLS — every hop, not just the
+first — and checkpoints only exact validator-matched byte ranges. A cancelled or interrupted operation
 never resumes network activity on restart; inspect it with `--model-status`, then explicitly
 choose `--resume-model` or `--discard-model`. Download and hashing progress are byte-accurate,
 transient retries stop after the displayed budget, and Ctrl-C cooperatively cancels transfer,
