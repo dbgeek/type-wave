@@ -4,6 +4,9 @@
 - Amended: 2026-07-25 (#255) — a dictation Insertion **proves its Focused Target** before it
   pastes, and fails **open** where Undo fails closed. See
   [Amendment](#amendment-2026-07-25-255--an-insertion-proves-its-focused-target).
+- Amended: 2026-07-26 (#273) — the Insert Worker is **joined at shutdown**, because the job it
+  drains owns state the process does not. See
+  [Amendment](#amendment-2026-07-26-273--a-drain-that-outlives-the-process-must-outlive-the-quit).
 
 ## Context
 
@@ -188,3 +191,49 @@ case as well.
 **Not decided here.** Field-level Focused Target capture stays out of scope, as the Undo effort
 (#209) ruled: the gate is app-level, so "the user kept typing in the same app" remains the
 known, accepted residual — the same limit ADR-0008 documents for Undo.
+
+## Amendment (2026-07-26, #273) — a drain that outlives the process must outlive the quit
+
+This record put every cursor job on the Insert Worker and made the drain the place where a job
+resolves. It said nothing about what happens when the process is told to stop mid-drain, and
+the answer was: nothing. The worker was spawned detached (`daemon.zig`), and the quit path
+joined only the supervisor and the local-retry thread, so a menu Quit, a SIGTERM, or a logout
+arriving inside a job simply ended the process on top of it.
+
+For three of the four cursor paths that is harmless — an unfinished Backspace burst or an
+un-run replay leaves nothing behind. The dictation path is different, and the difference is the
+one this ADR's own §"deferred restore" design created: `insert.paste` writes the Final
+Transcript to the **general pasteboard**, saves the user's clipboard as a retained `NSString`
+in process memory, and parks the restore for ~300 ms so the window pads the worker rather than
+the `.inserting` lockout. Quit inside that window and both halves are permanently wrong:
+
+- the Final Transcript — often the most sensitive text the user produces — stays on the
+  pasteboard, readable by every app and by the user's own next ⌘V, indefinitely;
+- the clipboard it displaced is gone, because the only copy was in the dead process.
+
+The Transient/Concealed markers do not help: they ask clipboard managers to skip the write,
+which is not the same as removing it. And "quit right after dictating" is not an exotic
+interleaving — it follows *every* pasted Insertion, and SIGTERM covers launchd bootout and
+logout.
+
+The fix needs no new mechanism, because the loop already has the property that matters:
+**`workerLoop` never returns owing a restore.** Every drain path calls `finishInsert` before it
+returns, and `shouldQuit` is polled only *between* iterations, so the quit flag can be raised at
+any instant and the in-flight job still finishes its own cleanup. Waiting for the loop to come
+around is therefore sufficient, and the change is to stop detaching the worker and join it —
+first, ahead of the supervisor, since every other join only delays the one thing here that
+outlives the process. The wait is bounded by whatever job is in flight: one Insertion's clamped
+pre-paste settle plus the restore remainder, or one Undo burst, each bounded by the record it
+acts on.
+
+The other two cursor-adjacent threads stay detached **and say so at the spawn site**. The
+rewrite worker's in-flight call is a bounded HTTP request whose answer only feeds an Utterance
+being abandoned anyway; the deadline timer owns nothing but a clock. Stating it there is what
+keeps the asymmetry from reading as an accident the next time someone tidies the three spawns
+into a loop.
+
+The generalization worth carrying forward: **detaching a thread is a claim that nothing it
+holds outlives it — so a thread that mutates state owned by the OS rather than the process must
+be joined before the process ends.** ADR-0008's #256 amendment made the same move in time (a
+gate is re-proved on the timescale of the effect); this one makes it at the process boundary
+(a cleanup is waited for on the scope of the state it cleans).
