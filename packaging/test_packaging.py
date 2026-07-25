@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -189,6 +190,23 @@ exit 0
         self.assertIn("Privacy & Security", uninstall)
         self.assertNotIn("huggingface-token", uninstall)
         self.assertNotIn("Hugging Face", uninstall)
+
+    # The CI gate switch skips Markdown as inert, which is true of every doc except the ones
+    # this suite asserts on: those are test inputs, and a PR editing one has to run the gate.
+    # ci.yml carves them out by name; this keeps that carve-out honest from the other end, so
+    # a new doc read here fails until the workflow knows about it.
+    def test_gate_covers_the_docs_this_suite_reads(self) -> None:
+        read_docs = set(re.findall(r'REPO_ROOT / "(docs/[^"]+)"', Path(__file__).read_text()))
+        self.assertTrue(read_docs, "expected this suite to read at least one repository doc")
+
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text()
+        carve_out = [line for line in workflow.splitlines() if line.strip().startswith("GATE_INPUT_DOCS=")]
+        self.assertEqual(len(carve_out), 1, "expected exactly one GATE_INPUT_DOCS line in ci.yml")
+
+        # The carve-out is a grep -E pattern; drop the escapes and compare literal paths.
+        covered = carve_out[0].replace("\\", "")
+        for doc in sorted(read_docs):
+            self.assertIn(doc, covered, f"{doc} is a gate input but ci.yml would skip PRs touching it")
 
 
 if __name__ == "__main__":
