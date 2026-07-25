@@ -527,6 +527,45 @@ test "hard cancellation terminates a non-responsive helper process" {
     try std.testing.expect(!helper.isReady());
 }
 
+test "a hard cancel of a Segment blocked mid-write fails the Utterance, not the process" {
+    var helper = try ProcessHelper.start(
+        std.testing.allocator,
+        std.testing.io,
+        "acceptance/local_backend/stalling_helper.py",
+        "deaf", // becomes ready, then never drains stdin again
+        helper_core.pinnedArtifact(),
+    );
+    defer {
+        helper.shutdown();
+        _ = usleep(200_000);
+        std.testing.allocator.free(helper.executable);
+        std.testing.allocator.free(helper.model);
+        std.testing.allocator.destroy(helper);
+    }
+
+    // A Segment payload the 64 KiB pipe buffer cannot swallow, so the submit worker is
+    // parked inside write(2) when the hard cancel closes the pipe under it.
+    const pcm = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(pcm);
+    @memset(pcm, 0);
+    try helper.reserveUtterance(993);
+    try helper.submit(993, .english, "", pcm);
+    _ = usleep(300_000);
+
+    helper.cancel(993);
+
+    // Reaching the next line is the assertion that matters: at SIGPIPE's default disposition
+    // the blocked write's next syscall terminated this whole process instead (#253).
+    try std.testing.expectEqual(@as(usize, 1), helper.forced_terminations.load(.acquire));
+    try std.testing.expect(!helper.isReady());
+
+    // …and the recovery ladder runs from there, so the next Utterance is servable.
+    var waited_ms: usize = 0;
+    while (!helper.isReady() and waited_ms < 6_000) : (waited_ms += 50) _ = usleep(50_000);
+    try std.testing.expect(helper.isReady());
+    try helper.reserveUtterance(994);
+}
+
 const AtomicFaultRecorder = struct {
     failures: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const broken_pipe = @import("broken_pipe.zig");
 const core = @import("whisper_helper_core.zig");
 const ipc = @import("whisper_ipc.zig");
 const artifact_identity = @import("artifact_identity.zig");
@@ -91,6 +92,11 @@ const Job = struct {
 };
 
 pub fn main(init: std.process.Init.Minimal) !void {
+    // Before the first response frame: a daemon that stops reading must fail this write, not
+    // this process (broken_pipe.zig). Inherited across exec when the daemon spawns us —
+    // established here too, because the helper is also runnable on its own.
+    broken_pipe.ignore();
+
     const allocator = std.heap.c_allocator;
     const argv = init.args.vector;
     if (argv.len != 2) {

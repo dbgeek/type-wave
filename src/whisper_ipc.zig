@@ -1,4 +1,5 @@
 const std = @import("std");
+const broken_pipe = @import("broken_pipe.zig");
 
 pub const magic = "TWW1";
 pub const version: u16 = 2;
@@ -268,6 +269,9 @@ pub fn readFd(allocator: std.mem.Allocator, fd: std.c.fd_t) !?Frame {
 }
 
 pub fn writeFd(allocator: std.mem.Allocator, fd: std.c.fd_t, frame: Frame) !void {
+    // Both entry points establish this before they can reach a pipe; re-asserted at the write
+    // itself so a future one cannot silently regress a frame write into process death.
+    broken_pipe.ignore();
     const bytes = try encodeAlloc(allocator, frame);
     defer allocator.free(bytes);
     var offset: usize = 0;
@@ -292,6 +296,15 @@ fn writeSome(fd: std.c.fd_t, bytes: []const u8) !usize {
         if (count >= 0) return @intCast(count);
         if (std.c.errno(count) != .INTR) return error.WriteFailed;
     }
+}
+
+test "a frame write to a pipe whose reader is gone fails the write, not the process" {
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    _ = std.c.close(fds[0]); // the reader is gone, exactly as a killed helper leaves it
+    defer _ = std.c.close(fds[1]);
+
+    try std.testing.expectError(error.WriteFailed, writeFd(std.testing.allocator, fds[1], .{ .cancel = 7 }));
 }
 
 test "version 2 protocol round-trips every identity-tagged frame" {
