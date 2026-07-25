@@ -93,6 +93,10 @@ pub fn rewrite(
     try buildRequestBody(&body.writer, utterance);
 
     var auth_buf: [512]u8 = undefined;
+    // The one stack copy of the key on this path: zeroed on the way out, whether the call
+    // succeeded or threw, so the secret does not sit in this frame's stack memory for a
+    // crash report or a core dump to pick up (#254).
+    defer std.crypto.secureZero(u8, &auth_buf);
     const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch
         return error.RewriteKeyTooLong;
 
