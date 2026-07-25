@@ -51,6 +51,13 @@ pub const Facts = struct {
     backend_available: bool,
     /// The menu-bar "Pause dictation" toggle is on (#34).
     paused: bool,
+    /// A Talk Key hold is open (`tap.Hold`): the adapter forwarded a press and has not
+    /// matched a release to it, so Capture is running.
+    hold_open: bool,
+    /// The key that opened that hold is still physically down, read from the HID state
+    /// rather than from the tap — the evidence that survives a tap which stopped
+    /// delivering edges (#272). False whenever no hold is open.
+    talk_key_down: bool,
 };
 
 /// The complete end-of-tick effect bundle the daemon thread executes. `announce_ready`
@@ -63,6 +70,9 @@ pub const Actions = struct {
     post_probe: bool,
     /// Fire `provisioner.removeSuperseded()` — reclaim a superseded Model Installation.
     remove_superseded: bool,
+    /// The Capture watchdog (#272): feed the Coordinator the `.release` the tap never
+    /// delivered, ending a hold whose key is demonstrably up.
+    end_lost_hold: bool,
     /// The Talk Key press gate: the tap callback consults this before starting Capture.
     capture_enabled: bool,
     /// Forwarded from the Configuration Phase: log the READY line this tick.
@@ -82,6 +92,13 @@ pub fn tick(facts: Facts, outcome: configuration_phase.Outcome) Actions {
         // round-trip, and the grant is not already proven.
         .post_probe = facts.grants_reached_post_event and facts.tap_enabled and !facts.post_event_granted,
         .remove_superseded = facts.no_utterance_in_flight,
+        // The Capture watchdog: a hold is open, and the key holding it open is up. Only
+        // the release edge stops the microphone, so an edge the tap never delivered — a
+        // dead tap, or a Talk Key change that predates the hold-matched release filter —
+        // would otherwise leave Capture running until the daemon restarts. Duration is
+        // deliberately not a term: a long hold is legitimate, and "the key is up" is
+        // cheap, direct evidence that this one is not one.
+        .end_lost_hold = facts.hold_open and !facts.talk_key_down,
         // The press gate: configured AND a live backend AND not paused.
         .capture_enabled = outcome.configured and facts.backend_available and !facts.paused,
         .announce_ready = outcome.actions.announce_ready,
@@ -112,6 +129,8 @@ fn okFacts() Facts {
         .no_utterance_in_flight = true,
         .backend_available = true,
         .paused = false,
+        .hold_open = false,
+        .talk_key_down = false,
     };
 }
 
@@ -166,6 +185,41 @@ test "remove_superseded is gated on no Utterance in flight" {
     var busy = okFacts();
     busy.no_utterance_in_flight = false;
     try testing.expect(!tick(busy, configuredOutcome()).remove_superseded);
+}
+
+test "end_lost_hold is exactly an open hold whose key is up" {
+    for ([_]bool{ false, true }) |hold_open| {
+        for ([_]bool{ false, true }) |key_down| {
+            var facts = okFacts();
+            facts.hold_open = hold_open;
+            facts.talk_key_down = key_down;
+
+            const acts = tick(facts, configuredOutcome());
+            try testing.expectEqual(hold_open and !key_down, acts.end_lost_hold);
+        }
+    }
+}
+
+test "a legitimate hold is never cut, however long it lasts" {
+    // Duration is not a term in the decision: the same held key, tick after tick, keeps
+    // the Utterance alive — a two-minute dictation is exactly as valid as a two-second one.
+    var facts = okFacts();
+    facts.hold_open = true;
+    facts.talk_key_down = true;
+    for (0..100) |_| try testing.expect(!tick(facts, configuredOutcome()).end_lost_hold);
+}
+
+test "the watchdog is independent of pause and of the capture gate" {
+    // The gate decides whether a *press* may start an Utterance; this ends one already
+    // running. A pause mid-hold must still let that hold stop the microphone.
+    var facts = okFacts();
+    facts.hold_open = true;
+    facts.talk_key_down = false;
+    facts.paused = true;
+
+    const acts = tick(facts, notConfiguredOutcome());
+    try testing.expect(!acts.capture_enabled);
+    try testing.expect(acts.end_lost_hold);
 }
 
 test "announce_ready and report_missing are forwarded verbatim from the outcome" {

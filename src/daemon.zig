@@ -758,6 +758,12 @@ const Daemon = struct {
     paused: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     capture_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// The open hold (tap.zig, #272): which Talk Key press was forwarded to the
+    /// Coordinator and has not been matched by a release. It is what the release edge is
+    /// recognised against, and — with `tapmod.keyIsDown` — the Capture watchdog's whole
+    /// evidence that a hold has outlived the key holding it open.
+    hold: tapmod.Hold = .{},
+
     // ---- long-lived modules ----
     capture: cap.Capture = .{},
     inserter: insertmod.Inserter = .{},
@@ -888,18 +894,38 @@ const Daemon = struct {
     // ---- tap callbacks: run on the run-loop thread, kept fast (filter, then trampoline) ----
     // talk_key is read from the live snapshot per event (#32 read-at-use): a menu change
     // binds at the next press. Release is NOT pause-gated so a hold that began before a
-    // pause still resolves (the Coordinator ignores a stray release anyway).
+    // pause still resolves — and it is matched against the **open hold** rather than the
+    // live setting (#272), so a Talk Key changed mid-hold cannot swallow the one edge that
+    // stops the microphone.
 
     fn tapPress(ctx: ?*anyopaque, key: tapmod.TalkKey, _: i64, _: u64) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
         if (key != self.store.current().talk_key) return; // key filtering stays in the adapter
         if (self.paused.load(.acquire)) return; // menu-paused: ignore the Talk Key (#34)
         if (!self.capture_enabled.load(.acquire)) return;
+        // Claim before forwarding, and keep an older hold if one is somehow still open —
+        // the Coordinator's overlap guard drops this press anyway, and re-pointing the
+        // hold would leave the key the user is actually holding unable to end it.
+        _ = self.hold.claim(key);
         self.coordinator.handle(.press);
     }
     fn tapRelease(ctx: ?*anyopaque, key: tapmod.TalkKey) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
-        if (key != self.store.current().talk_key) return;
+        // Only the key that opened the hold ends it; anything else — including a release of
+        // the key the settings now name — ends no Utterance. A release with no hold open is
+        // dropped here rather than by the Coordinator's phase guard.
+        if (!self.hold.end(key)) return;
+        self.coordinator.handle(.release);
+    }
+
+    /// The Capture watchdog's effect (#272), run from the supervisor tick that decided it:
+    /// end a hold whose release edge was never observed, through the ordinary `.release`
+    /// the tap would have delivered — so Capture stops and the Utterance commits or is
+    /// abandoned by exactly the usual rules, at most one tick late.
+    fn endLostHold(self: *Daemon) void {
+        // Null means the real release edge won the race and already ended it.
+        const key = self.hold.endOpen() orelse return;
+        feedback.log("  {s} is no longer held but the Utterance never saw its release — ending the hold\n", .{keyName(key)});
         self.coordinator.handle(.release);
     }
 
@@ -967,6 +993,12 @@ const Daemon = struct {
     /// the Backend Router prepared) so backend/grant facts are current. ADR-0005 keeps
     /// this gathering in the daemon rather than behind a Supervisor seam.
     fn supervisorFacts(self: *Daemon) supervisor.Facts {
+        // The hold first, the key state second, and never the other way round: reading the
+        // key before the hold could pair "no key down" from before a press with "a hold is
+        // open" from after it, and cut a legitimate hold at its very start. This order can
+        // only produce the harmless converse — a hold that ended between the two reads,
+        // where `endLostHold` finds nothing left to end.
+        const held = self.hold.open();
         return .{
             .tap_enabled = self.tap.isEnabled(),
             .grants_reached_post_event = self.grants.reached(.post_event),
@@ -974,6 +1006,8 @@ const Daemon = struct {
             .no_utterance_in_flight = self.transcription.activeId() == 0,
             .backend_available = self.transcription.available(),
             .paused = self.paused.load(.acquire),
+            .hold_open = held != null,
+            .talk_key_down = if (held) |key| tapmod.keyIsDown(key) else false,
         };
     }
 
@@ -1012,6 +1046,10 @@ const Daemon = struct {
             // busy operation/inference locks defer cleanup to the next tick without
             // disturbing dictation.
             if (acts.remove_superseded) self.provisioner.removeSuperseded();
+            // The Capture watchdog (#272). Unlike the async nudges above this one resolves
+            // within the tick — it runs the Coordinator's release path here, on this
+            // thread, exactly as the tap's run-loop thread would have.
+            if (acts.end_lost_hold) self.endLostHold();
             self.capture_enabled.store(acts.capture_enabled, .release);
             self.observeSecureInput();
         }

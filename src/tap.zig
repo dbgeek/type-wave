@@ -80,6 +80,13 @@ extern var _NSConcreteStackBlock: anyopaque;
 extern "c" fn CGPreflightListenEventAccess() bool;
 extern "c" fn CGRequestListenEventAccess() bool;
 
+// The HID-level key/modifier state, independent of anything this tap observed — the
+// Capture watchdog's ground truth (#272). insert.zig picks the same combined-session
+// source for its posts.
+const kCGEventSourceStateCombinedSessionState: i32 = 0;
+extern "c" fn CGEventSourceKeyState(state: i32, key: u16) bool;
+extern "c" fn CGEventSourceFlagsState(state: i32) u64;
+
 // scheduleRecreate hands the run loop a manual stack block (same layout as capture.zig's
 // PermissionBlock). CFRunLoopPerformBlock copies it, so the stack literal may die at
 // return; flags=0 means the copy is a plain memcpy, which is exactly right for the one
@@ -99,7 +106,81 @@ const recreate_block_descriptor = BlockDescriptor{ .size = @sizeOf(RecreateBlock
 /// it is the "fn" option in the config vocabulary (wayfinder #16). Its observation is
 /// compile-verified only — live behaviour is unverified and may collide with macOS's
 /// own Fn→Dictation binding (wayfinder #6). right_option / left_option are proven live.
-pub const TalkKey = enum { right_option, left_option, globe };
+/// Explicitly `u8`-tagged so `Hold` can carry it through one atomic byte.
+pub const TalkKey = enum(u8) { right_option, left_option, globe };
+
+/// The **open hold**: which Talk Key press the daemon forwarded and has not yet matched
+/// a release to — i.e. whether Capture is running, and on whose behalf (#272).
+///
+/// It exists because the release edge used to be recognised by comparing against the
+/// *live* Talk Key setting. That rule is right for a press ("a menu change binds at the
+/// next press") and wrong for a release: change the Talk Key from the Status Item while
+/// the old key is held, and the release arrives tagged with a key the filter no longer
+/// recognises, so it is dropped — leaving the microphone live and the Coordinator stuck
+/// in `.capturing` with no second route out. A release is matched to **the hold it ends**,
+/// which is what this holds; the Talk Key setting is consulted only at the press.
+///
+/// One atomic byte, because two threads touch it: the tap's run-loop thread at both real
+/// edges, and the supervisor thread when the Capture watchdog ends a hold whose release
+/// was never observed. Every transition is a compare-and-swap, so the watchdog and a real
+/// release that arrives at the same instant cannot both end the same hold.
+pub const Hold = struct {
+    /// No tag can collide: `TalkKey` has three of them.
+    const none: u8 = 0xFF;
+
+    key: std.atomic.Value(u8) = std.atomic.Value(u8).init(none),
+
+    /// Press edge. Opens a hold for `key`, returning whether it did — `false` means a hold
+    /// was already open and this press must not re-point it. (The Coordinator's overlap
+    /// guard is what drops such a press; keeping the older hold here is what keeps *its*
+    /// release recognisable.)
+    pub fn claim(self: *Hold, key: TalkKey) bool {
+        return self.key.cmpxchgStrong(none, @intFromEnum(key), .acq_rel, .acquire) == null;
+    }
+
+    /// The key holding the hold open, or null when none is.
+    pub fn open(self: *const Hold) ?TalkKey {
+        return fromTag(self.key.load(.acquire));
+    }
+
+    /// The stored byte back to a key — null for `none`, and for anything else that is not
+    /// a tag, since `@enumFromInt` on a stray value is illegal behaviour. Derived from the
+    /// enum rather than hand-listed, so a fourth Talk Key cannot be left out of it.
+    fn fromTag(tag: u8) ?TalkKey {
+        inline for (@typeInfo(TalkKey).@"enum".field_values) |value| {
+            if (tag == value) return @enumFromInt(value);
+        }
+        return null;
+    }
+
+    /// Release edge. Ends the hold iff `key` is the one that opened it — so a release
+    /// arriving for anything else (including the Talk Key the settings now name) is not
+    /// this hold's ending and changes nothing.
+    pub fn end(self: *Hold, key: TalkKey) bool {
+        return self.key.cmpxchgStrong(@intFromEnum(key), none, .acq_rel, .acquire) == null;
+    }
+
+    /// The watchdog's ending: retire whatever hold is open and report which key held it,
+    /// or null when there was none — which is also how the race against a real release
+    /// arriving in the same instant resolves, exactly one of the two ending the hold.
+    pub fn endOpen(self: *Hold) ?TalkKey {
+        return fromTag(self.key.swap(none, .acq_rel));
+    }
+};
+
+/// Is `key` **physically** down right now? Read from the HID-level key state rather than
+/// from anything the tap saw, which is the whole point: the Capture watchdog (#272) needs
+/// evidence that survives a tap that stopped delivering edges. Both Option keys carry a
+/// virtual keycode, so they are read exactly; Fn/Globe has none on the modifier path
+/// (wayfinder #6), so it is read as its device-independent flag — the same bit `callback`
+/// edge-tracks it by.
+pub fn keyIsDown(key: TalkKey) bool {
+    return switch (key) {
+        .right_option => CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, @intCast(kVK_RightOption)),
+        .left_option => CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, @intCast(kVK_Option)),
+        .globe => (CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState) & kCGEventFlagMaskSecondaryFn) != 0,
+    };
+}
 
 pub const Callbacks = struct {
     ctx: ?*anyopaque,
@@ -171,6 +252,11 @@ pub const Tap = struct {
             self.live.store(took, .release);
             if (self.cbs.on_disabled) |cb|
                 cb(self.cbs.ctx, etype == kCGEventTapDisabledByTimeout, took);
+            // Edges that fired while the tap was disabled were never delivered, so a
+            // tracker can now disagree with the key itself — and `edge` re-evaluates only
+            // on the *next* flagsChanged, which for a released Talk Key may be far away.
+            // Reconcile against the HID state and deliver whatever was missed (#272).
+            if (took) self.resync();
             return event;
         }
 
@@ -227,6 +313,18 @@ pub const Tap = struct {
         if (autorepeat != 0) return false;
         const need = kCGEventFlagMaskCommand | kCGEventFlagMaskControl;
         return (flags & need) == need;
+    }
+
+    /// Re-evaluate all three trackers against the keys themselves, firing the edges the
+    /// tap missed while it was disabled. Run-loop thread only, from the re-enable branch.
+    /// It fabricates nothing: an edge fires only where the tracker and the key disagree,
+    /// which is exactly the edge that was withheld. The watchdog (#272) still backs this —
+    /// a re-enable that never happens delivers nothing to reconcile.
+    fn resync(self: *Tap) void {
+        const flags = CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
+        self.edge(.right_option, &self.right_down, keyIsDown(.right_option), kVK_RightOption, flags);
+        self.edge(.left_option, &self.left_down, keyIsDown(.left_option), kVK_Option, flags);
+        self.edge(.globe, &self.fn_down, keyIsDown(.globe), 0, flags);
     }
 
     fn edge(self: *Tap, key: TalkKey, state: *bool, down: bool, keycode: i64, flags: u64) void {
@@ -336,6 +434,7 @@ pub const Tap = struct {
 // discrete-press / auto-repeat / self-tag / non-match behaviour is exercised without a tap.
 
 const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
 const both_mods = kCGEventFlagMaskCommand | kCGEventFlagMaskControl;
 
 test "recovery chord: ⌃⌘⌫ discrete press fires" {
@@ -367,4 +466,65 @@ test "recovery chord: unrelated keydowns are dropped" {
     try expect(!Tap.isRecoveryChordPress(kVK_Delete, kCGEventFlagMaskControl, 0, 0));
     // ⌫ with no modifiers at all.
     try expect(!Tap.isRecoveryChordPress(kVK_Delete, 0, 0, 0));
+}
+
+// ---- The open hold: fed edges (#272) ----
+// The live adapter drives these from the tap's run-loop thread and from the supervisor's
+// Capture watchdog; here the same transitions are fed directly, so "which edge ends which
+// hold" is exercised without a tap, a Talk Key, or a daemon.
+
+test "the hold is opened by a press and ended by that key's release" {
+    var hold = Hold{};
+    try expect(hold.open() == null);
+
+    try expect(hold.claim(.right_option));
+    try expectEqual(TalkKey.right_option, hold.open().?);
+
+    try expect(hold.end(.right_option));
+    try expect(hold.open() == null);
+}
+
+test "a release still ends the hold after the Talk Key setting moved on" {
+    // The #272 wedge, exactly: hold Right Option, switch the Talk Key to Left Option from
+    // the Status Item, release. The release is matched to the hold, not to the setting.
+    var hold = Hold{};
+    try expect(hold.claim(.right_option));
+
+    try expect(!hold.end(.left_option)); // the *new* Talk Key's release is not this hold's
+    try expectEqual(TalkKey.right_option, hold.open().?);
+
+    try expect(hold.end(.right_option));
+    try expect(hold.open() == null);
+}
+
+test "a press while a hold is open does not re-point it" {
+    // The Coordinator's overlap guard drops the press; keeping the older hold here is what
+    // keeps the key the user is actually holding able to end it.
+    var hold = Hold{};
+    try expect(hold.claim(.right_option));
+
+    try expect(!hold.claim(.globe));
+    try expectEqual(TalkKey.right_option, hold.open().?);
+    try expect(hold.end(.right_option));
+}
+
+test "the watchdog ends whatever hold is open, exactly once" {
+    var hold = Hold{};
+    try expect(hold.claim(.globe));
+
+    try expectEqual(TalkKey.globe, hold.endOpen().?);
+    try expect(hold.open() == null);
+    // A real release arriving late — the tap re-delivering an edge, or the two racing —
+    // finds nothing to end, so the Utterance can never be released twice.
+    try expect(!hold.end(.globe));
+    try expect(hold.endOpen() == null);
+}
+
+test "with no hold open, no release ends anything" {
+    var hold = Hold{};
+    for ([_]TalkKey{ .right_option, .left_option, .globe }) |key| {
+        try expect(!hold.end(key));
+        try expect(hold.open() == null);
+    }
+    try expect(hold.endOpen() == null);
 }
