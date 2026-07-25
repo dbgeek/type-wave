@@ -13,6 +13,12 @@ header = sys.stdin.buffer.read(12)
 if mode == "stall":
     while sys.stdin.buffer.read(4096):
         time.sleep(0.05)
+elif mode == "deaf":
+    # Never drain stdin again. The parent's next Segment payload fills the 64 KiB pipe
+    # buffer and blocks mid-write — the state a hard cancel has to be able to break by
+    # closing the pipe, without SIGPIPE taking the parent down with it (issue #253).
+    while True:
+        time.sleep(0.05)
 elif mode == "crash":
     raise SystemExit(17)
 elif mode == "malformed":

@@ -12,6 +12,7 @@
 //! daemon read it prompt-free. See keychain.zig.
 
 const std = @import("std");
+const broken_pipe = @import("broken_pipe.zig");
 const daemon = @import("daemon.zig");
 const keychain = @import("keychain.zig");
 const model_store = @import("model_store.zig");
@@ -68,6 +69,11 @@ fn finishModelAction(arg: []const u8, result: anyerror!void) void {
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
+    // Before anything can touch a pipe: as the daemon, whose Segment writes to the Whisper
+    // Helper are killed out from under them by design, and as a Model Operation child, whose
+    // stdout channel and stderr prose are pipes the daemon may stop draining (broken_pipe.zig).
+    broken_pipe.ignore();
+
     const alloc = std.heap.c_allocator;
     g_operation_channel = init.environ.getPosix(operation_channel.env_var) != null;
 
