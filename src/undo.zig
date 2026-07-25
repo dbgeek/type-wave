@@ -19,9 +19,15 @@
 //!
 //! The Ring is held concretely: it is heap-free and test-constructible, so faking it would
 //! mean re-implementing eviction and stamp-keying rather than exercising them. `Deps` covers
-//! only what the OS owns — the pause/grant gate, the frontmost read, the deletion mechanism,
-//! and the two HUD cue verbs (ADR-0007) — so the whole sequence is driven from tests by fed
-//! values, including the joins that were previously unreachable.
+//! only what the OS owns — the pause/grant gate, the frontmost read, the Secure Event Input
+//! probe, the deletion mechanism, and the two HUD cue verbs (ADR-0007) — so the whole sequence
+//! is driven from tests by fed values, including the joins that were previously unreachable.
+//!
+//! One rule runs through every exit (#244): **nothing claims a deletion that did not happen.**
+//! The deletion mechanism reports whether it posted, the runner probes Secure Event Input —
+//! which silently suppresses posted events — before it posts at all, and the `undone` flag and
+//! the green confirm cue both hang off a *successful* post. An Undo that could not land is a
+//! refusal that leaves the record retryable, never a green cue over unchanged text.
 //!
 //! Serialization against dictation stays the Insert Worker's: `insertion_runner.workerLoop`
 //! drains this last, after the dictation / replay / copy slots, so a deletion can never
@@ -53,6 +59,13 @@ pub const RefuseReason = enum {
     focus_null,
     /// Positive evidence of a change: bundle id or display name differs from the record's.
     app_changed,
+    /// Secure Event Input is held (a password field, Terminal's Secure Keyboard Entry), so
+    /// posted events are suppressed (#244). The deletion would vanish while the confirm cue
+    /// claimed it landed, which is the one outcome this module exists to prevent.
+    secure_input,
+    /// The deletion mechanism reported that it could not post (#244). Nothing landed, so the
+    /// record is left un-undone and the next press retries it.
+    post_failed,
 };
 
 /// The Undo Runner's dependency seam: everything the OS owns. Asserted by name here and
@@ -61,8 +74,8 @@ pub const RefuseReason = enum {
 /// calls its own assertion.
 pub fn assertDeps(comptime Deps: type) void {
     const required = [_][]const u8{
-        "enabled",       "focusedApp", "deleteChars",
-        "undoConfirmed", "undoRefused",
+        "enabled",     "focusedApp",    "secureInputActive",
+        "deleteChars", "undoConfirmed", "undoRefused",
     };
     inline for (required) |name| {
         if (!@hasDecl(Deps, name))
@@ -157,14 +170,14 @@ pub fn Undo(comptime Deps: type) type {
         }
 
         /// One Undo, start to finish, on the insert worker. The order below is the module's
-        /// whole reason to exist and is load-bearing (ADR-0008):
+        /// whole reason to exist and is load-bearing (ADR-0008, amended by #244):
         ///
-        ///   gate on pause/grant → resolve → count → fresh focus read → focus gate
-        ///                       → post → **flag undone** → confirm cue
+        ///   gate on pause/grant → resolve → count → secure-input probe → fresh focus read
+        ///                       → focus gate → post → **flag undone** → confirm cue
         ///
-        /// The flag flips only after `deleteChars` has posted, so no refusal can leave a
-        /// record rendering dimmed with nothing deleted. Every exit before the post fires
-        /// the refuse cue, so a press is never silently swallowed.
+        /// The flag flips only after `deleteChars` reports that it *did* post, so no refusal
+        /// can leave a record rendering dimmed with nothing deleted. Every exit before the post
+        /// fires the refuse cue, so a press is never silently swallowed.
         fn run(self: *Self) void {
             // ADR-0008: `⌃⌘⌫` is a system-wide chord, so it is gated like the Talk Key —
             // but on Undo's *own* prerequisites. Not `configured` (that bundles an OpenAI
@@ -202,19 +215,44 @@ pub fn Undo(comptime Deps: type) type {
                 return;
             }
 
+            // Secure Event Input suppresses posted events (#244), so a deletion attempted
+            // under it lands nowhere while the confirm cue claims it did. Probed here, at post
+            // time, for the same freshness reason the focus read is — but *before* it, because
+            // this one is a cheap in-process Carbon call and there is no sense paying for a
+            // cross-process NSWorkspace query for a post that cannot land.
+            if (self.deps.secureInputActive()) {
+                self.refuse(.secure_input, "Secure Event Input would suppress the backspaces");
+                return;
+            }
+
             const fresh = self.deps.focusedApp();
             if (evaluate(target.focused_app, fresh)) |reason| {
                 self.refuse(reason, "nothing posted");
                 return;
             }
 
-            self.deps.deleteChars(n);
+            // The post is a *result*, not a side effect to assume (#244): the flag and the
+            // confirm cue below are this module's claim that text was deleted, and nothing may
+            // make that claim on its behalf. Only a post of **zero** Backspaces is retryable —
+            // a burst that stopped partway already changed the target app, and re-running the
+            // full `n` on the next press would eat text that preceded the Insertion, which is
+            // exactly what single-shot (#225) exists to prevent. So a short burst commits like
+            // a whole one and says so in the log.
+            const posted = self.deps.deleteChars(n);
+            if (posted == 0) {
+                self.refuse(.post_failed, "the deletion mechanism posted nothing; the record stays retryable");
+                return;
+            }
             // Flagged **after** the post (ADR-0008), keyed by the record's stable
             // `timestamp` so a concurrent Insertion shifting the newest-first order cannot
             // flag a neighbour. Undo pushes no new ring entry: the record is kept and
             // flagged, and a re-insert redoes it (#225).
             self.ring.markUndone(target.timestamp);
-            feedback.log("  undo: posted {d} backspaces to delete the last Insertion\n", .{n});
+            if (posted < n) {
+                feedback.log("  undo: only {d} of {d} backspaces posted — the Insertion is partly deleted and the record is spent\n", .{ posted, n });
+            } else {
+                feedback.log("  undo: posted {d} backspaces to delete the last Insertion\n", .{n});
+            }
             self.deps.undoConfirmed();
         }
     };
@@ -241,8 +279,16 @@ const FakeDeps = struct {
     /// How many times the Runner read the frontmost app — lets the gate tests prove the
     /// read is fresh (taken during `run`) and skipped when nothing would post (#224).
     focus_reads: usize = 0,
+    /// Secure Event Input, and how many times the Runner probed it — the probe has to be as
+    /// fresh as the focus read (#244).
+    secure_input: bool = false,
+    secure_reads: usize = 0,
     deletes: usize = 0,
     last_delete_n: usize = 0,
+    /// How many Backspace pairs the mechanism manages to post; null means the whole burst (the
+    /// healthy case). `0` is the suppressed / refused post the Runner must not confirm, and a
+    /// value below `n` is a burst that stopped partway (#244).
+    delete_posts: ?usize = null,
     undo_confirms: usize = 0,
     undo_refuses: usize = 0,
 
@@ -254,9 +300,14 @@ const FakeDeps = struct {
         self.focus_reads += 1;
         return self.focused_app;
     }
-    fn deleteChars(self: *FakeDeps, n: usize) void {
+    fn secureInputActive(self: *FakeDeps) bool {
+        self.secure_reads += 1;
+        return self.secure_input;
+    }
+    fn deleteChars(self: *FakeDeps, n: usize) usize {
         self.deletes += 1;
         self.last_delete_n = n;
+        return @min(self.delete_posts orelse n, n);
     }
     fn undoConfirmed(self: *FakeDeps) void {
         self.undo_confirms += 1;
@@ -485,6 +536,67 @@ test "a refused undo stays retryable — fixing the focus and pressing again del
     try expectEqual(@as(usize, 1), runner.deps.undo_refuses); // the first press
 }
 
+// --- the post has to actually happen before anything claims it did (#244) ---
+
+test "a deletion the mechanism could not post refuses: no confirm cue, no undone flag" {
+    // #244's amplifier: the runner used to flag and confirm unconditionally after the call, so
+    // a mechanism failure became a permanent one — press #1 latched the record undone with
+    // nothing deleted, and every later press hit the already-undone guard.
+    var ring = recent_insertions.Ring{};
+    ring.record(rec("abc ", 1, slack));
+    var runner = Runner.init(&ring, .{ .focused_app = slack, .delete_posts = 0 });
+
+    runner.request();
+    try expect(runner.runOnce());
+
+    try expectEqual(@as(usize, 1), runner.deps.deletes); // it was attempted…
+    try expectEqual(@as(usize, 0), runner.deps.undo_confirms); // …but nothing is claimed
+    try expectEqual(@as(usize, 1), runner.deps.undo_refuses);
+    var out: [recent_insertions.max_bytes]u8 = undefined;
+    try expect(!ring.newestForUndo(&out).?.undone);
+}
+
+test "a record left un-undone by a failed post is still the newest target on the next press" {
+    var ring = recent_insertions.Ring{};
+    ring.record(rec("abc ", 1, slack));
+    var runner = Runner.init(&ring, .{ .focused_app = slack, .delete_posts = 0 });
+
+    runner.request();
+    try expect(runner.runOnce());
+
+    runner.deps.delete_posts = null; // whatever blocked the post cleared
+    runner.request();
+    try expect(runner.runOnce());
+
+    try expectEqual(@as(usize, 4), runner.deps.last_delete_n); // the same record, retried
+    try expectEqual(@as(usize, 1), runner.deps.undo_confirms);
+    var out: [recent_insertions.max_bytes]u8 = undefined;
+    try expect(ring.newestForUndo(&out).?.undone);
+}
+
+test "a burst that stopped partway commits the record — a retry would eat earlier text (#225)" {
+    // Only a *zero* post is retryable. Two of four Backspaces are already in the target app, so
+    // the record is spent: pressing again must refuse rather than delete four more.
+    var ring = recent_insertions.Ring{};
+    ring.record(rec("older ", 10, slack));
+    ring.record(rec("abc ", 20, slack));
+    var runner = Runner.init(&ring, .{ .focused_app = slack, .delete_posts = 2 });
+
+    runner.request();
+    try expect(runner.runOnce());
+
+    try expectEqual(@as(usize, 1), runner.deps.undo_confirms); // text *was* deleted
+    var out: [recent_insertions.max_bytes]u8 = undefined;
+    try expect(ring.newestForUndo(&out).?.undone);
+
+    runner.deps.delete_posts = null;
+    runner.request();
+    try expect(runner.runOnce());
+
+    try expectEqual(@as(usize, 1), runner.deps.deletes); // no second burst — "older " is safe
+    try expectEqual(@as(usize, 1), runner.deps.undo_refuses);
+}
+
 test "a second undo on an already-undone newest record refuses — it never eats earlier text (#225)" {
     var ring = recent_insertions.Ring{};
     ring.record(rec("older ", 10, slack));
@@ -526,6 +638,55 @@ test "resolution happens at post time: an Insertion landing between press and dr
     try expect(runner.runOnce());
 
     try expectEqual(@as(usize, 13), runner.deps.last_delete_n); // "landed after "
+}
+
+// --- Secure Event Input — the other silent-confirm path (#244) ---
+
+test "Secure Event Input refuses and posts nothing — never a confirm cue for a suppressed post" {
+    // A password field or Terminal's Secure Keyboard Entry suppresses posted events, so the
+    // Backspaces would vanish while the green cue claimed a deletion. Refuse honestly instead.
+    var ring = recent_insertions.Ring{};
+    ring.record(rec("abc ", 1, slack));
+    var runner = Runner.init(&ring, .{ .focused_app = slack, .secure_input = true });
+
+    runner.request();
+    try expect(runner.runOnce());
+
+    try expectEqual(@as(usize, 0), runner.deps.deletes);
+    try expectEqual(@as(usize, 0), runner.deps.undo_confirms);
+    try expectEqual(@as(usize, 1), runner.deps.undo_refuses);
+    // Nothing would post, so the gate's cross-process frontmost read is skipped (#224's rule).
+    try expectEqual(@as(usize, 0), runner.deps.focus_reads);
+    var out: [recent_insertions.max_bytes]u8 = undefined;
+    try expect(!ring.newestForUndo(&out).?.undone); // and the record stays retryable
+}
+
+test "leaving the secure field makes the same chord land" {
+    var ring = recent_insertions.Ring{};
+    ring.record(rec("abc ", 1, slack));
+    var runner = Runner.init(&ring, .{ .focused_app = slack, .secure_input = true });
+
+    runner.request();
+    try expect(runner.runOnce());
+    try expectEqual(@as(usize, 0), runner.deps.deletes);
+
+    runner.deps.secure_input = false;
+    runner.request();
+    try expect(runner.runOnce());
+
+    try expectEqual(@as(usize, 1), runner.deps.deletes);
+    try expectEqual(@as(usize, 4), runner.deps.last_delete_n);
+}
+
+test "the secure-input probe is read fresh on every press, not once at construction" {
+    var ring = recent_insertions.Ring{};
+    ring.record(rec("abc ", 1, slack));
+    var runner = Runner.init(&ring, .{ .focused_app = slack });
+
+    runner.request();
+    try expect(runner.runOnce());
+
+    try expectEqual(@as(usize, 1), runner.deps.secure_reads);
 }
 
 // --- the pause / PostEvent-grant gate — ADR-0008 ---

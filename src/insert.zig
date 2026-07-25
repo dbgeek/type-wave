@@ -37,7 +37,8 @@ pub const Plan = struct {
 // (warn-and-observe) precisely to answer that open question.
 
 // ---- CoreGraphics event synthesis ----
-const CGEventRef = ?*opaque {};
+const CGEvent = opaque {};
+const CGEventRef = ?*CGEvent;
 const CGEventSourceRef = ?*opaque {};
 const CGEventFlags = u64;
 const UniChar = u16;
@@ -46,6 +47,10 @@ const kCGHIDEventTap: u32 = 0;
 const kCGSessionEventTap: u32 = 1;
 const kCGEventSourceStateCombinedSessionState: i32 = 0; // Maccy's choice
 const kCGEventFlagMaskCommand: CGEventFlags = 0x100000; // CGEventTypes.h
+const kCGEventFlagMaskControl: CGEventFlags = 0x040000; // CGEventTypes.h (tests only, so far)
+/// An **un-modified** post: no ⌘, no ⌃, and — the point of naming it — nothing inherited from
+/// whatever the user's hand is on (#244).
+const no_flags: CGEventFlags = 0;
 const kVK_ANSI_V: u16 = 0x09; // layout note: Dvorak-QWERTY-⌘ would need a keycode map
 const kVK_Delete: u16 = 0x33; // Backspace / delete-backwards (Carbon HIToolbox Events.h)
 
@@ -129,6 +134,8 @@ pub const default_pre_paste_ms: u32 = 25;
 /// espanso's constants (§3): let the async paste read finish after Cmd-V.
 const restore_ms: u32 = 300;
 const cmd_v_gap_ms: u32 = 10;
+/// The Backspace burst's pacing, down-to-up and between pairs — `keystroke`'s chunk rhythm.
+const key_gap_ms: u32 = 1;
 /// Ceiling on a hand-edited `pre_paste_ms`: keeps `sleepMs`'s µs conversion inside u32
 /// and `usleep` under its POSIX-specified 1 s — a settle beyond this is nonsense anyway.
 const max_pre_paste_ms: u32 = 999;
@@ -222,6 +229,85 @@ pub fn stripTrailingSpace(text: []const u8) []const u8 {
     if (text.len == 0) return text;
     return if (text[text.len - 1] == ' ') text[0 .. text.len - 1] else text;
 }
+
+/// The one place a synthesized key pair is built, stamped and posted — ⌘V and the Undo
+/// Backspaces both go out through it, so a third primitive cannot repeat #244's omission.
+///
+/// **Flags are always set explicitly, on both the down and the up.** CoreGraphics stamps an
+/// event created from a combined-session-state source with the modifiers the user is
+/// *physically holding at creation time*, so a pair that merely omits `CGEventSetFlags`
+/// inherits them. That is what made `⌃⌘⌫` reach the target app as `⌃⌘⌫` — unbound in AppKit
+/// and Chromium — instead of a plain `⌫`, and delete nothing: the user's hand is still on the
+/// chord when the Backspaces post, ~5–20 ms later. Un-modified means `no_flags`, never
+/// "no call".
+///
+/// Generic over the event sink so what goes out is observable by *shape* (keycode, flags,
+/// down/up) from a test rather than as a bare call count — the blind spot that let the defect
+/// ship. `Sink` supplies `create` (null when the OS refuses), `setFlags`, `post`, `release`
+/// and `sleep`; production binds it to `CGEventSink` below.
+fn KeyPoster(comptime Sink: type) type {
+    return struct {
+        /// Post one down/up pair for `vk` carrying exactly `flags`, `gap_ms` apart. Returns
+        /// false when the OS would not create the events — nothing was posted, and the caller
+        /// must not claim otherwise.
+        fn pair(sink: *Sink, vk: u16, flags: CGEventFlags, gap_ms: u32) bool {
+            const down = sink.create(vk, true) orelse return false;
+            defer sink.release(down);
+            const up = sink.create(vk, false) orelse return false;
+            defer sink.release(up);
+
+            sink.setFlags(down, flags);
+            sink.setFlags(up, flags);
+            sink.post(down);
+            sink.sleep(gap_ms);
+            sink.post(up);
+            return true;
+        }
+
+        /// The Undo deletion primitive (#214/#222/#244): `n` discrete **un-modified** Backspace
+        /// (⌫) pairs, paced ~1 ms down-to-up and ~1 ms between pairs like `keystroke`'s chunks,
+        /// **no cap**. `n` is the record's grapheme count, computed by the caller
+        /// (`graphemeCount`, #220); `n == 0` posts nothing.
+        ///
+        /// Returns **how many pairs actually went out** — `n` when the whole burst posted,
+        /// fewer when the OS refused to create an event partway. A short count is not "nothing
+        /// happened": the pairs before the failure are already in the target app, so the caller
+        /// must treat any count above zero as a committed (if incomplete) deletion. Re-running
+        /// the full `n` would eat text that preceded the Insertion. Blind best-effort otherwise:
+        /// a post-paste transform (autocorrect, smart quotes) can make N over- or under-delete
+        /// by a bounded amount — accepted silently, no AX readback (#214).
+        fn deleteChars(sink: *Sink, n: usize) usize {
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                if (!pair(sink, kVK_Delete, no_flags, key_gap_ms)) return i;
+                sink.sleep(key_gap_ms);
+            }
+            return n;
+        }
+    };
+}
+
+/// The production sink: real CGEvents on the Inserter's **self-tagged** source — so the Talk
+/// Key tap recognises them as our own and skips them (#210) — posted to `kCGSessionEventTap`.
+const CGEventSink = struct {
+    src: CGEventSourceRef,
+
+    fn create(self: *CGEventSink, vk: u16, down: bool) ?*CGEvent {
+        return CGEventCreateKeyboardEvent(self.src, vk, down);
+    }
+    fn setFlags(_: *CGEventSink, ev: *CGEvent, flags: CGEventFlags) void {
+        CGEventSetFlags(ev, flags);
+    }
+    fn post(_: *CGEventSink, ev: *CGEvent) void {
+        CGEventPost(kCGSessionEventTap, ev);
+    }
+    fn release(_: *CGEventSink, ev: *CGEvent) void {
+        CFRelease(@ptrCast(ev));
+    }
+    fn sleep(_: *CGEventSink, ms: u32) void {
+        sleepMs(ms);
+    }
+};
 
 pub const Inserter = struct {
     /// A tagged event source so our observer can recognise our own posts (§4).
@@ -350,44 +436,27 @@ pub const Inserter = struct {
         feedback.log("  [copy] recorded insertion copied to the clipboard\n", .{});
     }
 
+    /// The pair result is discarded deliberately: `paste` has already written the pasteboard
+    /// and its caller reports the Insertion either way, so there is nothing here that could
+    /// act on a refused ⌘V. (Undo is the path where a post that did not happen must not be
+    /// claimed — see `deleteChars` and undo.zig, #244.)
     fn postCmdV(self: *Inserter) void {
-        const down = CGEventCreateKeyboardEvent(self.src, kVK_ANSI_V, true);
-        const up = CGEventCreateKeyboardEvent(self.src, kVK_ANSI_V, false);
-        CGEventSetFlags(down, kCGEventFlagMaskCommand);
-        CGEventSetFlags(up, kCGEventFlagMaskCommand);
-        CGEventPost(kCGSessionEventTap, down);
-        sleepMs(cmd_v_gap_ms);
-        CGEventPost(kCGSessionEventTap, up);
-        CFRelease(@ptrCast(down));
-        CFRelease(@ptrCast(up));
+        var sink = CGEventSink{ .src = self.src };
+        _ = KeyPoster(CGEventSink).pair(&sink, kVK_ANSI_V, kCGEventFlagMaskCommand, cmd_v_gap_ms);
     }
 
-    /// The Undo deletion primitive (backspace-posting mechanism, #214/#222): post `n`
-    /// discrete Backspace (⌫) key down/up pairs on this Inserter's **self-tagged** source
-    /// — so the Talk Key tap recognises them as our own and skips them (#210) — to
-    /// `kCGSessionEventTap`, ~1 ms paced, **no cap**. `n` is the record's grapheme count,
-    /// computed by the caller (`graphemeCount`, #220); `n == 0` posts nothing. Each pair is
-    /// an un-modified single-key post (like `postCmdV`, minus the ⌘ flag), paced ~1 ms
-    /// down-to-up and ~1 ms between pairs like `keystroke`'s chunks. Blind best-effort: a
-    /// post-paste transform (autocorrect, smart quotes) can make N over- or under-delete
-    /// by a bounded amount — accepted silently, no AX readback (#214).
-    pub fn deleteChars(self: *Inserter, n: usize) void {
+    /// The Undo deletion mechanism, bound to real CGEvents: `KeyPoster.deleteChars` on this
+    /// Inserter's self-tagged source. Returns how many Backspace pairs went out — `0` means
+    /// nothing landed and the Undo Runner must refuse rather than confirm, and anything short
+    /// of `n` is a committed-but-incomplete deletion the Runner must not retry (#244).
+    pub fn deleteChars(self: *Inserter, n: usize) usize {
         // Ordering guard, as in `paste`: never let posted Backspaces land while a previous
         // Insertion's clipboard restore is still pending. The Insert Worker drains the Undo
         // Runner last, which makes this a no-op in practice; this keeps the mechanism correct
         // on its own rather than by the worker's drain order (ADR-0009).
         self.drainDeferredRestore();
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const down = CGEventCreateKeyboardEvent(self.src, kVK_Delete, true);
-            const up = CGEventCreateKeyboardEvent(self.src, kVK_Delete, false);
-            CGEventPost(kCGSessionEventTap, down);
-            sleepMs(1);
-            CGEventPost(kCGSessionEventTap, up);
-            sleepMs(1);
-            CFRelease(@ptrCast(down));
-            CFRelease(@ptrCast(up));
-        }
+        var sink = CGEventSink{ .src = self.src };
+        return KeyPoster(CGEventSink).deleteChars(&sink, n);
     }
 
     /// Fallback: post `utf16` as synthetic keystrokes in ≤20-unit chunks, never
@@ -404,6 +473,13 @@ pub const Inserter = struct {
 
             const down = CGEventCreateKeyboardEvent(self.src, 0x31, true); // carrier keycode (space)
             const up = CGEventCreateKeyboardEvent(self.src, 0x31, false);
+            // Explicitly un-modified, for the reason `KeyPoster` documents (#244): these events
+            // are created from a combined-session-state source too, so omitting this inherits
+            // whatever the user is holding — and a chunk carrying ⌘ reads as a shortcut rather
+            // than text. This path posts to the HID tap with a Unicode payload, so it builds its
+            // own pair rather than going through the helper.
+            CGEventSetFlags(down, no_flags);
+            CGEventSetFlags(up, no_flags);
             CGEventKeyboardSetUnicodeString(down, @intCast(chunk.len), chunk.ptr);
             CGEventKeyboardSetUnicodeString(up, @intCast(chunk.len), chunk.ptr);
             CGEventPost(kCGHIDEventTap, down);
@@ -481,4 +557,116 @@ test "drainDeferredRestore with nothing pending is a no-op" {
     var inserter = Inserter{};
     inserter.drainDeferredRestore();
     try std.testing.expect(inserter.pending_restore == null);
+}
+
+// ---- tests: the posted key pairs, observed by shape (#244) ----
+//
+// The seam `KeyPoster` exists for is exactly the defect these cover: what the target app
+// receives is a (keycode, flags, down) triple, and a count of calls cannot see the flags. The
+// fake below reproduces the one CoreGraphics behaviour that made `⌃⌘⌫` delete nothing — an
+// event created from a combined-session-state source is stamped with the modifiers the user is
+// *physically holding at creation time* — so a primitive that omits `setFlags` inherits them.
+
+/// One synthesized key event as the target app receives it.
+const PostedKey = struct { keycode: u16, flags: CGEventFlags, down: bool };
+
+const FakeSink = struct {
+    /// What the user is holding when the events are created — CoreGraphics stamps it on.
+    live_flags: CGEventFlags = 0,
+    /// Creation returns null from this many events on (the OS-refused-to-create path).
+    creates_before_failure: usize = std.math.maxInt(usize),
+
+    events: [64]PostedKey = undefined,
+    created: usize = 0,
+    posted: [64]PostedKey = undefined,
+    posts: usize = 0,
+    releases: usize = 0,
+    sleeps: usize = 0,
+
+    fn create(self: *FakeSink, vk: u16, down: bool) ?*PostedKey {
+        if (self.created >= self.creates_before_failure) return null;
+        if (self.created == self.events.len) @panic("FakeSink: more events than the fake can hold");
+        const slot = &self.events[self.created];
+        self.created += 1;
+        slot.* = .{ .keycode = vk, .flags = self.live_flags, .down = down };
+        return slot;
+    }
+    fn setFlags(_: *FakeSink, ev: *PostedKey, flags: CGEventFlags) void {
+        ev.flags = flags;
+    }
+    fn post(self: *FakeSink, ev: *PostedKey) void {
+        // `zig build test` compiles ReleaseFast, where an out-of-bounds write is silent UB —
+        // so the capacity check is explicit rather than left to a safety panic.
+        if (self.posts == self.posted.len) @panic("FakeSink: more posts than the fake can record");
+        self.posted[self.posts] = ev.*;
+        self.posts += 1;
+    }
+    fn release(self: *FakeSink, _: *PostedKey) void {
+        self.releases += 1;
+    }
+    fn sleep(self: *FakeSink, _: u32) void {
+        self.sleeps += 1;
+    }
+};
+
+const FakeKeys = KeyPoster(FakeSink);
+
+test "the deletion primitive posts one un-modified Backspace pair per cluster while ⌃⌘ is held" {
+    // The regression (#244): the user is still holding the recovery chord when the Backspaces
+    // go out — the chord handler only bumps a counter and the worker's idle poll is ~2 ms, so
+    // the first ⌫ posts within ~5–20 ms of the press. Every posted event must carry flags = 0,
+    // or the app sees ⌃⌘⌫ (unbound in AppKit and Chromium) and deletes nothing.
+    var sink = FakeSink{ .live_flags = kCGEventFlagMaskControl | kCGEventFlagMaskCommand };
+
+    try std.testing.expectEqual(@as(usize, 3), FakeKeys.deleteChars(&sink, 3));
+
+    try std.testing.expectEqual(@as(usize, 6), sink.posts); // three down/up pairs, in order
+    for (sink.posted[0..6], 0..) |k, i| {
+        try std.testing.expectEqual(kVK_Delete, k.keycode);
+        try std.testing.expectEqual(@as(CGEventFlags, 0), k.flags);
+        try std.testing.expectEqual(i % 2 == 0, k.down); // down, up, down, up, …
+    }
+    try std.testing.expectEqual(sink.created, sink.releases); // nothing leaked
+}
+
+test "the deletion primitive posts nothing for zero clusters" {
+    var sink = FakeSink{ .live_flags = kCGEventFlagMaskCommand };
+    try std.testing.expectEqual(@as(usize, 0), FakeKeys.deleteChars(&sink, 0));
+    try std.testing.expectEqual(@as(usize, 0), sink.posts);
+}
+
+test "a deletion the OS will not create posts nothing and says so" {
+    // The Runner turns a zero count into a refusal: a record it could not delete must not be
+    // flagged undone or confirmed (#244).
+    var sink = FakeSink{ .creates_before_failure = 0 };
+
+    try std.testing.expectEqual(@as(usize, 0), FakeKeys.deleteChars(&sink, 4));
+
+    try std.testing.expectEqual(@as(usize, 0), sink.posts);
+    try std.testing.expectEqual(sink.created, sink.releases);
+}
+
+test "a burst that fails partway reports the pairs already posted, not zero" {
+    // The count is what stops the Runner from 'retrying' a deletion that half happened: those
+    // Backspaces are in the target app, and re-running the full n would eat earlier text.
+    var sink = FakeSink{ .creates_before_failure = 3 }; // pair 1 creates two, pair 2 fails on its down
+
+    try std.testing.expectEqual(@as(usize, 1), FakeKeys.deleteChars(&sink, 4));
+
+    try std.testing.expectEqual(@as(usize, 2), sink.posts); // exactly the one completed pair
+    try std.testing.expectEqual(sink.created, sink.releases); // the half-built pair is released too
+}
+
+test "the paste primitive's pair keeps the ⌘ flag through the same helper" {
+    // The other user of the shared helper: ⌘V must still carry ⌘ on *both* events, and must
+    // not inherit whatever else is held either.
+    var sink = FakeSink{ .live_flags = kCGEventFlagMaskControl };
+
+    try std.testing.expect(FakeKeys.pair(&sink, kVK_ANSI_V, kCGEventFlagMaskCommand, cmd_v_gap_ms));
+
+    try std.testing.expectEqual(@as(usize, 2), sink.posts);
+    for (sink.posted[0..2]) |k| {
+        try std.testing.expectEqual(kVK_ANSI_V, k.keycode);
+        try std.testing.expectEqual(kCGEventFlagMaskCommand, k.flags);
+    }
 }

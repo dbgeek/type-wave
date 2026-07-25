@@ -145,13 +145,17 @@ sequence — pause/grant gate, newest-record resolution, grapheme count, the fre
 on the Insert Worker** (ADR-0008): the gate's read must be fresh and is cross-process, so it
 cannot live on the tap's run-loop thread, and everything else therefore sits beside it — the
 chord callback only bumps a saturating press counter, one press to one verdict to one cue.
-The record is resolved at post time and flagged only *after* a deletion posts, so no refusal
-can dim a record nothing deleted, and every exit — including a degenerate record with no
-grapheme clusters — fires its cue rather than swallowing the press. It gates on its own
-prerequisites — not paused, plus the Grant Observer's PostEvent fact — never on the
-Configuration Phase or the Supervisor's capture-enable gate. It holds
+The record is resolved at post time and flagged only *after* a deletion **actually posts**, so
+no refusal can dim a record nothing deleted, and every exit — including a degenerate record
+with no grapheme clusters — fires its cue rather than swallowing the press. The deletion
+mechanism reports how many Backspaces went out and Secure Event Input is probed beside the
+frontmost read, so a post of none is a refusal that leaves the record retryable rather than a
+green cue over unchanged text, while a burst that stopped partway commits (its Backspaces
+already landed, and a retry would eat earlier text) (#244). It gates on its own prerequisites —
+not paused, plus the Grant Observer's PostEvent fact — never on the Configuration Phase or the
+Supervisor's capture-enable gate. It holds
 the Recent Insertions ring concretely (ADR-0006 keeps ownership with the daemon) and reaches
-every effect through a five-method seam it is handed, so the whole sequence is exercised by
+every effect through a six-method seam it is handed, so the whole sequence is exercised by
 fed values rather than by a live tap. Lives in `src/undo.zig`; drained last by the Insert
 Worker, which is what serializes a deletion against dictation. Sibling of the Insertion
 Runner, which owns the other three cursor paths under the same rule (ADR-0009).
@@ -306,6 +310,23 @@ exercised by fed probe values rather than by a live daemon. Read by the Configur
 the Supervisor, and the Undo Runner; lives in `src/grants.zig`. Distinct from the Supervisor,
 whose own facts the daemon still gathers (ADR-0005).
 _Avoid_: permissions manager, TCC helper, grant sequence (that names only the pure half)
+
+**Secure Input Observer**:
+The daemon's owner of one session-wide fact: whether **Secure Event Input** is held, and by
+whom (#245). While it is held the WindowServer withholds key events from every event tap, so
+the recovery chord never reaches the daemon at all — the Undo Runner's own secure-input
+refusal covers the case where a press *arrives* and cannot be acted on, and this covers the
+strictly upstream case where no press arrives. What makes it worth a module is the asymmetry
+it explains: modifier events keep flowing, so the Talk Key keeps working and every other sign
+says the tap is healthy while `⌃⌘⌫` is silently dead. Pure, in the Supervisor / Grant Observer
+idiom: the daemon polls the flag, the session's holder pid and the holder's name on the
+supervisor's existing facts pass, and this decides only *when a reading is worth saying* —
+once per hold, again if the holder or its kind changes, once on release. It distinguishes a
+**named** holder (quit it) from a **stale** one whose process is gone (only a re-login clears
+it) and from an unattributable hold. It observes and narrates; it gates nothing. Lives in
+`src/secure_input.zig`; its transitions reach the log with the holder named, and the Status
+Item as a row while the condition holds.
+_Avoid_: secure input guard/gate (it blocks nothing), keyboard lock
 
 **Configuration Phase**:
 The daemon's setup-readiness state for the selected Transcription Backend. `configured`
