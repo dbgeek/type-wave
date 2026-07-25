@@ -145,6 +145,8 @@ pub fn RewriteAdapter(comptime Deps: type) type {
 const FakeDeps = struct {
     result: []const u8 = "rewritten",
     failure: ?anyerror = null,
+    /// Clear `failure` after it fires once — lets a test show the worker recovering.
+    failure_once: bool = false,
     calls: usize = 0,
     last_raw: [256]u8 = undefined,
     last_raw_len: usize = 0,
@@ -160,7 +162,10 @@ const FakeDeps = struct {
         self.calls += 1;
         @memcpy(self.last_raw[0..raw.len], raw);
         self.last_raw_len = raw.len;
-        if (self.failure) |e| return e;
+        if (self.failure) |e| {
+            if (self.failure_once) self.failure = null;
+            return e;
+        }
         @memcpy(out[0..self.result.len], self.result);
         return out[0..self.result.len];
     }
@@ -236,6 +241,30 @@ test "a submit overlapping a hung in-flight call cannot corrupt that call's job"
     try std.testing.expect(adapter.runOnce()); // the overlapped job then drains intact
     try std.testing.expectEqual(@as(coord.UtteranceId, 2), adapter.deps.last_completion_id);
     try std.testing.expectEqualStrings("second raw", adapter.deps.completedText());
+}
+
+test "a call cut off by its deadline frees the worker: the next Utterance's Rewrite runs" {
+    // The defect this guards (issue #257): the call had no deadline, so a stalled one held
+    // the single worker for the process's life and every later Utterance staged a Rewrite
+    // nobody ever claimed. With the call bounded (openai_rewrite.call_deadline_ms) the
+    // stall is an ordinary failure, and the next job drains on the very next tick.
+    var adapter = RewriteAdapter(FakeDeps).init(.{
+        .failure = error.RewriteTimedOut,
+        .failure_once = true,
+        .result = "at 18:00",
+    });
+
+    adapter.submit(1, "the stalled one");
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(coord.RewriteResult.failed, adapter.deps.last_completion);
+    try std.testing.expectEqualStrings("the stalled one", adapter.deps.completedText());
+
+    adapter.submit(2, "at 20:00 no 18:00");
+    try std.testing.expect(adapter.runOnce());
+    try std.testing.expectEqual(@as(usize, 2), adapter.deps.calls);
+    try std.testing.expectEqual(@as(coord.UtteranceId, 2), adapter.deps.last_completion_id);
+    try std.testing.expectEqual(coord.RewriteResult.ok, adapter.deps.last_completion);
+    try std.testing.expectEqualStrings("at 18:00", adapter.deps.completedText());
 }
 
 test "runOnce reports idle without touching dependencies" {

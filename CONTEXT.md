@@ -201,7 +201,10 @@ Backtrack's one transformation of a Final Transcript, driven by the Utterance
 Coordinator's `.rewriting` phase through the Rewrite seam: a worker thread makes the
 OpenAI Responses call off-mutex (`rewrite_adapter.zig`, `openai_rewrite.zig`) and the
 `.rewritten` reverse edge hands the text to Insertion. A failed Rewrite falls back to
-the raw Final Transcript.
+the raw Final Transcript. Two distinct bounds apply and neither replaces the other: the
+Coordinator's ~3 s **rewrite budget** decides when the *Utterance* stops waiting, and
+`openai_rewrite.call_deadline_ms` (5 s) bounds how long one call may occupy the single
+**worker** — without it, one endpoint that never answers retires Backtrack until restart.
 _Avoid_: edit, fixup, transformation (vague), LLM call (mechanism)
 
 **Focused Target**:
