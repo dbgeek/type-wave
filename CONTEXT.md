@@ -224,7 +224,13 @@ The live connection to the transcription service over which an Utterance's audio
 out and transcripts stream back (the warm OpenAI Realtime link, `src/session.zig`). It
 owns the read-loop dispatch, the outbound-ring sender drain, and the keepalive/reconnect
 maintenance — each now a tested surface behind the **Session Transport** seam, so the
-whole warm lifecycle is exercised by fed events, not a live socket.
+whole warm lifecycle is exercised by fed events, not a live socket. Its **deadline** — when
+the maintenance thread must cycle the link ahead of the server's cap — is provisional from
+the moment `connect` returns, and the `expires_at` the server names in `session.created`
+only replaces it after it is *proved* to be a deadline. A value that fails the proof is
+ignored, not repaired: the provisional deadline is the degrade, and its cost is at most one
+server-forced reconnect. The proof is not defensive politeness — a remote number reaching
+unchecked arithmetic is undefined behavior in the ReleaseFast we ship, not a panic.
 _Avoid_: websocket (mechanism)
 
 **Session Transport**:

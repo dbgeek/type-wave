@@ -1091,12 +1091,16 @@ pub fn Session(comptime Transport: type) type {
 
                 if (std.mem.eql(u8, typ, "session.created")) {
                     // The session object carries the real 60-min deadline; read it so the
-                    // maintenance thread cycles the session just before the server would.
-                    if (getField(root, "session")) |sess| {
-                        if (getInt(sess, "expires_at")) |secs| {
-                            if (secs > 0) s.expires_at_ms.store(secs * 1000, .release);
-                        }
-                    }
+                    // maintenance thread cycles the session just before the server would. The
+                    // number is remote input reaching arithmetic that is undefined on overflow in
+                    // the optimize mode we ship, so it is proved before it is believed — and a
+                    // value that fails the proof is ignored rather than repaired, because the
+                    // provisional deadline from `connect` already covers exactly this case (#274).
+                    if (getField(root, "session")) |sess| switch (sessionDeadline(sess)) {
+                        .ms => |deadline_ms| s.expires_at_ms.store(deadline_ms, .release),
+                        .absent => {},
+                        .rejected => feedback.log("  session.created: expires_at is not a usable deadline — keeping the provisional one\n", .{}),
+                    };
                     try s.sendControl(s.su_buf[0..s.su_len]);
                     feedback.log("  session.created -> sent session.update\n", .{});
                 } else if (std.mem.eql(u8, typ, "session.updated")) {
@@ -1225,15 +1229,61 @@ fn getStr(v: std.json.Value, key: []const u8) ?[]const u8 {
     };
 }
 
-fn getInt(v: std.json.Value, key: []const u8) ?i64 {
-    const f = getField(v, key) orelse return null;
-    return switch (f) {
+/// Coerce one JSON number to an i64, or null if it is not one this process will believe.
+///
+/// The float arm is a **range test, not a safety check**: `@intFromFloat` on a value outside
+/// the destination's range is illegal behavior, and production builds are ReleaseFast
+/// (`build.zig`), so an unchecked cast there is undefined rather than a panic. The pinned std
+/// happens to keep NaN and the infinities out of `.float` on its own — `Value.parseFromNumberSlice`
+/// routes every non-finite spelling to `.number_string` — but that is std's business, not ours;
+/// the comparisons below refuse them regardless, and refuse NaN by failing both.
+///
+/// `.number_string` is a number too large or too precise for either arm. Nothing here needs one,
+/// so it reads as absent.
+fn intValue(v: std.json.Value) ?i64 {
+    // 2^63 is exactly representable in f64 and `@intFromFloat` truncates toward zero, so the
+    // open upper bound and the closed lower bound are exactly i64's range.
+    const i64_min_f: f64 = -9223372036854775808.0;
+    const i64_limit_f: f64 = 9223372036854775808.0;
+    return switch (v) {
         .integer => |i| i,
-        .float => |x| @intFromFloat(x),
+        .float => |x| if (x >= i64_min_f and x < i64_limit_f) @as(i64, @intFromFloat(x)) else null,
         else => null,
     };
 }
 
+/// What a `session.created` payload proves about the session's deadline.
+const DeadlineReading = union(enum) {
+    /// The server named a deadline: wall-clock ms.
+    ms: i64,
+    /// This payload names no deadline — the field is absent, or the `0` the daemon has always
+    /// read as "none reported". Ordinary, and not worth a line.
+    absent,
+    /// Present, but not something this process will treat as a deadline.
+    rejected,
+};
+
+/// Read the session deadline out of `session.created`'s session object, refusing every spelling
+/// that cannot be one.
+///
+/// A refusal needs no recovery story, and that is the point: `connect` stores a provisional
+/// deadline (`fallback_session_ms`) before this event can arrive, so a refused value simply
+/// leaves it standing. The worst case is one server-forced reconnect at the real cap, which drop
+/// detection already handles.
+fn sessionDeadline(sess: std.json.Value) DeadlineReading {
+    const field = getField(sess, "expires_at") orelse return .absent;
+    const secs = intValue(field) orelse return .rejected;
+    if (secs == 0) return .absent;
+    if (secs < 0) return .rejected;
+    // A real epoch-seconds deadline scales into i64 milliseconds with centuries to spare; a value
+    // that does not is not a deadline, and the multiply is undefined on overflow in ReleaseFast.
+    const ms = std.math.mul(i64, secs, 1000) catch return .rejected;
+    return .{ .ms = ms };
+}
+
+/// Audio seconds off the usage block, for the log line. Unlike `intValue` this coercion needs no
+/// range test and gets none: `@floatFromInt` is defined for every i64, and formatting an odd f64
+/// is defined too, so the worst a strange value can do here is print strangely.
 fn usageSeconds(root: std.json.Value) f64 {
     const u = getField(root, "usage") orelse return 0;
     const s = getField(u, "seconds") orelse return 0;
@@ -1495,6 +1545,101 @@ test "session.created replays the configured session.update through the transpor
     deliverServerMessage(&sess, "{\"type\":\"session.created\",\"session\":{\"expires_at\":0}}");
 
     try std.testing.expect(std.mem.indexOf(u8, sess.transport.written(), "\"type\":\"session.update\"") != null);
+}
+
+// ---- the session deadline: remote numbers proved before they are believed (#274) ----
+
+/// Parse a session object the way `serverMessage` does, then read its deadline. The reading
+/// borrows nothing from the parse, so the arena is freed before it is returned.
+fn readDeadline(json: []const u8) !DeadlineReading {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    return sessionDeadline(parsed.value);
+}
+
+test "a JSON number outside i64 reads as absent instead of reaching an unchecked cast" {
+    try std.testing.expectEqual(@as(?i64, 5), intValue(.{ .integer = 5 }));
+    try std.testing.expectEqual(@as(?i64, 1), intValue(.{ .float = 1.9 })); // truncates toward zero
+    try std.testing.expectEqual(@as(?i64, -1), intValue(.{ .float = -1.9 }));
+
+    // The shapes the bare `@intFromFloat` made undefined. JSON cannot spell NaN, and the pinned
+    // std keeps the infinities out of `.float`; the range test refuses them anyway, so `intValue`
+    // rests on neither fact.
+    try std.testing.expectEqual(@as(?i64, null), intValue(.{ .float = std.math.nan(f64) }));
+    try std.testing.expectEqual(@as(?i64, null), intValue(.{ .float = std.math.inf(f64) }));
+    try std.testing.expectEqual(@as(?i64, null), intValue(.{ .float = -std.math.inf(f64) }));
+    try std.testing.expectEqual(@as(?i64, null), intValue(.{ .float = 1e300 }));
+    try std.testing.expectEqual(@as(?i64, null), intValue(.{ .float = -1e300 }));
+
+    // The boundary itself: 2^63 is one past i64's max, -2^63 is exactly its min.
+    try std.testing.expectEqual(@as(?i64, null), intValue(.{ .float = 9223372036854775808.0 }));
+    try std.testing.expectEqual(@as(?i64, std.math.minInt(i64)), intValue(.{ .float = -9223372036854775808.0 }));
+
+    // Too large or too precise for either arm: std hands these back as text.
+    try std.testing.expectEqual(@as(?i64, null), intValue(.{ .number_string = "99999999999999999999999999" }));
+    try std.testing.expectEqual(@as(?i64, null), intValue(.{ .string = "60" }));
+}
+
+test "session.created's expires_at is proved before it becomes the deadline" {
+    try std.testing.expectEqual(DeadlineReading{ .ms = 1_800_000_000_000 }, try readDeadline("{\"expires_at\":1800000000}"));
+
+    // Naming no deadline is ordinary, in both spellings the daemon has always accepted.
+    try std.testing.expectEqual(@as(DeadlineReading, .absent), try readDeadline("{}"));
+    try std.testing.expectEqual(@as(DeadlineReading, .absent), try readDeadline("{\"expires_at\":0}"));
+
+    // Finite, comfortably inside i64, and still nonsense as milliseconds: one past
+    // i64_max/1000 is where the old unguarded `secs * 1000` started wrapping.
+    try std.testing.expectEqual(DeadlineReading{ .ms = std.math.maxInt(i64) - 807 }, try readDeadline("{\"expires_at\":9223372036854775}"));
+    try std.testing.expectEqual(@as(DeadlineReading, .rejected), try readDeadline("{\"expires_at\":9223372036854776}"));
+    // A finite float far outside i64 — the shape that reached the bare `@intFromFloat`.
+    try std.testing.expectEqual(@as(DeadlineReading, .rejected), try readDeadline("{\"expires_at\":1e300}"));
+    // Spellings the pinned std already hands over as text or as the wrong type; refused here on
+    // their own merit rather than by std's routing.
+    try std.testing.expectEqual(@as(DeadlineReading, .rejected), try readDeadline("{\"expires_at\":1e999}"));
+    try std.testing.expectEqual(@as(DeadlineReading, .rejected), try readDeadline("{\"expires_at\":99999999999999999999999999}"));
+    try std.testing.expectEqual(@as(DeadlineReading, .rejected), try readDeadline("{\"expires_at\":\"1800000000\"}"));
+    try std.testing.expectEqual(@as(DeadlineReading, .rejected), try readDeadline("{\"expires_at\":-1800000000}"));
+}
+
+test "a hostile expires_at leaves the provisional deadline standing and the session still comes up" {
+    var out_buf: [8]OutRecord = undefined;
+    var rec = Recorder{};
+    var sess: Session(FakeTransport) = undefined;
+    initFake(&sess, &out_buf, &rec);
+    sess.link_open = true;
+    sess.su_len = (try formatSessionUpdate(&sess.su_buf, .{})).len;
+
+    // Every shape a JSON body can spell that the old code ran through an unchecked cast or an
+    // unchecked ×1000. None may move the deadline, and none may cost the session its handshake.
+    const provisional: i64 = 1_234_567;
+    const hostile = [_][]const u8{
+        "{\"type\":\"session.created\",\"session\":{\"expires_at\":1e999}}",
+        "{\"type\":\"session.created\",\"session\":{\"expires_at\":1e300}}",
+        "{\"type\":\"session.created\",\"session\":{\"expires_at\":9223372036854776}}",
+        "{\"type\":\"session.created\",\"session\":{\"expires_at\":99999999999999999999999999}}",
+        "{\"type\":\"session.created\",\"session\":{\"expires_at\":-1800000000}}",
+        "{\"type\":\"session.created\",\"session\":{\"expires_at\":\"1800000000\"}}",
+    };
+    for (hostile) |msg| {
+        sess.expires_at_ms.store(provisional, .release);
+        deliverServerMessage(&sess, msg);
+        try std.testing.expectEqual(provisional, sess.expires_at_ms.load(.acquire));
+    }
+    try std.testing.expectEqual(hostile.len, sess.transport.writes);
+    try std.testing.expect(std.mem.indexOf(u8, sess.transport.written(), "\"type\":\"session.update\"") != null);
+}
+
+test "a sane expires_at still replaces the provisional deadline exactly as before" {
+    var out_buf: [8]OutRecord = undefined;
+    var rec = Recorder{};
+    var sess: Session(FakeTransport) = undefined;
+    initFake(&sess, &out_buf, &rec);
+    sess.link_open = true;
+    sess.su_len = (try formatSessionUpdate(&sess.su_buf, .{})).len;
+
+    sess.expires_at_ms.store(1_234_567, .release);
+    deliverServerMessage(&sess, "{\"type\":\"session.created\",\"session\":{\"expires_at\":1800000000}}");
+    try std.testing.expectEqual(@as(i64, 1_800_000_000_000), sess.expires_at_ms.load(.acquire));
 }
 
 test "the read loop tags a completed transcript to its Utterance by OpenAI item id" {
