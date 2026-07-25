@@ -383,6 +383,15 @@ pub fn InsertionRunner(comptime Deps: type) type {
         /// Process jobs until the owning daemon is quitting. Idle behavior stays with the
         /// dependency set so tests do not inherit wall-clock sleeps.
         ///
+        /// **This loop never returns owing a deferred clipboard restore** (#273). Every drain
+        /// path — the insert, the refusal, the Re-insert, the Copy — calls `finishInsert`
+        /// before it returns, and `shouldQuit` is polled only *between* iterations, so a quit
+        /// raised at any point during a job still leaves the restore run by the time the loop
+        /// exits. That invariant is what makes joining this thread at shutdown sufficient to
+        /// keep a Final Transcript off the general pasteboard: the daemon waits for the loop,
+        /// not for a flush API, because there is nothing left to flush once it comes around.
+        ///
+
         /// `undo` is the **Undo Runner** (undo.zig), duck-typed on `runOnce() bool` and
         /// drained on this same single worker — the **Insert Worker**, whose single-threadedness
         /// is exactly what serializes a deletion against dictation. Undo goes **last**: an
@@ -437,12 +446,17 @@ const FakeDeps = struct {
     refuses: usize = 0,
     quit: bool = false,
     idles: usize = 0,
+    /// Raise the quit flag from *inside* the mechanism — the SIGTERM/menu-Quit interleaving
+    /// the shutdown join exists for (#273): the process is told to go while a paste is in
+    /// flight and its clipboard restore is still owed.
+    quit_during_insert: bool = false,
 
     fn insertionPlan(self: *FakeDeps) insertmod.Plan {
         return self.plan;
     }
 
     fn insert(self: *FakeDeps, plan: insertmod.Plan, text: [*:0]const u8) insertmod.InsertError!void {
+        if (self.quit_during_insert) self.quit = true;
         self.calls += 1;
         self.last_plan = plan;
         const s = std.mem.span(text);
@@ -1095,4 +1109,45 @@ test "an idle worker with nothing queued on either side idles once and stops" {
 
     try std.testing.expectEqual(@as(usize, 1), runner.deps.idles);
     try std.testing.expectEqual(@as(usize, 0), undo.runs);
+}
+
+// --- Shutdown: the loop never returns owing a deferred restore (#273) ---
+
+test "a quit raised mid-insertion still drains the deferred restore before the loop returns" {
+    // The interleaving the daemon's join exists for: SIGTERM (or menu Quit) arrives while the
+    // paste is in flight, so the Final Transcript is on the general pasteboard and the user's
+    // own clipboard lives only in this process's memory. `shouldQuit` is polled between
+    // iterations, never inside one, so the drain still runs — which is what makes waiting for
+    // this loop sufficient, with no flush API to call.
+    var ring = recent_insertions.Ring{};
+    var runner = Runner.init(&ring, .{ .quit_during_insert = true });
+    var undo = FakeUndo{ .deps = &runner.deps };
+
+    runner.submit(7, "dictation", .normal);
+    runner.workerLoop(&undo);
+
+    try std.testing.expectEqual(@as(usize, 1), runner.deps.calls);
+    try std.testing.expectEqual(@as(usize, 1), runner.deps.completions);
+    // The whole point: the loop had come around, and the restore had run by then.
+    try std.testing.expectEqual(@as(usize, 1), runner.deps.finishes);
+    // It left through the quit flag, not the idle path — proving the drain was not merely a
+    // side effect of the loop having nothing else to do.
+    try std.testing.expectEqual(@as(usize, 0), runner.deps.idles);
+}
+
+test "a quit raised mid-replay drains that restore too" {
+    // The Re-insert path leaves the same deferred restore a dictation does, so a quit landing
+    // inside it must be waited for the same way. (Copy drains *before* its write and leaves
+    // nothing pending, so it has nothing to owe.)
+    var ring = recent_insertions.Ring{};
+    ring.record(rec("replay ", 10));
+    var runner = Runner.init(&ring, .{ .quit_during_insert = true });
+    var undo = FakeUndo{ .deps = &runner.deps };
+
+    runner.submitMenu(.reinsert, 10);
+    runner.workerLoop(&undo);
+
+    try std.testing.expectEqual(@as(usize, 1), runner.deps.calls);
+    try std.testing.expectEqual(@as(usize, 1), runner.deps.finishes);
+    try std.testing.expectEqual(@as(usize, 0), runner.deps.idles);
 }

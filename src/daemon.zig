@@ -45,7 +45,9 @@
 //!                        slow Insertion off the Coordinator's mutex, then reports `.inserted`
 //!                        with the bytes it landed. Also drains the Undo Runner (undo.zig,
 //!                        ADR-0008) last, which is what serializes a deletion against
-//!                        dictation.
+//!                        dictation. **Joined at shutdown** — the only cursor-side thread
+//!                        that is, because it is the only one whose unfinished work (the
+//!                        deferred clipboard restore) outlives the process (#273).
 //!   - rewrite worker   : the RewriteAdapter (docs/backtrack-spec.md) — drains one
 //!                        Backtrack rewrite job, makes the OpenAI Responses call off the
 //!                        Coordinator's mutex, then reports `.rewritten`. The call is
@@ -1505,8 +1507,14 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
         "no display — running headless (no status item)"});
 
     // ---- threads ----
+    // The Insert Worker is JOINED at shutdown (below), alone among the three: it is the one
+    // whose in-flight work holds *OS-global* state — the user's clipboard, with a Final
+    // Transcript sitting on it until the deferred restore runs (#273).
     const worker = try std.Thread.spawn(.{}, InsertionRunner.workerLoop, .{ &daemon.insertion, &daemon.undo });
-    worker.detach();
+    // These two stay detached, and that is not an oversight: everything they hold dies with
+    // the process. The rewrite worker's in-flight call is a bounded HTTP request whose answer
+    // only feeds an Utterance that is being abandoned anyway, and the deadline timer owns
+    // nothing but a clock.
     const rewrite_worker = try std.Thread.spawn(.{}, RewriteAdapter.workerLoop, .{&daemon.rewrite});
     rewrite_worker.detach();
     const timer = try std.Thread.spawn(.{}, DeadlineAdapter.timerLoop, .{&daemon.deadline});
@@ -1531,12 +1539,22 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     if (menu_up) appkit.run() else daemon.tap.run();
     g_quit.store(true, .release); // normally already set (menu Quit / signal) — belt-and-braces
 
-    // Quit: g_quit is set (that's why run() returned). Join the supervisor first so it is not
-    // mid-connect, then close the session gracefully (websocket close-frame drain, #17). We
-    // deliberately do NOT deinit the session: the process is exiting, the OS reclaims its
-    // memory, and skipping the free avoids any race with the detached worker/timer that may
-    // still hold the pointer (same process-lifetime-singleton stance as config).
+    // Quit: g_quit is set (that's why run() returned). The Insert Worker goes first — every
+    // other join only delays the one thing here that outlives the process. Its loop never
+    // returns owing a deferred restore (insertion_runner.workerLoop), so coming around is the
+    // whole guarantee: without this join a quit inside the ~300 ms restore window leaves the
+    // Final Transcript on the general pasteboard and the user's own clipboard gone with the
+    // process that held it (#273). The wait is bounded by whatever job is in flight — at worst
+    // one Insertion's clamped pre-paste settle plus the restore remainder, or one Undo burst,
+    // each of which is bounded by the record it acts on.
+    //
+    // Then the supervisor, so it is not mid-connect, then close the session gracefully
+    // (websocket close-frame drain, #17). We deliberately do NOT deinit the session: the
+    // process is exiting, the OS reclaims its memory, and skipping the free avoids any race
+    // with the detached rewrite worker/timer that may still hold the pointer (same
+    // process-lifetime-singleton stance as config).
     feedback.log("shutting down…\n", .{});
+    worker.join();
     supervisor_thread.join();
     local_retry.join();
     daemon.transcription.shutdown();

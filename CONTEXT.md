@@ -103,7 +103,11 @@ time-sensitive), then queued Recent Insertions actions, then Undo last. Its
 single-threadedness is the whole serialization story for the cursor — it is what keeps a
 deletion from landing between an Insertion's paste and its deferred clipboard restore, and
 what lets a Copy drain that restore without racing a live dictation. It owns only the
-priority; each Runner owns its own policy.
+priority; each Runner owns its own policy. Alone among the daemon's cursor-side threads it is
+**joined at shutdown**: its loop polls the quit flag only between jobs and every job drains its
+own restore, so waiting for it to come around is what keeps a Final Transcript from being left
+on the general pasteboard — and the user's clipboard from dying with the process — when a quit
+lands inside the ~300 ms restore window (#273).
 _Avoid_: insert thread, paste worker (mechanism); insertion worker
 
 **Insertion Record**:
