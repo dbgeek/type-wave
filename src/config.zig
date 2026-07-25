@@ -35,6 +35,10 @@
 const std = @import("std");
 const tap = @import("tap.zig");
 const insert = @import("insert.zig");
+/// Imported for one setter: `Store` publishes the log's transcript-redaction policy
+/// (#250) as each snapshot goes live. This module's *own* messages stay on plain stderr
+/// — they precede the running daemon, so they are not state transitions.
+const feedback = @import("feedback.zig");
 const keychain = @import("keychain.zig");
 const backend = @import("transcription_backend.zig");
 
@@ -74,6 +78,14 @@ pub const Settings = struct {
     /// effect is local-Whisper-only and read at Talk Key press (pinned with the Lease);
     /// the list is structurally clamped at load (see `clampVocabulary`).
     vocabulary: []const []const u8 = &.{},
+    /// Write the spoken words to the log, not just the fact that an Utterance resolved
+    /// (#250). Off by default: `~/Library/Logs/type-wave.log` is unrotated, uncapped
+    /// plaintext that the Status Item's Diagnostics action attaches to bug reports, so
+    /// Partial and Final Transcripts reach it as a byte count instead. Turn it on to
+    /// debug a transcription problem, then turn it off. Hand-edit-only like
+    /// `pre_paste_ms` — a diagnostic escape hatch, not a product setting, so no menu
+    /// group. The policy itself lives in feedback.zig; `Store` publishes it.
+    log_transcripts: bool = false,
 
     /// OpenAI input-audio noise reduction. `.off` sends JSON `null` (feature disabled).
     pub const NoiseReduction = enum { near_field, far_field, off };
@@ -287,12 +299,18 @@ pub const Store = struct {
     ptr: std.atomic.Value(usize),
 
     pub fn init(first: *const Settings) Store {
+        feedback.setLogTranscripts(first.log_transcripts);
         return .{ .ptr = std.atomic.Value(usize).init(@intFromPtr(first)) };
     }
     pub fn current(self: *Store) *const Settings {
         return @ptrFromInt(self.ptr.load(.acquire));
     }
+    /// Publishes the log's redaction policy (#250) alongside the pointer, so `log_transcripts`
+    /// binds through the one path every live snapshot already takes — no caller can swap in a
+    /// snapshot and leave the log speaking the old policy. Published *before* the pointer, so a
+    /// reader that can already see the new snapshot never logs under the old policy.
     pub fn swap(self: *Store, next: *const Settings) void {
+        feedback.setLogTranscripts(next.log_transcripts);
         self.ptr.store(@intFromPtr(next), .release);
     }
 };
@@ -320,6 +338,7 @@ pub fn diffSettings(a: *const Settings, b: *const Settings) Diff {
     if (a.overlay != b.overlay) d.overlay = true;
     if (a.backtrack != b.backtrack) d.any = true; // pinned at press with the Lease — read-at-use
     if (!vocabularyEql(a.vocabulary, b.vocabulary)) d.any = true; // read-at-use at press (Lease-pinned) — never session-shaped
+    if (a.log_transcripts != b.log_transcripts) d.any = true; // the swap itself republishes the log policy (#250)
     if (d.backend_selection or d.session_shaped or d.overlay) d.any = true;
     return d;
 }
@@ -513,6 +532,7 @@ fn serializeInto(w: *std.Io.Writer, s: Settings) std.Io.Writer.Error!void {
         \\//   .pre_paste_ms    = <ms between the pasteboard write and Cmd-V; raise for a slow target>
         \\//   .overlay         = true | false
         \\//   .backtrack       = true | false  (rewrite self-corrections via OpenAI — transcript text leaves your Mac)
+        \\//   .log_transcripts = true | false  (log the spoken words, not just that an Utterance resolved — off: the log is unrotated plaintext)
         \\//   .vocabulary      = .{{ "term", ... }}  (local-Whisper-only phrase biasing; empty = off)
         \\.{{
         \\    .transcription_backend = .{s},
@@ -525,11 +545,12 @@ fn serializeInto(w: *std.Io.Writer, s: Settings) std.Io.Writer.Error!void {
         \\    .pre_paste_ms = {d},
         \\    .overlay = {},
         \\    .backtrack = {},
+        \\    .log_transcripts = {},
         \\
     , .{
         @tagName(s.transcription_backend), @tagName(s.talk_key),  s.model,        s.language, s.delay,
         @tagName(s.noise_reduction),       @tagName(s.insertion), s.pre_paste_ms, s.overlay,
-        s.backtrack,
+        s.backtrack,                       s.log_transcripts,
     });
     try serializeVocabulary(w, s.vocabulary);
     try w.writeAll("}\n");
@@ -701,7 +722,7 @@ test "patchZonField does not confuse a longer field name for a prefix" {
 }
 
 test "serializeSettings round-trips through the ZON parser" {
-    const s = Settings{ .transcription_backend = .local, .talk_key = .left_option, .language = "", .delay = "high", .overlay = false, .pre_paste_ms = 42, .backtrack = true };
+    const s = Settings{ .transcription_backend = .local, .talk_key = .left_option, .language = "", .delay = "high", .overlay = false, .pre_paste_ms = 42, .backtrack = true, .log_transcripts = true };
     const text = serializeSettings(talloc, s) orelse return error.SerializeFailed;
     defer talloc.free(text);
     var diag: std.zon.parse.Diagnostics = .{};
@@ -716,6 +737,41 @@ test "serializeSettings round-trips through the ZON parser" {
     try std.testing.expect(!parsed.overlay);
     try std.testing.expectEqual(@as(u32, 42), parsed.pre_paste_ms);
     try std.testing.expect(parsed.backtrack);
+    try std.testing.expect(parsed.log_transcripts);
+    // The generated header is where a hand-editor discovers a setting with no menu group.
+    try std.testing.expect(std.mem.indexOf(u8, text, "//   .log_transcripts =") != null);
+}
+
+test "log_transcripts parses from config.zon and defaults to redacted when absent" {
+    var diag: std.zon.parse.Diagnostics = .{};
+    defer diag.deinit(talloc);
+    const parsed = try std.zon.parse.fromSliceAlloc(Settings, talloc, ".{ .log_transcripts = true }", &diag, .{});
+    try std.testing.expect(parsed.log_transcripts);
+    try std.testing.expect(!(Settings{}).log_transcripts); // the log carries no words by default
+}
+
+test "a Store swap republishes the log's redaction policy (#250)" {
+    const saved = feedback.logTranscripts();
+    defer feedback.setLogTranscripts(saved);
+
+    const quiet = Settings{};
+    var store = Store.init(&quiet);
+    try std.testing.expect(!feedback.logTranscripts()); // the first snapshot binds at init
+
+    const verbose = Settings{ .log_transcripts = true };
+    store.swap(&verbose);
+    try std.testing.expect(feedback.logTranscripts()); // …and every later one binds at swap
+
+    store.swap(&quiet);
+    try std.testing.expect(!feedback.logTranscripts());
+}
+
+test "diffSettings flags a log_transcripts change as plain (the swap republishes it)" {
+    const base = Settings{};
+    var b = base;
+    b.log_transcripts = true;
+    const d = diffSettings(&base, &b);
+    try std.testing.expect(d.any and !d.session_shaped and !d.overlay and !d.backend_selection);
 }
 
 test "backtrack parses from config.zon and defaults off when absent" {

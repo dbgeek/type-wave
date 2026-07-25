@@ -97,6 +97,13 @@ launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/me.ba78.type-wave.plist
 
 Logs (both stdout and stderr): `~/Library/Logs/type-wave.log`.
 
+That file is unrotated, uncapped plaintext and it is what the Status Item's **Diagnostics**
+action attaches to a bug report, so transcripts stay out of it: each Utterance's Partial and
+Final Transcripts are logged by **size**, alongside every state transition and timing the log
+already carried. Set `.log_transcripts = true` in `config.zon` to log the words verbatim while
+debugging a transcription problem, and set it back afterwards — it is a hand-edit-only escape
+hatch with no menu group.
+
 ## Grant the three permissions
 
 On its first run under launchd the daemon is its **own** TCC-responsible process, so the

@@ -14,8 +14,8 @@
 //!      to `~/Library/Logs/type-wave.log` — so that file is the daemon's diagnostic
 //!      surface without this module fighting launchd for the handle. In a foreground
 //!      `nix develop` run the same lines appear live in the terminal. Every state
-//!      transition + operational error goes through here; Partial Transcripts are
-//!      logged (never shown — there is no HUD yet).
+//!      transition + operational error goes through here; a Partial Transcript's
+//!      *arrival* is logged, but not its words — see the redaction policy below.
 //!
 //! This module knows nothing about the Talk Key, Capture, the Session, or Insertion —
 //! callers own the failure *policy* (what is an error, when to sound the error cue);
@@ -94,6 +94,92 @@ pub fn log(comptime fmt: []const u8, args: anytype) void {
         return;
     };
     std.debug.print("{s} {s}", .{ ts, msg });
+}
+
+// ---- transcript redaction (#250) --------------------------------------------
+//
+// The log narrates that an Utterance resolved, not what was said. Dictation is the one
+// input channel where people say things they would never paste into a log, and this log
+// is the worst possible place for it: unrotated, uncapped, no opt-out, readable by any
+// process running as the user, swept into `sysdiagnose` bundles and Time Machine, and
+// attached to bug reports by the Status Item's own Diagnostics action. The acceptance
+// gate already treats a transcript leaking into the *helper's* diagnostics as
+// release-blocking (acceptance/local_backend/collect.py); this is the same rule applied
+// one process up.
+//
+// So a transcript reaches the log as its **size**. `log_transcripts = true` in config.zon
+// puts the words back verbatim for debugging — a hand-edit-only escape hatch with no menu
+// group, like `pre_paste_ms`.
+
+/// Whether transcript text may be written to the log verbatim. Process-wide because this
+/// is a property of the log rather than of any one producer: it is republished by every
+/// `config.Store` snapshot that goes live, so no producer has to carry the flag and no
+/// new logging site can forget it. Default **false** — the safe reading is the one that
+/// holds before any config has loaded. Ordering is loose on purpose: a line either side
+/// of a flip is equally correct.
+var transcripts_verbatim = std.atomic.Value(bool).init(false);
+
+/// Publish the log's redaction policy from a Settings snapshot. Called by `config.Store`
+/// on init and on every swap.
+pub fn setLogTranscripts(on: bool) void {
+    transcripts_verbatim.store(on, .release);
+}
+
+/// The live policy, read at the moment a line is written.
+pub fn logTranscripts() bool {
+    return transcripts_verbatim.load(.acquire);
+}
+
+/// Scratch a caller lends `renderTranscript` for the redacted form. Comfortably over the
+/// widest `<N bytes>` any of our accumulators can produce.
+pub const transcript_render_len = 32;
+
+/// One transcript — or any other body too sensitive to log — as it reaches the log: the
+/// bytes themselves when the operator opted in, `<N bytes>` otherwise. Pure, with the
+/// policy as an argument rather than a read, so both renderings are asserted directly
+/// rather than by flipping process state around a test.
+pub fn renderTranscript(buf: *[transcript_render_len]u8, text: []const u8, verbatim: bool) []const u8 {
+    if (verbatim) return text;
+    return std.fmt.bufPrint(buf, "<{d} bytes>", .{text.len}) catch "<redacted>";
+}
+
+test "the redacted rendering carries no transcript bytes; the opt-in one is verbatim" {
+    var buf: [transcript_render_len]u8 = undefined;
+    const spoken = "my bank password is hunter2";
+
+    const redacted = renderTranscript(&buf, spoken, false);
+    try std.testing.expectEqualStrings("<27 bytes>", redacted);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "hunter2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "bank") == null);
+    // Nothing of the text survives: no three-byte run of it appears in the rendering,
+    // the same shape the acceptance gate's leak check uses on the helper's diagnostics.
+    var i: usize = 0;
+    while (i + 3 <= spoken.len) : (i += 1) {
+        try std.testing.expect(std.mem.indexOf(u8, redacted, spoken[i..][0..3]) == null);
+    }
+
+    try std.testing.expectEqualStrings(spoken, renderTranscript(&buf, spoken, true));
+}
+
+test "an empty transcript still renders its size, and a full accumulator fits the scratch" {
+    var buf: [transcript_render_len]u8 = undefined;
+    try std.testing.expectEqualStrings("<0 bytes>", renderTranscript(&buf, "", false));
+
+    // session.zig's `partial`/`final` accumulators are 8192 bytes; the widest rendering
+    // the log can be asked for must not fall back to "<redacted>".
+    var full: [8192]u8 = undefined;
+    @memset(&full, 'x');
+    try std.testing.expectEqualStrings("<8192 bytes>", renderTranscript(&buf, &full, false));
+}
+
+test "the log's redaction policy round-trips through the publisher" {
+    const saved = logTranscripts(); // other tests share the process-wide flag
+    defer setLogTranscripts(saved);
+
+    setLogTranscripts(true);
+    try std.testing.expect(logTranscripts());
+    setLogTranscripts(false);
+    try std.testing.expect(!logTranscripts());
 }
 
 // ---- sound cues (AudioToolbox, pure C) --------------------------------------
