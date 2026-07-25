@@ -48,7 +48,9 @@
 //!                        dictation.
 //!   - rewrite worker   : the RewriteAdapter (docs/backtrack-spec.md) — drains one
 //!                        Backtrack rewrite job, makes the OpenAI Responses call off the
-//!                        Coordinator's mutex, then reports `.rewritten`.
+//!                        Coordinator's mutex, then reports `.rewritten`. The call is
+//!                        bounded (openai_rewrite.call_deadline_ms), so one endpoint that
+//!                        never answers cannot park this single worker for good.
 //!   - deadline timer   : the DeadlineAdapter — fires `.deadline` if a Final Transcript does
 //!                        not arrive within the release-anchored window.
 //!   - supervisor       : the self-heal loop (config phase above).
@@ -657,7 +659,7 @@ const RealRewriteDeps = struct {
         // retain a key, and this path is not one.
         const key = config.loadApiKeyOnly(d.io, d.alloc) orelse return error.RewriteKeyMissing;
         defer api_key.scrub(d.alloc, key);
-        return openai_rewrite.rewrite(&d.rewrite_http, d.alloc, key, raw, out);
+        return openai_rewrite.rewrite(d.io, &d.rewrite_http, d.alloc, key, raw, out);
     }
     pub fn complete(self: *RealRewriteDeps, id: coord.UtteranceId, text: []const u8, result: coord.RewriteResult) void {
         self.on_done(self.co_ctx, id, text, result);

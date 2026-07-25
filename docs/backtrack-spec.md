@@ -107,6 +107,19 @@ exceed 2.5 s, with rare 9.8 s / 14.7 s outliers — so ~3 s is the spec budget a
 fallback covers the rest. Independent of the release-anchored 15 s deadline (which
 is cancelled when the Final Transcript arrives).
 
+**Call deadline — 5 s, and it is not the budget** ([#257](https://github.com/dbgeek/type-wave/issues/257),
+`openai_rewrite.call_deadline_ms`). The ~3 s budget above bounds how long the
+*Utterance* waits; it never unblocks the worker thread. Since the Rewrite adapter runs
+a single worker that claims its next job only when the current call returns, an
+endpoint that accepts the request and then answers nothing would park that worker for
+the process's life — every later Utterance staging a Rewrite nobody claims, Backtrack
+silently gone until restart, with no evidence but a log line that stops appearing. So
+one call is also bounded end to end, connect through read: 5 s, i.e. the budget plus a
+small margin. Nothing under the budget is at risk, and by 3 s a still-running call has
+already been superseded by the raw insert, so cutting it costs only a warm pooled
+connection. The user never meets this deadline as a fallback — the budget always fires
+first. It exists so the *feature* survives, not this Utterance.
+
 **Fallback — never lose dictation, and flag the downgrade.** On timeout, API error,
 or rate limit: insert the **raw** Final Transcript, show the degraded-insertion
 flash (see [UX](#settings--ux-140)), and log one line. The error cue sound is **not**
@@ -234,6 +247,8 @@ practice), adding one is a cheap additive change under the same raw-insert fallb
 
 - **Timeout: 2.5 s → ~3 s** (from #141's measured latency tail; supersedes #138's
   2.5 s).
+- **A second, distinct bound: the 5 s call deadline** (#257) — the budget protects the
+  Utterance, the call deadline protects the worker, and neither substitutes for the other.
 - **ADR-0002 exception**: a single semantic accent (`systemOrangeColor`) is
   permitted for the degraded-insertion flash — [ADR-0004](adr/0004-backtrack-degraded-insertion-amber-accent.md).
 - **No per-utterance size cap** (resolved here from #137's negligible-cost finding
