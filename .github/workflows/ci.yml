@@ -16,11 +16,28 @@
 #
 # The `test` job name is the required status-check context on `main` (branch protection).
 #
-# Zig-change gating (pull_request only): the job ALWAYS runs so the required `test`
-# context is always posted — otherwise a path-filtered workflow would never report and
-# branch protection would block the merge forever. Instead we detect whether any Zig
-# sources changed and skip the expensive Nix + `zig build test` steps when they didn't,
-# reporting a fast green `test`. push(main)/workflow_dispatch always run the full gate.
+# Change gating (pull_request only): the job ALWAYS runs so the required `test` context is
+# always posted — otherwise a path-filtered workflow would never report and branch
+# protection would block the merge forever. Instead the gate switch decides whether to run
+# the expensive Nix + `zig build test` steps. push(main)/workflow_dispatch always run the
+# full gate.
+#
+# The switch is a SKIPLIST, not a run list, and that direction is the point (ticket #258).
+# It used to run only on `**/*.zig` + `build.zig.zon`, which meant every non-Zig change —
+# the installer, the tooling scripts, the acceptance gate, the flake inputs, these workflow
+# files — merged behind a required check that reported green without having run. The
+# sharpest case: `tools/build-whisper-runtime.sh` carries the size + SHA-256 verification of
+# the whisper.cpp tarball, so an edit weakening the one thing standing between a substituted
+# upstream archive and our build was not a Zig change and so was never tested.
+#
+# So the gate now runs by default and skips only for paths nothing in the build or the suite
+# reads. A directory nobody remembered to classify is substantive, and runs — the switch
+# fails toward running the gate, never toward a green skip. Everything that can go wrong here
+# (an unreadable file list, an API failure) fails the job, which blocks the merge, rather than
+# reporting the fast green.
+#
+# The changed-file list comes straight from the PR API rather than a third-party filter
+# action, so the decision to skip the release gate depends on nothing outside this file.
 
 name: CI
 
@@ -48,25 +65,54 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # On pull_request, flag whether any Zig sources changed vs the base ref.
-      - name: Detect Zig changes
-        id: changes
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            zig:
-              - '**/*.zig'
-              - 'build.zig.zon'
-
-      # Single gate switch: run the full suite unless this is a PR with no Zig changes.
+      # Single gate switch: run the full suite unless every file this PR touches is inert.
       - name: Decide whether to run the gate
         id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ] || [ "${{ steps.changes.outputs.zig }}" = "true" ]; then
+          set -euo pipefail
+
+          # Paths nothing in the build or the test suite reads. Extend this only for files
+          # that are provably inert — anything not listed here runs the gate.
+          INERT='(^docs/|^assets/|^\.claude/|^LICENSE$|\.md$)'
+
+          # …except the docs the suite actually asserts on, which gate like source. Kept
+          # honest from the other end by PackagingTests.test_gate_covers_the_docs_this_suite_reads.
+          GATE_INPUT_DOCS='^docs/packaging\.md$'
+
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # `set -e` makes an API failure fail the job — a merge blocked on a red required
+          # check, never a merge waved through on a green one.
+          files="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --jq '.[].filename')"
+
+          if [ -z "$files" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Could not read this PR's changed files — running the full gate." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          substantive="$(
+            { printf '%s\n' "$files" | grep -Ev "$INERT" || true
+              printf '%s\n' "$files" | grep -E "$GATE_INPUT_DOCS" || true
+            } | sort -u
+          )"
+
+          if [ -n "$substantive" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "Running the full gate — these changed files are not inert:"
+              echo
+              printf '%s\n' "$substantive" | sed 's/^/- `/; s/$/`/'
+            } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "No Zig files changed in this PR — skipping the build/test gate." >> "$GITHUB_STEP_SUMMARY"
+            echo "Every file in this PR is inert (docs, assets, agent config) — skipping the build/test gate." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # Reproduce the exact pinned dev shell (Zig + cmake/ninja/python3/mypy) from flake.lock.
