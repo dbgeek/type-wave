@@ -21,6 +21,9 @@ comptime {
 
 const startup_timeout_ms: u32 = 15_000;
 
+/// Sentinel for a parent-side pipe end already retired by its owner.
+const closed_fd: std.c.fd_t = -1;
+
 const StartupRead = struct {
     allocator: std.mem.Allocator,
     fd: std.c.fd_t,
@@ -67,9 +70,21 @@ fn spawnWarm(
         .stdout = .pipe,
         .stderr = .inherit,
     });
-    errdefer child.kill(io);
-
+    // The parent-side pipe ends are taken away from `child` immediately: `kill` closes
+    // whatever handles the child still carries, and a descriptor number freed under a
+    // thread that still holds it would be recycled by the next open. From here a kill
+    // only terminates the process; the ends are closed by the code that owns them —
+    // in this function, only after the startup reader has been joined.
+    const stdin_fd = child.stdin.?.handle;
     const stdout_fd = child.stdout.?.handle;
+    child.stdin = null;
+    child.stdout = null;
+    errdefer {
+        child.kill(io);
+        _ = std.c.close(stdin_fd);
+        _ = std.c.close(stdout_fd);
+    }
+
     var startup = StartupRead{ .allocator = allocator, .fd = stdout_fd };
     const reader = try std.Thread.spawn(.{}, StartupRead.run, .{&startup});
     var waited_ms: u32 = 0;
@@ -98,7 +113,7 @@ fn spawnWarm(
     if (event != .ready) return error.HelperDidNotBecomeReady;
     return .{
         .child = child,
-        .stdin_fd = child.stdin.?.handle,
+        .stdin_fd = stdin_fd,
         .stdout_fd = stdout_fd,
         .supervisor = supervisor,
     };
@@ -115,6 +130,9 @@ pub fn smokeTest(
 ) !void {
     var process = try spawnWarm(allocator, io, executable, model, helper_core.pinnedArtifact(), cancel);
     process.child.kill(io);
+    // No reader or writer thread exists here, so this thread owns both ends.
+    _ = std.c.close(process.stdin_fd);
+    _ = std.c.close(process.stdout_fd);
 }
 
 fn spawnWarmWithRecovery(
@@ -142,6 +160,10 @@ pub const ProcessHelper = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     child: std.process.Child,
+    /// Parent-side pipe ends, detached from `child` at spawn so a kill can only
+    /// terminate the process, never free a descriptor number a thread still holds.
+    /// The write side is closed only under `write_mu`, the read side only on the
+    /// reader-owner thread; `closed_fd` marks an end already retired.
     stdin_fd: std.c.fd_t,
     stdout_fd: std.c.fd_t,
     supervisor: helper_supervisor.Supervisor,
@@ -175,7 +197,11 @@ pub const ProcessHelper = struct {
     ) !*ProcessHelper {
         const recovered = try spawnWarmWithRecovery(allocator, io, executable, model, artifact);
         var instance = recovered.process;
-        errdefer instance.child.kill(io);
+        errdefer {
+            instance.child.kill(io);
+            _ = std.c.close(instance.stdin_fd);
+            _ = std.c.close(instance.stdout_fd);
+        }
 
         const self = try allocator.create(ProcessHelper);
         errdefer allocator.destroy(self);
@@ -363,6 +389,40 @@ pub const ProcessHelper = struct {
         thread.detach();
     }
 
+    /// Retires the current parent-side pipe ends. The caller must hold `write_mu` — the
+    /// write side's owner — and be the reader-owner thread, the read side's owner: the
+    /// only context allowed to close these numbers. A kill never closes them, so a freed
+    /// number can never be recycled under a thread about to use it.
+    fn closeEndpointsLocked(self: *ProcessHelper) void {
+        if (self.stdin_fd == closed_fd and self.stdout_fd == closed_fd) return;
+        if (self.stdin_fd != closed_fd) {
+            _ = std.c.close(self.stdin_fd);
+            self.stdin_fd = closed_fd;
+        }
+        if (self.stdout_fd != closed_fd) {
+            _ = std.c.close(self.stdout_fd);
+            self.stdout_fd = closed_fd;
+        }
+        // Retiring the ends invalidates every descriptor a write worker has captured:
+        // a worker that only reaches `write_mu` after this hold re-checks the
+        // generation and bails, so no syscall ever lands on a retired number.
+        self.generation +%= 1;
+    }
+
+    /// The reader-owner's terminal exit. The ends are retired *before* ownership is
+    /// conceded — `recovering` drops inside the same hold as the close — so a successor
+    /// spawned by `retry` can never install fresh ends that a late predecessor would
+    /// close. Any writer parked on the write side has been woken by the kill that made
+    /// this exit terminal, so `write_mu` is obtainable.
+    fn retireAsOwner(self: *ProcessHelper) void {
+        self.write_mu.lockUncancelable(self.io);
+        defer self.write_mu.unlock(self.io);
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.closeEndpointsLocked();
+        self.recovering = false;
+    }
+
     fn readerLoop(self: *ProcessHelper) void {
         while (!self.stopped.load(.acquire)) {
             var frame = ipc.readFd(self.allocator, self.stdout_fd) catch {
@@ -400,6 +460,10 @@ pub const ProcessHelper = struct {
                 else => unreachable,
             }
         }
+        // Shutdown observed between frames: the reader-owner retires the ends on its
+        // way out. Every early `return` above exits through a false `recover`, which
+        // has already retired them.
+        self.retireAsOwner();
     }
 
     /// Returns false when the recovery budget has latched or shutdown has begun.
@@ -426,12 +490,14 @@ pub const ProcessHelper = struct {
         if (self.recover()) self.readerLoop();
     }
 
+    /// A false return is the reader-owner's terminal exit and always goes through
+    /// `retireAsOwner`, so the pipe ends never outlive their owning thread.
     fn recover(self: *ProcessHelper) bool {
         while (!self.stopped.load(.acquire)) {
             self.mu.lockUncancelable(self.io);
             const delay = self.recovery.failed() orelse {
-                self.recovering = false;
                 self.mu.unlock(self.io);
+                self.retireAsOwner();
                 return false;
             };
             const terminal = self.recovery.latched();
@@ -440,12 +506,13 @@ pub const ProcessHelper = struct {
             var waited_ms: u32 = 0;
             while (waited_ms < delay and !self.stopped.load(.acquire)) : (waited_ms += 50)
                 _ = usleep(50_000);
-            if (self.stopped.load(.acquire)) return false;
+            if (self.stopped.load(.acquire)) {
+                self.retireAsOwner();
+                return false;
+            }
             self.launch() catch {
                 if (terminal) {
-                    self.mu.lockUncancelable(self.io);
-                    self.recovering = false;
-                    self.mu.unlock(self.io);
+                    self.retireAsOwner();
                     return false;
                 }
                 continue;
@@ -455,18 +522,28 @@ pub const ProcessHelper = struct {
             self.mu.unlock(self.io);
             return true;
         }
+        self.retireAsOwner();
         return false;
     }
 
+    /// Only ever runs on the reader-owner thread (via `recover`), which together with
+    /// holding `write_mu` is what entitles it to retire the previous pipe ends. Those
+    /// ends stay open until this point, so the replacement helper's pipes — created in
+    /// `spawnWarm` above, before `write_mu` is held — cannot take their numbers.
     fn launch(self: *ProcessHelper) !void {
         var instance = try spawnWarm(self.allocator, self.io, self.executable, self.model, self.artifact, null);
-        errdefer instance.child.kill(self.io);
+        errdefer {
+            instance.child.kill(self.io);
+            _ = std.c.close(instance.stdin_fd);
+            _ = std.c.close(instance.stdout_fd);
+        }
 
         self.write_mu.lockUncancelable(self.io);
         defer self.write_mu.unlock(self.io);
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         if (self.stopped.load(.acquire)) return error.ShuttingDown;
+        self.closeEndpointsLocked();
         self.child = instance.child;
         self.stdin_fd = instance.stdin_fd;
         self.stdout_fd = instance.stdout_fd;
@@ -564,6 +641,58 @@ test "a hard cancel of a Segment blocked mid-write fails the Utterance, not the 
     while (!helper.isReady() and waited_ms < 6_000) : (waited_ms += 50) _ = usleep(50_000);
     try std.testing.expect(helper.isReady());
     try helper.reserveUtterance(994);
+}
+
+test "a hard cancel never frees descriptor numbers under the parked writer" {
+    var helper = try ProcessHelper.start(
+        std.testing.allocator,
+        std.testing.io,
+        "acceptance/local_backend/stalling_helper.py",
+        "deaf", // becomes ready, then never drains stdin again
+        helper_core.pinnedArtifact(),
+    );
+    defer {
+        helper.shutdown();
+        _ = usleep(200_000);
+        std.testing.allocator.free(helper.executable);
+        std.testing.allocator.free(helper.model);
+        std.testing.allocator.destroy(helper);
+    }
+
+    const stdin_fd = helper.stdin_fd;
+    const stdout_fd = helper.stdout_fd;
+
+    const pcm = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(pcm);
+    @memset(pcm, 0);
+    try helper.reserveUtterance(995);
+    try helper.submit(995, .english, "", pcm);
+    _ = usleep(300_000); // the submit worker is parked inside write(2), mid-frame
+
+    helper.cancel(995);
+
+    // POSIX hands out the lowest free descriptor numbers: were the kill still closing
+    // the parent-side ends, this sentinel pipe — opened right behind it — would take
+    // exactly those numbers, and the parked writer's next write(2) would deliver the
+    // rest of the frame, microphone PCM included, into it. The ends stay with their
+    // owning threads, so the sentinel must come out with fresh numbers.
+    var sentinel: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&sentinel));
+    defer {
+        _ = std.c.close(sentinel[0]);
+        _ = std.c.close(sentinel[1]);
+    }
+    try std.testing.expect(sentinel[0] != stdin_fd and sentinel[0] != stdout_fd);
+    try std.testing.expect(sentinel[1] != stdin_fd and sentinel[1] != stdout_fd);
+
+    // Recovery retires the old numbers under write_mu on the reader thread and installs
+    // a replacement helper; through all of it not one byte may reach the sentinel.
+    var waited_ms: usize = 0;
+    while (!helper.isReady() and waited_ms < 6_000) : (waited_ms += 50) _ = usleep(50_000);
+    try std.testing.expect(helper.isReady());
+
+    var probe = [_]std.c.pollfd{.{ .fd = sentinel[0], .events = std.c.POLL.IN, .revents = 0 }};
+    try std.testing.expectEqual(@as(c_int, 0), std.c.poll(&probe, 1, 0));
 }
 
 const AtomicFaultRecorder = struct {
