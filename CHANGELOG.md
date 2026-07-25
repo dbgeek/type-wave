@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.3](https://github.com/dbgeek/type-wave/compare/v0.3.2...v0.3.3) (2026-07-25)
+
+
+### Bug Fixes
+
+* **undo:** ⌃⌘⌫ deletes again, and a held Secure Event Input says so ([#246](https://github.com/dbgeek/type-wave/issues/246)) ([64114f7](https://github.com/dbgeek/type-wave/commit/64114f7fa5b710aec440278eb83fa00763baf4ff))
+
 ## [0.3.2](https://github.com/dbgeek/type-wave/compare/v0.3.1...v0.3.2) (2026-07-24)
 
 
