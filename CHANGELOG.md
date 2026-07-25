@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.4](https://github.com/dbgeek/type-wave/compare/v0.3.3...v0.3.4) (2026-07-25)
+
+
+### Features
+
+* **log:** the user can clear the daemon's log from the Status Item ([#252](https://github.com/dbgeek/type-wave/issues/252)) ([#262](https://github.com/dbgeek/type-wave/issues/262)) ([50466c4](https://github.com/dbgeek/type-wave/commit/50466c400b2e4bdf23d85d4ec97e28de15b24d7f))
+
+
+### Bug Fixes
+
+* **insert:** an Insertion proves its Focused Target before it pastes ([#265](https://github.com/dbgeek/type-wave/issues/265)) ([6c623d0](https://github.com/dbgeek/type-wave/commit/6c623d06e949becd5792febb95d647d21e22bd7d)), closes [#255](https://github.com/dbgeek/type-wave/issues/255)
+* **ipc:** a broken pipe fails the write, not the process ([#253](https://github.com/dbgeek/type-wave/issues/253)) ([#263](https://github.com/dbgeek/type-wave/issues/263)) ([3c529e3](https://github.com/dbgeek/type-wave/commit/3c529e3c01f96edccfe006f18ca47b36532d3c3d))
+* **key:** the daemon holds one API key copy, and scrubs it ([#254](https://github.com/dbgeek/type-wave/issues/254)) ([#264](https://github.com/dbgeek/type-wave/issues/264)) ([7c326ba](https://github.com/dbgeek/type-wave/commit/7c326ba49878b49ffb52002a7564dbabe18c18af))
+* **log:** the daemon's log records that an Utterance resolved, not what was said ([#259](https://github.com/dbgeek/type-wave/issues/259)) ([c8e9d9c](https://github.com/dbgeek/type-wave/commit/c8e9d9cbd9a4536a537658d1d511dbf5b0dc080b)), closes [#250](https://github.com/dbgeek/type-wave/issues/250)
+* **model:** re-prove the trusted origin on every redirect hop ([#261](https://github.com/dbgeek/type-wave/issues/261)) ([90265cf](https://github.com/dbgeek/type-wave/commit/90265cf0b64eb8901b74534da4da5a0855048905))
+* **rewrite:** a Rewrite that never answers fails, it doesn't retire Backtrack ([#257](https://github.com/dbgeek/type-wave/issues/257)) ([#267](https://github.com/dbgeek/type-wave/issues/267)) ([d98e016](https://github.com/dbgeek/type-wave/commit/d98e016c52f39237a3752a5ae06acfb565fcc29a))
+* **undo:** a long deletion re-proves its Focused Target as it goes ([#266](https://github.com/dbgeek/type-wave/issues/266)) ([027bab6](https://github.com/dbgeek/type-wave/commit/027bab6c11907d45e7081e45c45e2bf28782dc04)), closes [#256](https://github.com/dbgeek/type-wave/issues/256)
+
 ## [0.3.3](https://github.com/dbgeek/type-wave/compare/v0.3.2...v0.3.3) (2026-07-25)
 
 
