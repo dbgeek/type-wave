@@ -201,6 +201,16 @@ pub fn Undo(comptime Deps: type) type {
                 self.refuse(.already_undone, "the newest Insertion is already undone");
                 return;
             }
+            // The newest record never put bytes at the cursor — the mechanism failed, or the
+            // Focused Target gate refused the paste (ADR-0009 amendment). Its clusters are
+            // still counted and its text is still re-insertable, but backspacing that count
+            // would delete whatever the user *did* write since. `.no_target` is the honest
+            // reason for the same reason the degenerate-record exit uses it: this record
+            // cannot be a target, and every reason collapses to the one red cue anyway.
+            if (!target.landed) {
+                self.refuse(.no_target, "the newest Insertion never reached the cursor — there is nothing of it to delete");
+                return;
+            }
 
             // One `⌫` per extended grapheme cluster (#220), trailing Insertion space
             // included (#214 — restore the pre-Insertion state).
@@ -394,6 +404,42 @@ test "undo on an empty ring posts nothing (no_target) and fires the refuse cue (
     try expectEqual(@as(usize, 1), runner.deps.undo_refuses);
     // No target means nothing would post, so the cross-process focus read is skipped.
     try expectEqual(@as(usize, 0), runner.deps.focus_reads);
+}
+
+test "a record whose text never reached the cursor is not a deletion target" {
+    // The ring keeps records that never inserted — that is the recovery case Recent
+    // Insertions exists for — but Undo deletes by *count*. Backspacing this record's clusters
+    // would eat that many clusters of whatever the user actually typed since.
+    for ([_]coord.InsertResult{ .refused, .failed }) |never_landed| {
+        var ring = recent_insertions.Ring{};
+        var record = rec("never landed ", 1, slack);
+        record.outcome = never_landed;
+        ring.record(record);
+        var runner = Runner.init(&ring, .{ .focused_app = slack });
+
+        runner.request();
+        try expect(runner.runOnce());
+
+        try expectEqual(@as(usize, 0), runner.deps.deletes);
+        try expectEqual(@as(usize, 1), runner.deps.undo_refuses);
+        // Nothing would post, so the cross-process read is skipped as on every other
+        // no-target exit.
+        try expectEqual(@as(usize, 0), runner.deps.focus_reads);
+    }
+}
+
+test "a degraded record IS a deletion target — the raw text still landed" {
+    var ring = recent_insertions.Ring{};
+    var record = rec("raw fallback ", 1, slack);
+    record.outcome = .degraded;
+    ring.record(record);
+    var runner = Runner.init(&ring, .{ .focused_app = slack });
+
+    runner.request();
+    try expect(runner.runOnce());
+
+    try expectEqual(@as(usize, 1), runner.deps.deletes);
+    try expectEqual(@as(usize, 1), runner.deps.undo_confirms);
 }
 
 test "a record with zero grapheme clusters refuses without reading the frontmost app" {

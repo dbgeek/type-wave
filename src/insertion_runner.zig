@@ -8,6 +8,13 @@
 //!   **every cursor job resolves at drain time, on the Insert Worker, beside the effect it
 //!   authorizes — and any ring bookkeeping flips only after that effect landed.**
 //!
+//! A dictation job additionally **proves its Focused Target**. The Coordinator notes the
+//! frontmost app when the Talk Key is released (`noteTarget`); this module re-reads it at
+//! drain time, immediately before the paste, and refuses when it has positively changed —
+//! the Undo Runner's gate, applied to the additive path that runs on every Utterance and
+//! whose window (transcription latency plus the whole Rewrite budget) is the *longer* of the
+//! two. It differs from Undo in exactly one way, and deliberately: see `targetChange`.
+//!
 //! For a dictation job that means copying the transcript, applying the Insertion separator,
 //! reading the Settings Snapshot at execution time, running the slow macOS mechanism off the
 //! Coordinator mutex, and reporting the **landed bytes** back through the reverse edge —
@@ -52,6 +59,32 @@ pub const MenuAction = enum { copy, reinsert };
 /// each. The stamp is the record's stable capture `timestamp`, the same identity the ring's
 /// `textForStamp` / `clearUndone` and the menu's reveal state key on.
 const MenuJob = struct { action: MenuAction, stamp: i64 };
+
+/// Positive evidence that the Focused Target moved: both readings existed and they differ.
+/// Returned rather than reduced to a bool so the refusal's log has both identities without
+/// re-unwrapping optionals the predicate has already checked.
+const TargetChange = struct { from: coord.AppIdentity, to: coord.AppIdentity };
+
+/// The **Focused Target gate** (ADR-0009 amendment): did the frontmost app at paste time
+/// positively change from the one the Utterance was dictated into? `expected` is the reading
+/// `noteTarget` took at Talk Key release; `fresh` the one taken immediately before the paste.
+/// Null means insert.
+///
+/// The comparison is the Undo Runner's, byte for byte — bundle id **and** display name, the
+/// strictest rule #213 offers. **Which way it fails when a reading is missing is not.** Undo
+/// deletes, so a missing reading on either side refuses (`undo.evaluate` returns
+/// `.focus_null`). An Insertion is additive and is the entire purpose of the app, so absence
+/// is treated as consent: refusing on an unreadable frontmost would break dictation outright
+/// on the first app that does not report cleanly, which is far worse than the rare
+/// mis-target. **Only positive evidence of a change refuses.** The asymmetry is deliberate —
+/// if this ever reads as an oversight, read `undo.evaluate` beside it.
+fn targetChange(expected: ?coord.AppIdentity, fresh: ?coord.AppIdentity) ?TargetChange {
+    const e = expected orelse return null; // no baseline — insert
+    const f = fresh orelse return null; // nothing to compare against — insert
+    if (std.mem.eql(u8, e.bundleId(), f.bundleId()) and
+        std.mem.eql(u8, e.displayName(), f.displayName())) return null;
+    return .{ .from = e, .to = f };
+}
 
 /// The Insertion Runner's dependency seam: everything the OS and the Coordinator own.
 /// Asserted by name here and invoked by the Runner itself below, so a production adapter can
@@ -106,6 +139,17 @@ pub fn InsertionRunner(comptime Deps: type) type {
         /// the final→inserted split in the timing logs (issues #36–#38). Ordered across
         /// threads by the `pending` release-store / acquire-swap, like `job`.
         submitted_at_ms: i64 = 0,
+        /// The Focused Target this Utterance was dictated into: the frontmost app as
+        /// `noteTarget` read it at Talk Key release, compared against a fresh reading at paste
+        /// time by `targetChange`. Null means no reading — which inserts, per that
+        /// predicate's fail-open rule.
+        ///
+        /// One note per submit, always: the Coordinator takes it on the release edge of the
+        /// same Utterance that later submits, and ADR-0001's fully-serialized lifecycle means
+        /// no second Utterance can interleave. Written before `submit`, so the same `pending`
+        /// release-store / acquire-swap that publishes `job` publishes this too — it needs no
+        /// synchronization of its own.
+        target: ?coord.AppIdentity = null,
         pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
         /// The **Coordinator-less** menu queue (recent-insertions spec §5/§5.2, issues
@@ -130,6 +174,16 @@ pub fn InsertionRunner(comptime Deps: type) type {
 
         pub fn init(ring: *recent_insertions.Ring, deps: Deps) Self {
             return .{ .ring = ring, .deps = deps };
+        }
+
+        /// Coordinator seam, called on the Talk Key release edge: capture the Focused Target
+        /// this Utterance is being dictated into (ADR-0009 amendment). One cross-process
+        /// `frontmost()` read, on the tap's run-loop thread under the Coordinator's mutex —
+        /// the only point in the lifecycle where that is affordable, and the Coordinator
+        /// documents why at the call site. Best-effort: a null reading simply leaves the gate
+        /// with no baseline, which inserts.
+        pub fn noteTarget(self: *Self) void {
+            self.target = self.deps.focusedApp();
         }
 
         /// Coordinator seam. Runs under the Coordinator's mutex; must not block. The
@@ -187,10 +241,42 @@ pub fn InsertionRunner(comptime Deps: type) type {
             return false;
         }
 
-        /// Drain the one pending dictation job: insert it, report `.inserted` back into the
-        /// Coordinator (which records the Insertion Record), then drain the deferred restore.
+        /// Drain the one pending dictation job: prove the Focused Target, insert it, report
+        /// `.inserted` back into the Coordinator (which records the Insertion Record), then
+        /// drain the deferred restore.
         fn runInsertion(self: *Self) void {
             const t_pick = feedback.nowMs();
+
+            // The Focused Target gate (ADR-0009 amendment). Fresh, cross-process, and taken
+            // *before* the paste — the one placement that can actually stop bytes from
+            // landing, where the pre-amendment read happened after and was only ever a
+            // receipt. It doubles as the Insertion Record's App Identity hint below, so the
+            // gate costs no extra query: on the insert path it is what the text landed in,
+            // proven rather than guessed.
+            const fresh = self.deps.focusedApp();
+            const expected = self.target;
+            self.target = null; // one note, one job — never gate a later job on a stale one
+            if (targetChange(expected, fresh)) |change| {
+                feedback.log(
+                    "  insertion refused: the Focused Target changed since the Talk Key was released ({s} → {s}) — nothing pasted; re-insert it from Recent Insertions\n",
+                    .{ change.from.displayName(), change.to.displayName() },
+                );
+                // The same red bloom + shake every cursor action that did nothing shows
+                // (ADR-0007/ADR-0009) — the Coordinator adds no second verb for `.refused`.
+                self.deps.actionRefused();
+                // Reported like any other resolution so the Utterance leaves `.inserting` and
+                // the transcript is retained: a `.refused` record is kept exactly as a
+                // `.failed` one is (ADR-0006 §2.2, the recovery case), which is what makes the
+                // refusal recoverable from Recent Insertions. `expected` is the hint, not
+                // `fresh` — the record names the app the Utterance was dictated into, and
+                // claiming the app that stole focus would be a plain lie about text that never
+                // went there.
+                self.deps.complete(self.job_id, .refused, expected, self.job[0..self.job_len]);
+                // A no-op unless a *prior* job left a restore pending; kept for the same
+                // reason `runCopy` drains first.
+                self.deps.finishInsert();
+                return;
+            }
 
             const z: [*:0]const u8 = @ptrCast(&self.job);
             const plan = self.deps.insertionPlan();
@@ -208,10 +294,15 @@ pub fn InsertionRunner(comptime Deps: type) type {
                 const note = if (result == .degraded) " [raw fallback]" else "";
                 feedback.log("  inserted at the cursor (+{d}ms after the Final Transcript; mechanism {d}ms){s}\n", .{ now - self.submitted_at_ms, now - t_pick, note });
             }
-            // App Identity hint for the Insertion Record (ADR-0006 §3.3): read off-mutex here,
-            // the moment the text landed — never under coordinator.mu — and carried back
-            // through the `.inserted` report. Best-effort; a null just leaves the hint empty.
-            const focused_app = self.deps.focusedApp();
+            // App Identity hint for the Insertion Record (ADR-0006 §3.3): the gate's own fresh
+            // reading, taken off-mutex on this worker a moment *before* the text landed rather
+            // than after it. Reusing it is what keeps the drain at one cross-process query
+            // instead of two, and it is the stronger hint — the paste is gated on it, where
+            // the post-paste read was a guess taken after the fact. `expected` covers the case
+            // where the gate had a baseline but the fresh read came back null (absence is
+            // consent, so the paste went ahead; the release-time reading is still the best
+            // name for where it went).
+            const focused_app = fresh orelse expected;
             // Report completion *before* the deferred clipboard restore (issue #38): the
             // Coordinator leaves `.inserting` at the Cmd-V settle, so the ~300 ms restore
             // pads this worker's time, not the lockout. Serialization is the ordering
@@ -416,11 +507,19 @@ const FakeDeps = struct {
 const Runner = InsertionRunner(FakeDeps);
 
 const slack = coord.AppIdentity.init("com.tinyspeck.slackmacgap", "Slack");
+const notes = coord.AppIdentity.init("com.apple.Notes", "Notes");
+/// Same bundle id, different display name — the half of the gate a bundle-only comparison
+/// would miss, and the reason the rule names both fields (as `undo.evaluate` does).
+const slack_renamed = coord.AppIdentity.init("com.tinyspeck.slackmacgap", "Slack Canary");
 
 /// One stored Insertion Record, as the Coordinator would have committed it — with-space
 /// bytes, since this module is what applied the separator on the way to the cursor.
 fn rec(text: []const u8, stamp: i64) coord.InsertionRecord {
-    return .{ .inserted = text, .raw = null, .timestamp = stamp, .outcome = .ok, .focused_app = slack };
+    return outcomeRec(text, stamp, .ok);
+}
+
+fn outcomeRec(text: []const u8, stamp: i64, outcome: coord.InsertResult) coord.InsertionRecord {
+    return .{ .inserted = text, .raw = null, .timestamp = stamp, .outcome = outcome, .focused_app = slack };
 }
 
 // --- dictation jobs -----------------------------------------------------------------
@@ -557,6 +656,168 @@ test "a null focused app carries through as a null hint" {
     runner.submit(7, "hello", .normal);
     try std.testing.expect(runner.runOnce());
     try std.testing.expect(runner.deps.last_focused_app == null);
+}
+
+// --- the Focused Target gate (ADR-0009 amendment) ------------------------------------
+
+/// Drive one Utterance the way the Coordinator does: note the target on the release edge,
+/// then let `at_drain` stand in for whatever the user did during transcription and the
+/// Rewrite budget before the job drains.
+fn dictateInto(runner: *Runner, at_release: ?coord.AppIdentity, at_drain: ?coord.AppIdentity) void {
+    runner.deps.focused_app = at_release;
+    runner.noteTarget();
+    runner.submit(7, "the secret", .normal);
+    runner.deps.focused_app = at_drain;
+}
+
+test "the Focused Target is unchanged, so the transcript inserts" {
+    var ring = recent_insertions.Ring{};
+    var runner = Runner.init(&ring, .{});
+
+    dictateInto(&runner, slack, slack);
+    try std.testing.expect(runner.runOnce());
+
+    try std.testing.expectEqualStrings("the secret ", runner.deps.lastText());
+    try std.testing.expectEqual(coord.InsertResult.ok, runner.deps.last_completion);
+    try std.testing.expectEqual(@as(usize, 0), runner.deps.refuses);
+    // Two cross-process reads for the whole Utterance — one at the release note, one at the
+    // drain — and the drain's single reading serves both the gate and the record's App
+    // Identity hint. The gate costs the note; it does not also cost a second read here.
+    try std.testing.expectEqual(@as(usize, 2), runner.deps.focus_reads);
+    try std.testing.expectEqualStrings("Slack", runner.deps.last_focused_app.?.displayName());
+}
+
+test "a changed Focused Target refuses: nothing is pasted and nothing touches the pasteboard" {
+    var ring = recent_insertions.Ring{};
+    var runner = Runner.init(&ring, .{});
+
+    // The window the finding names: between the Talk Key release and the paste there is
+    // transcription latency and, with Backtrack on, the whole Rewrite budget — long enough to
+    // switch apps deliberately, and long enough for an app to steal activation on its own.
+    dictateInto(&runner, slack, notes);
+    try std.testing.expect(runner.runOnce());
+
+    try std.testing.expectEqual(@as(usize, 0), runner.deps.calls); // nothing pasted
+    try std.testing.expectEqual(@as(usize, 0), runner.deps.copies); // pasteboard untouched
+    try std.testing.expectEqual(coord.InsertResult.refused, runner.deps.last_completion);
+}
+
+test "a display-name change alone refuses — the gate compares both fields, as Undo's does" {
+    var ring = recent_insertions.Ring{};
+    var runner = Runner.init(&ring, .{});
+
+    dictateInto(&runner, slack, slack_renamed);
+    try std.testing.expect(runner.runOnce());
+
+    try std.testing.expectEqual(@as(usize, 0), runner.deps.calls);
+    try std.testing.expectEqual(coord.InsertResult.refused, runner.deps.last_completion);
+}
+
+test "a refusal fires exactly one refuse cue" {
+    var ring = recent_insertions.Ring{};
+    var runner = Runner.init(&ring, .{});
+
+    dictateInto(&runner, slack, notes);
+    try std.testing.expect(runner.runOnce());
+
+    // The same red bloom + shake every cursor action that did nothing shows (ADR-0007). The
+    // Coordinator deliberately adds no second verb for `.refused`, so this count is the whole
+    // user-visible signal.
+    try std.testing.expectEqual(@as(usize, 1), runner.deps.refuses);
+}
+
+test "a refused transcript is still recorded, so it can be re-inserted" {
+    var ring = recent_insertions.Ring{};
+    var runner = Runner.init(&ring, .{});
+
+    dictateInto(&runner, slack, notes);
+    try std.testing.expect(runner.runOnce());
+
+    // A refusal is recoverable and must be: the Utterance still resolves through the reverse
+    // edge carrying its bytes, so the Coordinator commits an Insertion Record and the user can
+    // re-insert it into the app they actually meant.
+    try std.testing.expectEqual(@as(usize, 1), runner.deps.completions);
+    try std.testing.expectEqualStrings("the secret ", runner.deps.lastInserted());
+    // And the hint names the app it was *dictated into*, not the one that stole focus.
+    try std.testing.expectEqualStrings("Slack", runner.deps.last_focused_app.?.displayName());
+}
+
+test "a record that a refusal produced still re-inserts from Recent Insertions" {
+    var ring = recent_insertions.Ring{};
+    ring.record(outcomeRec("the secret ", 42, .refused));
+    var runner = Runner.init(&ring, .{});
+
+    // The recovery the refusal promises: Re-insert is user-initiated at a moment when the user
+    // has just chosen the target, so it stays unconditional — no gate, whatever the outcome
+    // the row carries.
+    runner.submitMenu(.reinsert, 42);
+    try std.testing.expect(runner.runOnce());
+
+    try std.testing.expectEqualStrings("the secret ", runner.deps.lastText());
+    try std.testing.expectEqual(@as(usize, 0), runner.deps.refuses);
+}
+
+test "an unreadable frontmost at drain time INSERTS — absence is consent, unlike Undo" {
+    var ring = recent_insertions.Ring{};
+    var runner = Runner.init(&ring, .{});
+
+    // The one place this gate must differ from `undo.evaluate`, which refuses on a null on
+    // either side. Refusing here would break dictation outright on the first app that does not
+    // report cleanly — far worse than the rare mis-target this gate is for.
+    dictateInto(&runner, slack, null);
+    try std.testing.expect(runner.runOnce());
+
+    try std.testing.expectEqualStrings("the secret ", runner.deps.lastText());
+    try std.testing.expectEqual(coord.InsertResult.ok, runner.deps.last_completion);
+    try std.testing.expectEqual(@as(usize, 0), runner.deps.refuses);
+    // With no fresh reading the release-time one is still the best name for where it went.
+    try std.testing.expectEqualStrings("Slack", runner.deps.last_focused_app.?.displayName());
+}
+
+test "an unreadable frontmost at release time INSERTS — no baseline, no positive evidence" {
+    var ring = recent_insertions.Ring{};
+    var runner = Runner.init(&ring, .{});
+
+    dictateInto(&runner, null, notes);
+    try std.testing.expect(runner.runOnce());
+
+    try std.testing.expectEqualStrings("the secret ", runner.deps.lastText());
+    try std.testing.expectEqual(coord.InsertResult.ok, runner.deps.last_completion);
+    // The fresh reading is the honest hint: it is where the text actually went.
+    try std.testing.expectEqualStrings("Notes", runner.deps.last_focused_app.?.displayName());
+}
+
+test "a job with no note at all inserts, and a refusal cannot gate the next Utterance" {
+    var ring = recent_insertions.Ring{};
+    var runner = Runner.init(&ring, .{});
+
+    dictateInto(&runner, slack, notes);
+    try std.testing.expect(runner.runOnce());
+    try std.testing.expectEqual(coord.InsertResult.refused, runner.deps.last_completion);
+
+    // The note is consumed by the job it belongs to. A second job that somehow arrives without
+    // one must not inherit the refused Utterance's baseline and refuse forever after.
+    runner.submit(8, "next one", .normal);
+    try std.testing.expect(runner.runOnce());
+    try std.testing.expectEqualStrings("next one ", runner.deps.lastText());
+    try std.testing.expectEqual(coord.InsertResult.ok, runner.deps.last_completion);
+}
+
+test "a menu Re-insert is never gated — it ignores a live note entirely" {
+    var ring = recent_insertions.Ring{};
+    ring.record(rec("recovered text ", 42));
+    var runner = Runner.init(&ring, .{ .focused_app = notes });
+
+    // The user clicked a row in the Status Item just now, so the frontmost app *is* the target
+    // they chose; a stale dictation note must not veto it (spec §5.1: unconditional).
+    runner.deps.focused_app = slack;
+    runner.noteTarget();
+    runner.deps.focused_app = notes;
+    runner.submitMenu(.reinsert, 42);
+
+    try std.testing.expect(runner.runOnce());
+    try std.testing.expectEqualStrings("recovered text ", runner.deps.lastText());
+    try std.testing.expectEqual(@as(usize, 0), runner.deps.refuses);
 }
 
 test "runOnce reports idle without touching dependencies" {

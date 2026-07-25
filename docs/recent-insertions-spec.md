@@ -46,7 +46,7 @@ One entry in the ring is an **Insertion Record**. Fields:
 | `inserted` | `[]const u8` | The **with-space** form — the literal bytes placed at the cursor (post-Rewrite when Backtrack ran, raw otherwise). Re-insert replays it verbatim; its char count is what a future Undo would delete. |
 | `raw` | `?[]const u8` | The **trimmed** Final Transcript, present **only when it differs** from `inserted` (i.e. a Rewrite changed it). Absent ⇒ identical to `inserted`. Gives faithful pre-Rewrite recovery when Backtrack mangled a dictation. |
 | `timestamp` | `i64` | `nowMs()` at capture — drives newest-first ordering and menu labels. |
-| `outcome` | `InsertResult` (`ok` / `degraded` / `failed`) | Full enum, not a bool. Drives the menu's status dot and the high-value "recover a *failed* insertion" case. **Known only at `onInserted`.** |
+| `outcome` | `InsertResult` (`ok` / `degraded` / `failed` / `refused`) | Full enum, not a bool. Drives the menu's status dot and the high-value "recover a *failed* insertion" case. **Known only at `onInserted`.** `refused` was added by the Focused Target gate (ADR-0009 amendment, #255): nothing landed, but nothing went wrong — it shares the red dot with `failed` and carries its own `[refused]` tag, and re-insert is exactly its recovery. Neither `failed` nor `refused` is an Undo target. |
 | `focused_app` | `?AppIdentity` | Best-effort **App Identity** hint (bundle id + display name via `NSWorkspace.frontmostApplication`). Nullable, never load-bearing. |
 
 **Byte forms are deliberate:** `inserted` is what hit the cursor (with its single

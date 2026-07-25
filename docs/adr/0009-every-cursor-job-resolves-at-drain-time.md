@@ -1,6 +1,9 @@
 # ADR 0009 — Every cursor job resolves at drain time
 
 - Status: accepted (2026-07-24; candidate 1 of the 2026-07-24 architecture review)
+- Amended: 2026-07-25 (#255) — a dictation Insertion **proves its Focused Target** before it
+  pastes, and fails **open** where Undo fails closed. See
+  [Amendment](#amendment-2026-07-25-255--an-insertion-proves-its-focused-target).
 
 ## Context
 
@@ -119,3 +122,69 @@ Two consequences of the same rule, decided here:
   line references) describes the shipped shape and is left as written; where it and this ADR
   disagree on *where* a step happens, this ADR is current. The user-visible behaviour it
   specifies is unchanged except for the added refusal cue.
+
+## Amendment (2026-07-25, #255) — an Insertion proves its Focused Target
+
+This record moved every cursor job's *resolution* to drain time. It left one thing on the
+dictation path resolved nowhere at all: **which app the text goes into.**
+
+The Insertion Runner did read the frontmost app — but *after* the paste, as the best-effort
+App Identity hint for the Insertion Record (ADR-0006 §3.3). That is a receipt, not a gate.
+Between the Talk Key release and the `⌘V` there is transcription latency and, when Backtrack
+is on, the whole ~3 s Rewrite budget. That window is long enough to switch apps deliberately
+and long enough for an app to steal activation on its own, and what lands in it is a Final
+Transcript — often the most sensitive text the user produces — pasted into an arbitrary field
+of an arbitrary app.
+
+The argument is the asymmetry inside our own code. The **Undo Runner** gates hard on exactly
+this fact, fail-closed on bundle id *and* display name, because posting into the wrong app is
+dangerous (ADR-0008). The **additive** path, which runs on every single Utterance and has the
+*longer* window, had no gate at all.
+
+**Decided:**
+
+- **The Coordinator notes the Focused Target on the release edge.** `insertion.noteTarget()`
+  is called from `onRelease`, after the abandonment checks — so a hold that cannot insert
+  never pays for the read — and before `.awaiting_final`. This is the one cross-process
+  `frontmost()` read in the lifecycle that is affordable on the tap's run-loop thread under
+  `coordinator.mu`: the machine is mid-Utterance and nothing waits on it, and `audio.stop()`
+  on the line above already does strictly more work on that same thread. ADR-0006's rejection
+  of a read under the mutex was about `onInserted`, the point where the *next press* is
+  waiting; it is not disturbed.
+- **The Insertion Runner re-reads and compares at drain time**, immediately before the paste —
+  the same beside-the-effect rule this ADR states for everything else. A positive change
+  refuses: nothing is pasted, the pasteboard is untouched.
+- **It fails open where Undo fails closed.** `undo.evaluate` refuses on a null reading on
+  either side, because Backspaces are destructive and irreversible. `insertion_runner
+  .targetChange` **inserts** on a null, because refusing on an unreadable frontmost would
+  break dictation outright on the first app that does not report cleanly — a far worse outcome
+  than the rare mis-target. Only *positive evidence of a change* refuses. This is the single
+  deliberate divergence between two otherwise identical predicates, and it is stated at both.
+- **A refusal is a new `InsertResult`, not a `.failed`.** Both mean nothing landed; only one
+  means something went *wrong*. `.refused` carries the red bloom + shake this ADR already gave
+  to "that cursor action did not happen", fired by the Runner beside the refusal — the
+  Coordinator adds no second Feedback Surface verb, so the audible error cue stays with genuine
+  failures. The Status Item tags the row `[refused]` beside the same red dot `[failed]` gets.
+- **A refusal is recoverable, and recorded so that it is.** The Utterance still resolves
+  through the `.inserted` edge carrying its bytes, so the Insertion Record is committed and the
+  transcript is re-insertable from Recent Insertions into the app the user actually meant.
+  Re-insert stays unconditional (spec §5.1): it is user-initiated at a moment when the user has
+  just chosen the target, so a stale dictation note must not veto it.
+- **The record's App Identity hint becomes the gate's own reading.** The post-paste read is
+  gone; the pre-paste one serves both, so the drain still costs one query. The hint is now
+  *proven* rather than guessed after the fact — and on a refusal it names the app the Utterance
+  was dictated into, never the one that stole focus, which would be a plain lie about text that
+  never went there.
+
+**A consequence outside the Insertion path, and a latent bug it exposed.** `newestForUndo`
+returned the newest record whatever its outcome, and Undo deletes by *count* — so a record
+whose text never reached the cursor would have had its clusters backspaced out of whatever the
+user wrote instead. `.refused` makes that reachable under a healthy, fully-granted daemon,
+where `.failed` had kept it mostly theoretical (an insert fails on a missing PostEvent grant,
+which Undo's own `enabled()` also requires). The `UndoTarget` now carries whether the record
+*landed*, and the Undo Runner refuses with `.no_target` when it did not — closing the `.failed`
+case as well.
+
+**Not decided here.** Field-level Focused Target capture stays out of scope, as the Undo effort
+(#209) ruled: the gate is app-level, so "the user kept typing in the same app" remains the
+known, accepted residual — the same limit ADR-0008 documents for Undo.

@@ -194,9 +194,12 @@ pub const IconTier = enum { normal, dimmed };
 /// red `failed`.
 pub const HistoryDot = enum { ok, degraded, failed };
 
-/// The distinct outcome tag rendered beside the dot so a never-inserted (`failed`) or
-/// `degraded` entry is unmistakable (spec §2.4 / §4). `.none` for a clean `ok` insertion.
-pub const HistoryTag = enum { none, degraded, failed };
+/// The distinct outcome tag rendered beside the dot so a never-inserted (`failed` /
+/// `refused`) or `degraded` entry is unmistakable (spec §2.4 / §4). `.none` for a clean `ok`
+/// insertion. `refused` keeps its own tag rather than folding into `failed`: both mean
+/// nothing landed, but only one of them means something went wrong, and the recovery differs
+/// — a refused transcript re-inserts cleanly once the intended app is frontmost again.
+pub const HistoryTag = enum { none, degraded, failed, refused };
 
 /// One entry as the menu renders it — the derived, still text-free descriptor. `derive`
 /// turns each `HistoryEntryView` into this (dot colour + tag from the outcome), leaving the
@@ -245,7 +248,9 @@ fn historyDot(outcome: coord.InsertResult) HistoryDot {
     return switch (outcome) {
         .ok => .ok,
         .degraded => .degraded,
-        .failed => .failed,
+        // A refusal shares the red dot: the dot answers "did this text land", and it did not.
+        // The tag below is what separates the two reasons.
+        .failed, .refused => .failed,
     };
 }
 fn historyTag(outcome: coord.InsertResult) HistoryTag {
@@ -253,6 +258,7 @@ fn historyTag(outcome: coord.InsertResult) HistoryTag {
         .ok => .none,
         .degraded => .degraded,
         .failed => .failed,
+        .refused => .refused,
     };
 }
 
@@ -481,6 +487,7 @@ fn historyTagSuffix(tag: HistoryTag) []const u8 {
         .none => "",
         .degraded => "  [degraded]",
         .failed => "  [failed]",
+        .refused => "  [refused]",
     };
 }
 
@@ -1439,6 +1446,21 @@ test "derive maps outcome to dot colour and tag, newest-first order preserved" {
     try std.testing.expectEqual(HistoryDot.ok, h.entries[2].dot);
     try std.testing.expectEqual(HistoryTag.none, h.entries[2].tag); // a clean insertion gets no tag
     try std.testing.expectEqual(@as(u16, 3), h.entries[0].char_len); // order == the ring's newest-first
+}
+
+test "a refused Insertion reads as never-landed, but not as a failure" {
+    // Both mean nothing reached the cursor, so both take the red dot; only the tag separates
+    // them, because the recovery differs — a refused transcript re-inserts cleanly once the
+    // intended app is frontmost again, where a failed one hit a broken mechanism.
+    const s = history(&.{.{ .char_len = 9, .outcome = .refused, .timestamp = 30 }});
+    const h = derive(s).history;
+    try std.testing.expectEqual(HistoryDot.failed, h.entries[0].dot);
+    try std.testing.expectEqual(HistoryTag.refused, h.entries[0].tag);
+
+    var buf: [512]u8 = undefined;
+    const label = historyRowLabel(&buf, h.entries[0], "•••••••••", 30);
+    try std.testing.expect(std.mem.indexOf(u8, label, "[refused]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "[failed]") == null);
 }
 
 test "derive carries the undone flag through to the rendered entry (#225)" {

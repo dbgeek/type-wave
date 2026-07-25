@@ -672,6 +672,9 @@ const IntegrationInsertion = struct {
     id: backend.UtteranceId = 0,
     text: [64]u8 = undefined,
     text_len: usize = 0,
+    /// The Focused Target note the release edge takes (ADR-0009 amendment). Nothing here
+    /// gates on it — this integration drives the Segmenting path, not the cursor.
+    pub fn noteTarget(_: *IntegrationInsertion) void {}
     pub fn submit(self: *IntegrationInsertion, id: backend.UtteranceId, value: []const u8, kind: coordinator.InsertKind) void {
         self.submits += 1;
         self.id = id;

@@ -91,7 +91,23 @@ pub const UndoTarget = struct {
     focused_app: ?coord.AppIdentity,
     timestamp: i64,
     undone: bool,
+    /// Whether this record's bytes ever reached the cursor. The ring retains records that
+    /// never inserted — `.failed` (the mechanism could not post) and `.refused` (the Focused
+    /// Target gate stopped the paste) — because those are the recovery cases the Recent
+    /// Insertions submenu exists for (§2.2). But Undo deletes by *count*: backspacing N
+    /// clusters for text that was never placed eats N clusters of whatever the user did write.
+    /// So the outcome travels with the target and the Undo Runner refuses on it.
+    landed: bool,
 };
+
+/// Did this outcome put bytes at the cursor? The single home of that reading, so a future
+/// `InsertResult` variant has to answer the question rather than default into "deletable".
+fn landed(outcome: coord.InsertResult) bool {
+    return switch (outcome) {
+        .ok, .degraded => true,
+        .failed, .refused => false,
+    };
+}
 
 pub const Ring = struct {
     mu: Mutex = .{},
@@ -188,7 +204,13 @@ pub const Ring = struct {
         const rec = &self.buf[idx];
         const n = @min(rec.inserted_len, out.len);
         @memcpy(out[0..n], rec.inserted_bytes[0..n]);
-        return .{ .len = n, .focused_app = rec.focused_app, .timestamp = rec.timestamp, .undone = rec.undone };
+        return .{
+            .len = n,
+            .focused_app = rec.focused_app,
+            .timestamp = rec.timestamp,
+            .undone = rec.undone,
+            .landed = landed(rec.outcome),
+        };
     }
 
     /// Flag the record with capture `stamp` as undone, walking newest-first under the leaf
