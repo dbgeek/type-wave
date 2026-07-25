@@ -178,7 +178,11 @@ not paused, plus the Grant Observer's PostEvent fact — never on the Configurat
 Supervisor's capture-enable gate. It holds
 the Recent Insertions ring concretely (ADR-0006 keeps ownership with the daemon) and reaches
 every effect through a six-method seam it is handed, so the whole sequence is exercised by
-fed values rather than by a live tap. Lives in `src/undo.zig`; drained last by the Insert
+fed values rather than by a live tap. The gate is re-proved **as the burst runs** (#256): a
+verdict is fresh at the instant it is taken but a burst of thousands of Backspaces lasts
+seconds, so the deletion goes out in batches of 16 clusters with the same comparison between
+them, and a focus change stops the remainder — committing what already landed, as any partway
+burst does. Lives in `src/undo.zig`; drained last by the Insert
 Worker, which is what serializes a deletion against dictation. Sibling of the Insertion
 Runner, which owns the other three cursor paths under the same rule (ADR-0009).
 _Avoid_: undo manager, deletion engine, trigger (that named only the discarded run-loop half)

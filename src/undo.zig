@@ -29,6 +29,16 @@
 //! the green confirm cue both hang off a *successful* post. An Undo that could not land is a
 //! refusal that leaves the record retryable, never a green cue over unchanged text.
 //!
+//! And the gate is re-proved **as the burst runs** (#256), not once ahead of it. A verdict is
+//! fresh at the instant it is taken but does not survive duration: an Insertion Record holds up
+//! to 8 KiB, so a long dictation is thousands of Backspace pairs and the burst runs for
+//! *seconds*. Anything that takes focus during those seconds — the user switching away because
+//! the deletion looked stuck, an app raising a window — would receive every remaining
+//! Backspace, destructively, against text Undo never inspected. So the burst goes out in
+//! `batch_clusters`-sized batches with the same `evaluate` between them, and a change stops it.
+//! That needs no new policy: a burst that stopped partway already **commits** (#244), and an
+//! abort is precisely that case at a new stopping point.
+//!
 //! Serialization against dictation stays the Insert Worker's: `insertion_runner.workerLoop`
 //! drains this last, after the dictation / replay / copy slots, so a deletion can never
 //! interleave with an Insertion's clipboard-swap dance.
@@ -117,6 +127,21 @@ pub fn Undo(comptime Deps: type) type {
         /// four queued Undos when the single-shot model refuses everything after the first.
         pub const max_queued: u8 = 3;
 
+        /// How many Backspace pairs go out between two proofs of the Focused Target (#256).
+        ///
+        /// This is the **worst-case overshoot**: after focus lands somewhere else, at most this
+        /// many Backspaces reach the new app before the next re-read stops the burst. Sixteen
+        /// clusters is one short word — recoverable — and at `insert.key_gap_ms`' ~1 ms down-to-up
+        /// plus ~1 ms between pairs it is ~32 ms of posting, well inside the time an app switch
+        /// takes to complete.
+        ///
+        /// The cost is the other side: one cross-process `frontmost()` query per batch. Even the
+        /// theoretical maximum burst — 8192 clusters, `recent_insertions.max_bytes` of
+        /// single-byte text — is 512 reads against ~16 s of posting, so the proof is a rounding
+        /// error on a burst long enough to need it. Smaller batches buy proportionally less
+        /// overshoot for proportionally more querying; this is the knee.
+        pub const batch_clusters: usize = 16;
+
         /// The authoritative Recent Insertions ring (ADR-0006). Held concretely, not behind
         /// `Deps`: it is daemon-owned, heap-free and leaf-locked, and the Runner only drives
         /// it — resolve the newest, flag it on a committed deletion. Never under any other
@@ -170,10 +195,11 @@ pub fn Undo(comptime Deps: type) type {
         }
 
         /// One Undo, start to finish, on the insert worker. The order below is the module's
-        /// whole reason to exist and is load-bearing (ADR-0008, amended by #244):
+        /// whole reason to exist and is load-bearing (ADR-0008, amended by #244 and #256):
         ///
         ///   gate on pause/grant → resolve → count → secure-input probe → fresh focus read
-        ///                       → focus gate → post → **flag undone** → confirm cue
+        ///                       → focus gate → (post a batch → re-prove focus)* → **flag
+        ///                       undone** → confirm cue
         ///
         /// The flag flips only after `deleteChars` reports that it *did* post, so no refusal
         /// can leave a record rendering dimmed with nothing deleted. Every exit before the post
@@ -248,7 +274,31 @@ pub fn Undo(comptime Deps: type) type {
             // full `n` on the next press would eat text that preceded the Insertion, which is
             // exactly what single-shot (#225) exists to prevent. So a short burst commits like
             // a whole one and says so in the log.
-            const posted = self.deps.deleteChars(n);
+            //
+            // It goes out in batches, re-proving the Focused Target between them (#256), so a
+            // focus change partway through stops the burst rather than emptying it into an app
+            // Undo never inspected. `fresh` above is the first batch's proof; every later batch
+            // pays for its own. The re-read is cross-process, which is exactly why the whole
+            // sequence lives on the insert worker (ADR-0008) — the loop below changes how many
+            // such reads happen, not which thread they happen on.
+            var posted: usize = 0;
+            var aborted: ?RefuseReason = null;
+            while (posted < n) {
+                if (posted > 0) {
+                    if (evaluate(target.focused_app, self.deps.focusedApp())) |reason| {
+                        aborted = reason;
+                        break;
+                    }
+                }
+                const want = @min(batch_clusters, n - posted);
+                const got = self.deps.deleteChars(want);
+                posted += got;
+                // The mechanism refused partway through this batch — the same committed-but-
+                // incomplete case as an abort, and nothing suggests the next batch would fare
+                // better.
+                if (got < want) break;
+            }
+
             if (posted == 0) {
                 self.refuse(.post_failed, "the deletion mechanism posted nothing; the record stays retryable");
                 return;
@@ -258,11 +308,17 @@ pub fn Undo(comptime Deps: type) type {
             // flag a neighbour. Undo pushes no new ring entry: the record is kept and
             // flagged, and a re-insert redoes it (#225).
             self.ring.markUndone(target.timestamp);
-            if (posted < n) {
+            if (aborted) |reason| {
+                feedback.log("  undo aborted: {s} — {d} of {d} backspaces posted before the focus moved; the record is spent\n", .{ @tagName(reason), posted, n });
+            } else if (posted < n) {
                 feedback.log("  undo: only {d} of {d} backspaces posted — the Insertion is partly deleted and the record is spent\n", .{ posted, n });
             } else {
                 feedback.log("  undo: posted {d} backspaces to delete the last Insertion\n", .{n});
             }
+            // One cue on this exit as on every other, and the green one: text *was* deleted, which
+            // is the only thing the confirm cue claims. An abort is #244's partial burst reached
+            // by a different route, so it ends the same way — red would read as "nothing
+            // happened, press again", and the retry it invites refuses (the record is spent).
             self.deps.undoConfirmed();
         }
     };
@@ -287,18 +343,30 @@ const FakeDeps = struct {
     enabled_reads: usize = 0,
     focused_app: ?coord.AppIdentity = null,
     /// How many times the Runner read the frontmost app — lets the gate tests prove the
-    /// read is fresh (taken during `run`) and skipped when nothing would post (#224).
+    /// read is fresh (taken during `run`), skipped when nothing would post (#224), and
+    /// repeated between batches of a long burst (#256).
     focus_reads: usize = 0,
+    /// Once this many frontmost reads have been served, `focusedApp` starts returning
+    /// `focused_app_later` — how a test drives an app switch *during* the burst (#256), which
+    /// no amount of mutating the fake from outside could reach: the whole burst runs inside
+    /// one synchronous `run`.
+    focus_switch_after: ?usize = null,
+    focused_app_later: ?coord.AppIdentity = null,
     /// Secure Event Input, and how many times the Runner probed it — the probe has to be as
     /// fresh as the focus read (#244).
     secure_input: bool = false,
     secure_reads: usize = 0,
+    /// How many batches the Runner asked for, and the size of the last one.
     deletes: usize = 0,
     last_delete_n: usize = 0,
-    /// How many Backspace pairs the mechanism manages to post; null means the whole burst (the
-    /// healthy case). `0` is the suppressed / refused post the Runner must not confirm, and a
-    /// value below `n` is a burst that stopped partway (#244).
+    /// How many Backspace pairs the mechanism manages to post **across the whole burst**; null
+    /// means every batch posts in full (the healthy case). `0` is the suppressed / refused post
+    /// the Runner must not confirm, and a value below the record's cluster count is a burst that
+    /// stopped partway (#244). A budget rather than a per-call cap, so it means the same thing
+    /// whether the Runner asks in one batch or several (#256).
     delete_posts: ?usize = null,
+    /// Pairs posted so far, summed across this burst's batches.
+    posted_total: usize = 0,
     undo_confirms: usize = 0,
     undo_refuses: usize = 0,
 
@@ -308,6 +376,9 @@ const FakeDeps = struct {
     }
     fn focusedApp(self: *FakeDeps) ?coord.AppIdentity {
         self.focus_reads += 1;
+        if (self.focus_switch_after) |k| {
+            if (self.focus_reads > k) return self.focused_app_later;
+        }
         return self.focused_app;
     }
     fn secureInputActive(self: *FakeDeps) bool {
@@ -317,7 +388,10 @@ const FakeDeps = struct {
     fn deleteChars(self: *FakeDeps, n: usize) usize {
         self.deletes += 1;
         self.last_delete_n = n;
-        return @min(self.delete_posts orelse n, n);
+        const available = if (self.delete_posts) |budget| budget -| self.posted_total else n;
+        const got = @min(available, n);
+        self.posted_total += got;
+        return got;
     }
     fn undoConfirmed(self: *FakeDeps) void {
         self.undo_confirms += 1;
@@ -641,6 +715,148 @@ test "a burst that stopped partway commits the record — a retry would eat earl
 
     try expectEqual(@as(usize, 1), runner.deps.deletes); // no second burst — "older " is safe
     try expectEqual(@as(usize, 1), runner.deps.undo_refuses);
+}
+
+// --- the burst re-proves its target as it goes (#256) ---
+
+/// 41 clusters — two full `batch_clusters` batches and a short third, so the batching is
+/// exercised in both directions by one record.
+const long_text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ";
+comptime {
+    std.debug.assert(long_text.len == 2 * Undo(FakeDeps).batch_clusters + 9);
+}
+
+test "a short Insertion still posts in one batch, with one frontmost read" {
+    // The floor the batching must not raise: an ordinary dictation is far under one batch, so
+    // it pays for exactly the pre-burst proof and nothing more.
+    var ring = recent_insertions.Ring{};
+    ring.record(rec("abc ", 1, slack));
+    var runner = Runner.init(&ring, .{ .focused_app = slack });
+
+    runner.request();
+    try expect(runner.runOnce());
+
+    try expectEqual(@as(usize, 1), runner.deps.deletes);
+    try expectEqual(@as(usize, 1), runner.deps.focus_reads);
+    try expectEqual(@as(usize, 4), runner.deps.posted_total);
+}
+
+test "a burst longer than one batch posts every cluster, re-proving the target between batches" {
+    var ring = recent_insertions.Ring{};
+    ring.record(rec(long_text, 1, slack));
+    var runner = Runner.init(&ring, .{ .focused_app = slack });
+
+    runner.request();
+    try expect(runner.runOnce());
+
+    // 16 + 16 + 9 — the whole record, in three batches.
+    try expectEqual(@as(usize, 3), runner.deps.deletes);
+    try expectEqual(@as(usize, 41), runner.deps.posted_total);
+    try expectEqual(@as(usize, 9), runner.deps.last_delete_n);
+    // One proof before the burst, then one before each of the two later batches.
+    try expectEqual(@as(usize, 3), runner.deps.focus_reads);
+    try expectEqual(@as(usize, 1), runner.deps.undo_confirms);
+    try expectEqual(@as(usize, 0), runner.deps.undo_refuses);
+}
+
+test "a focus change mid-burst stops the remaining batches — the overshoot is one batch" {
+    // The defect: the pre-burst verdict is fresh but does not survive the seconds a long burst
+    // takes. Without the re-proof every remaining Backspace lands in whatever app took focus.
+    var ring = recent_insertions.Ring{};
+    ring.record(rec(long_text, 1, slack));
+    var runner = Runner.init(&ring, .{
+        .focused_app = slack,
+        .focus_switch_after = 1, // the pre-burst read passes; the first re-proof sees Notes
+        .focused_app_later = notes,
+    });
+
+    runner.request();
+    try expect(runner.runOnce());
+
+    try expectEqual(@as(usize, 1), runner.deps.deletes);
+    try expectEqual(Runner.batch_clusters, runner.deps.posted_total); // 16 of 41, not 41
+    try expectEqual(@as(usize, 2), runner.deps.focus_reads);
+    // Text *was* deleted, so this commits and cues like #244's partial burst.
+    try expectEqual(@as(usize, 1), runner.deps.undo_confirms);
+    try expectEqual(@as(usize, 0), runner.deps.undo_refuses);
+}
+
+test "an unreadable frontmost mid-burst stops it too — the re-proof is fail-closed like the gate" {
+    var ring = recent_insertions.Ring{};
+    ring.record(rec(long_text, 1, slack));
+    var runner = Runner.init(&ring, .{
+        .focused_app = slack,
+        .focus_switch_after = 1,
+        .focused_app_later = null, // frontmost() came back empty
+    });
+
+    runner.request();
+    try expect(runner.runOnce());
+
+    try expectEqual(@as(usize, 1), runner.deps.deletes);
+    try expectEqual(Runner.batch_clusters, runner.deps.posted_total);
+}
+
+test "an aborted burst spends the record — the next press refuses rather than deleting again" {
+    // The single-shot rule (#225) reached by a new route: 16 clusters are already gone from the
+    // target app, so re-running the full 41 would eat 25 clusters of whatever preceded it.
+    var ring = recent_insertions.Ring{};
+    ring.record(rec("older ", 10, slack));
+    ring.record(rec(long_text, 20, slack));
+    var runner = Runner.init(&ring, .{
+        .focused_app = slack,
+        .focus_switch_after = 1,
+        .focused_app_later = notes,
+    });
+
+    runner.request();
+    try expect(runner.runOnce());
+
+    var out: [recent_insertions.max_bytes]u8 = undefined;
+    try expect(ring.newestForUndo(&out).?.undone);
+
+    runner.deps.focus_switch_after = null; // back in the right app
+    runner.request();
+    try expect(runner.runOnce());
+
+    try expectEqual(@as(usize, 1), runner.deps.deletes); // no second burst — "older " is safe
+    try expectEqual(@as(usize, 1), runner.deps.undo_refuses);
+    try expectEqual(@as(usize, 1), runner.deps.undo_confirms);
+}
+
+test "a mechanism failure inside a later batch commits what landed and stops" {
+    // #244's short count, now reachable partway through a multi-batch burst: the budget runs
+    // out inside batch two, so batch three is never asked for.
+    var ring = recent_insertions.Ring{};
+    ring.record(rec(long_text, 1, slack));
+    var runner = Runner.init(&ring, .{ .focused_app = slack, .delete_posts = 20 });
+
+    runner.request();
+    try expect(runner.runOnce());
+
+    try expectEqual(@as(usize, 2), runner.deps.deletes);
+    try expectEqual(@as(usize, 20), runner.deps.posted_total);
+    try expectEqual(@as(usize, 1), runner.deps.undo_confirms);
+    var out: [recent_insertions.max_bytes]u8 = undefined;
+    try expect(ring.newestForUndo(&out).?.undone);
+}
+
+test "a first batch that posts nothing refuses, and never asks for a second" {
+    // A whole-burst failure is still retryable, and the Runner must not keep paying for batches
+    // against a mechanism that posted zero.
+    var ring = recent_insertions.Ring{};
+    ring.record(rec(long_text, 1, slack));
+    var runner = Runner.init(&ring, .{ .focused_app = slack, .delete_posts = 0 });
+
+    runner.request();
+    try expect(runner.runOnce());
+
+    try expectEqual(@as(usize, 1), runner.deps.deletes);
+    try expectEqual(@as(usize, 1), runner.deps.focus_reads); // no re-proof for a burst that failed
+    try expectEqual(@as(usize, 0), runner.deps.undo_confirms);
+    try expectEqual(@as(usize, 1), runner.deps.undo_refuses);
+    var out: [recent_insertions.max_bytes]u8 = undefined;
+    try expect(!ring.newestForUndo(&out).?.undone);
 }
 
 test "a second undo on an already-undone newest record refuses — it never eats earlier text (#225)" {

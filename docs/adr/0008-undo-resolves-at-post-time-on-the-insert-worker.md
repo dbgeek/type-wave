@@ -3,6 +3,9 @@
 - Status: accepted (2026-07-24; candidate 1 of the 2026-07-24 architecture review)
 - Amended: 2026-07-25 (#244) — `Deps` is **6** methods, not 5, and `deleteChars` returns a
   result. See [Amendment](#amendment-2026-07-25-244--a-post-is-a-result-not-an-assumption).
+- Amended: 2026-07-25 (#256) — the focus gate is re-proved **between batches** of the burst, not
+  once ahead of it. See
+  [Amendment](#amendment-2026-07-25-256--a-verdict-is-fresh-at-an-instant-a-burst-lasts-seconds).
 - Supersedes: the trigger-side resolution and commit rationale recorded in
   `src/undo_trigger.zig`'s module doc (#223/#225), and the "dim without deleting" edge it
   declared accepted
@@ -179,6 +182,49 @@ structurally invisible to tests. `deleteChars(n)` is a *count*, so the shape of 
 events — keycode, flags, pairing — could not be observed by any fake. `KeyPoster` is generic
 over its event sink, and the fake sink stamps created events with simulated held modifiers,
 so the regression is pinned by a test that watches what the target app would receive.
+
+## Amendment (2026-07-25, #256) — a verdict is fresh at an instant; a burst lasts seconds
+
+This record's central move was making the focus read **fresh at the post**, and #244 then made
+the post a result rather than an assumption. Both treat the post as a *moment*. It is not one.
+
+`deleteChars` posts one Backspace pair per grapheme cluster with `insert.key_gap_ms` (~1 ms)
+down-to-up and again between pairs, uncapped. An Insertion Record holds up to
+`recent_insertions.max_bytes` (8 KiB), so a long dictation is thousands of pairs and the burst
+runs for **seconds** on a single verdict. Anything that takes focus during those seconds — the
+user switching apps because the deletion looked stuck, an app raising a window, a notification
+stealing the key window — receives every remaining Backspace, destructively, against text Undo
+never inspected. The gate was fresh and still wrong, because freshness at the start of an
+interval says nothing about its end.
+
+The sequence gains one loop and no new policy:
+
+```
+… → focus gate → (post ≤batch_clusters pairs → re-prove focus)* → flag undone → cue
+```
+
+- **`batch_clusters` is 16** — deliberately the *worst-case overshoot*, since that many
+  Backspaces can reach the new app before the next proof stops the burst. Sixteen clusters is
+  one short word, and ~32 ms of posting at the documented pacing. The cost is one cross-process
+  `frontmost()` query per batch: even the theoretical maximum burst is 512 reads against ~16 s
+  of posting, so the proof is a rounding error on any burst long enough to need it.
+- **The re-proof is `evaluate`, unchanged** — the same both-fields comparison, the same
+  fail-closed treatment of a null reading. One rule, one function, one place to change it. A
+  mid-burst read that comes back empty stops the burst for the same reason a pre-burst one
+  refuses it: Backspaces are irreversible and the gate never posts on missing evidence.
+- **An abort commits, exactly like #244's short count.** Its Backspaces are already in the
+  target app, so re-running the full `n` on the next press would eat text that preceded the
+  Insertion — single-shot (#225) again. The record is flagged, the shortfall and the reason go
+  to the log, and the **green** cue fires: text *was* deleted, which is all that cue claims. Red
+  would read as "nothing happened, press again", and the retry it invites refuses.
+
+Nothing moves threads. The re-read is cross-process, which is precisely why the whole sequence
+already lives on the insert worker; this changes how many such reads happen, not where.
+
+The generalization worth carrying forward: **a gate that authorizes an effect must be re-proved
+on the timescale the effect takes.** The Insertion Runner's own Focused Target gate (ADR-0009
+amendment) sits beside a single ⌘V and does not need this; Undo's burst does, because it is the
+one cursor effect whose duration is proportional to the text it touches.
 
 A future review should not "restore" trigger-time resolution without re-reading this record:
 resolving on the run-loop thread was the original design and was traded away on purpose,
