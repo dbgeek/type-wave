@@ -53,7 +53,13 @@ pub const InsertKind = enum { normal, raw_fallback };
 /// successful `.raw_fallback` insertion (docs/backtrack-spec.md §UX 4, ADR-0004): the text
 /// still landed — no error cue — but the downgrade earns the amber HUD pulse. The insertion
 /// mechanism failing outright is still `.failed`, whatever the submitted kind.
-pub const InsertResult = enum { ok, degraded, failed };
+///
+/// `.refused` is the Focused Target gate (ADR-0009 amendment): the frontmost app positively
+/// changed between the Talk Key release and the paste, so the Insertion Runner placed nothing
+/// rather than pasting a Final Transcript into whatever now owns the cursor. Like `.failed`
+/// nothing landed — but unlike it nothing *went wrong*, so it carries the red refuse cue the
+/// Runner already fires for a cursor action that did nothing, not the audible error cue.
+pub const InsertResult = enum { ok, degraded, failed, refused };
 
 /// Best-effort **App Identity** hint (CONTEXT.md) stamped into an Insertion Record's
 /// `focused_app`: the frontmost app's bundle id + display name, read best-effort from
@@ -265,6 +271,15 @@ pub fn Coordinator(comptime Deps: type) type {
             if (!self.deps.audio.heardSound())
                 feedback.log("  microphone captured only silence — is Microphone permission granted to this process?\n", .{});
 
+            // The Focused Target this Utterance was dictated into (ADR-0009 amendment). Taken
+            // here — once the Utterance is committed to `.awaiting_final`, so an abandoned hold
+            // never pays for it — and carried by the Insertion Runner to its own gate at paste
+            // time. Deliberately *not* at `onInserted`, which ADR-0006 rules out: that read
+            // would stall the machine at the point the next press is waiting on. Here nothing
+            // waits — the machine is mid-Utterance and `audio.stop()` above already did far
+            // more work on this same thread.
+            self.deps.insertion.noteTarget();
+
             self.deps.deadline.arm(lease.id, .release, lease.deadline); // release-anchored; final cancels it
             lease.release() catch |e| {
                 self.deps.deadline.cancel(lease.id);
@@ -390,6 +405,13 @@ pub fn Coordinator(comptime Deps: type) type {
                     feedback.log("  insertion failed — nothing landed at the cursor\n", .{});
                     self.deps.feedback.abandoned();
                 },
+                // The Focused Target gate refused (ADR-0009 amendment). No Feedback Surface
+                // verb here on purpose: the Insertion Runner already fired the red refuse cue
+                // beside the refusal, the same cue every other cursor action that did nothing
+                // shows (ADR-0007/ADR-0009), and that cue self-hides the pill. A second verb
+                // here would either double the cue or bury it under the audible error cue,
+                // which belongs to things that went *wrong*.
+                .refused => feedback.log("  insertion refused — the Focused Target changed; the transcript is kept in Recent Insertions\n", .{}),
             }
             self.deps.backends.resolve(id);
             self.active = null;
@@ -513,6 +535,15 @@ const FakeInsertion = struct {
     last: [256]u8 = undefined,
     last_len: usize = 0,
     last_kind: InsertKind = .normal,
+    /// Focused Target notes taken on the release edge (ADR-0009 amendment), and how many
+    /// submits had happened when the last one was taken — the Coordinator's whole share of
+    /// the gate is *that it notes, once, before the Utterance can reach `submit`*.
+    notes: usize = 0,
+    submits_at_note: usize = 0,
+    fn noteTarget(self: *FakeInsertion) void {
+        self.notes += 1;
+        self.submits_at_note = self.submits;
+    }
     fn submit(self: *FakeInsertion, id: UtteranceId, text: []const u8, kind: InsertKind) void {
         self.submits += 1;
         self.last_id = id;
@@ -682,6 +713,61 @@ test "1 happy path: press → release → final → inserted(ok)" {
     co.handle(.press);
     try expect(h.backends.began == 2);
     try expectEqual(@as(UtteranceId, 2), h.backends.last_id);
+}
+
+// --- the Focused Target note (ADR-0009 amendment) ---
+// The Coordinator's whole share of the gate: it takes the note on the release edge of an
+// Utterance that is going to proceed, exactly once, before anything can reach `submit`. The
+// comparison itself belongs to the Insertion Runner.
+
+test "the release edge notes the Focused Target once, before the Utterance can submit" {
+    var h = Harness{};
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+
+    try expectEqual(@as(usize, 1), h.insertion.notes);
+    try expectEqual(@as(usize, 0), h.insertion.submits_at_note); // taken ahead of the paste
+
+    co.handle(.{ .final = .{ .id = 1, .text = "hello" } });
+    try expectEqual(@as(usize, 1), h.insertion.submits);
+    try expectEqual(@as(usize, 1), h.insertion.notes); // one note per Utterance, not per event
+}
+
+test "an Utterance that never reaches awaiting_final takes no note" {
+    // No audio, so the hold is abandoned on the release edge. The note sits after that check
+    // on purpose: a cross-process read is not worth paying for an Utterance that cannot insert.
+    var h = Harness{};
+    h.audio.captured = false;
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+
+    try expectEqual(@as(usize, 0), h.insertion.notes);
+}
+
+test "a refused Insertion is recorded and resolves silently — the Runner already cued it" {
+    var h = Harness{};
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.{ .final = .{ .id = 1, .text = "the secret" } });
+    co.handle(.{ .inserted = .{ .id = 1, .result = .refused, .inserted = "the secret " } });
+
+    // Recorded, so the transcript survives in Recent Insertions for a re-insert.
+    try expectEqual(@as(usize, 1), h.recorder.records);
+    try expectEqual(InsertResult.refused, h.recorder.last_outcome);
+    try expectEqualStrings("the secret ", h.recorder.lastInserted());
+    // And silent here: the red refuse cue is the Insertion Runner's, fired beside the refusal.
+    // The audible error cue belongs to things that went wrong, which this did not.
+    try expectEqual(@as(usize, 0), h.feedback.abandoneds);
+    try expectEqual(@as(usize, 0), h.feedback.inserteds);
+    try expectEqual(@as(usize, 0), h.feedback.degradeds);
+    // The lease resolves and the machine is idle: a refusal ends the Utterance like any other
+    // resolution, so the next press is accepted.
+    try expectEqual(@as(usize, 1), h.backends.resolved);
+    co.handle(.press);
+    try expectEqual(@as(usize, 2), h.backends.began);
 }
 
 test "backend lease is resolved after abandonment" {

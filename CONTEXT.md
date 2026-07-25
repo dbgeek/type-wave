@@ -60,7 +60,15 @@ _Avoid_: whisper server, worker, subprocess (that names the mechanism, not the r
 
 **Insertion**:
 Placing a Final Transcript at the cursor of the Focused Target. Every Insertion ends with
-a single trailing space, so consecutive Insertions don't run their words together.
+a single trailing space, so consecutive Insertions don't run their words together. It is
+**gated on its Focused Target** (ADR-0009 amendment): the frontmost app noted at Talk Key
+release must not have positively changed by the time the text would land, or the Insertion
+refuses and shows the red refuse cue rather than pasting into whatever now owns the cursor.
+Where Undo's identical comparison fails *closed*, this one fails **open** — a missing reading
+on either side inserts, because refusing on an unreadable frontmost would break dictation
+outright, which is far worse than the rare mis-target. A refusal is recoverable: the
+transcript is still recorded, so the user re-inserts it from Recent Insertions into the app
+they meant.
 _Avoid_: typing, pasting (those name mechanisms, not the act)
 
 **Insertion Runner**:
@@ -71,7 +79,10 @@ directions, drain-time resolution, and the ring bookkeeping that follows an effe
 and any flag flips only after that effect landed** — ADR-0008's Undo rule, generalized. A
 dictation job carries text and reports the bytes it *landed* back through the `.inserted`
 reverse edge, which makes the Runner the sole applier of the separator: the Utterance
-Coordinator stamps those bytes into the Insertion Record rather than re-deriving them. A menu
+Coordinator stamps those bytes into the Insertion Record rather than re-deriving them. It also
+owns the **Focused Target gate**: the Coordinator notes the frontmost app on the Talk Key
+release edge (`noteTarget`) and the Runner re-reads it beside the paste, refusing on a
+positive change and reusing that one reading as the record's App Identity hint. A menu
 job carries only a capture stamp, queued on one bounded single-producer ring (the main thread
 in, the worker out), so a second click during a ~300 ms drain queues rather than silently
 overwriting the first. Anything that did nothing — a failed replay, an evicted stamp, a click
@@ -99,8 +110,9 @@ Insertion Runner that placed them rather than re-derived — post-Rewrite when B
 raw otherwise; its grapheme-cluster count — `graphemeCount`, per #211 —
 is what an Undo would delete); `raw`, the
 trimmed Final Transcript, present only when it differs from `inserted` (i.e. a Rewrite
-changed it); a capture `timestamp`; the `outcome` (`ok` / `degraded` / `failed`, known
-only at `onInserted`); and a best-effort **App Identity** hint (`focused_app` — bundle id
+changed it); a capture `timestamp`; the `outcome` (`ok` / `degraded` / `failed` / `refused`,
+known only at `onInserted` — the last two never reached the cursor, so neither is an Undo
+target); and a best-effort **App Identity** hint (`focused_app` — bundle id
 + display name of the frontmost app, nullable, never load-bearing). The record is
 deliberately app-level only: the Undo effort (#209) ruled Accessibility field-level
 Focused Target capture out of scope and gates on `focused_app` instead, so a record never
@@ -110,7 +122,11 @@ _Avoid_: history entry, log entry (vague); transcript (that's the Final Transcri
 **App Identity**:
 The frontmost application at Insertion time as recorded in an Insertion Record's
 `focused_app` hint — bundle id plus display name, read best-effort from `NSWorkspace`. A
-hint, not the Focused Target: it names the app, never the text field.
+hint, not the Focused Target: it names the app, never the text field. Since the Focused
+Target gate (ADR-0009 amendment) it is the gate's own reading, taken immediately *before* the
+paste rather than after it, so on an Insertion that landed it is proven rather than guessed;
+on a refused one it names the app the Utterance was dictated into, never the one that took
+focus.
 
 **Recent Insertions View**:
 The **text-free, masked projection** of the Recent Insertions ring that rides through the
@@ -131,7 +147,11 @@ Removing the newest Insertion's text from the Focused Target on the recovery cho
 N Backspaces, one per extended grapheme cluster of the Insertion Record's `inserted` bytes,
 trailing Insertion space included, so the pre-Insertion state is restored. Gated app-level:
 it proceeds only on positive evidence that the frontmost app is unchanged since the
-Insertion (bundle id **and** display name both match), fail-closed on either side missing.
+Insertion (bundle id **and** display name both match), fail-closed on either side missing —
+the same comparison an Insertion now makes, but the opposite way round on missing evidence,
+because Backspaces are destructive where a paste is additive. Only a record whose text
+actually reached the cursor is a target: a `failed` or `refused` Insertion is refused, since
+deleting its cluster count would eat that much of whatever the user wrote instead.
 **Single-shot**: a committed Undo flags its record `undone` and a second chord on that record
 refuses rather than eating earlier text; re-inserting it redoes it. Blind and best-effort —
 post-Insertion edits can make N over- or under-delete, an accepted limit of the app-level
