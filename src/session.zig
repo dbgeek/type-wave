@@ -356,8 +356,34 @@ pub const WebsocketTransport = struct {
         errdefer self.client.deinit();
         // The library sends no Host header itself, so include it here alongside auth.
         var hdr_buf: [512]u8 = undefined;
+        // Both copies of the key this frame makes are zeroed on the way out — the stack
+        // buffer here, and the client's own request buffer, which the library fills with
+        // this exact header and then reuses for frames without ever clearing it (#254).
+        // Declared after the errdefer above so both run before the client is deinited on a
+        // failed handshake, when the buffer still exists to be scrubbed.
+        defer std.crypto.secureZero(u8, &hdr_buf);
+        defer scrubHandshakeBuffer(&self.client);
         const headers = try std.fmt.bufPrint(&hdr_buf, "Host: {s}\r\nAuthorization: Bearer {s}", .{ host, api_key });
         try self.client.handshake("/v1/realtime?intent=transcription", .{ .timeout_ms = 10_000, .headers = headers });
+    }
+
+    /// Zero the vendored client's request/read buffer past whatever it has already read
+    /// back for us.
+    ///
+    /// `websocket.Client.handshake` composes the whole HTTP upgrade request — our
+    /// `Authorization: Bearer …` header included — into the reader's static buffer, reads
+    /// the reply back into the same buffer, then leaves any over-read frame bytes at
+    /// `[0..pos]`. Whatever the reply did not happen to overwrite is still the key, for the
+    /// life of the client (16 KiB that is never zeroed on `deinit` either). Everything from
+    /// `pos` on is dead space the reader will refill, so it is ours to clear.
+    ///
+    /// Reaching past the library's `_`-prefixed fields is deliberate and cheap to keep
+    /// honest: a vendor bump that renames or restructures them fails this compile rather
+    /// than silently stopping the scrub.
+    fn scrubHandshakeBuffer(client: *websocket.Client) void {
+        const reader = &client._reader;
+        const consumed = @min(reader.pos, reader.static.len);
+        std.crypto.secureZero(u8, reader.static[consumed..]);
     }
 
     pub fn startReadLoop(self: *WebsocketTransport, handler: anytype) !Reader {

@@ -72,6 +72,7 @@ const coord = @import("coordinator.zig");
 const menu_mod = @import("menu.zig");
 const appkit = @import("appkit.zig");
 const keychain = @import("keychain.zig");
+const api_key = @import("api_key.zig");
 const insertion_runner = @import("insertion_runner.zig");
 const recent_insertions = @import("recent_insertions.zig");
 const undo_mod = @import("undo.zig");
@@ -270,17 +271,21 @@ const DaemonDeps = struct {
     pub const LocalResource = LocalAdapter;
 
     daemon: *Daemon,
-    /// Freshly loaded by gatherOutcome for this tick's potential connect; the Session
-    /// retains the slice (a process-lifetime allocation, like snapshots).
-    pending_key: ?[]const u8 = null,
     /// The Configuration Phase outcome gathered mid-tick by `wants`; the supervisor
     /// loop executes its non-router actions (READY, reporting) afterwards.
     outcome: configuration_phase.Outcome = undefined,
 
     pub fn connectOpenai(self: *DaemonDeps) !*Session {
         const d = self.daemon;
-        const key = self.pending_key orelse return error.MissingApiKey;
-        return Session.connect(d.io, d.alloc, key, .{ .ctx = d, .get = Daemon.getParams }, d.observer());
+        // Borrowed, not taken: a connect that throws leaves the copy the Key Holder's, so
+        // the next facts pass scrubs it rather than orphaning a plaintext key (#254).
+        const key = d.api_key.borrow() orelse return error.MissingApiKey;
+        const session = try Session.connect(d.io, d.alloc, key, .{ .ctx = d, .get = Daemon.getParams }, d.observer());
+        // A live holder provably exists now: the Session retains the slice for the
+        // reconnects it may make for the rest of the process's life, so ownership moves
+        // here and no later refresh/drop can pull it out from under it.
+        d.api_key.handOff();
+        return session;
     }
 
     pub fn prepareLocal(self: *DaemonDeps) ?*LocalAdapter {
@@ -292,7 +297,7 @@ const DaemonDeps = struct {
     pub fn wants(self: *DaemonDeps) backend_router.Wants {
         self.outcome = self.daemon.gatherOutcome();
         return .{
-            .connect_openai = self.outcome.actions.connect_session and self.pending_key != null,
+            .connect_openai = self.outcome.actions.connect_session and self.daemon.api_key.borrow() != null,
             .prepare_local = self.outcome.actions.prepare_local,
         };
     }
@@ -623,6 +628,17 @@ const RealGrantProbes = struct {
 };
 const GrantObserver = grants_mod.Observer(RealGrantProbes);
 
+/// The Key Holder's source (api_key.zig): the real read of the OpenAI secret — process env
+/// override, then the login keychain, then the one-time legacy env-file migration.
+const RealKeySource = struct {
+    io: std.Io = undefined,
+
+    pub fn load(self: *RealKeySource, gpa: std.mem.Allocator) ?[:0]u8 {
+        return config.loadApiKeyOnly(self.io, gpa);
+    }
+};
+const KeyHolder = api_key.Holder(RealKeySource);
+
 /// Real dependencies for rewrite_adapter.zig (docs/backtrack-spec.md). The adapter owns
 /// the asynchronous Rewrite policy; daemon.zig supplies the OpenAI mechanism — the
 /// long-lived HTTP client whose connection pool keeps HTTPS warm across Utterances, the
@@ -637,9 +653,10 @@ const RealRewriteDeps = struct {
     pub fn rewrite(self: *RealRewriteDeps, raw: []const u8, out: []u8) anyerror![]const u8 {
         const d = self.daemon;
         // Freshly loaded per rewrite, like the supervisor's poll — env override first,
-        // then the keychain item. Freed after the call; only Sessions retain a key.
+        // then the keychain item. Scrubbed and freed after the call (#254); only Sessions
+        // retain a key, and this path is not one.
         const key = config.loadApiKeyOnly(d.io, d.alloc) orelse return error.RewriteKeyMissing;
-        defer d.alloc.free(key);
+        defer api_key.scrub(d.alloc, key);
         return openai_rewrite.rewrite(&d.rewrite_http, d.alloc, key, raw, out);
     }
     pub fn complete(self: *RealRewriteDeps, id: coord.UtteranceId, text: []const u8, result: coord.RewriteResult) void {
@@ -750,6 +767,13 @@ const Daemon = struct {
     hud: Hud = undefined,
     menu: menu_mod.Menu = .{},
     tap: tapmod.Tap = undefined, // built in run()
+
+    /// The Key Holder (api_key.zig, #254): the daemon's *one* plaintext copy of the OpenAI
+    /// secret. The supervisor's facts pass refreshes it, `connectOpenai` hands it to the
+    /// Session it connects, and every copy nobody took is zeroed before it is released.
+    /// Supervisor-thread-only, like the `pending_key` field it replaces: `gatherOutcome`
+    /// and the Backend Router's prepare both run on that one thread.
+    api_key: KeyHolder = undefined,
 
     // ---- the Coordinator's real adapters + the Coordinator itself (wired in run()) ----
     router_deps: DaemonDeps = undefined,
@@ -922,14 +946,18 @@ const Daemon = struct {
     fn gatherOutcome(self: *Daemon) configuration_phase.Outcome {
         const selected = self.transcription.selected();
         const local_installation = self.provisioner.installationPresent();
-        const key = if (selected == .openai and !self.transcription.resourcePresent(.openai))
-            config.loadApiKeyOnly(self.io, self.alloc)
-        else
-            null;
-        self.router_deps.pending_key = key;
+        // The key is read only on a tick that could actually connect one. Every other tick
+        // ends the copy the last one left: the Key Holder owns that lifetime, so this pass
+        // can no longer strew a plaintext key across the heap every 3 s (#254, finding 9).
+        const key_present = if (selected == .openai and !self.transcription.resourcePresent(.openai))
+            self.api_key.refresh()
+        else present: {
+            self.api_key.drop();
+            break :present false;
+        };
         const im = self.grants.granted(.input_monitoring);
         const pe = self.grants.granted(.post_event);
-        return self.configuration.tick(self.configurationFacts(im, pe, key != null, local_installation));
+        return self.configuration.tick(self.configurationFacts(im, pe, key_present, local_installation));
     }
 
     /// Gather this tick's Supervisor facts — the impure OS/router/grant reads the pure
@@ -1308,6 +1336,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
         .process_environ = process_environ,
         .store = config.Store.init(first_snapshot),
     };
+    daemon.api_key = KeyHolder.init(alloc, .{ .io = io });
     daemon.router_deps = .{ .daemon = &daemon };
     daemon.transcription = BackendRouter.init(io, &daemon.router_deps, selected_backend);
     daemon.model_operation_runner_deps = .{ .daemon = &daemon };

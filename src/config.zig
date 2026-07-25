@@ -146,7 +146,11 @@ pub fn loadSettingsOnly(io: std.Io, gpa: std.mem.Allocator) Settings {
 /// supervisor (wayfinder #19) polls this until a key appears (exported env var,
 /// keychain item, or a legacy env file to migrate), then constructs the Transcription
 /// Session. NUL-terminated so it drops straight into the `Authorization: Bearer` header.
-pub fn loadApiKeyOnly(io: std.Io, gpa: std.mem.Allocator) ?[:0]const u8 {
+///
+/// Mutable on purpose (#254): every caller owes the copy an `api_key.scrub` — a plaintext
+/// key returned to the allocator un-zeroed outlives its use in the heap. The lifetime rule
+/// itself is the Key Holder's (api_key.zig); this is only the read.
+pub fn loadApiKeyOnly(io: std.Io, gpa: std.mem.Allocator) ?[:0]u8 {
     return loadApiKey(io, gpa);
 }
 
@@ -187,7 +191,7 @@ fn loadSettings(io: std.Io, gpa: std.mem.Allocator, home: []const u8) Settings {
 /// The secret: process environment first (the dev override), then the keychain item.
 /// A keychain miss falls through to the one-time env-file migration. Returns null only
 /// when no source yields a key.
-fn loadApiKey(io: std.Io, gpa: std.mem.Allocator) ?[:0]const u8 {
+fn loadApiKey(io: std.Io, gpa: std.mem.Allocator) ?[:0]u8 {
     if (apiKeyFromEnv(gpa)) |key| return key;
     switch (keychain.readKey(gpa)) {
         .key => |key| {
@@ -226,7 +230,7 @@ fn logKeychainErrOnce(st: keychain.OSStatus) void {
 /// ACL note: the migrating process becomes the item's creator, so this is meant to run in
 /// the installed signed daemon. Foreground dev runs export OPENAI_API_KEY and never get
 /// here (the env override wins above).
-fn migrateEnvFile(io: std.Io, gpa: std.mem.Allocator) ?[:0]const u8 {
+fn migrateEnvFile(io: std.Io, gpa: std.mem.Allocator) ?[:0]u8 {
     const home = homeDir() orelse return null;
     var path_buf: [4096]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ home, env_rel }) catch return null;
@@ -236,7 +240,12 @@ fn migrateEnvFile(io: std.Io, gpa: std.mem.Allocator) ?[:0]const u8 {
             std.debug.print("config: could not read {s}: {s}\n", .{ path, @errorName(e) });
         return null; // no legacy file (the normal case once migrated) => no key anywhere
     };
-    defer gpa.free(raw);
+    // The whole file is a key copy for as long as it is mapped: zero it before it goes
+    // back to the allocator, exactly as the Key Holder does to the copies it owns (#254).
+    defer {
+        std.crypto.secureZero(u8, raw);
+        gpa.free(raw);
+    }
     const val = parseEnvKey(raw) orelse return null;
     const key = gpa.dupeSentinel(u8, val, 0) catch return null;
 
@@ -256,7 +265,7 @@ fn migrateEnvFile(io: std.Io, gpa: std.mem.Allocator) ?[:0]const u8 {
     return key;
 }
 
-fn apiKeyFromEnv(gpa: std.mem.Allocator) ?[:0]const u8 {
+fn apiKeyFromEnv(gpa: std.mem.Allocator) ?[:0]u8 {
     const v = std.c.getenv("OPENAI_API_KEY") orelse return null;
     const s = std.mem.span(v);
     if (s.len == 0) return null;

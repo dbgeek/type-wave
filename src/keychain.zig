@@ -115,8 +115,9 @@ fn dict(keys: []const CFTypeRef, vals: []const CFTypeRef) CFDictionaryRef {
 }
 
 pub const ReadResult = union(enum) {
-    /// NUL-terminated (drops straight into the Authorization header), owned by the caller.
-    key: [:0]const u8,
+    /// NUL-terminated (drops straight into the Authorization header), owned by the caller —
+    /// mutable so the owner can zero it before releasing it (api_key.scrub, #254).
+    key: [:0]u8,
     /// `errSecItemNotFound` — the not-configured path; config.zig's cue to try migration.
     absent,
     /// Any other status: locked keychain, ACL denial, user hit Deny… The caller logs it

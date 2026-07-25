@@ -204,6 +204,20 @@ than against live OpenAI. It carries no policy — the Session decides; the Tran
 moves bytes.
 _Avoid_: socket, client (mechanism), connection
 
+**Key Holder**:
+The owner of the daemon's *one* plaintext copy of the OpenAI API key (`src/api_key.zig`).
+It answers the Configuration Phase's *is a key configured?* fact with the same read that
+produces the value the Backend Router connects with, so the two can never disagree, and it
+decides when a copy stops existing: exactly one exists at a time, and every copy it
+finishes with is zeroed before it is released — `free` alone hands the secret to the next
+allocation and to whatever reads that memory later (a crash report, a core dump, a swapped
+page). A **hand-off** is the one way a copy legitimately outlives it: a connected
+Transcription Session retains its key for the process lifetime, so ownership moves at the
+moment `connect` returns and no later refresh can pull it out from under a live holder. Its
+`Source` seam is the real env-then-keychain read (config.zig), so the lifetime rule is
+driven against counted fake copies rather than against the login keychain.
+_Avoid_: key cache, key manager, secret store (that names the keychain item)
+
 **Transcription Backend**:
 The selected source of a Final Transcript for an Utterance; it may also emit Partial Transcripts. OpenAI is the default backend; the local Whisper backend is an offline alternative.
 _Avoid_: transcription provider, engine
