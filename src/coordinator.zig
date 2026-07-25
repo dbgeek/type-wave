@@ -1399,3 +1399,40 @@ test "34 a stale/mismatched .inserted does not record" {
     co.handle(.{ .inserted = .{ .id = 1, .result = .ok } }); // duplicate late edge, now idle
     try expectEqual(@as(usize, 1), h.recorder.records);
 }
+
+// --- the Capture watchdog's release (#272) ---
+// The watchdog does not get its own event: it feeds the ordinary `.release` the tap never
+// delivered, from the supervisor thread. These two tests are the Coordinator's whole share
+// of that — the synthesized edge takes the normal path, and a second one cannot double-stop
+// Capture if the real edge and the watchdog land together.
+
+test "35 a release the tap never delivered ends the hold by the ordinary path" {
+    var h = Harness{};
+    const co = h.wire();
+    co.handle(.press);
+    // No tap release ever arrives — this one comes from the watchdog instead.
+    co.handle(.release);
+
+    try expectEqual(@as(usize, 1), h.audio.stopped); // the microphone is off, which is the point
+    try expectEqual(@as(usize, 1), h.backends.released);
+    try expectEqual(@as(usize, 1), h.deadline.arms);
+    try expectEqual(@as(usize, 1), h.insertion.notes);
+    // And it resolves as any Utterance does, rather than being discarded for its provenance.
+    co.handle(.{ .final = .{ .id = 1, .text = "said before the edge was lost" } });
+    co.handle(.{ .inserted = .{ .id = 1, .result = .ok } });
+    try expectEqual(@as(usize, 1), h.feedback.inserteds);
+}
+
+test "36 a real release racing the watchdog's cannot stop Capture twice" {
+    var h = Harness{};
+    const co = h.wire();
+    co.handle(.press);
+    co.handle(.release);
+    co.handle(.release); // the loser of the race, whichever it was
+
+    try expectEqual(@as(usize, 1), h.audio.stopped);
+    try expectEqual(@as(usize, 1), h.backends.released);
+    try expectEqual(@as(usize, 1), h.feedback.releaseds);
+    try expectEqual(@as(usize, 1), h.deadline.arms);
+    try expectEqual(@as(usize, 1), h.insertion.notes);
+}

@@ -9,7 +9,11 @@ One hold-to-talk span of speech, from Talk Key press to release. The unit of dic
 _Avoid_: recording, clip
 
 **Talk Key**:
-The key held down to capture an Utterance; releasing it ends the Utterance.
+The key held down to capture an Utterance; releasing it ends the Utterance. Which key is the
+Talk Key is read from the Settings Snapshot **at the press** — a menu change binds at the next
+one — but the release is matched against the **open hold** (`tap.Hold`: the press that was
+forwarded and not yet released), never against the live setting, so changing the Talk Key while
+the old one is held cannot swallow the edge that stops the microphone (#272).
 _Avoid_: hotkey, PTT key
 
 **Partial Transcript**:
@@ -319,7 +323,13 @@ Backend Router's path. Lives in `src/model_operation.zig`.
 _Avoid_: model manager, operation orchestrator, download manager
 
 **Capture**:
-The microphone audio stream feeding a Transcription Session.
+The microphone audio stream feeding a Transcription Session. It stops on the Talk Key release
+edge — and, when that edge is never observed, on the **Capture watchdog**: the Supervisor's
+per-tick reading that a hold is open while the key holding it open is physically up
+(`CGEventSourceKeyState`, deliberately not anything the tap saw), which feeds the Coordinator
+the ordinary `.release` so the Utterance resolves by the usual rules at most one tick late
+(#272, ADR-0005 amendment). Hold duration is never a term in that decision: a long dictation
+hold is legitimate.
 _Avoid_: recording
 
 **Utterance Coordinator**:
@@ -380,9 +390,10 @@ _Avoid_: setup state, readiness state, configured flag
 
 **Supervisor**:
 The pure per-tick decider of the daemon's self-heal nudges — the Talk Key tap re-arm and
-the PostEvent probe (#127/#129) — plus the superseded-Model-Installation cleanup and the
+the PostEvent probe (#127/#129) — plus the superseded-Model-Installation cleanup, the
 capture-enable gate (the Talk Key press gate: `configured` AND a live backend AND not
-paused). Fed a `Facts` snapshot and the Configuration Phase `Outcome`, it returns an
+paused), and the Capture watchdog (a hold open while its key is up: `hold_open AND
+NOT talk_key_down`, #272). Fed a `Facts` snapshot and the Configuration Phase `Outcome`, it returns an
 `Actions` bundle the daemon's self-heal loop executes; it reads the Configuration Phase
 and sits beside the grant sequence but owns neither — those stay peer machines the daemon
 drives. Lives in `src/supervisor.zig`, exercised by fed facts. Pure by choice, not

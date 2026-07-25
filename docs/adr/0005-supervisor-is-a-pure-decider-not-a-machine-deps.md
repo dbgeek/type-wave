@@ -79,3 +79,45 @@ Also decided, and load-bearing for the shape:
 A future architecture review should not "upgrade" the Supervisor to a `Machine(Deps)`
 without re-reading this record: the Deps idiom was considered here and traded away on
 purpose, because for this module the seam would out-weigh the behaviour behind it.
+
+## Amendment (2026-07-25, #272) — the Supervisor also ends a hold the tap stopped narrating
+
+The four decisions above are all *nudges*: re-arm, probe, reclaim, and a gate a callback
+consults. The Capture watchdog is the first Supervisor decision whose action drives the
+Utterance Coordinator directly — `end_lost_hold` feeds it the `.release` the tap never
+delivered — so it is worth saying why it belongs here rather than in the tap adapter or the
+Coordinator.
+
+`.capturing` had exactly one exit: `onRelease`, reachable only from the Talk Key release edge
+arriving through the tap. `onBackendFailed` mid-hold poisons and waits for that edge; the
+deadline is armed only at release. So anything that ate the edge left the microphone live and
+the machine wedged — every later press dropped by the overlap guard, dictation dead until
+restart. Two routes did eat it: a Talk Key changed from the Status Item mid-hold (the release
+filter compared against the *live* setting, which no longer named the held key), and a tap
+death mid-hold (edges fired while disabled are never delivered, and a re-enable that fails
+delivers nothing ever again).
+
+The first route is closed where it was opened — the release is matched against the **open
+hold** (`tap.Hold`), not the Talk Key setting — and needs no watchdog. The second cannot be:
+no fix inside the tap can deliver an edge the OS withheld. That leaves a second, independent
+route to the same terminal edge, and this loop already has the two properties it needs — a
+~3 s cadence, and a fact-gathering pass that may make cross-process OS reads. The evidence is
+`CGEventSourceKeyState` on the held key: HID-level, and specifically *not* anything the tap
+observed, since a tap that stopped reporting is the failure being detected.
+
+- **The decision stays two facts and an AND** (`hold_open and !talk_key_down`), so the whole
+  rule is a fed-facts test like the capture-enable gate beside it. Duration is deliberately
+  not a term: a long dictation hold is legitimate, and "the key is up" is direct evidence
+  that this hold is not one.
+- **The action is the ordinary `.release`**, so a watchdog-ended hold commits or is abandoned
+  by exactly the usual rules — no second lifecycle path, nothing for the Coordinator to know
+  about its provenance. `Hold`'s compare-and-swap makes the watchdog and a real release
+  racing resolve to one ending, not two.
+- **It runs synchronously, unlike `rearm_tap` / `post_probe`.** Those are async nudges read
+  next tick; this one calls `coordinator.handle` on the supervisor thread, which is what
+  `handle` is built for (four other threads already trampoline into it).
+
+The generalization worth carrying forward: **a state entered on an edge needs an exit that
+does not depend on the counterpart edge arriving.** The counterpart is the normal exit and
+stays the fast one; the watchdog is the proof that ground truth, polled, can reach the same
+exit when the edge never comes.
