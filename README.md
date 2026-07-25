@@ -150,7 +150,9 @@ the OpenAI key in the login keychain so it can be read without prompts across re
 
 The one-time signing identity setup, LaunchAgent load/unload commands, and TCC grant
 persistence checks are documented in [docs/packaging.md](./docs/packaging.md). Logs go
-to `~/Library/Logs/type-wave.log`.
+to `~/Library/Logs/type-wave.log` — they record that an Utterance resolved and how long
+each stage took, never the words (set `.log_transcripts = true` while debugging a
+transcription problem).
 
 ## Configuration
 

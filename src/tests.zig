@@ -16,6 +16,7 @@ test {
     _ = @import("whisper_runtime_test.zig"); // the real C-ABI runtime wrapper, driven via a fake bridge (#207)
     _ = @import("whisper_supervisor.zig");
     _ = @import("config.zig");
+    _ = @import("feedback.zig"); // the log's transcript-redaction policy + rendering (#250)
     _ = @import("vocab.zig"); // the pure vocabulary helpers: buildPrompt glossary + budget estimation
     _ = @import("session.zig");
     _ = @import("hud.zig");

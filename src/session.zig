@@ -1052,7 +1052,11 @@ pub fn Session(comptime Transport: type) type {
             pub fn serverMessage(self: *Handler, data: []u8) !void {
                 const s = self.session;
                 const parsed = std.json.parseFromSlice(std.json.Value, s.alloc, data, .{}) catch {
-                    feedback.log("  [unparseable event] {s}\n", .{data});
+                    // A raw server body can itself carry transcript text — an unparseable
+                    // event is the easiest place to leak what the two named sites below
+                    // redact — so it goes to the log by size under the same policy (#250).
+                    var tbuf: [feedback.transcript_render_len]u8 = undefined;
+                    feedback.log("  [unparseable event] {s}\n", .{feedback.renderTranscript(&tbuf, data, feedback.logTranscripts())});
                     return;
                 };
                 defer parsed.deinit();
@@ -1078,9 +1082,12 @@ pub fn Session(comptime Transport: type) type {
                         @memcpy(s.partial[s.partial_len..][0..d.len], d);
                         s.partial_len += d.len;
                     }
-                    // Partial Transcript: always logged (#18). The HUD shows no text (#27), so
-                    // nothing subscribes partials today; the observer hook stays for the future.
-                    feedback.log("  [{d:>6}ms] partial: {s}\n", .{ nowMs() - s.t0_ms, s.partial[0..s.partial_len] });
+                    // Partial Transcript: its arrival is always logged (#18), its words are not
+                    // (#250) — the line reports how much has accumulated so far instead. The HUD
+                    // shows no text (#27), so nothing subscribes partials today; the observer hook
+                    // stays for the future.
+                    var tbuf: [feedback.transcript_render_len]u8 = undefined;
+                    feedback.log("  [{d:>6}ms] partial: {s}\n", .{ nowMs() - s.t0_ms, feedback.renderTranscript(&tbuf, s.partial[0..s.partial_len], feedback.logTranscripts()) });
                     if (s.observer) |o| if (o.on_partial) |f| f(o.ctx, s.partial[0..s.partial_len]);
                 } else if (std.mem.eql(u8, typ, "conversation.item.input_audio_transcription.completed")) {
                     const item_id = getStr(root, "item_id") orelse "";
@@ -1090,7 +1097,11 @@ pub fn Session(comptime Transport: type) type {
                     @memcpy(s.final[0..n], t[0..n]);
                     s.final_len = n;
                     const now = nowMs();
-                    feedback.log("  [{d:>6}ms] FINAL (+{d}ms after release): {s}  ({d:.2}s audio)\n", .{ now - s.t0_ms, now - s.t_release_ms, t, usageSeconds(root) });
+                    // The Final Transcript's size, not its words (#250): the line still carries
+                    // every timing and the audio seconds, so the log shows that the Utterance
+                    // resolved and how long each stage took without recording what was said.
+                    var tbuf: [feedback.transcript_render_len]u8 = undefined;
+                    feedback.log("  [{d:>6}ms] FINAL (+{d}ms after release): {s}  ({d:.2}s audio)\n", .{ now - s.t0_ms, now - s.t_release_ms, feedback.renderTranscript(&tbuf, t, feedback.logTranscripts()), usageSeconds(root) });
                     // Deliver the Final Transcript to the observer (the Utterance Coordinator, and
                     // through it the overlay HUD). This synchronous push IS the delivery — there is
                     // no polled got_final flag any more (architecture review 2026-07-08, candidate 1).

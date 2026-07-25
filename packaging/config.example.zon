@@ -59,4 +59,12 @@
     // TEXT leaves your Mac (audio handling is unchanged), it needs internet, and it does
     // not apply on the Local backend — there the raw transcript inserts unchanged.
     .backtrack = false,
+
+    // Diagnostics escape hatch. type-wave's log (~/Library/Logs/type-wave.log) records
+    // that an Utterance resolved, how long each stage took and how big the text was —
+    // never the words themselves. That log is unrotated plaintext, it goes into
+    // sysdiagnose bundles and Time Machine, and the menu's Diagnostics action attaches
+    // it to bug reports, so your dictation stays out of it. Set true only while
+    // debugging a transcription problem, and set it back afterwards.
+    .log_transcripts = false,
 }

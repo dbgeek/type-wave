@@ -1282,8 +1282,11 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     first_snapshot.* = config.loadSettingsOnly(io, alloc);
     const settings = first_snapshot.*;
     const selected_backend = settings.transcription_backend;
-    std.debug.print("config: backend={s} talk_key={s} model=\"{s}\" language=\"{s}\" delay=\"{s}\" noise_reduction={s} insertion={s} pre_paste_ms={d} overlay={} backtrack={} vocabulary={d} terms\n", .{
-        @tagName(selected_backend), @tagName(settings.talk_key), settings.model, settings.language, settings.delay, @tagName(settings.noise_reduction), @tagName(settings.insertion), settings.pre_paste_ms, settings.overlay, settings.backtrack, settings.vocabulary.len,
+    // `log_transcripts` is named here so the log says which way it is reading itself: off,
+    // it explains why every transcript below is a byte count; on, it is the one line that
+    // warns this log now holds the spoken words (#250).
+    std.debug.print("config: backend={s} talk_key={s} model=\"{s}\" language=\"{s}\" delay=\"{s}\" noise_reduction={s} insertion={s} pre_paste_ms={d} overlay={} backtrack={} vocabulary={d} terms log_transcripts={}\n", .{
+        @tagName(selected_backend), @tagName(settings.talk_key), settings.model, settings.language, settings.delay, @tagName(settings.noise_reduction), @tagName(settings.insertion), settings.pre_paste_ms, settings.overlay, settings.backtrack, settings.vocabulary.len, settings.log_transcripts,
     });
 
     var daemon = Daemon{
