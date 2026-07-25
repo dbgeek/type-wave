@@ -16,6 +16,8 @@
 //!      `nix develop` run the same lines appear live in the terminal. Every state
 //!      transition + operational error goes through here; a Partial Transcript's
 //!      *arrival* is logged, but not its words — see the redaction policy below.
+//!      `clearLog` is the disposal half of the same surface: the user-initiated truncate
+//!      that empties what earlier versions already wrote there.
 //!
 //! This module knows nothing about the Talk Key, Capture, the Session, or Insertion —
 //! callers own the failure *policy* (what is an error, when to sound the error cue);
@@ -180,6 +182,101 @@ test "the log's redaction policy round-trips through the publisher" {
     try std.testing.expect(logTranscripts());
     setLogTranscripts(false);
     try std.testing.expect(!logTranscripts());
+}
+
+// ---- clearing the log (#252) ------------------------------------------------
+//
+// Redacting new writes (#250) does nothing about the transcript history already on disk:
+// anyone upgrading past it still has a log holding every word they have dictated since they
+// installed type-wave. Clearing is the disposal path for that, and it is **user-initiated
+// only** — nothing below is reachable from startup, an upgrade, or a size threshold. The log
+// is the surface the operator is told to attach to a bug report, and a daemon that truncates
+// it on its own is a daemon that eats the evidence.
+//
+// Two mechanics decide the shape:
+//
+//   - **Truncate, don't unlink.** The daemon does not own the handle — launchd opened
+//     `StandardErrorPath`/`StandardOutPath` on our behalf — so unlinking would leave it
+//     writing to an unlinked inode and the file would appear not to have cleared. Truncating
+//     the descriptor we *inherited* keeps launchd's handle live and needs no path at all.
+//   - **Under the stderr lock.** Every `log()` line is emitted through `std.debug.print`,
+//     which serialises on that lock; taking it here means a write landing at this moment is
+//     ordered against the truncate rather than racing it, and the "cleared" line is written
+//     from inside the same hold, so no other thread's line can land in front of it.
+
+pub const ClearError = error{
+    /// The daemon's diagnostics are not going to a file — a foreground run in a terminal, or
+    /// a pipe. There is nothing on disk to clear.
+    NotAFile,
+    /// The truncate failed for some other reason.
+    ClearFailed,
+};
+
+/// The first line of a cleared log, after the timestamp `clearLog` stamps on it. A cleared log
+/// whose first line says when and why it was cleared beats one that starts mid-sentence.
+const cleared_note = "  log: cleared from the Status Item — every line before this one is gone\n";
+
+/// Truncate `fd` to nothing and put the next write at the front of it.
+///
+/// The rewind is belt-and-braces: launchd opens the log in append mode, where a write already
+/// seeks to end-of-file and therefore lands at 0 after the truncate. A foreground run
+/// redirected with `>` has no `O_APPEND`, and without the rewind its next write would land at
+/// the old offset — the file would spring straight back to its former size with a hole of NUL
+/// bytes where the cleared log used to be.
+fn clearFile(fd: std.posix.fd_t) ClearError!void {
+    const rc = std.c.ftruncate(fd, 0);
+    if (rc != 0) return switch (std.c.errno(rc)) {
+        .INVAL => error.NotAFile, // ftruncate rejects a tty or a pipe
+        else => error.ClearFailed,
+    };
+    _ = std.c.lseek(fd, 0, std.c.SEEK.SET);
+}
+
+/// Clear the daemon's log in place and record that it was cleared as its new first line.
+/// Called only from the Status Item's confirmed Clear action; the caller surfaces a failure
+/// rather than swallowing it.
+pub fn clearLog() ClearError!void {
+    var buffer: [128]u8 = undefined;
+    const stderr = std.debug.lockStderr(&buffer);
+    defer std.debug.unlockStderr();
+
+    try clearFile(stderr.file_writer.file.handle);
+
+    var tsbuf: [32]u8 = undefined;
+    const ts = writeTimestamp(&tsbuf);
+    // Written through the locked writer rather than `log()`, which would re-enter this lock.
+    stderr.file_writer.interface.print("{s} {s}", .{ ts, cleared_note }) catch {};
+}
+
+test "clearing empties the file and puts the next write at the front of it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile(std.testing.io, "type-wave.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "2026-07-25 09:00:00.000   openai: my bank password is hunter2\n");
+
+    try clearFile(file.handle);
+    try std.testing.expectEqual(@as(u64, 0), try file.length(std.testing.io));
+
+    // The daemon keeps logging to the same handle — the next line is the whole file, with no
+    // hole in front of it where the cleared bytes were.
+    try file.writeStreamingAll(std.testing.io, "after\n");
+    var buf: [64]u8 = undefined;
+    const contents = try tmp.dir.readFile(std.testing.io, "type-wave.log", &buf);
+    try std.testing.expectEqualStrings("after\n", contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "hunter2") == null);
+}
+
+test "clearing something that is not a file says so rather than reporting success" {
+    // A pipe stands in for the foreground / terminal case: `ftruncate` rejects both the same
+    // way, and there is no log on disk to clear either way.
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    try std.testing.expectError(error.NotAFile, clearFile(fds[1]));
 }
 
 // ---- sound cues (AudioToolbox, pure C) --------------------------------------

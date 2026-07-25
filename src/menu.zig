@@ -208,6 +208,11 @@ pub const Host = struct {
     /// Store the API key (Keychain). Returns whether the store succeeded.
     storeApiKey: *const fn (ctx: *anyopaque, key: []const u8) bool,
     modelAction: *const fn (ctx: *anyopaque, action: ModelAction) void,
+    /// Clear the daemon's log (#252) — the disposal path for the transcript history #250's
+    /// redaction leaves behind on disk. Returns whether it was cleared, so a failure can be
+    /// shown rather than swallowed: the user just asked for their dictation history to be
+    /// gone, and a silent failure would tell them it is when it isn't.
+    clearLog: *const fn (ctx: *anyopaque) bool,
     /// On-demand text fetch for one Recent Insertions entry (spec §4.1 / §5): copy the record
     /// with capture `stamp`'s `inserted` bytes into `out` under the ring's leaf lock, returning
     /// the byte count (0 if it was evicted). The reveal path reads the receipt's `inserted`
@@ -668,6 +673,11 @@ pub const Menu = struct {
             msgLong(item, "setTag:", @intFromEnum(definition.action));
             self.chrome.model_actions[@intFromEnum(definition.action)] = item;
         }
+        // Clear log (#252) sits beside Open diagnostics — the two log affordances together,
+        // one to read it and one to dispose of it. Static like "Open config file" and "Quit":
+        // its title never changes and it is never hidden, so there is nothing for the
+        // Presentation to decide about it.
+        _ = self.addAction(sub, "Clear log\xe2\x80\xa6", "onClearLog:");
         const parent = makeItem("Local Model", null);
         msg1v(parent, "setSubmenu:", sub);
         msg1v(menu, "addItem:", parent);
@@ -912,13 +922,40 @@ fn onReinsertFire(_: id, _: SEL, _: id) callconv(.c) void {
     m.host.reinsert(m.host.ctx, stamp);
 }
 
-const ModelActionConfirmation = struct {
+/// Clear log… (#252): confirm, clear, and say so if it did not work. Never reachable from
+/// anywhere but this click — no timer, no startup path, no size threshold calls `host.clearLog`.
+fn onClearLog(_: id, _: SEL, _: id) callconv(.c) void {
+    const m = g_menu orelse return;
+    if (!confirm(clear_log_confirmation)) return;
+    if (m.host.clearLog(m.host.ctx)) return; // the cleared log's own first line records it
+    // A failure has to reach the user directly, not only the log: the log is what failed, and
+    // a clear that did nothing looks exactly like one that worked. The daemon writes the
+    // reason to the log for a bug report; this is the half the user sees.
+    acknowledge(clear_log_failure);
+}
+
+const Confirmation = struct {
     title: [*:0]const u8,
     detail: [*:0]const u8,
     button: [*:0]const u8,
 };
 
-fn confirmationForModelAction(action: ModelAction) ?ModelActionConfirmation {
+/// The Clear log… confirmation (#252). It names what disappears — the whole diagnostic
+/// history, transcripts included — and what does not, so nobody clears it expecting the
+/// Recent Insertions ring or their settings to go with it.
+const clear_log_confirmation = Confirmation{
+    .title = "Clear the type-wave log?",
+    .detail = "Every line currently in ~/Library/Logs/type-wave.log is deleted, including any transcript text an earlier version recorded verbatim. The diagnostic history a bug report would attach goes with it, and it cannot be recovered. type-wave keeps logging to the same file afterwards; your settings and Recent Insertions are unaffected.",
+    .button = "Clear log",
+};
+
+const clear_log_failure = Confirmation{
+    .title = "The log was not cleared.",
+    .detail = "type-wave could not empty ~/Library/Logs/type-wave.log, so its contents are unchanged. This is expected when the daemon is running in the foreground, where its diagnostics go to the terminal rather than to a file.",
+    .button = "OK",
+};
+
+fn confirmationForModelAction(action: ModelAction) ?Confirmation {
     return switch (action) {
         .install => .{
             .title = "Install Whisper Large v3 Turbo?",
@@ -956,28 +993,44 @@ fn confirmationForModelAction(action: ModelAction) ?ModelActionConfirmation {
 
 fn confirmModelAction(action: ModelAction) bool {
     const content = confirmationForModelAction(action) orelse return true;
+    return confirm(content);
+}
+
+/// Raise a two-button confirmation and report whether the affirmative one was chosen.
+///
+/// Unlike the top-level Set-API-Key item, everything routed through here fires from the
+/// Local Model submenu, whose tracking run loop is still tearing down as we present. An
+/// accessory app is never frontmost, so activateIgnoringOtherApps: alone lands too late and
+/// the alert opens behind the frontmost app. Activate, then raise the alert's own window
+/// above ordinary windows and order it front regardless of active state — hud.zig's #20
+/// recipe — so the confirmation always surfaces focused (#31).
+fn confirm(content: Confirmation) bool {
+    return runAlert(content, "Cancel") == NSAlertFirstButtonReturn;
+}
+
+/// The one-button variant: something already happened (or failed to), and the user only has
+/// to acknowledge it. Same surfacing recipe as `confirm`.
+fn acknowledge(content: Confirmation) void {
+    _ = runAlert(content, null);
+}
+
+fn runAlert(content: Confirmation, second_button: ?[*:0]const u8) c_long {
     const pool = objc_autoreleasePoolPush();
     defer objc_autoreleasePoolPop(pool);
 
-    // Unlike the top-level Set-API-Key item, Install/Remove fire from the Local Model
-    // submenu, whose tracking run loop is still tearing down as we present. An accessory
-    // app is never frontmost, so activateIgnoringOtherApps: alone lands too late and the
-    // alert opens behind the frontmost app. Activate, then raise the alert's own window
-    // above ordinary windows and order it front regardless of active state — hud.zig's
-    // #20 recipe — so the confirmation always surfaces focused (#31).
     msgBool(appkit.app(), "activateIgnoringOtherApps:", true);
 
     const alert = msg(msg(cls("NSAlert"), "alloc"), "init");
     msg1v(alert, "setMessageText:", nsstr(content.title));
     msg1v(alert, "setInformativeText:", nsstr(content.detail));
     _ = msg1(alert, "addButtonWithTitle:", nsstr(content.button));
-    _ = msg1(alert, "addButtonWithTitle:", nsstr("Cancel"));
+    if (second_button) |title| _ = msg1(alert, "addButtonWithTitle:", nsstr(title));
 
     const win = msg(alert, "window");
     msgLong(win, "setLevel:", NSStatusWindowLevel);
     _ = msg(win, "orderFrontRegardless");
 
-    return msgLongR(alert, "runModal") == NSAlertFirstButtonReturn;
+    return msgLongR(alert, "runModal");
 }
 
 test "Install confirmation names the pinned large artifact and its privacy boundary" {
@@ -1007,6 +1060,29 @@ test "state-changing Local Model confirmations explain their containment boundar
     const discard = std.mem.span(confirmationForModelAction(.discard).?.detail);
     try std.testing.expect(std.mem.indexOf(u8, discard, "staged data") != null);
     try std.testing.expect(std.mem.indexOf(u8, discard, "working Model Installation") != null);
+}
+
+test "the Clear log confirmation says what disappears and what survives" {
+    const detail = std.mem.span(clear_log_confirmation.detail);
+    // What goes: the file by name, the whole history, and the transcripts #250's redaction
+    // stopped writing but could not retract.
+    try std.testing.expect(std.mem.indexOf(u8, detail, "~/Library/Logs/type-wave.log") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "transcript") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "cannot be recovered") != null);
+    // What the user is giving up by clearing: the diagnostics a bug report attaches.
+    try std.testing.expect(std.mem.indexOf(u8, detail, "bug report") != null);
+    // And what does *not* go, so nobody reads this as a wider erase than it is.
+    try std.testing.expect(std.mem.indexOf(u8, detail, "keeps logging") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "Recent Insertions are unaffected") != null);
+
+    // A confirmation, not a notice: the affirmative button names the act.
+    try std.testing.expectEqualStrings("Clear log", std.mem.span(clear_log_confirmation.button));
+}
+
+test "a failed clear says the log is unchanged rather than implying it went" {
+    const detail = std.mem.span(clear_log_failure.detail);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "unchanged") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "foreground") != null);
 }
 
 // ---- vocabulary editing pure halves (spec §3/§4) --------------------------------------
@@ -1263,6 +1339,7 @@ fn makeTarget() id {
     _ = class_addMethod(target_cls, sel_registerName("onBacktrack:"), @ptrCast(&onBacktrack), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onPause:"), @ptrCast(&onPause), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onOpenConfig:"), @ptrCast(&onOpenConfig), v_at);
+    _ = class_addMethod(target_cls, sel_registerName("onClearLog:"), @ptrCast(&onClearLog), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onSetApiKey:"), @ptrCast(&onSetApiKey), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onVocabulary:"), @ptrCast(&onVocabulary), v_at);
     _ = class_addMethod(target_cls, sel_registerName("onQuit:"), @ptrCast(&onQuit), v_at);

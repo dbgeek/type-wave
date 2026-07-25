@@ -152,7 +152,9 @@ The one-time signing identity setup, LaunchAgent load/unload commands, and TCC g
 persistence checks are documented in [docs/packaging.md](./docs/packaging.md). Logs go
 to `~/Library/Logs/type-wave.log` — they record that an Utterance resolved and how long
 each stage took, never the words (set `.log_transcripts = true` while debugging a
-transcription problem).
+transcription problem). **Local Model ▸ Clear log…** empties that file after a
+confirmation, for disposing of a history an earlier version recorded verbatim; nothing
+clears it automatically.
 
 ## Configuration
 

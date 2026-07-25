@@ -1254,6 +1254,19 @@ const Daemon = struct {
         }
     }
 
+    /// Clear log… → truncate the log the Diagnostics action opens (#252). The mechanism is
+    /// feedback's, because the log is its surface and the clear has to take the same stderr
+    /// lock every line does; what lives here is only the routing. Returns whether it cleared,
+    /// so the menu can say so when it did not.
+    fn menuClearLog(ctx: *anyopaque) bool {
+        _ = ctx;
+        feedback.clearLog() catch |failure| {
+            feedback.log("  log: clear failed ({s}) — the log is unchanged\n", .{@errorName(failure)});
+            return false;
+        };
+        return true;
+    }
+
     fn waitForDetached(io: std.Io, child_value: std.process.Child) void {
         var child = child_value;
         _ = child.wait(io) catch {};
@@ -1411,6 +1424,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
         .setPaused = Daemon.menuSetPaused,
         .storeApiKey = Daemon.menuStoreApiKey,
         .modelAction = Daemon.menuModelAction,
+        .clearLog = Daemon.menuClearLog,
         .historyText = Daemon.menuHistoryText,
         .copy = Daemon.menuCopy,
         .reinsert = Daemon.menuReinsert,
