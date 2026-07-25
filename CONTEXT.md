@@ -114,13 +114,15 @@ hint, not the Focused Target: it names the app, never the text field.
 
 **Recent Insertions View**:
 The **text-free, masked projection** of the Recent Insertions ring that rides through the
-pure Status Item pipeline (`status_item.project` / `derive`) for rendering — one
+pure Status Item pipeline (`status_item.project` / `derive` / `present`) for rendering — one
 `HistoryEntryView` per entry: `{ char_len, app: AppIdentity, timestamp, outcome, undone }`, no
 transcript bytes (`undone` marks a record undone by `⌃⌘⌫`, rendered dimmed where a re-insert
-redoes it). It is fixed-size and `std.meta.eql`-comparable so the menu's snapshot
+redoes it). It is fixed-size and `std.meta.eql`-comparable so the Chrome's
 early-out keeps working, and it keeps transcript text out of the projected `Snapshot`
 entirely (privacy by construction): the actual `inserted` / `raw` text is fetched from the
-authoritative ring on demand only at reveal / copy / re-insert. Distinct from the Insertion
+authoritative ring on demand only at reveal / copy / re-insert. That rule is why the
+Presentation's history rows stay **structural** — `entry` + `revealed` + `hidden`, no label
+bytes — and the Status Item Chrome formats each row itself (ADR-0011). Distinct from the Insertion
 Record, which is the authoritative, text-bearing entry the ring owns.
 _Avoid_: history model, menu record (vague); Insertion Record (that's the text-bearing entry, not this masked view)
 
@@ -372,7 +374,9 @@ Whether anything is drawn at all is the adapter's business: the daemon leaves th
 disabled when the Chrome could not be built, which is what makes `isOn` report honestly to
 the Feedback Surface. It carries no policy — the Sequencer decides, the pump composes, the
 Chrome only draws — and `Hud(Chrome)` asserts the contract itself, unlike the Helper and
-Session Transport seams, whose contracts nothing invokes.
+Session Transport seams, whose contracts nothing invokes. The **Status Item Chrome** is its
+twin one tier up, on the same three-part shape: pure decider, composing pump, drawing-only
+adapter.
 _Avoid_: renderer, painter (mechanism); view, layer, window (AppKit nouns)
 
 **Feedback Surface**:
@@ -389,9 +393,50 @@ _Avoid_: notifier, feedback manager; HUD (that is one of the two halves, not the
 The daemon's menu-bar presence (icon near the clock): a two-tier icon — normal when
 dictation can fire, dimmed when it can't (paused / no key / permission missing) — whose
 menu shows the status line and edits every setting live. Recording/processing feedback
-stays the HUD's job, never the Status Item's. Its presentation is pure: the daemon gathers
-raw readings, `status_item.project` assembles them into a `Snapshot` (the corrupt override
-and the Model Operation Runner precedence), and `status_item.derive` turns that into the
-`Presentation` the menu renders — including the two-tier icon as its `icon_tier`. The menu
-(`menu.zig`) is the AppKit adapter that reads that `Presentation`; it decides no status.
+stays the HUD's job, never the Status Item's. Its presentation is pure, in three stages
+(ADR-0011): the daemon gathers raw readings, `status_item.project` assembles them into a
+`Snapshot` (the corrupt override and the Model Operation Runner precedence), `derive` turns
+that into the private `Decisions` (headline, `icon_tier`, primary action, allowed Model
+Actions), and `present` words those into the **Presentation** — the complete value the menu
+renders. The menu (`menu.zig`) is the AppKit adapter behind the Status Item Chrome seam; it
+decides no status, and a click routes off the Presentation it last displayed rather than
+re-deriving from a fresh read.
 _Avoid_: tray icon, menu-bar app (the daemon is one process, not a separate app)
+
+**Presentation**:
+The complete, `std.meta.eql`-comparable description of everything the Status Item shows —
+the value that crosses the **Status Item Chrome** seam. Per row it carries the *finished
+title bytes* (`Row`, a zero-tailed `[512]u8`, so equal titles compare equal and `NSString`
+gets its sentinel for free) plus explicit `hidden` / `enabled` / `checked` flags; and
+alongside the wording it carries what a click *means* — `primary_action`, `paused`, and each
+history row's capture stamp — because routing reads the Presentation that was displayed
+(ADR-0011). Assembled by `present(Decisions, SettingsView, RevealSet)`; the one thing it
+deliberately omits is Recent Insertions row text, which would put transcript bytes in a
+projected value. Distinct from `Decisions`, the private middle stage that answers *what the
+state means* before any wording exists.
+_Avoid_: view model, render state (vague); Snapshot (that is stage 1, what is true)
+
+**Status Item Chrome**:
+The seam the Status Item paints through: one method, `apply(Presentation)`. The production
+adapter is `AppKitChrome` (every menu-item handle, every ObjC call, and the `CFRunLoopTimer`
+chrome pump that calls back in — the cadence stays with the adapter, exactly as the HUD's
+does); a `FakeChrome` records applied Presentations, so every row title is asserted as a
+value rather than read out of a running menu. It carries no policy — `present` decides, the
+Chrome draws — and `StatusItem(Chrome)` asserts the contract itself, as `Hud(Chrome)` does
+and unlike the Helper and Session Transport seams. The pump holds only the last Presentation
+applied, which is the whole apply-only-on-change rule: comparing the Presentation rather
+than the `Snapshot` it came from means two Snapshots that read identically cost one apply.
+The twin of **HUD Chrome**, one tier up: that seam paints in-flight feedback, this one
+paints status.
+_Avoid_: renderer, painter (mechanism); menu, view, item (AppKit nouns)
+
+**SettingsView**:
+The scalar projection of the Settings Snapshot that `present` words the settings-shaped rows
+from — which curated option each radio group has selected (null where a hand-edited value
+matches no preset, so that group shows no checkmark), the Backtrack and Overlay flags, the
+vocabulary term count, and the settings-side backend. It exists because `config.Settings`
+holds slices, which no comparable value can carry: reducing them to scalars is what keeps
+the Presentation comparable, and therefore what keeps the Chrome's early-out honest. The
+radio-group table lives beside it in `status_item.zig` — which option *reads* as selected is
+presentation — while `menu.zig` keeps the write path that turns a click into a field.
+_Avoid_: settings snapshot (that is the live `Settings` the daemon reads), config view

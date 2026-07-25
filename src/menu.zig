@@ -28,12 +28,7 @@
 const std = @import("std");
 const appkit = @import("appkit.zig");
 const config = @import("config.zig");
-const readiness = @import("readiness.zig");
 const status_item = @import("status_item.zig");
-const secure_input = @import("secure_input.zig");
-const backend = @import("transcription_backend.zig");
-const tapmod = @import("tap.zig");
-const insertmod = @import("insert.zig");
 const keychain = @import("keychain.zig");
 const feedback = @import("feedback.zig");
 const vocab = @import("vocab.zig");
@@ -176,49 +171,10 @@ const NSAlertFirstButtonReturn: c_long = 1000;
 const NSStatusWindowLevel: c_long = 25; // floats above ordinary windows (matches hud.zig)
 const NSEventModifierFlagOption: c_long = 1 << 19; // ⌥ — the reveal chord's key-equivalent mask
 
-/// Ephemeral per-entry reveal state for the Recent Insertions submenu (spec §4): which entries
-/// the user has ⌥-clicked (or picked "Reveal text" for) to show inline. Keyed by the entry's
-/// capture `timestamp` — stable across menu reopens and safe under ring shift (an evicted
-/// entry's stamp simply stops matching), unlike the newest-first index, which slides as new
-/// Insertions arrive. Holds **no transcript text** — reveal only flips a flag; the bytes are
-/// fetched on demand via `Host.historyText`. At most `capacity` entries can be live at once.
-const RevealSet = struct {
-    stamps: [recent_insertions.capacity]i64 = @splat(0),
-    len: usize = 0,
-
-    fn contains(self: *const RevealSet, ts: i64) bool {
-        for (self.stamps[0..self.len]) |s| {
-            if (s == ts) return true;
-        }
-        return false;
-    }
-
-    /// Add `ts` if absent, remove it if present — the ⌥-click toggle. A full set (all
-    /// `capacity` slots taken) silently ignores a new add; every real ring has ≤ capacity
-    /// distinct stamps, so this only guards the degenerate case.
-    fn toggle(self: *RevealSet, ts: i64) void {
-        for (self.stamps[0..self.len], 0..) |s, i| {
-            if (s == ts) {
-                self.stamps[i] = self.stamps[self.len - 1]; // swap-remove; order is irrelevant
-                self.len -= 1;
-                return;
-            }
-        }
-        if (self.len < self.stamps.len) {
-            self.stamps[self.len] = ts;
-            self.len += 1;
-        }
-    }
-};
-
 // =====================================================================================
 // The daemon-facing seams.
 // =====================================================================================
 
-/// What the status line / icon tier reflect, in priority order. `paused` overlays all
-/// of them (a paused daemon reads needs-attention even when otherwise healthy).
-pub const Status = readiness.Status;
-pub const Health = readiness.Health;
 pub const ModelAction = status_item.ModelAction;
 const ModelActionDefinition = struct { title: [*:0]const u8, action: ModelAction };
 const model_action_definitions = [_]ModelActionDefinition{
@@ -279,196 +235,34 @@ pub const Host = struct {
 };
 
 // =====================================================================================
-// The six radio groups — the config.zon settings the menu edits. model/language/delay
-// carry the #31-decided curated presets (exotic values stay hand-editable — a snapshot
-// value matching no preset simply shows no checkmark in that group); the rest are the
-// closed enums.
+// The settings write path's half of the radio groups. The table itself — and every
+// checkmark decision over it — moved to status_item.zig (ADR-0011), because which option
+// reads as selected is presentation. What stays here is the write: turning a clicked
+// (group, option) into a field on a `Settings` under construction.
 // =====================================================================================
 
-const Opt = struct {
-    label: [*:0]const u8,
-    zon: []const u8, // the value text written into config.zon
-};
-const GroupDef = struct {
-    title: [*:0]const u8,
-    field: []const u8, // the config.zon field name
-    session_shaped: bool,
-    openai_only: bool = false,
-    opts: []const Opt,
-};
+const groups = status_item.groups;
 
-const groups = [_]GroupDef{
-    .{ .title = "Transcription Backend", .field = "transcription_backend", .session_shaped = false, .opts = &.{
-        .{ .label = "OpenAI", .zon = ".openai" },
-        .{ .label = "Local — Whisper Large v3 Turbo", .zon = ".local" },
-    } },
-    .{ .title = "Talk Key", .field = "talk_key", .session_shaped = false, .opts = &.{
-        .{ .label = "Right Option", .zon = ".right_option" },
-        .{ .label = "Left Option", .zon = ".left_option" },
-        .{ .label = "Globe (fn)", .zon = ".globe" },
-    } },
-    .{ .title = "Model", .field = "model", .session_shaped = true, .openai_only = true, .opts = &.{
-        .{ .label = "gpt-realtime-whisper", .zon = "\"gpt-realtime-whisper\"" },
-    } },
-    .{ .title = "Language", .field = "language", .session_shaped = true, .opts = &.{
-        .{ .label = "en", .zon = "\"en\"" },
-        .{ .label = "sv", .zon = "\"sv\"" },
-        .{ .label = "auto-detect", .zon = "\"\"" },
-    } },
-    .{ .title = "Delay", .field = "delay", .session_shaped = true, .openai_only = true, .opts = &.{
-        .{ .label = "minimal", .zon = "\"minimal\"" },
-        .{ .label = "low", .zon = "\"low\"" },
-        .{ .label = "medium", .zon = "\"medium\"" },
-        .{ .label = "high", .zon = "\"high\"" },
-    } },
-    .{ .title = "Noise reduction", .field = "noise_reduction", .session_shaped = true, .openai_only = true, .opts = &.{
-        .{ .label = "near field", .zon = ".near_field" },
-        .{ .label = "far field", .zon = ".far_field" },
-        .{ .label = "off", .zon = ".off" },
-    } },
-    .{ .title = "Insertion", .field = "insertion", .session_shaped = false, .opts = &.{
-        .{ .label = "paste", .zon = ".paste" },
-        .{ .label = "keystroke", .zon = ".keystroke" },
-    } },
-};
-
-const talk_keys = [_]tapmod.TalkKey{ .right_option, .left_option, .globe };
-const backends = [_]backend.Backend{ .openai, .local };
-const languages = [_][]const u8{ "en", "sv", "" }; // "" = auto-detect (session omits the field)
-// "minimal" earned its slot via the issue #36 benchmark: ~30-50ms faster to Final
-// Transcript than "low" but measurably worse WER on quiet speech, so "low" stays the
-// default and "minimal" is the one-click latency escape hatch ("xhigh" stays
-// hand-edit-only). See docs/research/delay-tier-benchmark.md.
-const delays = [_][]const u8{ "minimal", "low", "medium", "high" };
-const noises = [_]config.Settings.NoiseReduction{ .near_field, .far_field, .off };
-const insertions = [_]insertmod.Method{ .paste, .keystroke };
-
-/// Set group `gi`'s option `oi` on a Settings under construction.
+/// Set group `gi`'s option `oi` on a Settings under construction. The typed option tables
+/// live beside the group table in status_item.zig, so this and `settingsView`'s read-back
+/// can never drift apart.
 fn applyOption(s: *config.Settings, gi: usize, oi: usize) void {
     switch (gi) {
-        0 => s.transcription_backend = backends[oi],
-        1 => s.talk_key = talk_keys[oi],
+        0 => s.transcription_backend = status_item.backends[oi],
+        1 => s.talk_key = status_item.talk_keys[oi],
         2 => s.model = "gpt-realtime-whisper",
-        3 => s.language = languages[oi],
-        4 => s.delay = delays[oi],
-        5 => s.noise_reduction = noises[oi],
-        6 => s.insertion = insertions[oi],
+        3 => s.language = status_item.languages[oi],
+        4 => s.delay = status_item.delays[oi],
+        5 => s.noise_reduction = status_item.noises[oi],
+        6 => s.insertion = status_item.insertions[oi],
         else => unreachable,
     }
-}
-
-/// Which option of group `gi` the snapshot holds — null when a hand-edited value
-/// matches no curated preset (that group then shows no checkmark).
-fn currentOption(s: *const config.Settings, gi: usize) ?usize {
-    switch (gi) {
-        0 => for (backends, 0..) |b, i| {
-            if (s.transcription_backend == b) return i;
-        },
-        1 => for (talk_keys, 0..) |k, i| {
-            if (s.talk_key == k) return i;
-        },
-        2 => if (std.mem.eql(u8, s.model, "gpt-realtime-whisper")) return 0,
-        3 => for (languages, 0..) |l, i| {
-            if (std.mem.eql(u8, s.language, l)) return i;
-        },
-        4 => for (delays, 0..) |d, i| {
-            if (std.mem.eql(u8, s.delay, d)) return i;
-        },
-        5 => for (noises, 0..) |n, i| {
-            if (s.noise_reduction == n) return i;
-        },
-        6 => for (insertions, 0..) |m, i| {
-            if (s.insertion == m) return i;
-        },
-        else => unreachable,
-    }
-    return null;
-}
-
-fn statusText(p: status_item.Presentation, selected: backend.Backend) [*:0]const u8 {
-    return switch (p.headline) {
-        .paused => "type-wave — Paused",
-        .ready => "type-wave — OpenAI ready",
-        .ready_offline => "type-wave — Ready offline",
-        .preparing => if (selected == .openai) "type-wave — Reconnecting\xe2\x80\xa6" else "type-wave — Preparing local backend\xe2\x80\xa6",
-        .selected_backend_prerequisite_missing => if (selected == .openai) "type-wave — No OpenAI API key" else "type-wave — No local Model Installation",
-        .backend_failure => if (selected == .openai) "type-wave — OpenAI unavailable" else "type-wave — Local backend unavailable",
-        .microphone_needed => "type-wave — Microphone needed",
-        .input_monitoring_needed => "type-wave — Input Monitoring needed",
-        .accessibility_needed => "type-wave — Accessibility needed",
-    };
-}
-
-/// Disclosure line 2 beneath the Backtrack toggle. On the Local backend with Backtrack
-/// on it sharpens to the "enabled but not applying" status — the toggle stays checked so
-/// it can be pre-enabled for the switch to OpenAI (docs/backtrack-spec.md §Settings & UX);
-/// otherwise it states the cloud/network reality, shown identically whether on or off.
-fn backtrackLine2(s: *const config.Settings) [*:0]const u8 {
-    if (s.transcription_backend == .local and s.backtrack)
-        return "Not applying \xe2\x80\x94 needs the OpenAI backend";
-    return "Needs internet; unavailable on the Local backend";
-}
-
-/// The Secure Event Input row's wording (#245), one string per published state. The two held
-/// states are worded apart because the remedy is: a live holder can be quit, while a hold
-/// whose holder is gone can only be cleared by logging out. Both say what is actually lost —
-/// dictation is unaffected, the recovery chord is not. `.clear` hides the row, so its string
-/// is never shown; it exists so this stays a total switch.
-fn secureInputText(state: secure_input.State) [*:0]const u8 {
-    return switch (state) {
-        .clear => "",
-        .held => "Secure Input on \xe2\x80\x94 undo (\xe2\x8c\x83\xe2\x8c\x98\xe2\x8c\xab) unavailable",
-        .stuck => "Secure Input stuck on \xe2\x80\x94 undo (\xe2\x8c\x83\xe2\x8c\x98\xe2\x8c\xab) needs a log out",
-    };
-}
-
-fn primaryText(action: status_item.PrimaryAction, operation: status_item.Operation) [*:0]const u8 {
-    return switch (action) {
-        .none => "",
-        .set_openai_api_key => "Set OpenAI API key\xe2\x80\xa6",
-        .install_local_model => "Install Whisper Large v3 Turbo\xe2\x80\xa6",
-        .update_local_model => "Local model update available\xe2\x80\xa6",
-        .resume_model_operation => "Resume Model Operation",
-        .retry_model_operation => "Retry Model Operation",
-        .repair_local_model => "Repair local model\xe2\x80\xa6",
-        .retry_local_runtime => "Retry local runtime",
-        .operation_progress => switch (operation) {
-            .installing => "Installing Whisper Large v3 Turbo\xe2\x80\xa6",
-            .updating => "Staging local model update\xe2\x80\xa6",
-            .verifying => "Verifying Model Installation\xe2\x80\xa6",
-            .smoke_testing => "Smoke-testing Model Installation\xe2\x80\xa6",
-            .waiting_for_inference => "Waiting for local inference to drain\xe2\x80\xa6",
-            .activating => "Activating Model Installation\xe2\x80\xa6",
-            .removing => "Removing Model Installation\xe2\x80\xa6",
-            .discarding => "Discarding staged model data\xe2\x80\xa6",
-            else => "Model Operation in progress\xe2\x80\xa6",
-        },
-    };
 }
 
 // =====================================================================================
 // Vocabulary editing (spec §3/§4) — the pure halves, kept off AppKit so they unit-test
 // without a display. `onVocabulary` below is the thin ObjC glue that drives them.
 // =====================================================================================
-
-// " — local only" and "…" as UTF-8 bytes (the file's convention for the em dash / ellipsis).
-const local_only_suffix = " \xe2\x80\x94 local only";
-const dialog_ellipsis = "\xe2\x80\xa6";
-
-/// The Vocabulary menu-item title from the live term count and the active backend. Local:
-/// `Vocabulary (off)` / `Vocabulary (3 terms)…`. OpenAI: the same with a ` — local only`
-/// suffix that replaces the disclosure ellipsis — the list is editable but inert there
-/// until you switch to Local (spec §4). Static fallback on the (unreachable) format overflow.
-fn vocabularyTitle(buf: []u8, count: usize, selected: backend.Backend) [:0]const u8 {
-    if (count == 0)
-        return std.fmt.bufPrintSentinel(buf, "Vocabulary (off){s}", .{
-            if (selected == .openai) local_only_suffix else "",
-        }, 0) catch "Vocabulary";
-    const unit = if (count == 1) "term" else "terms";
-    if (selected == .openai)
-        return std.fmt.bufPrintSentinel(buf, "Vocabulary ({d} {s}){s}", .{ count, unit, local_only_suffix }, 0) catch "Vocabulary";
-    return std.fmt.bufPrintSentinel(buf, "Vocabulary ({d} {s}){s}", .{ count, unit, dialog_ellipsis }, 0) catch "Vocabulary";
-}
 
 /// Split the editor's text into the entered vocabulary list (spec §3): one term per line,
 /// each trimmed of surrounding whitespace, blank lines dropped. Terms are duped into `gpa`
@@ -529,18 +323,30 @@ fn vocabularyInfoText(buf: []u8, list: []const []const u8) [:0]const u8 {
 
 var g_menu: ?*Menu = null;
 
-pub const Menu = struct {
-    io: std.Io = undefined,
-    alloc: std.mem.Allocator = undefined,
-    store: *config.Store = undefined,
+// =====================================================================================
+// AppKitChrome — the production adapter at the **Status Item Chrome** seam (ADR-0011). It
+// owns every menu-item handle and every ObjC call, and decides nothing: `apply` is a
+// straight run of setTitle: / setHidden: / setEnabled: / setState: over the Presentation's
+// rows. The one impure reading it still makes is the clock, for the Recent Insertions
+// relative times — a clock in a value-compared Presentation would defeat the early-out.
+// =====================================================================================
+
+fn setTitle(item: id, row: *const status_item.Row) void {
+    msg1v(item, "setTitle:", nsstr(row.title()));
+}
+fn setTitleHidden(item: id, row: *const status_item.Row) void {
+    setTitle(item, row);
+    msgBool(item, "setHidden:", row.hidden);
+}
+fn setChecked(item: id, on: bool) void {
+    msgLong(item, "setState:", if (on) NSControlStateOn else NSControlStateOff);
+}
+
+const AppKitChrome = struct {
+    /// Only for the on-demand Recent Insertions text fetch — a revealed row's `inserted`
+    /// bytes come from the authoritative ring, never from a projected value.
     host: Host = undefined,
 
-    /// False until `init` succeeds; false forever on a headless start. The daemon then
-    /// runs without a status item (and blocks on plain CFRunLoopRun, not [NSApp run]).
-    active: bool = false,
-
-    // ---- AppKit handles (main-thread only) ----
-    target: id = null, // the runtime-minted TWMenuTarget instance
     button: id = null, // the status-item button (carries the icon)
     status_line: id = null, // the disabled first item
     primary_item: id = null,
@@ -556,8 +362,8 @@ pub const Menu = struct {
     backtrack_item: id = null, // checkbox mirror of settings.backtrack
     backtrack_cloud_item: id = null, // disclosure line 1 (static; on and off)
     backtrack_backend_item: id = null, // disclosure line 2 (swaps on Local + on)
-    submenu: [groups.len]id = @splat(null),
-    group_parent: [groups.len]id = @splat(null),
+    submenu: [status_item.group_count]id = @splat(null),
+    group_parent: [status_item.group_count]id = @splat(null),
     local_model_parent: id = null,
     local_model_status: id = null,
     local_model_source: id = null,
@@ -566,20 +372,147 @@ pub const Menu = struct {
     local_model_installer: id = null,
     local_operation_status: id = null,
     local_failure_status: id = null,
-    model_actions: [std.meta.fieldNames(ModelAction).len]id = @splat(null),
+    model_actions: [status_item.model_action_count]id = @splat(null),
 
-    // ---- Recent Insertions (spec §4): fixed items, retitled/toggled per open ----
+    // ---- Recent Insertions (spec §4): fixed items, retitled/toggled per apply ----
     history_parent: id = null, // the top-level "Recent Insertions ▸" item
     history_submenu: id = null, // its submenu; holds the fixed entry rows
-    history_entries: [recent_insertions.capacity]id = @splat(null), // one masked-label row each
+    history_entries: [recent_insertions.capacity]id = @splat(null), // one label row each
     history_alt_entries: [recent_insertions.capacity]id = @splat(null), // the ⌥-alternate twin per row (fires reveal)
     history_reveal_items: [recent_insertions.capacity]id = @splat(null), // the in-submenu "Reveal text" item per row
-    reveal: RevealSet = .{}, // which entries the user has toggled to show inline (spec §4)
+
+    pub fn apply(self: *AppKitChrome, p: *const status_item.Presentation) void {
+        const pool = objc_autoreleasePoolPush();
+        defer objc_autoreleasePoolPop(pool);
+
+        // ---- the menu-bar icon ----
+        var img = sfSymbol("waveform.badge.mic");
+        if (img != null) {
+            const cfg = symbolConfig(17.0, 0.0, 2); // 17 pt, regular weight, medium scale
+            img = msg1(img, "imageWithSymbolConfiguration:", cfg);
+            msgBool(img, "setTemplate:", true); // adopt the menu bar's monochrome light/dark
+            msg1v(self.button, "setImage:", img);
+            msg1v(self.button, "setTitle:", nsstr(""));
+        } else {
+            // No SF Symbols on this macOS — a text glyph keeps the item clickable.
+            msg1v(self.button, "setTitle:", nsstr(p.icon_fallback.title()));
+        }
+        // How dim is the Chrome's business; whether, is the Presentation's.
+        msgDouble(self.button, "setAlphaValue:", if (p.dimmed) 0.35 else 1.0);
+
+        // ---- title-only rows (each built disabled or always-enabled; the flag stays put) ----
+        setTitle(self.status_line, &p.status_line);
+        setTitle(self.pause_item, &p.pause);
+        setTitle(self.vocabulary_item, &p.vocabulary);
+        setTitle(self.backtrack_backend_item, &p.backtrack_backend);
+        setTitle(self.local_model_status, &p.installation);
+        setTitle(self.local_operation_status, &p.operation);
+
+        // ---- checkmarks ----
+        setChecked(self.overlay_item, p.overlay.checked);
+        setChecked(self.backtrack_item, p.backtrack.checked);
+        for (0..status_item.group_count) |gi| {
+            const sub = self.submenu[gi];
+            const n = msgLongR(sub, "numberOfItems");
+            var i: c_long = 0;
+            while (i < n) : (i += 1) {
+                const oi: usize = @intCast(i);
+                setChecked(
+                    msgIdxId(sub, "itemAtIndex:", i),
+                    oi < status_item.max_group_opts and p.group_checked[gi][oi],
+                );
+            }
+            msgBool(self.group_parent[gi], "setHidden:", p.group_hidden[gi]);
+        }
+
+        // ---- visibility-only rows ----
+        msgBool(self.set_api_key_item, "setHidden:", p.set_api_key.hidden);
+        msgBool(self.privacy_item, "setHidden:", p.privacy.hidden);
+        msgBool(self.network_item, "setHidden:", p.network.hidden);
+
+        // ---- title + visibility rows ----
+        setTitleHidden(self.primary_item, &p.primary);
+        msgBool(self.primary_item, "setEnabled:", p.primary.enabled);
+        setTitleHidden(self.secure_input_item, &p.secure_input);
+        setTitleHidden(self.local_failure_status, &p.failure);
+        setTitleHidden(self.local_model_source, &p.identity_source);
+        setTitleHidden(self.local_model_artifact, &p.identity_artifact);
+        setTitleHidden(self.local_model_runtime, &p.identity_runtime);
+        setTitleHidden(self.local_model_installer, &p.identity_installer);
+
+        // ---- the Local Model action rows ----
+        for (self.model_actions, 0..) |item, i|
+            msgBool(item, "setHidden:", p.model_action_hidden[i]);
+
+        self.applyHistory(&p.history);
+    }
+
+    /// The Recent Insertions rows (spec §4.1). The Presentation says which rows show and
+    /// which are revealed; the label itself is formatted here, because a revealed row's text
+    /// is fetched on demand from the authoritative ring — transcript bytes never ride a
+    /// projected value.
+    fn applyHistory(self: *AppKitChrome, h: *const status_item.History) void {
+        if (self.history_parent == null) return;
+        setTitle(self.history_parent, &h.parent);
+        msgBool(self.history_parent, "setEnabled:", h.parent.enabled);
+        // Drop the disclosure arrow while the ring is empty — there is nothing to open.
+        msg1v(self.history_parent, "setSubmenu:", if (h.empty) null else self.history_submenu);
+
+        const now = feedback.nowMs();
+        var label_buf: [1024]u8 = undefined; // a revealed snippet + a long app name + metadata
+        for (self.history_entries, 0..) |row, i| {
+            const hidden = h.rows[i].hidden;
+            msgBool(row, "setHidden:", hidden);
+            msgBool(self.history_alt_entries[i], "setHidden:", hidden);
+            if (hidden) continue;
+
+            const entry = h.rows[i].entry;
+            const revealed = h.rows[i].revealed;
+            const label = if (revealed) label: {
+                // On-demand text fetch (spec §4.1 / §5): the `inserted` bytes are read from the
+                // authoritative ring under its leaf lock — never from a projected value — keyed
+                // by the entry's stable timestamp so text can't misalign with its row.
+                var text_buf: [recent_insertions.max_bytes]u8 = undefined;
+                const n = self.host.historyText(self.host.ctx, entry.timestamp, &text_buf);
+                break :label status_item.historyRevealedLabel(&label_buf, entry, text_buf[0..n], now);
+            } else status_item.historyLabel(&label_buf, entry, now);
+
+            msg1v(row, "setTitle:", nsstr(label.ptr));
+            // Keep the ⌥-alternate's title in lockstep so the row doesn't jump on ⌥-hold.
+            msg1v(self.history_alt_entries[i], "setTitle:", nsstr(label.ptr));
+            // The in-submenu affordance mirrors the toggle state.
+            msg1v(self.history_reveal_items[i], "setTitle:", nsstr(status_item.revealItemTitle(revealed).ptr));
+        }
+    }
+};
+
+pub const Menu = struct {
+    io: std.Io = undefined,
+    alloc: std.mem.Allocator = undefined,
+    store: *config.Store = undefined,
+    host: Host = undefined,
+
+    /// False until `init` succeeds; false forever on a headless start. The daemon then
+    /// runs without a status item (and blocks on plain CFRunLoopRun, not [NSApp run]).
+    active: bool = false,
+    target: id = null, // the runtime-minted TWMenuTarget instance
+
+    /// The two halves of the Status Item Chrome seam: the AppKit adapter, and the pump that
+    /// composes one Presentation per refresh and applies it across the seam.
+    chrome: AppKitChrome = .{},
+    pump: status_item.StatusItem(AppKitChrome) = undefined,
+
+    /// Which entries the user has toggled to show inline (spec §4). Menu-session state: the
+    /// adapter owns it and hands it to `present` as an input (ADR-0011).
+    reveal: status_item.RevealSet = .{},
     /// The entry stamp a "Re-insert here" click stashed, awaiting the deferred fire once the menu
     /// closes (spec §5.1.5). At most one is pending — the menu closes on the click, so a second
     /// re-insert can only start after this one has fired and cleared it.
     pending_reinsert: ?i64 = null,
 
+    /// The last Snapshot pulled from the daemon. A settings write re-applies from this rather
+    /// than paying for `Host.status`'s model_store I/O again: a menu write cannot move a
+    /// daemon-side axis, and the ~2 s pump tick picks up anything that follows from it.
     last_snapshot: ?status_item.Snapshot = null,
     timer_ctx: CFRunLoopTimerContext = .{},
 
@@ -594,6 +527,8 @@ pub const Menu = struct {
         self.alloc = alloc;
         self.store = store;
         self.host = host;
+        self.chrome = .{ .host = host };
+        self.pump = .init(&self.chrome);
         g_menu = self;
 
         const pool = objc_autoreleasePoolPush();
@@ -606,37 +541,33 @@ pub const Menu = struct {
         // statusItemWithLength: returns an autoreleased item the status bar holds; keep
         // our own ref for the process lifetime.
         _ = msg(item, "retain");
-        self.button = msg(item, "button");
+        self.chrome.button = msg(item, "button");
 
+        // Every row is built with a placeholder title and default visibility: the first
+        // `apply` fills all of them, so no build step decides any wording or state.
         const menu = newMenu();
-        self.status_line = self.addDisabled(menu, "type-wave");
+        self.chrome.status_line = self.addDisabled(menu, "type-wave");
         addSeparator(menu);
-        const snap = self.store.current();
-        self.addRadioGroup(menu, 0, snap);
+        self.addRadioGroup(menu, 0);
         // Backtrack sits directly beneath the Backend radio group it depends on, with two
         // always-visible disclosure lines (docs/backtrack-spec.md §Settings & UX). Unlike
         // the openai_only groups it is never hidden — hiding would erase an opted-in
         // preference — so on the Local backend it stays checked/enabled and line 2 sharpens.
-        self.backtrack_item = self.addAction(menu, "Backtrack (rewrite self-corrections)", "onBacktrack:");
-        self.backtrack_cloud_item = self.addDisabled(menu, "Uses OpenAI cloud \xe2\x80\x94 transcript text leaves your Mac");
-        self.backtrack_backend_item = self.addDisabled(menu, ""); // wording filled by syncBacktrack
-        self.syncBacktrack(); // set the toggle state + line-2 wording from the snapshot
-        self.primary_item = self.addAction(menu, "", "onPrimary:");
-        self.privacy_item = self.addDisabled(menu, "Audio stays on this Mac");
-        self.network_item = self.addDisabled(menu, "Network used only for this model operation");
-        // Hidden unless Secure Event Input is held (#245); wording filled by refresh, since
-        // the two cases send the user to different remedies.
-        self.secure_input_item = self.addDisabled(menu, "");
+        self.chrome.backtrack_item = self.addAction(menu, "Backtrack (rewrite self-corrections)", "onBacktrack:");
+        self.chrome.backtrack_cloud_item = self.addDisabled(menu, "Uses OpenAI cloud \xe2\x80\x94 transcript text leaves your Mac");
+        self.chrome.backtrack_backend_item = self.addDisabled(menu, "");
+        self.chrome.primary_item = self.addAction(menu, "", "onPrimary:");
+        self.chrome.privacy_item = self.addDisabled(menu, "Audio stays on this Mac");
+        self.chrome.network_item = self.addDisabled(menu, "Network used only for this model operation");
+        self.chrome.secure_input_item = self.addDisabled(menu, "");
         addSeparator(menu);
-        for (1..groups.len) |gi| self.addRadioGroup(menu, gi, snap);
+        for (1..status_item.group_count) |gi| self.addRadioGroup(menu, gi);
         self.addLocalModel(menu);
-        self.overlay_item = self.addAction(menu, "Overlay HUD", "onOverlay:");
-        msgLong(self.overlay_item, "setState:", if (snap.overlay) NSControlStateOn else NSControlStateOff);
+        self.chrome.overlay_item = self.addAction(menu, "Overlay HUD", "onOverlay:");
         addSeparator(menu);
-        self.set_api_key_item = self.addAction(menu, "Set OpenAI API Key\xe2\x80\xa6", "onSetApiKey:");
-        self.pause_item = self.addAction(menu, "Pause dictation", "onPause:");
-        self.vocabulary_item = self.addAction(menu, "Vocabulary (off)", "onVocabulary:");
-        self.syncVocabulary(); // title from the current list count + backend
+        self.chrome.set_api_key_item = self.addAction(menu, "Set OpenAI API Key\xe2\x80\xa6", "onSetApiKey:");
+        self.chrome.pause_item = self.addAction(menu, "Pause dictation", "onPause:");
+        self.chrome.vocabulary_item = self.addAction(menu, "Vocabulary (off)", "onVocabulary:");
         _ = self.addAction(menu, "Open config file", "onOpenConfig:");
         addSeparator(menu);
         self.addRecentInsertions(menu);
@@ -648,7 +579,7 @@ pub const Menu = struct {
         msg1v(item, "setMenu:", menu);
 
         self.active = true;
-        self.refreshChrome(); // paint the initial icon + status line
+        self.refresh(); // the first apply paints every row
 
         // The chrome pump: keep the icon tier honest while the menu is closed.
         self.timer_ctx = .{ .info = self };
@@ -663,6 +594,30 @@ pub const Menu = struct {
         );
         CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopCommonModes);
         return true;
+    }
+
+    // ---- the refresh path (pull → compose → apply across the seam) -------------------
+
+    /// Pull a fresh Snapshot from the daemon and re-apply.
+    fn refresh(self: *Menu) void {
+        if (!self.active) return;
+        self.last_snapshot = self.host.status(self.host.ctx);
+        self.applyNow();
+    }
+
+    /// Re-apply after a settings write, reusing the cached Snapshot — see `last_snapshot`.
+    fn refreshSettings(self: *Menu) void {
+        if (!self.active) return;
+        self.applyNow();
+    }
+
+    fn applyNow(self: *Menu) void {
+        const snapshot = self.last_snapshot orelse blk: {
+            const fresh = self.host.status(self.host.ctx);
+            self.last_snapshot = fresh;
+            break :blk fresh;
+        };
+        _ = self.pump.refresh(snapshot, status_item.settingsView(self.store.current()), self.reveal);
     }
 
     // ---- build helpers -------------------------------------------------------------
@@ -682,52 +637,48 @@ pub const Menu = struct {
         return it;
     }
 
-    fn addRadioGroup(self: *Menu, menu: id, gi: usize, snap: *const config.Settings) void {
+    fn addRadioGroup(self: *Menu, menu: id, gi: usize) void {
         const g = &groups[gi];
         const sub = newMenu();
-        const cur = currentOption(snap, gi);
         for (g.opts, 0..) |opt, oi| {
             const it = makeItem(opt.label, sel_registerName("onRadio:"));
             msg1v(it, "setTarget:", self.target);
             msgLong(it, "setTag:", @intCast(gi * 100 + oi));
-            msgLong(it, "setState:", if (cur == oi) NSControlStateOn else NSControlStateOff);
             msg1v(sub, "addItem:", it);
         }
         const parent = makeItem(g.title, null);
         msg1v(parent, "setSubmenu:", sub);
         msg1v(menu, "addItem:", parent);
-        self.submenu[gi] = sub;
-        self.group_parent[gi] = parent;
+        self.chrome.submenu[gi] = sub;
+        self.chrome.group_parent[gi] = parent;
     }
 
     fn addLocalModel(self: *Menu, menu: id) void {
         const sub = newMenu();
-        self.local_model_status = self.addDisabled(sub, "Whisper Large v3 Turbo — not installed");
-        self.local_model_source = self.addDisabled(sub, "");
-        self.local_model_artifact = self.addDisabled(sub, "");
-        self.local_model_runtime = self.addDisabled(sub, "");
-        self.local_model_installer = self.addDisabled(sub, "");
-        self.local_operation_status = self.addDisabled(sub, "Model Operation — idle");
-        self.local_failure_status = self.addDisabled(sub, "");
+        self.chrome.local_model_status = self.addDisabled(sub, "Whisper Large v3 Turbo — not installed");
+        self.chrome.local_model_source = self.addDisabled(sub, "");
+        self.chrome.local_model_artifact = self.addDisabled(sub, "");
+        self.chrome.local_model_runtime = self.addDisabled(sub, "");
+        self.chrome.local_model_installer = self.addDisabled(sub, "");
+        self.chrome.local_operation_status = self.addDisabled(sub, "Model Operation — idle");
+        self.chrome.local_failure_status = self.addDisabled(sub, "");
         addSeparator(sub);
         for (model_action_definitions) |definition| {
             const item = self.addAction(sub, definition.title, "onModelAction:");
             msgLong(item, "setTag:", @intFromEnum(definition.action));
-            self.model_actions[@intFromEnum(definition.action)] = item;
+            self.chrome.model_actions[@intFromEnum(definition.action)] = item;
         }
         const parent = makeItem("Local Model", null);
         msg1v(parent, "setSubmenu:", sub);
         msg1v(menu, "addItem:", parent);
-        self.local_model_parent = parent;
+        self.chrome.local_model_parent = parent;
     }
 
     /// The **Recent Insertions ▸** submenu (spec §4). Built once with a fixed pool of
-    /// `capacity` entry rows — each row is itself a submenu carrying placeholder **Copy** and
-    /// **Re-insert here** items (behaviour lands in a later ticket; they stay disabled for
-    /// now). Rows are retitled and shown/hidden per open by `rebuildHistory`, mirroring the
-    /// codebase's "build once, toggle" idiom (no per-open allocation, no leak). Autoenable is
-    /// turned off so an enabled row can carry a submenu of disabled placeholders and still
-    /// open.
+    /// `capacity` entry rows — each row is itself a submenu carrying **Copy**, **Re-insert
+    /// here** and the reveal toggle. Rows are retitled and shown/hidden per apply, mirroring
+    /// the codebase's "build once, toggle" idiom (no per-open allocation, no leak). Autoenable
+    /// is turned off so an enabled row can carry a submenu of disabled items and still open.
     fn addRecentInsertions(self: *Menu, menu: id) void {
         const sub = newMenu();
         msgBool(sub, "setAutoenablesItems:", false);
@@ -736,8 +687,8 @@ pub const Menu = struct {
             const row_sub = newMenu();
             msgBool(row_sub, "setAutoenablesItems:", false);
             // Copy (spec §5.2): fires the shared `onHistoryCopy:` selector, tagged with this
-            // row's fixed newest-first index — the daemon resolves it to the entry's stamp,
-            // copies the trimmed `inserted` on the insert worker.
+            // row's fixed newest-first index — resolved against the displayed Presentation to
+            // the entry's stamp, then copied on the insert worker.
             const copy_it = makeItem("Copy", sel_registerName("onHistoryCopy:"));
             msg1v(copy_it, "setTarget:", self.target);
             msgLong(copy_it, "setTag:", @intCast(i));
@@ -757,12 +708,12 @@ pub const Menu = struct {
             msg1v(reveal_it, "setTarget:", self.target);
             msgLong(reveal_it, "setTag:", @intCast(i));
             msg1v(row_sub, "addItem:", reveal_it);
-            self.history_reveal_items[i] = reveal_it;
+            self.chrome.history_reveal_items[i] = reveal_it;
 
             msg1v(row, "setSubmenu:", row_sub);
             msgBool(row, "setHidden:", true);
             msg1v(sub, "addItem:", row);
-            self.history_entries[i] = row;
+            self.chrome.history_entries[i] = row;
 
             // The Option-alternate twin, added immediately after its row with a matching (empty)
             // key equivalent and the ⌥ modifier mask: AppKit hides it at rest and swaps it in
@@ -776,222 +727,13 @@ pub const Menu = struct {
             msgLong(alt, "setKeyEquivalentModifierMask:", NSEventModifierFlagOption);
             msgBool(alt, "setHidden:", true);
             msg1v(sub, "addItem:", alt);
-            self.history_alt_entries[i] = alt;
+            self.chrome.history_alt_entries[i] = alt;
         }
         const parent = makeItem("Recent Insertions", null);
         msg1v(parent, "setSubmenu:", sub);
         msg1v(menu, "addItem:", parent);
-        self.history_parent = parent;
-        self.history_submenu = sub;
-        self.rebuildHistory(); // start life reading "No recent insertions"
-    }
-
-    /// Repopulate the Recent Insertions rows from the pure `Presentation.history` (spec §4.1):
-    /// masked, newest-first, dot colour + failed/degraded tag already decided by `derive`.
-    /// Called at `menuWillOpen` so relative times stay fresh — the only impure input,
-    /// `feedback.nowMs()`, is read here, never in the value-compared `Snapshot`. Reuses the
-    /// `Snapshot` `refreshChrome` just cached (both run on open) rather than re-reading
-    /// `host.status`, which does model_store I/O; the `orelse` fetch covers the init-time
-    /// resting build before the first `refreshChrome`.
-    fn rebuildHistory(self: *Menu) void {
-        if (self.history_parent == null) return;
-        const pool = objc_autoreleasePoolPush();
-        defer objc_autoreleasePoolPop(pool);
-
-        const view = status_item.derive(self.last_snapshot orelse self.host.status(self.host.ctx)).history;
-        if (view.count == 0) {
-            // Empty ring: the parent itself reads disabled "No recent insertions" (spec §4).
-            msg1v(self.history_parent, "setTitle:", nsstr("No recent insertions"));
-            msgBool(self.history_parent, "setEnabled:", false);
-            msg1v(self.history_parent, "setSubmenu:", null); // drop the arrow while empty
-            for (self.history_entries) |row| msgBool(row, "setHidden:", true);
-            for (self.history_alt_entries) |alt| msgBool(alt, "setHidden:", true);
-            return;
-        }
-        msg1v(self.history_parent, "setTitle:", nsstr("Recent Insertions"));
-        msgBool(self.history_parent, "setEnabled:", true);
-        msg1v(self.history_parent, "setSubmenu:", self.history_submenu);
-
-        const now = feedback.nowMs();
-        var label_buf: [1024]u8 = undefined; // room for a revealed snippet + a long app name + metadata
-        for (self.history_entries, 0..) |row, i| {
-            if (i >= view.count) {
-                msgBool(row, "setHidden:", true);
-                msgBool(self.history_alt_entries[i], "setHidden:", true);
-                continue;
-            }
-            const entry = view.entries[i];
-            const revealed = self.reveal.contains(entry.timestamp);
-            const label = if (revealed) label: {
-                // On-demand text fetch (spec §4.1 / §5): the `inserted` bytes are read from the
-                // authoritative ring under its leaf lock — never from the projected Snapshot —
-                // keyed by the entry's stable timestamp so text can't misalign with its row.
-                var text_buf: [recent_insertions.max_bytes]u8 = undefined;
-                const n = self.host.historyText(self.host.ctx, entry.timestamp, &text_buf);
-                break :label status_item.historyRevealedLabel(&label_buf, entry, text_buf[0..n], now);
-            } else status_item.historyLabel(&label_buf, entry, now);
-
-            msg1v(row, "setTitle:", nsstr(label.ptr));
-            msgBool(row, "setHidden:", false);
-            // Keep the ⌥-alternate's title in lockstep so the row doesn't jump on ⌥-hold.
-            msg1v(self.history_alt_entries[i], "setTitle:", nsstr(label.ptr));
-            msgBool(self.history_alt_entries[i], "setHidden:", false);
-            // The in-submenu affordance mirrors the toggle state.
-            msg1v(self.history_reveal_items[i], "setTitle:", nsstr(if (revealed) "Hide text" else "Reveal text"));
-        }
-    }
-
-    // ---- UI sync -------------------------------------------------------------------
-
-    /// Re-checkmark group `gi` from the current snapshot.
-    fn syncGroup(self: *Menu, gi: usize) void {
-        const cur = currentOption(self.store.current(), gi);
-        const sub = self.submenu[gi];
-        const n = msgLongR(sub, "numberOfItems");
-        var i: c_long = 0;
-        while (i < n) : (i += 1) {
-            const it = msgIdxId(sub, "itemAtIndex:", i);
-            const on = cur != null and i == @as(c_long, @intCast(cur.?));
-            msgLong(it, "setState:", if (on) NSControlStateOn else NSControlStateOff);
-        }
-    }
-
-    /// Re-checkmark the Backtrack toggle and set disclosure line 2 from the current
-    /// snapshot. Called on menu open, on toggle, and when the backend selection changes
-    /// (line 2 tracks the backend). The toggle is never disabled or hidden.
-    fn syncBacktrack(self: *Menu) void {
-        const snap = self.store.current();
-        msgLong(self.backtrack_item, "setState:", if (snap.backtrack) NSControlStateOn else NSControlStateOff);
-        msg1v(self.backtrack_backend_item, "setTitle:", nsstr(backtrackLine2(snap)));
-    }
-
-    /// Re-title the Vocabulary item from the current snapshot's term count and backend
-    /// (spec §3/§4). Called on init, on Save, on a backend switch, and on menu open (to
-    /// pick up a hand-edited list) — the same cadence as `syncBacktrack`.
-    fn syncVocabulary(self: *Menu) void {
-        const snap = self.store.current();
-        var buf: [96]u8 = undefined;
-        const title = vocabularyTitle(&buf, snap.vocabulary.len, snap.transcription_backend);
-        msg1v(self.vocabulary_item, "setTitle:", nsstr(title.ptr));
-    }
-
-    /// Push the independent state axes into the compact hierarchy. Cheap when nothing
-    /// changed; AppKit is touched only from the main thread.
-    fn refreshChrome(self: *Menu) void {
-        const snapshot = self.host.status(self.host.ctx);
-        if (self.last_snapshot) |last| {
-            if (std.meta.eql(last, snapshot)) return;
-        }
-        self.last_snapshot = snapshot;
-        const h = snapshot.health;
-        const presentation = status_item.derive(snapshot);
-        const dimmed = presentation.icon_tier == .dimmed;
-
-        var img = sfSymbol("waveform.badge.mic");
-        if (img != null) {
-            const cfg = symbolConfig(17.0, 0.0, 2); // 17 pt, regular weight, medium scale
-            img = msg1(img, "imageWithSymbolConfiguration:", cfg);
-            msgBool(img, "setTemplate:", true); // adopt the menu bar's monochrome light/dark
-            msg1v(self.button, "setImage:", img);
-            msg1v(self.button, "setTitle:", nsstr(""));
-        } else {
-            // No SF Symbols on this macOS — a text glyph keeps the item clickable.
-            msg1v(self.button, "setTitle:", nsstr(if (dimmed) "tw!" else "tw"));
-        }
-        msgDouble(self.button, "setAlphaValue:", if (dimmed) 0.35 else 1.0);
-        msg1v(self.status_line, "setTitle:", nsstr(statusText(presentation, snapshot.selected_backend)));
-        msg1v(self.pause_item, "setTitle:", nsstr(if (h.paused) "Resume dictation" else "Pause dictation"));
-
-        for (groups, 0..) |group, gi|
-            if (group.openai_only) msgBool(self.group_parent[gi], "setHidden:", !presentation.show_openai_controls);
-        msgBool(self.set_api_key_item, "setHidden:", !presentation.show_openai_controls);
-
-        var progress_buffer: [160]u8 = undefined;
-        const primary_title: [*:0]const u8 = if (presentation.primary_action == .operation_progress and snapshot.operation_bytes != null) title: {
-            const printed = std.fmt.bufPrintSentinel(&progress_buffer, "{s} — {d}/{d} bytes", .{
-                std.mem.span(primaryText(presentation.primary_action, snapshot.operation)),
-                snapshot.operation_bytes.?.completed,
-                snapshot.operation_bytes.?.total,
-            }, 0) catch break :title primaryText(presentation.primary_action, snapshot.operation);
-            break :title printed.ptr;
-        } else primaryText(presentation.primary_action, snapshot.operation);
-        msg1v(self.primary_item, "setTitle:", nsstr(primary_title));
-        msgBool(self.primary_item, "setHidden:", presentation.primary_action == .none);
-        msgBool(self.primary_item, "setEnabled:", presentation.primary_action != .operation_progress);
-        msgBool(self.privacy_item, "setHidden:", !presentation.audio_stays_on_mac);
-        msgBool(self.network_item, "setHidden:", !presentation.model_operation_uses_network);
-        msg1v(self.secure_input_item, "setTitle:", nsstr(secureInputText(presentation.secure_input)));
-        msgBool(self.secure_input_item, "setHidden:", presentation.secure_input == .clear);
-
-        const installation_title: [*:0]const u8 = switch (snapshot.installation) {
-            .absent => "Whisper Large v3 Turbo — not installed",
-            .ready => "Whisper Large v3 Turbo — installed",
-            .update_available => "Whisper Large v3 Turbo — update available",
-            .corrupt => "Whisper Large v3 Turbo — corrupt",
-        };
-        msg1v(self.local_model_status, "setTitle:", nsstr(installation_title));
-        var source_buffer: [384]u8 = undefined;
-        var artifact_buffer: [384]u8 = undefined;
-        var runtime_buffer: [384]u8 = undefined;
-        var installer_buffer: [192]u8 = undefined;
-        if (snapshot.installation_identity) |identity| {
-            const source = std.fmt.bufPrintSentinel(&source_buffer, "Repository — {s}@{s} — installation {s}", .{
-                identity.repository.value(),
-                identity.revision.value(),
-                if (identity.installation_id) |installation_id| installation_id.value() else "legacy",
-            }, 0) catch "Repository identity unavailable";
-            const artifact = std.fmt.bufPrintSentinel(&artifact_buffer, "Artifact — {s} — {d} bytes — sha256 {s}", .{
-                identity.artifact.value(),
-                identity.artifact_size,
-                &std.fmt.bytesToHex(identity.artifact_sha256, .lower),
-            }, 0) catch "Artifact identity unavailable";
-            const runtime = std.fmt.bufPrintSentinel(&runtime_buffer, "Runtime — {s} — sha256 {s}", .{
-                identity.runtime.value(),
-                &std.fmt.bytesToHex(identity.runtime_sha256, .lower),
-            }, 0) catch "Runtime identity unavailable";
-            const installer = std.fmt.bufPrintSentinel(&installer_buffer, "Installed by — {s}", .{identity.installed_by.value()}, 0) catch "Installer identity unavailable";
-            msg1v(self.local_model_source, "setTitle:", nsstr(source.ptr));
-            msg1v(self.local_model_artifact, "setTitle:", nsstr(artifact.ptr));
-            msg1v(self.local_model_runtime, "setTitle:", nsstr(runtime.ptr));
-            msg1v(self.local_model_installer, "setTitle:", nsstr(installer.ptr));
-        }
-        for ([_]id{ self.local_model_source, self.local_model_artifact, self.local_model_runtime, self.local_model_installer }) |item|
-            msgBool(item, "setHidden:", snapshot.installation_identity == null);
-        var operation_buffer: [160]u8 = undefined;
-        const operation_title: [*:0]const u8 = if (snapshot.operation_bytes) |bytes| title: {
-            const printed = std.fmt.bufPrintSentinel(&operation_buffer, "Model Operation — {s} — {d}/{d} bytes", .{ @tagName(snapshot.operation), bytes.completed, bytes.total }, 0) catch break :title "Model Operation";
-            break :title printed.ptr;
-        } else title: {
-            const printed = std.fmt.bufPrintSentinel(&operation_buffer, "Model Operation — {s}", .{@tagName(snapshot.operation)}, 0) catch break :title "Model Operation";
-            break :title printed.ptr;
-        };
-        msg1v(self.local_operation_status, "setTitle:", nsstr(operation_title));
-
-        var failure_buffer: [512]u8 = undefined;
-        const recovery: []const u8 = switch (presentation.model_failure) {
-            .none => "",
-            .installation_corrupt => "Repair or Remove",
-            .runtime_unavailable => "Retry or Open diagnostics",
-            .operation_failed => "Retry or Open diagnostics",
-            .operation_cancelled => "Retry if still needed",
-        };
-        const failure_title: [*:0]const u8 = if (snapshot.failure_detail) |detail| title: {
-            const printed = std.fmt.bufPrintSentinel(&failure_buffer, "Failure — {s} — {s}", .{ detail.value(), recovery }, 0) catch break :title "Failure — Open diagnostics";
-            break :title printed.ptr;
-        } else switch (presentation.model_failure) {
-            .none => "",
-            .installation_corrupt => "Failure — Model Installation corrupt; Repair or Remove",
-            .runtime_unavailable => "Failure — Local runtime unavailable; Retry or Open diagnostics",
-            .operation_failed => "Failure — Model Operation failed; Retry or Open diagnostics",
-            .operation_cancelled => "Model Operation cancelled; Retry if still needed",
-        };
-        msg1v(self.local_failure_status, "setTitle:", nsstr(failure_title));
-        msgBool(self.local_failure_status, "setHidden:", presentation.model_failure == .none);
-
-        for (model_action_definitions) |definition| {
-            const item = self.model_actions[@intFromEnum(definition.action)];
-            msgBool(item, "setHidden:", !presentation.allowsModelAction(definition.action));
-        }
+        self.chrome.history_parent = parent;
+        self.chrome.history_submenu = sub;
     }
 
     // ---- the settings write path (menu action → snapshot swap → config.zon) ---------
@@ -1038,11 +780,9 @@ fn onRadio(_: id, _: SEL, sender: id) callconv(.c) void {
     var next = m.store.current().*;
     applyOption(&next, gi, oi);
     m.commitSettings(next, g.field, g.opts[oi].zon, g.session_shaped);
-    m.syncGroup(gi);
-    if (gi == 0) {
-        m.syncBacktrack(); // backend switch re-words Backtrack disclosure line 2
-        m.syncVocabulary(); // …and flips the Vocabulary item's `— local only` suffix (§4)
-    }
+    // One apply re-checkmarks the group and re-words everything that tracks the backend —
+    // the Backtrack disclosure line and the Vocabulary item's `— local only` suffix (§4).
+    m.refreshSettings();
     feedback.log("  menu: {s} → {s}{s}\n", .{
         g.title,                                                                 g.opts[oi].label,
         if (g.session_shaped) " (binds at the next idle session cycle)" else "",
@@ -1054,8 +794,8 @@ fn onOverlay(_: id, _: SEL, _: id) callconv(.c) void {
     var next = m.store.current().*;
     next.overlay = !next.overlay;
     m.commitSettings(next, "overlay", if (next.overlay) "true" else "false", false);
-    msgLong(m.overlay_item, "setState:", if (next.overlay) NSControlStateOn else NSControlStateOff);
     m.host.setOverlay(m.host.ctx, next.overlay);
+    m.refreshSettings();
     feedback.log("  menu: Overlay HUD → {s}\n", .{if (next.overlay) "on" else "off"});
 }
 
@@ -1065,22 +805,28 @@ fn onBacktrack(_: id, _: SEL, _: id) callconv(.c) void {
     next.backtrack = !next.backtrack;
     // Read-at-use / pinned at Talk Key press — no Host callback, no session cycle.
     m.commitSettings(next, "backtrack", if (next.backtrack) "true" else "false", false);
-    m.syncBacktrack(); // toggle checkmark + line-2 wording (sharpens on Local + on)
+    m.refreshSettings(); // toggle checkmark + line-2 wording (sharpens on Local + on)
     feedback.log("  menu: Backtrack → {s}\n", .{if (next.backtrack) "on" else "off"});
 }
 
+/// Pause/resume, flipping the state the **displayed** Presentation reported (ADR-0011) rather
+/// than re-reading it — the row the user clicked said which way it would go, and re-reading
+/// would pay for the status read's model_store I/O to answer one bool.
 fn onPause(_: id, _: SEL, _: id) callconv(.c) void {
     const m = g_menu orelse return;
-    const h = m.host.status(m.host.ctx).health;
-    m.host.setPaused(m.host.ctx, !h.paused);
-    feedback.log("  menu: dictation {s}\n", .{if (!h.paused) "paused" else "resumed"});
-    m.refreshChrome();
+    const paused = (m.pump.displayed() orelse return).paused;
+    m.host.setPaused(m.host.ctx, !paused);
+    feedback.log("  menu: dictation {s}\n", .{if (!paused) "paused" else "resumed"});
+    m.refresh();
 }
 
+/// The primary row's click, routed off the action the **displayed** Presentation carries
+/// (ADR-0011): what fires is what the label offered, not what a fresh derivation would now
+/// decide — which is what closes the gap where the state moved between render and click.
 fn onPrimary(sender_self: id, command: SEL, sender: id) callconv(.c) void {
     const m = g_menu orelse return;
-    const snapshot = m.host.status(m.host.ctx);
-    switch (status_item.derive(snapshot).primary_action) {
+    const action = (m.pump.displayed() orelse return).primary_action;
+    switch (action) {
         .none, .operation_progress => {},
         .set_openai_api_key => onSetApiKey(sender_self, command, sender),
         .install_local_model => if (confirmModelAction(.install)) m.host.modelAction(m.host.ctx, .install),
@@ -1090,8 +836,8 @@ fn onPrimary(sender_self: id, command: SEL, sender: id) callconv(.c) void {
         .repair_local_model => if (confirmModelAction(.repair)) m.host.modelAction(m.host.ctx, .repair),
         .retry_local_runtime => m.host.modelAction(m.host.ctx, .retry_runtime),
     }
-    m.last_snapshot = null;
-    m.refreshChrome();
+    m.pump.invalidate();
+    m.refresh();
 }
 
 fn onModelAction(_: id, _: SEL, sender: id) callconv(.c) void {
@@ -1100,57 +846,53 @@ fn onModelAction(_: id, _: SEL, sender: id) callconv(.c) void {
     const action = std.enums.fromInt(ModelAction, raw) orelse return;
     if (!confirmModelAction(action)) return;
     m.host.modelAction(m.host.ctx, action);
-    m.last_snapshot = null;
-    m.refreshChrome();
+    m.pump.invalidate();
+    m.refresh();
+}
+
+/// Resolve a history row's `tag` (its fixed newest-first index) to the entry's stable capture
+/// stamp, off the **displayed** Presentation (ADR-0011) — the row the user clicked is the row
+/// they saw, so the index can never point at an entry that has since shifted.
+fn historyStampForSender(m: *Menu, sender: id) ?i64 {
+    const raw = msgLongR(sender, "tag");
+    if (raw < 0) return null;
+    const i: usize = @intCast(raw);
+    const p = m.pump.displayed() orelse return null;
+    if (i >= p.history.count) return null;
+    return p.history.rows[i].entry.timestamp;
 }
 
 /// Reveal toggle for one Recent Insertions entry (spec §4): the shared selector behind both
-/// the ⌥-click alternate row and the in-submenu "Reveal text" item, dispatched with the row's
-/// newest-first index in the item `tag` (mirroring `onModelAction` + `setTag:`). It resolves
-/// the index to the entry's stable `timestamp` off the current view, flips its reveal flag, and
-/// re-renders so the next open shows (or re-masks) that one row's text — no transcript byte is
-/// touched here; `rebuildHistory` fetches it on demand only for a revealed row.
+/// the ⌥-click alternate row and the in-submenu "Reveal text" item. It flips that entry's
+/// reveal flag and re-applies, so the row shows (or re-masks) its text — no transcript byte is
+/// touched here; the Chrome fetches it on demand only for a revealed row.
 fn onHistoryEntry(_: id, _: SEL, sender: id) callconv(.c) void {
     const m = g_menu orelse return;
-    const raw = msgLongR(sender, "tag");
-    if (raw < 0) return;
-    const i: usize = @intCast(raw);
-    const view = status_item.derive(m.last_snapshot orelse m.host.status(m.host.ctx)).history;
-    if (i >= view.count) return;
-    m.reveal.toggle(view.entries[i].timestamp);
-    m.rebuildHistory();
+    const stamp = historyStampForSender(m, sender) orelse return;
+    m.reveal.toggle(stamp);
+    // The reveal set is an input to `present`, so the Presentation genuinely changed and the
+    // pump's early-out will let this through — no invalidate needed.
+    m.refreshSettings();
 }
 
 /// Copy one Recent Insertions entry to the clipboard (spec §5.2): the per-entry Copy item's
-/// selector, dispatched with the row's newest-first index in the item `tag` (mirroring
-/// `onHistoryEntry:`). It resolves the index to the entry's stable `timestamp` off the current
-/// view and hands it to `host.copy`; the daemon fetches + trims the text and does the pasteboard
-/// write on the insert worker. No transcript byte is touched here — the menu only dispatches.
+/// selector. It hands the resolved stamp to `host.copy`; the daemon fetches + trims the text and
+/// does the pasteboard write on the insert worker. No transcript byte is touched here — the menu
+/// only dispatches.
 fn onHistoryCopy(_: id, _: SEL, sender: id) callconv(.c) void {
     const m = g_menu orelse return;
-    const raw = msgLongR(sender, "tag");
-    if (raw < 0) return;
-    const i: usize = @intCast(raw);
-    const view = status_item.derive(m.last_snapshot orelse m.host.status(m.host.ctx)).history;
-    if (i >= view.count) return;
-    m.host.copy(m.host.ctx, view.entries[i].timestamp);
+    const stamp = historyStampForSender(m, sender) orelse return;
+    m.host.copy(m.host.ctx, stamp);
 }
 
 /// Re-insert one Recent Insertions entry at the current frontmost cursor (spec §5.1): the
-/// per-entry "Re-insert here" item's selector, dispatched with the row's newest-first index in
-/// the item `tag` (mirroring `onHistoryCopy:`). It resolves the index to the entry's stable
-/// `timestamp` off the current view, **stashes** it, and defers the actual replay to
-/// `onReinsertFire:` — the Status Item menu's modal tracking holds key focus until it closes, so
-/// firing now would land the insert in the menu, not the user's target. No transcript byte is
-/// touched here; the daemon fetches the verbatim bytes on the deferred fire.
+/// per-entry "Re-insert here" item's selector. It **stashes** the resolved stamp and defers the
+/// actual replay to `onReinsertFire:` — the Status Item menu's modal tracking holds key focus
+/// until it closes, so firing now would land the insert in the menu, not the user's target. No
+/// transcript byte is touched here; the daemon fetches the verbatim bytes on the deferred fire.
 fn onHistoryReinsert(_: id, _: SEL, sender: id) callconv(.c) void {
     const m = g_menu orelse return;
-    const raw = msgLongR(sender, "tag");
-    if (raw < 0) return;
-    const i: usize = @intCast(raw);
-    const view = status_item.derive(m.last_snapshot orelse m.host.status(m.host.ctx)).history;
-    if (i >= view.count) return;
-    m.pending_reinsert = view.entries[i].timestamp;
+    m.pending_reinsert = historyStampForSender(m, sender) orelse return;
     // Defer until the menu's modal loop unwinds: an afterDelay:0 timer fires in the default
     // run-loop mode, i.e. only once NSMenu tracking has ended and the prior app is key again
     // (spec §5.1.5). The replay then lands at whatever Focused Target is frontmost — unconditional.
@@ -1267,52 +1009,9 @@ test "state-changing Local Model confirmations explain their containment boundar
     try std.testing.expect(std.mem.indexOf(u8, discard, "working Model Installation") != null);
 }
 
-test "backtrackLine2 sharpens to not-applying only on Local with Backtrack on" {
-    const cloud = "unavailable on the Local backend";
-    const sharpened = "Not applying";
-
-    // The three non-sharpened cases all show the plain cloud/network line.
-    inline for (.{
-        config.Settings{ .transcription_backend = .openai, .backtrack = true },
-        config.Settings{ .transcription_backend = .openai, .backtrack = false },
-        config.Settings{ .transcription_backend = .local, .backtrack = false },
-    }) |s| {
-        var settings = s;
-        try std.testing.expect(std.mem.indexOf(u8, std.mem.span(backtrackLine2(&settings)), cloud) != null);
-    }
-
-    // Only Local + on sharpens — the opted-in preference is kept, not erased.
-    var on_local = config.Settings{ .transcription_backend = .local, .backtrack = true };
-    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(backtrackLine2(&on_local)), sharpened) != null);
-}
-
-test "the Secure Event Input row names what is lost, and only the stuck case asks for a log out" {
-    // The row's whole job is to correct the impression the rest of the menu gives: dictation
-    // is fine, so the wording has to say which half is actually gone (#245).
-    const held = std.mem.span(secureInputText(.held));
-    try std.testing.expect(std.mem.indexOf(u8, held, "undo") != null);
-    try std.testing.expect(std.mem.indexOf(u8, held, "log out") == null); // the holder can be quit
-
-    const stuck = std.mem.span(secureInputText(.stuck));
-    try std.testing.expect(std.mem.indexOf(u8, stuck, "undo") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stuck, "log out") != null); // nothing else clears it
-
-    // `.clear` hides the row, so its string is never rendered.
-    try std.testing.expectEqualStrings("", std.mem.span(secureInputText(.clear)));
-}
-
 // ---- vocabulary editing pure halves (spec §3/§4) --------------------------------------
-
-test "vocabularyTitle reflects the count, plural, and backend-aware suffix" {
-    var buf: [96]u8 = undefined;
-    // Local: `(off)` / `(N terms)…`, no suffix.
-    try std.testing.expectEqualStrings("Vocabulary (off)", vocabularyTitle(&buf, 0, .local));
-    try std.testing.expectEqualStrings("Vocabulary (1 term)\xe2\x80\xa6", vocabularyTitle(&buf, 1, .local));
-    try std.testing.expectEqualStrings("Vocabulary (3 terms)\xe2\x80\xa6", vocabularyTitle(&buf, 3, .local));
-    // OpenAI: the ` — local only` suffix replaces the disclosure ellipsis (§4).
-    try std.testing.expectEqualStrings("Vocabulary (off) \xe2\x80\x94 local only", vocabularyTitle(&buf, 0, .openai));
-    try std.testing.expectEqualStrings("Vocabulary (3 terms) \xe2\x80\x94 local only", vocabularyTitle(&buf, 3, .openai));
-}
+// The Vocabulary *item title* moved to status_item.zig with the rest of the wording
+// (ADR-0011); what stays here is the dialog, which is interaction rather than reflection.
 
 test "parseVocabularyLines splits, trims, and drops blank lines" {
     const list = parseVocabularyLines(std.testing.allocator, "  type-wave \n\nwhisper.cpp\n   \nBjorn").?;
@@ -1385,32 +1084,11 @@ test "vocabularyInfoText always guides, and adds a soft hint only when near/over
     try std.testing.expect(std.mem.indexOf(u8, long, "tokens") != null);
 }
 
-test "RevealSet toggles one entry on and off, keyed by timestamp" {
-    var set = RevealSet{};
-    try std.testing.expect(!set.contains(100));
-    set.toggle(100);
-    try std.testing.expect(set.contains(100));
-    set.toggle(100); // second ⌥-click re-masks
-    try std.testing.expect(!set.contains(100));
-    try std.testing.expectEqual(@as(usize, 0), set.len);
-}
-
-test "RevealSet reveals entries independently — one row's toggle never flips another" {
-    var set = RevealSet{};
-    set.toggle(10);
-    set.toggle(20);
-    set.toggle(30);
-    try std.testing.expect(set.contains(10) and set.contains(20) and set.contains(30));
-    set.toggle(20); // hide only the middle one
-    try std.testing.expect(set.contains(10) and !set.contains(20) and set.contains(30));
-    try std.testing.expectEqual(@as(usize, 2), set.len);
-}
-
-test "RevealSet never overflows its capacity-bounded backing" {
-    var set = RevealSet{};
-    var ts: i64 = 1;
-    while (ts <= recent_insertions.capacity + 5) : (ts += 1) set.toggle(ts);
-    try std.testing.expectEqual(@as(usize, recent_insertions.capacity), set.len); // capped, no overrun
+test "the Status Item Chrome contract holds for the production adapter" {
+    // Unlike the Helper and Session Transport seams, whose contracts nothing invokes, this one
+    // is asserted by StatusItem(Chrome) itself — including for AppKitChrome, which no test can
+    // otherwise reach. A renamed or dropped `apply` fails the build here rather than at runtime.
+    status_item.assertChrome(AppKitChrome);
 }
 
 fn onOpenConfig(_: id, _: SEL, _: id) callconv(.c) void {
@@ -1520,7 +1198,7 @@ fn onVocabulary(_: id, _: SEL, _: id) callconv(.c) void {
     const value = config.serializeVocabularyValue(m.alloc, committed) orelse return;
     defer m.alloc.free(value);
     m.commitSettings(next, "vocabulary", value, false); // read-at-use — never session_shaped (§4)
-    m.syncVocabulary();
+    m.refreshSettings();
     feedback.log("  menu: Vocabulary → {d} terms{s}\n", .{ committed.len, if (dropped > 0) " (clamped)" else "" });
 
     if (dropped > 0) {
@@ -1556,13 +1234,12 @@ fn onMenuWillOpen(_: id, _: SEL, _: id) callconv(.c) void {
         if (d.session_shaped) m.host.markSessionDirty(m.host.ctx);
         if (d.overlay) m.host.setOverlay(m.host.ctx, fresh.overlay);
     }
-    for (0..groups.len) |gi| m.syncGroup(gi);
-    msgLong(m.overlay_item, "setState:", if (m.store.current().overlay) NSControlStateOn else NSControlStateOff);
-    m.syncBacktrack(); // pick up a hand-edited .backtrack and re-word line 2 for the backend
-    m.syncVocabulary(); // pick up a hand-edited vocabulary list (count) + backend suffix
-    m.last_snapshot = null; // force refresh after settings or external model-state changes
-    m.refreshChrome();
-    m.rebuildHistory(); // (re)populate Recent Insertions with fresh masked labels (spec §4.1)
+    // Apply unconditionally: the Recent Insertions relative times are the one thing the
+    // Presentation deliberately does not carry, so an unchanged value would still render stale
+    // ("2m ago" on a row that is now an hour old). Everything else — checkmarks, hand-edited
+    // settings, external model-state changes — rides the pump's own comparison.
+    m.pump.invalidate();
+    m.refresh();
 }
 
 /// twStop: — runs on the main thread via requestStop(); unwinds [NSApp run].
@@ -1595,8 +1272,9 @@ fn makeTarget() id {
     return msg(msg(target_cls, "alloc"), "init");
 }
 
-/// CFRunLoopTimer callout — the chrome pump tick (main thread).
+/// CFRunLoopTimer callout — the chrome pump tick (main thread). The cadence lives here in the
+/// adapter, as the HUD's does: the timer calls in, the pump composes, the Chrome draws.
 fn chromeTick(_: CFRunLoopTimerRef, info: ?*anyopaque) callconv(.c) void {
     const self: *Menu = @ptrCast(@alignCast(info.?));
-    self.refreshChrome();
+    self.refresh();
 }
