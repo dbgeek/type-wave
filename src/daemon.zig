@@ -385,21 +385,20 @@ const LocalProvisionerDeps = struct {
         const root = model_store.rootPath(home, &install.root_buf) catch return null;
         install.root_len = root.len;
         install.lease = model_store.RuntimeLease.acquire(d.io, install.root()) catch return null;
-        const model = (model_store.activeModelPath(d.io, install.root(), &install.model_buf) catch {
-            install.lease.release();
-            return null;
-        }) orelse {
+        // One Models Root Reading, taken under the lease so the bytes it names cannot go
+        // while we decide (ADR-0012). The lease is the only mutation on this path.
+        const reading = model_store.observe(d.io, install.root(), model_store.pinned_manifest);
+        const model = reading.modelPath() orelse {
             install.lease.release();
             return null;
         };
+        const artifact = reading.artifact orelse {
+            install.lease.release();
+            return null;
+        };
+        @memcpy(install.model_buf[0..model.len], model);
         install.model_len = model.len;
-        install.artifact = (model_store.activeArtifact(d.io, install.root()) catch {
-            install.lease.release();
-            return null;
-        }) orelse {
-            install.lease.release();
-            return null;
-        };
+        install.artifact = artifact;
         return install;
     }
 
@@ -448,16 +447,19 @@ const LocalProvisionerDeps = struct {
         const raw_home = std.c.getenv("HOME") orelse return false;
         var root_buf: [std.fs.max_path_bytes]u8 = undefined;
         const root = model_store.rootPath(std.mem.span(raw_home), &root_buf) catch return false;
-        if (model_store.modelRemovalPending(d.io, root)) return false;
-        var model_buf: [std.fs.max_path_bytes]u8 = undefined;
-        return (model_store.activeModelPath(d.io, root, &model_buf) catch return false) != null;
+        return model_store.observe(d.io, root, model_store.pinned_manifest).installationLive();
     }
 
-    /// The idle reclaim pass: model storage nobody owns any more. Two jobs, both destructive,
-    /// both drain-gated, both retried next tick when a lock is busy — which is why they share
-    /// one effect rather than sitting on the read-only `recoveryState` probe the menu calls.
-    /// The stranded-removal heal goes first: it can delete the very installation the
-    /// superseded sweep would otherwise walk (#276).
+    /// The idle reclaim pass: model storage nobody owns any more. Three jobs, all destructive,
+    /// all drain-gated, all retried next tick when a lock is busy — which is why they share one
+    /// effect rather than riding a status probe. The stranded-removal heal goes first: it can
+    /// delete the very installation the superseded sweep would otherwise walk (#276).
+    ///
+    /// The staging discard joined them in ADR-0012. It used to ride `recoveryState`, which the
+    /// comment here once called read-only and which the menu called every ~2 s on the run loop —
+    /// it took the operation lock and `deleteTree`d from inside a status read. A Models Root
+    /// Reading is now genuinely read-only, so the destructive half moved to where the other two
+    /// destructive halves already were.
     pub fn reclaimModelStorage(self: *LocalProvisionerDeps) void {
         const d = self.daemon;
         const raw_home = std.c.getenv("HOME") orelse return;
@@ -477,6 +479,16 @@ const LocalProvisionerDeps = struct {
             return;
         };
         if (removed > 0) feedback.log("  removed {d} superseded Model Installation(s) after helper drain\n", .{removed});
+        // Staging directories left by a superseded manifest (ADR-0012). Silent unless it
+        // actually reclaims something: there is nothing staged on essentially every tick.
+        const staged = model_store.discardSupersededStages(d.io, root, model_store.pinned_manifest) catch |failure| switch (failure) {
+            error.ModelOperationInProgress => return,
+            else => {
+                feedback.log("  superseded staging cleanup failed: {s}; retrying while idle\n", .{@errorName(failure)});
+                return;
+            },
+        };
+        if (staged > 0) feedback.log("  discarded {d} superseded Model Operation staging director(ies)\n", .{staged});
     }
 
     pub fn note(_: *LocalProvisionerDeps, event: local_provisioner.Event) void {
@@ -1196,9 +1208,10 @@ const Daemon = struct {
             false,
             self.provisioner.installationPresent(),
         ));
-        // Gathering glue: the model_store I/O and the recovery-phase -> Operation map that
-        // stay in the daemon. The corrupt override and runner precedence are status_item's
-        // pure `project` (Candidate 2 of the 2026-07-22 architecture review).
+        // Gathering glue: one Models Root Reading and the Work -> Operation map that stays in
+        // the daemon (ADR-0012). The reading cannot fail and cannot mutate, so this is safe on
+        // the run loop the Talk Key tap shares. The corrupt override and runner precedence are
+        // status_item's pure `project` (Candidate 2 of the 2026-07-22 architecture review).
         var installation: status_item.Installation = .absent;
         var operation: status_item.Operation = .idle;
         var operation_bytes: ?status_item.ByteProgress = null;
@@ -1206,29 +1219,18 @@ const Daemon = struct {
         if (std.c.getenv("HOME")) |raw_home| {
             var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
             if (model_store.rootPath(std.mem.span(raw_home), &root_buffer)) |root| {
-                if (model_store.activeArtifact(self.io, root) catch null) |identity| {
-                    _ = identity;
-                    installation_identity = model_store.activeInstallationIdentity(self.io, root) catch null;
-                    installation = if (model_store.updateAvailable(self.io, root, model_store.pinned_manifest) catch false)
-                        .update_available
-                    else
-                        .ready;
+                const reading = model_store.observe(self.io, root, model_store.pinned_manifest);
+                if (reading.present) {
+                    installation_identity = reading.identity;
+                    installation = if (reading.update_available) .update_available else .ready;
                 }
-                const recovery = model_store.recoveryState(self.io, root, model_store.pinned_manifest) catch null;
-                if (recovery) |state| {
-                    if (state.phase == .downloading or state.phase == .paused)
-                        operation_bytes = .{ .completed = state.bytes.completed, .total = state.bytes.total };
-                    operation = switch (state.phase) {
-                        .idle => .idle,
-                        .downloading => .installing,
-                        .paused => .paused,
-                        .verifying => .verifying,
-                        .smoke_testing => .smoke_testing,
-                        .activating => .activating,
-                        .removing => .removing,
-                        .failed => .failed,
-                    };
-                }
+                if (reading.work != .none)
+                    operation_bytes = .{ .completed = reading.bytes.completed, .total = reading.bytes.total };
+                operation = switch (reading.work) {
+                    .none => .idle,
+                    .foreign => .installing,
+                    .paused => .paused,
+                };
             } else |_| {}
         }
         // Project the Recent Insertions ring to its text-free view (spec §4.1): snapshot the
@@ -1249,10 +1251,11 @@ const Daemon = struct {
         return status_item.project(.{
             .selected_backend = self.store.current().transcription_backend,
             .health = h,
-            .terminal_backend_failure = self.store.current().transcription_backend == .local and recovery_state == .runtime_failure,
-            .local_runtime_failure = recovery_state == .runtime_failure,
+            // Raw, not derived: `project` turns this one reading into the corrupt override,
+            // `local_runtime_failure` and `terminal_backend_failure` (ADR-0012), so all three
+            // are asserted as values instead of computed in an untested gather.
+            .recovery_state = recovery_state,
             .installation = installation,
-            .recovery_is_corrupt = recovery_state == .corrupt,
             .operation = operation,
             .operation_bytes = operation_bytes,
             .installation_identity = installation_identity,
