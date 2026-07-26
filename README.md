@@ -173,7 +173,7 @@ cp packaging/config.example.zon ~/.config/type-wave/config.zon
 | `language` | `"en"` | `"en"`, `"sv"`, or `""` for auto-detect |
 | `delay` | `"low"` | `"minimal"`, `"low"`, `"medium"`, `"high"`; other strings stay hand-editable |
 | `noise_reduction` | `.near_field` | `.near_field`, `.far_field`, or `.off` |
-| `insertion` | `.paste` | `.paste` or `.keystroke` |
+| `insertion` | `.paste` | `.paste` or `.keystroke`; paste transits the general pasteboard for ~300 ms ([accepted limitations](./SECURITY.md#accepted-limitations)) |
 | `pre_paste_ms` | `25` | Pasteboard settle delay before Cmd-V |
 | `overlay` | `true` | Show the silent waveform/processing HUD |
 | `backtrack` | `false` | Opt-in OpenAI rewrite of spoken self-corrections and fillers; OpenAI backend only, sends transcript text to the cloud |
