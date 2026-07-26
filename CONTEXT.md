@@ -268,7 +268,7 @@ The seam the Transcription Session speaks the wire through: `connect` / `startRe
 `write` / `writePing` / `writePong` / `writeCloseFrame` / `close`, behind one contract
 (`assertTransport`) so `Session(comptime Transport)` is generic over it — the OpenAI twin
 of the local backend's Helper seam. The production adapter is `WebsocketTransport` (a thin
-wrapper over the vendored `websocket.Client` that also owns the read-loop thread handle); a
+wrapper over upstream's `websocket.Client` that also owns the read-loop thread handle); a
 `FakeTransport` records writes and drives the read loop synchronously, so `serverMessage`
 dispatch, the sender drain, and the pure `maintenanceDecision` are tested off it rather
 than against live OpenAI. It carries no policy — the Session decides; the Transport only

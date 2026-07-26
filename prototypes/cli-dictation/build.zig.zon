@@ -4,14 +4,16 @@
     .fingerprint = 0x593374dab792ba58,
     .minimum_zig_version = "0.17.0-dev.1267+300116b02",
     .dependencies = .{
-        // Vendored at dev commit 4b475a8 — the §3.5 TLS-read fix is now upstream, so the
-        // vendored one-line patch is dropped. See docs/toolchain.md.
-        .websocket = .{ .path = "vendor/websocket.zig" },
+        // The same url+hash pin the root build.zig.zon carries — one authoritative pin for
+        // the whole repo, rather than a second tree that nothing kept in sync (#290).
+        .websocket = .{
+            .url = "https://github.com/karlseguin/websocket.zig/archive/4b475a8683f9769bd12f0221e5e87141c9a9175f.tar.gz",
+            .hash = "websocket-0.1.0-ZPISdcLsBACOaekLXhXYDzDwZhmXVcH0Afmcyf-cdQWs",
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
-        "vendor",
     },
 }

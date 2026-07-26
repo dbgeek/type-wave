@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 import os
 from pathlib import Path
 import re
@@ -10,6 +11,19 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = REPO_ROOT / "packaging" / "install.sh"
+
+# Build products and VCS internals are not "the tree" for any question this suite asks of it.
+# `zig-pkg` in particular is where the package manager unpacks the *pinned* dependency — the
+# opposite of the unpinned second copy the websocket test hunts for.
+_NOT_THE_TREE = frozenset({".git", ".zig-cache", "zig-out", "zig-pkg", "__pycache__"})
+
+
+def _repo_files() -> Iterator[Path]:
+    """Every committed-ish file in the repo, with build products pruned as we walk."""
+    for directory, subdirectories, names in os.walk(REPO_ROOT):
+        subdirectories[:] = [name for name in subdirectories if name not in _NOT_THE_TREE]
+        for name in sorted(names):
+            yield Path(directory) / name
 
 
 class PackagingTests(unittest.TestCase):
@@ -131,6 +145,12 @@ exit 0
         self.assertIn("1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69", provenance)
         self.assertIn("whisper.cpp v1.9.1", provenance)
         self.assertIn("147267177eef7b22ec3d2476dd514d1b12e160e176230b740e3d1bd600118447", provenance)
+        # The daemon statically links websocket.zig, so its MIT text ships too — it cannot
+        # ride along in the fetched package, whose upstream `.paths` omits LICENSE (#290).
+        self.assertIn(
+            "Karl Seguin",
+            (installed_data / "LICENSES/websocket.zig-MIT.txt").read_text(),
+        )
 
     def test_signing_failure_cannot_displace_an_existing_pair(self) -> None:
         self._seed_installed_pair()
@@ -190,6 +210,46 @@ exit 0
         self.assertIn("Privacy & Security", uninstall)
         self.assertNotIn("huggingface-token", uninstall)
         self.assertNotIn("Hugging Face", uninstall)
+
+    # Finding 21 of the security review (#290): the client carrying the API key and every
+    # Utterance's audio was the one dependency with no integrity identity, in two
+    # independently-editable copies. The url+hash pin is what the package manager verifies —
+    # this guards the other half, that there is nothing else for it to drift against.
+    def test_the_websocket_client_is_pinned_by_hash_in_exactly_one_place(self) -> None:
+        pins: set[tuple[str, str]] = set()
+        vendored: list[Path] = []
+        for path in _repo_files():
+            if path.name == "client.zig" and "websocket.zig" in path.parts:
+                vendored.append(path.relative_to(REPO_ROOT))
+            if path.name != "build.zig.zon":
+                continue
+            text = path.read_text()
+            if ".websocket = " not in text:
+                continue
+            where = path.relative_to(REPO_ROOT)
+            # Just this dependency's declaration — up to the brace that closes it, so a
+            # sibling dependency's url can never be read as the websocket pin.
+            declaration = text.split(".websocket = ", maxsplit=1)[1].split("},", maxsplit=1)[0]
+            self.assertNotIn(
+                ".path",
+                declaration,
+                f"{where} vendors the websocket client instead of pinning it by hash",
+            )
+            url = re.search(r'\.url = "([^"]+)"', declaration)
+            digest = re.search(r'\.hash = "([^"]+)"', declaration)
+            self.assertIsNotNone(url, f"{where} declares websocket without a .url")
+            self.assertIsNotNone(digest, f"{where} declares websocket without a .hash")
+            assert url is not None and digest is not None  # narrowed for --strict
+            # A short sha resolves today and is ambiguous later; the pin records the whole one.
+            self.assertRegex(
+                url.group(1),
+                r"/archive/[0-9a-f]{40}\.tar\.gz$",
+                f"{where} pins websocket at something other than a full commit archive",
+            )
+            pins.add((url.group(1), digest.group(1)))
+
+        self.assertEqual(len(pins), 1, f"the repo carries {len(pins)} different websocket pins")
+        self.assertEqual(vendored, [], "a second, unpinned copy of the websocket client is in the tree")
 
     # The CI gate switch skips Markdown as inert, which is true of every doc except the ones
     # this suite asserts on: those are test inputs, and a PR editing one has to run the gate.

@@ -1,5 +1,8 @@
 /.zig-cache/
 /zig-out/
+# Where the package manager unpacks fetched dependencies — a build product, and since #290
+# the place the websocket client actually lives. The pin is build.zig.zon, never this tree.
+/zig-pkg/
 .DS_Store
 /acceptance/local_backend/network_trace.dylib
 /.claude/
