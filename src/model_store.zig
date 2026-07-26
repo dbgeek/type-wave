@@ -280,6 +280,64 @@ pub fn modelRemovalPending(io: std.Io, root: []const u8) bool {
     return intentFilePresent(io, root, removal_intent_name);
 }
 
+/// Finish a confirmed removal whose process died between publishing its intent and clearing
+/// it. `remove()` clears the marker on unwind, which covers every cooperative ending —
+/// including SIGTERM — but not SIGKILL, power loss, or a ReleaseFast panic. A marker left
+/// behind refuses both leases and makes `installationProbe` read the installation as absent,
+/// so the local Transcription Backend stays dead; and because the probe says *absent*, the
+/// Status Item offers Install rather than Remove, so the one action whose unwind would clear
+/// it is not even reachable. Nothing else ever deletes this file.
+///
+/// The operation lock is the whole proof: every Model Operation takes it exclusively, so a
+/// marker still on disk while we hold it has no living writer. What the marker records is an
+/// *intent*, so the honest self-heal is to honor it — finishing the removal rather than
+/// discarding the file keeps a confirmed Remove meaning what the user was told it meant.
+/// `removeModelData` is idempotent, so a heal interrupted partway is simply healed again.
+///
+/// Non-blocking throughout: this runs on the daemon's ~3 s reclaim pass, where a busy lock
+/// means "not this tick" rather than "wait here". Returns true when a stranded removal was
+/// completed.
+pub fn completeStrandedRemoval(io: std.Io, root: []const u8) !bool {
+    // Cheap pre-check so the common case — no marker — costs one `access` and no lock churn.
+    if (!intentFilePresent(io, root, removal_intent_name)) return false;
+    const l = Layout.init(root);
+    var operation_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const operation_path = try l.child(operation_lock_name, &operation_path_buffer);
+    var operation_lock = std.Io.Dir.cwd().createFile(io, operation_path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |failure| switch (failure) {
+        error.WouldBlock => return error.ModelOperationInProgress,
+        else => return failure,
+    };
+    defer operation_lock.close(io);
+    // Re-read under the lock. Outside it a live removal's marker is indistinguishable from a
+    // stranded one, and the pre-check above is exactly that unproven reading.
+    if (!intentFilePresent(io, root, removal_intent_name)) return false;
+
+    // The same order `remove()` drains in, for the same reason: no warm helper may hold the
+    // model mapped and no inference may be running when the bytes go. The marker itself
+    // keeps new holders out — both leases refuse while it is present — so this only waits on
+    // holders that predate it, which the daemon retires on the tick that reads the probe.
+    var runtime_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const runtime_path = try l.child(runtime_lock_name, &runtime_path_buffer);
+    var runtime_lock = std.Io.Dir.cwd().createFile(io, runtime_path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |failure| switch (failure) {
+        error.WouldBlock => return error.ModelRuntimeActive,
+        else => return failure,
+    };
+    defer runtime_lock.close(io);
+    var inference_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const inference_path = try l.child(inference_lock_name, &inference_path_buffer);
+    var inference_lock = std.Io.Dir.cwd().createFile(io, inference_path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |failure| switch (failure) {
+        error.WouldBlock => return error.ModelInferenceActive,
+        else => return failure,
+    };
+    defer inference_lock.close(io);
+
+    // Data first, then the marker — `remove()`'s order, so a death inside the heal leaves the
+    // same stranded marker this pass already knows how to finish.
+    try removeModelData(io, root);
+    removeIntentFile(io, root, removal_intent_name);
+    return true;
+}
+
 pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
     return struct {
         allocator: std.mem.Allocator,
@@ -381,7 +439,14 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
         pub fn install(self: *Self) !void {
             const locked = try self.beginAcquisition();
             defer locked.deinit();
-            if (try activeInstallationPresent(self.io, self.root, self.manifest)) return;
+            if (try activeInstallationPresent(self.io, self.root, self.manifest)) {
+                // Install found exactly what it would have produced, so there is nothing to
+                // activate — but a stranded removal marker is what makes *this* installation
+                // unreadable to every lease and probe, and returning over one would report
+                // success on a backend that stays dead (#276).
+                removeIntentFile(self.io, self.root, removal_intent_name);
+                return;
+            }
 
             if ((try loadPartial(self.io, self.root, self.manifest)) != null)
                 return error.PartialRequiresExplicitResume;
@@ -595,7 +660,18 @@ pub fn Operation(comptime Transport: type, comptime Smoke: type) type {
             }
         }
 
+        /// Publish a verified staged installation, then retire the removal intent it
+        /// supersedes. A published receipt is the user's newer answer: they were shown
+        /// Install (the marker made the probe read absent), they took it, and the
+        /// installation it produced must be usable when it returns (#276). We hold the
+        /// operation lock, so a marker still on disk has no live removal behind it. Single
+        /// exit for both publish paths — the `.replace_invalid` one returns early.
         fn activate(self: *Self, stage_model: []const u8, stage_dir: []const u8, policy: ActivationPolicy) !void {
+            try self.publishActivation(stage_model, stage_dir, policy);
+            removeIntentFile(self.io, self.root, removal_intent_name);
+        }
+
+        fn publishActivation(self: *Self, stage_model: []const u8, stage_dir: []const u8, policy: ActivationPolicy) !void {
             var prepared = self.prepareInstallation(stage_model, stage_dir) catch |failure| {
                 if (failure == error.ModelSizeMismatch or failure == error.ModelDigestMismatch)
                     try discardStage(self.io, stage_dir);
@@ -1835,6 +1911,171 @@ test "confirmed removal rejects new local Utterances, drains the helper, and rem
     var stage_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const stage = try Layout.init(root).stagingDir(test_manifest.installation_id, &stage_path_buf);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stage, .{}));
+}
+
+test "an interrupted removal is completed by the reclaim pass, not left disabling the local backend" {
+    // The uncooperative death `remove()`'s unwind cannot cover: the marker is up, the model
+    // data is still there, and nothing but this pass will ever take the file away.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try installTestModel(root);
+    try writeTestPartial(root, "pinned", "\"immutable-test\"");
+    try writeIntentFile(std.testing.io, root, removal_intent_name);
+
+    // The trap the finding describes: every lease refuses, so the local backend is dead.
+    try std.testing.expect(modelRemovalPending(std.testing.io, root));
+    try std.testing.expectError(error.ModelRemovalInProgress, InferenceLease.acquire(std.testing.io, root));
+    try std.testing.expectError(error.ModelRemovalInProgress, RuntimeLease.acquire(std.testing.io, root));
+
+    try std.testing.expect(try completeStrandedRemoval(std.testing.io, root));
+
+    // Honored, not discarded: the removal the user confirmed actually happened.
+    try std.testing.expect(!modelRemovalPending(std.testing.io, root));
+    var model_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expect((try activeModelPath(std.testing.io, root, &model_path_buf)) == null);
+    var installations_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const installations = try Layout.init(root).installations(&installations_path_buf);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, installations, .{}));
+    var stage_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const stage = try Layout.init(root).stagingDir(test_manifest.installation_id, &stage_path_buf);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stage, .{}));
+    var lease = try InferenceLease.acquire(std.testing.io, root);
+    lease.release();
+
+    // Idempotent, and silent once there is nothing left to finish.
+    try std.testing.expect(!try completeStrandedRemoval(std.testing.io, root));
+}
+
+test "a marker stranded after the model data is already gone is cleared by the same pass" {
+    // The other half of the window: the death landed after `removeModelData` and before the
+    // unwind, so the heal has only the file to retire.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try writeIntentFile(std.testing.io, root, removal_intent_name);
+    try std.testing.expectError(error.ModelRemovalInProgress, RuntimeLease.acquire(std.testing.io, root));
+
+    try std.testing.expect(try completeStrandedRemoval(std.testing.io, root));
+
+    try std.testing.expect(!modelRemovalPending(std.testing.io, root));
+    var lease = try RuntimeLease.acquire(std.testing.io, root);
+    lease.release();
+}
+
+test "a live removal is never raced: the reclaim pass defers to a held operation lock" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try installTestModel(root);
+    try writeIntentFile(std.testing.io, root, removal_intent_name);
+
+    // Stand in for the running `remove()` that owns this marker: it holds the operation lock
+    // for its whole drain, which is exactly the window in which the marker means "in flight".
+    var operation_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const operation_path = try Layout.init(root).child(operation_lock_name, &operation_path_buf);
+    var live = try std.Io.Dir.cwd().createFile(std.testing.io, operation_path, .{ .lock = .exclusive });
+
+    try std.testing.expectError(error.ModelOperationInProgress, completeStrandedRemoval(std.testing.io, root));
+    try std.testing.expect(modelRemovalPending(std.testing.io, root));
+    var model_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expect((try activeModelPath(std.testing.io, root, &model_path_buf)) != null);
+
+    live.close(std.testing.io);
+    try std.testing.expect(try completeStrandedRemoval(std.testing.io, root));
+}
+
+test "the reclaim pass waits for a helper that predates the marker rather than pulling files from under it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try installTestModel(root);
+    // A warm helper's lease, taken before the removal published its intent — the one holder
+    // the marker cannot keep out. The daemon retires it on the tick that reads the probe.
+    var runtime = try RuntimeLease.acquire(std.testing.io, root);
+    try writeIntentFile(std.testing.io, root, removal_intent_name);
+
+    try std.testing.expectError(error.ModelRuntimeActive, completeStrandedRemoval(std.testing.io, root));
+    var model_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expect((try activeModelPath(std.testing.io, root, &model_path_buf)) != null);
+
+    runtime.release();
+    try std.testing.expect(try completeStrandedRemoval(std.testing.io, root));
+    try std.testing.expect(!modelRemovalPending(std.testing.io, root));
+}
+
+test "a reinstall clears a stale removal marker, so the Status Item's own Install offer is true" {
+    // What the user actually does: the probe reads absent, the menu offers Install, they
+    // take it. The receipt it publishes is the newer answer, and must be usable.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try writeIntentFile(std.testing.io, root, removal_intent_name);
+    try installTestModel(root);
+
+    try std.testing.expect(!modelRemovalPending(std.testing.io, root));
+    try std.testing.expect(try activeInstallationPresent(std.testing.io, root, test_manifest));
+    var lease = try InferenceLease.acquire(std.testing.io, root);
+    lease.release();
+}
+
+test "an Install over intact data clears a stale marker instead of reporting success on a dead backend" {
+    // Install has nothing to activate here — the installation it would produce is already
+    // active — and returning over the marker would leave every lease refusing anyway.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try installTestModel(root);
+    try writeIntentFile(std.testing.io, root, removal_intent_name);
+
+    try installTestModel(root);
+
+    try std.testing.expect(!modelRemovalPending(std.testing.io, root));
+    try std.testing.expect(try activeInstallationPresent(std.testing.io, root, test_manifest));
+    var lease = try InferenceLease.acquire(std.testing.io, root);
+    lease.release();
+}
+
+test "a cooperative removal still clears its own marker on unwind" {
+    // The cancel path the finding leaves alone: the operation child's SIGTERM handler sets
+    // the cancel flag, the drain errors out, and `remove()`'s `defer` runs. Nothing here
+    // should ever reach the reclaim pass.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try installTestModel(root);
+    var transport = FakeTransport{};
+    var smoke = FakeSmoke{};
+    var operation = Operation(FakeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
+    operation.cancel.request();
+
+    try std.testing.expectError(error.ModelOperationCancelled, operation.remove());
+
+    try std.testing.expect(!modelRemovalPending(std.testing.io, root));
+    var model_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expect((try activeModelPath(std.testing.io, root, &model_path_buf)) != null);
+    try std.testing.expect(!try completeStrandedRemoval(std.testing.io, root));
 }
 
 test "acquisition starts only at the exact trusted artifact origin" {

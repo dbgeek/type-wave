@@ -319,7 +319,16 @@ which is the record; the Layout is its address.
 _Avoid_: paths helper, fs utils (they name a grab-bag, not the single owner)
 
 **Model Operation**:
-A user-authorized acquisition, verification, activation, repair, or removal acting on a Model Installation. An operation may be in progress while the current Model Installation remains usable.
+A user-authorized acquisition, verification, activation, repair, or removal acting on a
+Model Installation. An operation may be in progress while the current Model Installation
+remains usable. A **removal** publishes its intent (`.removal.pending`) before it takes the
+exclusive gates, so selected-local readiness drains before any model bytes disappear — and
+because that marker alone makes the installation unreadable to every lease and probe, the
+system must converge on it from every interleaving (#276): a marker with no live writer is
+**stranded**, proved so by the operation lock every Model Operation takes, and the daemon's
+reclaim pass *finishes* the removal it recorded rather than merely discarding the file. A
+Model Operation that publishes a receipt retires the marker too — the user's newer answer
+wins — which is what makes the Install the Status Item offers actually revive the backend.
 _Avoid_: download state, model task
 
 **Model Operation Runner**:
@@ -400,7 +409,8 @@ _Avoid_: setup state, readiness state, configured flag
 
 **Supervisor**:
 The pure per-tick decider of the daemon's self-heal nudges — the Talk Key tap re-arm and
-the PostEvent probe (#127/#129) — plus the superseded-Model-Installation cleanup, the
+the PostEvent probe (#127/#129) — plus the model-storage reclaim (a superseded Model
+Installation, or one an interrupted removal never finished deleting, #276), the
 capture-enable gate (the Talk Key press gate: `configured` AND a live backend AND not
 paused), and the Capture watchdog (a hold open while its key is up: `hold_open AND
 NOT talk_key_down`, #272). Fed a `Facts` snapshot and the Configuration Phase `Outcome`, it returns an

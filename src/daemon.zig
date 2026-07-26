@@ -444,11 +444,24 @@ const LocalProvisionerDeps = struct {
         return (model_store.activeModelPath(d.io, root, &model_buf) catch return false) != null;
     }
 
-    pub fn removeSuperseded(self: *LocalProvisionerDeps) void {
+    /// The idle reclaim pass: model storage nobody owns any more. Two jobs, both destructive,
+    /// both drain-gated, both retried next tick when a lock is busy — which is why they share
+    /// one effect rather than sitting on the read-only `recoveryState` probe the menu calls.
+    /// The stranded-removal heal goes first: it can delete the very installation the
+    /// superseded sweep would otherwise walk (#276).
+    pub fn reclaimModelStorage(self: *LocalProvisionerDeps) void {
         const d = self.daemon;
         const raw_home = std.c.getenv("HOME") orelse return;
         var root_buf: [std.fs.max_path_bytes]u8 = undefined;
         const root = model_store.rootPath(std.mem.span(raw_home), &root_buf) catch return;
+        // A removal whose process died before clearing its intent marker. Silent unless it
+        // actually heals something: the marker is absent on essentially every tick.
+        if (model_store.completeStrandedRemoval(d.io, root)) |healed| {
+            if (healed) feedback.log("  completed an interrupted Model removal left pending by a previous run; Install is required\n", .{});
+        } else |failure| switch (failure) {
+            error.ModelOperationInProgress, error.ModelRuntimeActive, error.ModelInferenceActive => {},
+            else => feedback.log("  interrupted Model removal cleanup failed: {s}; retrying while idle\n", .{@errorName(failure)}),
+        }
         const removed = model_store.removeInactiveInstallations(d.io, root) catch |failure| {
             if (failure == error.ModelOperationInProgress or failure == error.ModelInferenceActive) return;
             feedback.log("  superseded Model Installation cleanup failed: {s}; retrying while idle\n", .{@errorName(failure)});
@@ -1049,10 +1062,11 @@ const Daemon = struct {
             if (acts.announce_ready)
                 feedback.log("  READY — hold {s}, speak, release; the transcript lands at the cursor.\n", .{keyName(self.store.current().talk_key)});
             if (acts.report_missing) |report| self.reportMissing(report);
-            // Reclaim a superseded Model Installation only with no Utterance in flight;
-            // busy operation/inference locks defer cleanup to the next tick without
+            // Reclaim model storage nobody owns — a superseded Model Installation, or one a
+            // killed removal never finished deleting — only with no Utterance in flight;
+            // busy operation/runtime/inference locks defer cleanup to the next tick without
             // disturbing dictation.
-            if (acts.remove_superseded) self.provisioner.removeSuperseded();
+            if (acts.reclaim_model_storage) self.provisioner.reclaimModelStorage();
             // The Capture watchdog (#272). Unlike the async nudges above this one resolves
             // within the tick — it runs the Coordinator's release path here, on this
             // thread, exactly as the tap's run-loop thread would have.
