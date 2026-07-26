@@ -58,6 +58,12 @@ Before changing anything non-trivial, please read:
 
 Match the style and comment density of the surrounding code.
 
+If you add a step to a workflow in `.github/workflows/`, pin the action to a
+full commit SHA with the release in a trailing comment
+(`uses: owner/action@<40-hex> # v1.2.3`) — a tag or a branch is a name its
+author can re-point, and Dependabot advances the SHA and the comment together.
+The test suite enforces this, so an unpinned action fails the build.
+
 ## Conduct
 
 Be kind and assume good faith. This project follows a
