@@ -94,6 +94,7 @@ const local_backend = @import("local_backend.zig");
 const whisper_process_helper = @import("whisper_process_helper.zig");
 const model_store = @import("model_store.zig");
 const local_provisioner = @import("local_provisioner.zig");
+const signing_identity = @import("signing_identity.zig");
 const status_item = @import("status_item.zig");
 const secure_input_mod = @import("secure_input.zig");
 
@@ -409,7 +410,15 @@ const LocalProvisionerDeps = struct {
 
     pub fn startHelper(self: *LocalProvisionerDeps, install: *Install) local_provisioner.StartOutcome(LocalAdapter) {
         const d = self.daemon;
-        const helper = whisper_process_helper.ProcessHelper.start(d.alloc, d.io, install.helperPath(), install.modelPath(), install.artifact) catch |failure| {
+        const helper = whisper_process_helper.ProcessHelper.start(
+            d.alloc,
+            d.io,
+            install.helperPath(),
+            install.modelPath(),
+            install.artifact,
+            .by_self_signature,
+        ) catch |failure| {
+            if (signing_identity.isRefusal(failure)) return .{ .identity_refused = failure };
             return .{ .spawn_failed = failure };
         };
         const local = d.alloc.create(LocalAdapter) catch {
@@ -478,6 +487,7 @@ const LocalProvisionerDeps = struct {
             .load_failed => |failure| feedback.log("  local Whisper load failed: {s}; verifying the Model Installation offline\n", .{@errorName(failure)}),
             .runtime_failure => |failure| feedback.log("  local Whisper runtime failure after verified installation: {s}; send SIGHUP to Retry\n", .{@errorName(failure)}),
             .runtime_failure_after_verify => |failure| feedback.log("  Model Installation verified, but local runtime load failed again: {s}; send SIGHUP to Retry\n", .{@errorName(failure)}),
+            .identity_refused => |failure| feedback.log("  Whisper Helper refused: {s}; the binary at ~/.local/libexec/type-wave is not signed by this daemon's identity — reinstall the daemon/helper pair, then send SIGHUP to Retry\n", .{@errorName(failure)}),
             .adapter_unavailable => feedback.log("  local Whisper unavailable: adapter allocation failed\n", .{}),
         }
     }
@@ -1549,6 +1559,13 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     watcher.detach();
 
     feedback.log("type-wave daemon up — self-healing. SIGTERM/Ctrl-C to quit; SIGHUP retries selected local inference.\n", .{});
+    // Said once here rather than per spawn: whether the Whisper Helper gets proved at all is
+    // a property of *this build's* signing, so it is a startup fact, not an event (#284).
+    switch (signing_identity.describeSelf()) {
+        .leaf => feedback.log("  Whisper Helper spawns are gated on this daemon's own signing identity\n", .{}),
+        .anonymous => feedback.log("  Whisper Helper spawns are NOT identity-gated: this build carries no signing certificate (expected for an unsigned dev build; installed builds are signed)\n", .{}),
+        .unreadable => |status| feedback.log("  Whisper Helper spawns are NOT identity-gated: this daemon could not read its own code signature (OSStatus {d})\n", .{status}),
+    }
 
     // The main loop. With the status item up this MUST be [NSApp run] — a bare
     // CFRunLoopRun never runs AppKit's nextEvent→sendEvent: dispatch, so status-item

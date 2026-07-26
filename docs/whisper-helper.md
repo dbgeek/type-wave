@@ -5,6 +5,37 @@ Whisper Large v3 Turbo F16 artifact. It accepts only a model path and version 2 
 stdin, writes frames on stdout, and reserves stderr for bounded operational diagnostics.
 It has no downloader, credential input, network client, or OpenAI fallback.
 
+## The daemon proves the helper before spawning it
+
+The helper receives the PCM of every local Utterance, and the daemon reaches it through a
+fixed path in the user's home directory (`~/.local/libexec/type-wave/type-wave-whisper`,
+itself a symlink through the `current` pair pointer). Before any spawn — the warm, the
+recovery ladder's relaunches, and the Model Operation smoke test alike — the daemon requires
+that binary to carry a valid code signature made with **the same leaf certificate the running
+daemon carries** (`src/signing_identity.zig`). Nothing else about the helper is checked here;
+"signed by us" is the whole claim.
+
+Consequences worth knowing:
+
+- **The gate is exactly as strong as your own build's signing, never stronger.** A daemon
+  that carries no certificate chain of its own — an unsigned or ad-hoc `zig-out` dev build —
+  has no identity to demand, so it gates nothing and says so once in the log at startup. An
+  installed build is always signed: `packaging/install.sh` refuses to run without an
+  identity and codesign-verifies both binaries before and after publishing the pair.
+- **An upgrade is not a refusal.** The `type-wave dev` identity is stable across rebuilds
+  (the same property that keeps the keychain item's ACL working), so a freshly built helper
+  proves against a daemon built weeks earlier.
+- **A refusal is not a model problem.** It skips model verification entirely and latches like
+  any other runtime failure: the log names the reason, the Status Item shows it, the Model
+  Installation stays usable, and the way back is to reinstall the daemon/helper pair and then
+  send SIGHUP to Retry.
+
+The receipt's `runtime_sha256` is deliberately *not* the gate. It is recorded at model-install
+time as the smoke test's witness — which binary proved this model loads — and the installer
+republishes the helper on every upgrade without touching the receipt, so it goes stale on an
+ordinary upgrade with no recovery path short of re-downloading the model. It is also the
+weaker claim: whoever can write the helper can rewrite the plaintext receipt beside it.
+
 ## Build from the pinned runtime
 
 Every normal build acquires the upstream `whisper.cpp-v1.9.1.tar.gz` archive and rejects

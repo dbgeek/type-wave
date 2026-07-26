@@ -62,6 +62,27 @@ reverse edge — whose contract lives with that adapter (`local_backend.assertHe
 adapter is exercised against a `FakeHelper` rather than a real subprocess.
 _Avoid_: whisper server, worker, subprocess (that names the mechanism, not the role)
 
+**Signing Identity**:
+The leaf certificate a binary's code signature was made with, and the proof the daemon
+requires of the Whisper Helper before spawning it (`src/signing_identity.zig`, #284): the
+helper must carry the leaf the *running daemon* carries. It is deliberately the signature
+and not the receipt's `runtime_sha256` — that digest is recorded at model-install time and
+the installer republishes the helper on every upgrade without touching the receipt, so
+gating on it would retire the local backend at the next upgrade with no way back short of
+re-downloading the model; it is also the weaker claim, since whoever can write the helper
+can rewrite the plaintext receipt beside it. **We demand what was demanded of us**: the gate
+is exactly as strong as this build's own signing and never stronger, so an unsigned or
+ad-hoc dev build gates nothing and says so once at startup. The two sides fail opposite
+ways, as the Insertion's Focused Target gate and Undo's do: an unreadable reading of
+*ourselves* fails open (an oddity in our own house must not retire the backend), an
+unverifiable *candidate* fails closed. Proved at **every** spawn including the recovery
+ladder's relaunches — the helper path is a symlink through the `current` pair pointer, so a
+proof taken at warm would be a proof about a file a later relaunch need not open. A refusal
+skips the Local Provisioner's verify/retry ladder entirely and latches `runtime_failure`:
+the Model Installation is not what failed.
+_Avoid_: code signature check (that names the mechanism), helper hash, runtime digest
+(`runtime_sha256` is the smoke test's witness, not an admission token)
+
 **Insertion**:
 Placing a Final Transcript at the cursor of the Focused Target. Every Insertion ends with
 a single trailing space, so consecutive Insertions don't run their words together. It is
