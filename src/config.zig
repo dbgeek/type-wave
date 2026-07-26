@@ -719,7 +719,7 @@ fn serializeInto(w: *std.Io.Writer, s: Settings) std.Io.Writer.Error!void {
         \\//   .language        = "<ISO code>"  ("" = auto-detect)
         \\//   .delay           = "minimal" | "low" | "medium" | "high" | "xhigh"
         \\//   .noise_reduction = .near_field | .far_field | .off
-        \\//   .insertion       = .paste | .keystroke
+        \\//   .insertion       = .paste | .keystroke  (.paste transits the general pasteboard for ~300ms, readable session-wide; .keystroke never does — SECURITY.md)
         \\//   .pre_paste_ms    = <ms between the pasteboard write and Cmd-V; raise for a slow target>
         \\//   .overlay         = true | false
         \\//   .backtrack       = true | false  (rewrite self-corrections via OpenAI — transcript text leaves your Mac)

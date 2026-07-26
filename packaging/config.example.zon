@@ -38,6 +38,10 @@
     // How the Final Transcript lands at the cursor:
     //   .paste     — clipboard swap + ⌘V (primary; best for terminals/Electron)
     //   .keystroke — synthetic Unicode typing (fallback)
+    // The trade-off is a security one too: .paste puts the transcript on the general
+    // pasteboard for ~300 ms, where any process in your session can read it (the
+    // transient/concealed markers are an honor system, not enforcement), while
+    // .keystroke never touches the pasteboard. See SECURITY.md, "Accepted limitations".
     .insertion = .paste,
 
     // Milliseconds between writing the pasteboard and posting ⌘V (paste insertion
