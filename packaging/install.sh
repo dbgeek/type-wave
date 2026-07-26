@@ -242,7 +242,8 @@ daemon's menu-bar icon (Set API Key…) once it is running, or right now via:
       $install_daemon --set-key
 Run --set-key through THIS installed signed binary — the keychain item's ACL keys to its
 creator, so only then does the daemon read it prompt-free. A key still in the legacy
-~/.config/type-wave/env file is auto-migrated into the keychain on first run. The daemon
+~/.config/type-wave/env file is auto-migrated into the keychain on first run, and that
+plaintext file is then deleted rather than left holding your key. The daemon
 starts fine without a key: the menu-bar icon dims and the status line reads
 "No API key" until one appears.
 EOF

@@ -25,8 +25,10 @@
           # Dev-shell convenience: make sure OPENAI_API_KEY is exported — the dev
           # override for foreground runs (#33; the installed daemon reads the login
           # keychain instead). A legacy ~/.config/type-wave/env file is still sourced
-          # if present so old setups keep working; the daemon itself no longer reads
-          # it (beyond a one-time migration into the keychain).
+          # if present so old setups keep working — but do not count on it: the
+          # installed daemon now *removes* that file once the keychain provably holds
+          # the key (#282), so a machine that has run the daemon exports the key some
+          # other way.
           shellHook = ''
             if [ -z "''${OPENAI_API_KEY:-}" ] && [ -f "$HOME/.config/type-wave/env" ]; then
               . "$HOME/.config/type-wave/env"
