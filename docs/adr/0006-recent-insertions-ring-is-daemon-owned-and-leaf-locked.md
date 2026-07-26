@@ -105,3 +105,34 @@ A future review should not "upgrade" this ring to the inverted lock-free swap
 without re-reading this record: that idiom was considered here and traded away on
 purpose, because for a per-dictation write it costs an unbounded leak or a
 reclamation scheme that a 20-entry, read-on-open buffer does not justify.
+
+## Amendment (2026-07-26, [#286](https://github.com/dbgeek/type-wave/issues/286)): a record's cluster count is computed at `record`, not derived at use
+
+An Utterance spoken while Secure Event Input was held is recorded **with no transcript
+bytes at all** (`Record.withheld`): the row exists, the retention rule is amended in
+`docs/recent-insertions-spec.md` §2.2, and there is nothing to reveal, copy or replay.
+That broke an assumption nothing had stated — that any consumer wanting a property *of*
+the text can recompute it from the text, because the text is always there.
+
+The consumer in question is Undo, which needs one number: how many `⌫` to post. It used
+to copy the record's bytes out of this ring and run `grapheme.graphemeCount` over them at
+post time. So the ring now **counts at `record` time**, where the bytes are in hand by
+definition, and `newestForUndo` hands over the count instead of a buffer.
+
+The generalization, and the reason it belongs in this ADR rather than in the ticket that
+found it: **a derived value must be computed where its input is guaranteed to exist, not
+where it happens to be convenient.** A store that may legitimately hold less than it was
+given owes its consumers the derivations they used to make themselves.
+
+Three things follow:
+
+- **The Undo path reads no transcript bytes.** Deleting text needs its count, never its
+  content — so a withheld record is deletable on exactly the same terms as any other, with
+  no special case anywhere in `undo.zig`. The 8 KiB stack buffer that path used to carry is
+  gone.
+- **The count is taken over the *stored* slice**, so a transcript longer than
+  `max_bytes` cannot authorize backspacing past what the ring kept. (The cap does not bind
+  in practice — an `inserted` reaches at most `max_bytes` — but the count and the bytes must
+  not be *able* to disagree.)
+- **`record` stays inside its "must not block" contract.** The count is one bounded pass
+  over the same bytes the memcpy beside it already walks.

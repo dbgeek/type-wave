@@ -90,6 +90,35 @@ Record whenever a non-empty Final Transcript was produced, i.e.
 
 The capture design (§4) realizes this rule for free — no extra filter is needed.
 
+**Amendment ([#286](https://github.com/dbgeek/type-wave/issues/286), 2026-07-26): an
+Utterance spoken under a held Secure Event Input is recorded *without its text*.** The
+rule above still decides *which* Utterances get a record; this decides what a record
+holds. When Secure Event Input was held at the Talk Key press **or** at its release, the
+Coordinator marks the Utterance and the ring stores **no transcript bytes** — neither
+`inserted` nor `raw`, `Record.withheld` set. Its words are presumed a secret: the flag is
+the OS's strongest available signal that a secure field has focus somewhere, and a
+retained, re-openable, revealable entry is the one exposure dictation adds that typing
+into that field would not have.
+
+- **The record is kept, not dropped.** A missing row would be a silent gap
+  indistinguishable from a bug — and it would hand `⌃⌘⌫` a stale newest record whose
+  count no longer matches what is at the cursor (§5, #212's single-newest rule).
+- **It stays deletable.** `Record.clusters` is counted at `record` time, so Undo works
+  normally on a withheld record (ADR-0006's amendment). The count is not the secret; the
+  words are.
+- **Reveal / Copy / Re-insert are unavailable**, shown disabled with the reason rather
+  than hidden (§4.1, §5).
+- **The outcome does not change it.** A withheld `.failed` or `.refused` record is
+  withheld on the same terms — there is no text either way, so the recovery those records
+  exist for is exactly what this trades away.
+- **The log is covered too**, and this is the one part outside this spec: while a marked
+  Utterance is live, transcript text renders redacted even under `.log_transcripts = true`
+  (`feedback.zig`). The on-disk log is the stronger retention of the two; refusing the
+  in-memory copy while writing the plaintext one would be incoherent.
+
+Dictation itself is **not** gated by the flag — the posture, and why, is recorded in
+`SECURITY.md`'s accepted limitations.
+
 ### 2.3 Ring size — N = 20, fixed
 `N = 20`, a fixed compile-time constant, **not** user-configurable (configurability
 is scope creep for a recovery buffer; add later only if asked). Newest-first; the
@@ -107,6 +136,14 @@ which shows no text — #27).
   Insertion noticed a few minutes late; a retention timer would delete exactly
   that text right when the user reaches for it. Masking bounds exposure without
   sacrificing recovery.
+- **A withheld entry has nothing to mask** ([#286](https://github.com/dbgeek/type-wave/issues/286)).
+  Its row reads `not retained · <App> · <time>  [secure input]` — no `•` run, because the run
+  means *text is here, masked* and would promise a reveal that cannot happen, and no char
+  count, because the one entry whose content is presumed a secret is the one not to publish a
+  length for. Reveal, Copy and Re-insert are **disabled** on it, and the reveal item carries
+  the reason. The gate is the `HistoryRow.text_available` flag, decided in the Presentation
+  where it is tested; the ring yielding zero bytes for that stamp is the floor under it, not
+  the gate.
 
 ---
 

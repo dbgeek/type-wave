@@ -1,8 +1,8 @@
 //! undo.zig — the **Undo Runner**: the daemon's one route from the recovery chord `⌃⌘⌫`
 //! to a deletion (undo-spec, ADR-0008).
 //!
-//! One Undo is a single sequence — resolve the newest Insertion Record, count its grapheme
-//! clusters, read the frontmost app, evaluate the app-level focus gate, post that many
+//! One Undo is a single sequence — resolve the newest Insertion Record for its grapheme-cluster
+//! count, read the frontmost app, evaluate the app-level focus gate, post that many
 //! Backspaces, flag the record `undone`, show the cue — and this module owns **all** of it,
 //! start to finish, **on the insert worker**. The chord callback does one thing: bump a
 //! counter (`request`). That placement is the point (ADR-0008):
@@ -42,11 +42,15 @@
 //! Serialization against dictation stays the Insert Worker's: `insertion_runner.workerLoop`
 //! drains this last, after the dictation / replay / copy slots, so a deletion can never
 //! interleave with an Insertion's clipboard-swap dance.
+//!
+//! One thing this module never touches: **the transcript itself.** A deletion needs the record's
+//! cluster count, not its content, so the count is what the ring hands over (#286) — which is
+//! why an Utterance spoken under a held Secure Event Input, whose text the ring deliberately
+//! does not store, is still deletable here on exactly the same terms as any other.
 
 const std = @import("std");
 const coord = @import("coordinator.zig");
 const feedback = @import("feedback.zig");
-const grapheme = @import("grapheme.zig");
 const recent_insertions = @import("recent_insertions.zig");
 
 /// Why an Undo refused — written to the log for the feedback layer (#213: every reason
@@ -215,11 +219,10 @@ pub fn Undo(comptime Deps: type) type {
                 return;
             }
 
-            // Resolved **here**, at post time, not at chord time: bytes, App Identity, stamp
-            // and undone flag come out of one hold of the ring's leaf lock, so a concurrent
-            // Insertion can never pair one record's text with another's app.
-            var buf: [recent_insertions.max_bytes]u8 = undefined;
-            const target = self.ring.newestForUndo(&buf) orelse {
+            // Resolved **here**, at post time, not at chord time: cluster count, App Identity,
+            // stamp and undone flag come out of one hold of the ring's leaf lock, so a
+            // concurrent Insertion can never pair one record's length with another's app.
+            const target = self.ring.newestForUndo() orelse {
                 self.refuse(.no_target, "the ring holds no Insertion to delete");
                 return;
             };
@@ -239,8 +242,10 @@ pub fn Undo(comptime Deps: type) type {
             }
 
             // One `⌫` per extended grapheme cluster (#220), trailing Insertion space
-            // included (#214 — restore the pre-Insertion state).
-            const n = grapheme.graphemeCount(buf[0..target.len]);
+            // included (#214 — restore the pre-Insertion state). Counted by the ring at record
+            // time, where the bytes were: a deletion needs the *count*, never the content, and
+            // that is what lets a withheld record (#286) be deleted like any other.
+            const n = target.clusters;
             if (n == 0) {
                 // A degenerate record: empty bytes, or a segmentation failure. There is
                 // nothing to delete, so the gate's cross-process read is skipped — but the
@@ -423,6 +428,31 @@ test "undo resolves the newest record and deletes one cluster per grapheme, trai
     try expectEqual(@as(usize, 7), runner.deps.last_delete_n);
     try expectEqual(@as(usize, 1), runner.deps.undo_confirms);
     try expectEqual(@as(usize, 0), runner.deps.undo_refuses);
+}
+
+test "undo deletes a withheld record on exactly the same terms as any other (#286)" {
+    // The highest-value case this ticket touches: a password just dictated into a field. The
+    // ring stored none of its text, so this is a deletion driven entirely by the count it
+    // carried out of `record` — and it is the ordinary path, not a special one.
+    var ring = recent_insertions.Ring{};
+    var withheld = rec("hunter2 ", 20, slack);
+    withheld.withheld = true;
+    ring.record(rec("first ", 10, slack));
+    ring.record(withheld);
+    var runner = Runner.init(&ring, .{ .focused_app = slack });
+
+    runner.request();
+    try expect(runner.runOnce());
+
+    try expectEqual(@as(usize, 8), runner.deps.last_delete_n); // "hunter2 " incl. the space
+    try expectEqual(@as(usize, 1), runner.deps.undo_confirms);
+    try expectEqual(@as(usize, 0), runner.deps.undo_refuses);
+    // And the single-shot rule still binds: the record is flagged, so a second press refuses
+    // rather than eating the older Insertion's text.
+    runner.request();
+    try expect(runner.runOnce());
+    try expectEqual(@as(usize, 1), runner.deps.deletes);
+    try expectEqual(@as(usize, 1), runner.deps.undo_refuses);
 }
 
 test "undo targets only the newest, ignoring older records (single-shot, #212)" {
@@ -616,8 +646,7 @@ test "a committed undo flags the record undone — after the post, keyed by time
     try expect(runner.runOnce());
 
     try expectEqual(@as(usize, 1), runner.deps.deletes);
-    var out: [recent_insertions.max_bytes]u8 = undefined;
-    try expect(ring.newestForUndo(&out).?.undone); // kept and flagged, not removed
+    try expect(ring.newestForUndo().?.undone); // kept and flagged, not removed
 }
 
 test "a gate refusal leaves the record NOT undone — no dimmed row for a deletion that never happened" {
@@ -631,8 +660,7 @@ test "a gate refusal leaves the record NOT undone — no dimmed row for a deleti
     try expect(runner.runOnce());
 
     try expectEqual(@as(usize, 0), runner.deps.deletes);
-    var out: [recent_insertions.max_bytes]u8 = undefined;
-    try expect(!ring.newestForUndo(&out).?.undone);
+    try expect(!ring.newestForUndo().?.undone);
 }
 
 test "a refused undo stays retryable — fixing the focus and pressing again deletes" {
@@ -672,8 +700,7 @@ test "a deletion the mechanism could not post refuses: no confirm cue, no undone
     try expectEqual(@as(usize, 1), runner.deps.deletes); // it was attempted…
     try expectEqual(@as(usize, 0), runner.deps.undo_confirms); // …but nothing is claimed
     try expectEqual(@as(usize, 1), runner.deps.undo_refuses);
-    var out: [recent_insertions.max_bytes]u8 = undefined;
-    try expect(!ring.newestForUndo(&out).?.undone);
+    try expect(!ring.newestForUndo().?.undone);
 }
 
 test "a record left un-undone by a failed post is still the newest target on the next press" {
@@ -690,8 +717,7 @@ test "a record left un-undone by a failed post is still the newest target on the
 
     try expectEqual(@as(usize, 4), runner.deps.last_delete_n); // the same record, retried
     try expectEqual(@as(usize, 1), runner.deps.undo_confirms);
-    var out: [recent_insertions.max_bytes]u8 = undefined;
-    try expect(ring.newestForUndo(&out).?.undone);
+    try expect(ring.newestForUndo().?.undone);
 }
 
 test "a burst that stopped partway commits the record — a retry would eat earlier text (#225)" {
@@ -706,8 +732,7 @@ test "a burst that stopped partway commits the record — a retry would eat earl
     try expect(runner.runOnce());
 
     try expectEqual(@as(usize, 1), runner.deps.undo_confirms); // text *was* deleted
-    var out: [recent_insertions.max_bytes]u8 = undefined;
-    try expect(ring.newestForUndo(&out).?.undone);
+    try expect(ring.newestForUndo().?.undone);
 
     runner.deps.delete_posts = null;
     runner.request();
@@ -812,8 +837,7 @@ test "an aborted burst spends the record — the next press refuses rather than 
     runner.request();
     try expect(runner.runOnce());
 
-    var out: [recent_insertions.max_bytes]u8 = undefined;
-    try expect(ring.newestForUndo(&out).?.undone);
+    try expect(ring.newestForUndo().?.undone);
 
     runner.deps.focus_switch_after = null; // back in the right app
     runner.request();
@@ -837,8 +861,7 @@ test "a mechanism failure inside a later batch commits what landed and stops" {
     try expectEqual(@as(usize, 2), runner.deps.deletes);
     try expectEqual(@as(usize, 20), runner.deps.posted_total);
     try expectEqual(@as(usize, 1), runner.deps.undo_confirms);
-    var out: [recent_insertions.max_bytes]u8 = undefined;
-    try expect(ring.newestForUndo(&out).?.undone);
+    try expect(ring.newestForUndo().?.undone);
 }
 
 test "a first batch that posts nothing refuses, and never asks for a second" {
@@ -855,8 +878,7 @@ test "a first batch that posts nothing refuses, and never asks for a second" {
     try expectEqual(@as(usize, 1), runner.deps.focus_reads); // no re-proof for a burst that failed
     try expectEqual(@as(usize, 0), runner.deps.undo_confirms);
     try expectEqual(@as(usize, 1), runner.deps.undo_refuses);
-    var out: [recent_insertions.max_bytes]u8 = undefined;
-    try expect(!ring.newestForUndo(&out).?.undone);
+    try expect(!ring.newestForUndo().?.undone);
 }
 
 test "a second undo on an already-undone newest record refuses — it never eats earlier text (#225)" {
@@ -919,8 +941,7 @@ test "Secure Event Input refuses and posts nothing — never a confirm cue for a
     try expectEqual(@as(usize, 1), runner.deps.undo_refuses);
     // Nothing would post, so the gate's cross-process frontmost read is skipped (#224's rule).
     try expectEqual(@as(usize, 0), runner.deps.focus_reads);
-    var out: [recent_insertions.max_bytes]u8 = undefined;
-    try expect(!ring.newestForUndo(&out).?.undone); // and the record stays retryable
+    try expect(!ring.newestForUndo().?.undone); // and the record stays retryable
 }
 
 test "leaving the secure field makes the same chord land" {
@@ -964,8 +985,7 @@ test "a paused daemon refuses the chord before reading the ring or the frontmost
     try expectEqual(@as(usize, 0), runner.deps.deletes);
     // The outermost gate: no cross-process focus read, and the record is left untouched.
     try expectEqual(@as(usize, 0), runner.deps.focus_reads);
-    var out: [recent_insertions.max_bytes]u8 = undefined;
-    try expect(!ring.newestForUndo(&out).?.undone);
+    try expect(!ring.newestForUndo().?.undone);
     // Refused, not swallowed — the user sees why (ADR-0007, #226).
     try expectEqual(@as(usize, 1), runner.deps.undo_refuses);
 }
