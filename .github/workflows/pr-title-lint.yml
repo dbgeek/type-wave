@@ -31,7 +31,7 @@ jobs:
       # The `v5` tag it used to name still points at a June-2024 major-tag commit made
       # *before* v5.5.3 shipped — a name that stopped meaning "latest v5" without anyone
       # here noticing is the argument for pinning, so the pin is v5.5.3 itself.
-      - uses: amannn/action-semantic-pull-request@0723387faaf9b38adef4775cd42cfd5155ed6017 # v5.5.3
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
