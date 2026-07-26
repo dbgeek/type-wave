@@ -127,9 +127,44 @@ pub fn setLogTranscripts(on: bool) void {
     transcripts_verbatim.store(on, .release);
 }
 
-/// The live policy, read at the moment a line is written.
-pub fn logTranscripts() bool {
+/// Whether the *operator's* verbatim opt-in is on, ignoring any per-Utterance suppression.
+/// Only the narration reads this: a line saying "its words stayed out of the log" is worth
+/// writing when the opt-in was on and worth omitting when the words were never going to be
+/// logged anyway.
+pub fn transcriptsVerbatim() bool {
     return transcripts_verbatim.load(.acquire);
+}
+
+/// Set for the lifetime of an Utterance spoken while Secure Event Input was held (#286): the
+/// words are presumed a secret, so they must not reach the log even under the verbatim
+/// opt-in — the log is the *stronger* retention of the two the posture refuses (unrotated
+/// plaintext on disk, swept into `sysdiagnose` and Time Machine, attached to bug reports by
+/// the Diagnostics action), so refusing to hold the transcript in memory while writing it
+/// here would be incoherent.
+///
+/// Process-wide for the same reason the opt-in is, plus one this cell relies on: ADR-0001
+/// fully serializes Utterances, so there is never a second one whose transcript this could
+/// gag by accident. Kept as its **own** cell rather than folded into `transcripts_verbatim`
+/// so a config swap mid-Utterance — which republishes the opt-in — cannot clobber it.
+var transcripts_suppressed = std.atomic.Value(bool).init(false);
+
+/// Raise or drop the per-Utterance suppression. The Coordinator owns both edges: it sets this
+/// when it marks an Utterance, and clears it when the Utterance resolves, whatever the outcome.
+pub fn setTranscriptSuppression(on: bool) void {
+    transcripts_suppressed.store(on, .release);
+}
+
+/// The suppression cell alone. Exists so a test can save and restore it around the
+/// process-wide flag it shares with every other test in this binary.
+pub fn transcriptsSuppressed() bool {
+    return transcripts_suppressed.load(.acquire);
+}
+
+/// The live policy, read at the moment a line is written: the operator's opt-in **and** no
+/// suppression in force. Both halves are read here rather than at any producer, so a new
+/// logging site cannot forget either one.
+pub fn logTranscripts() bool {
+    return transcripts_verbatim.load(.acquire) and !transcripts_suppressed.load(.acquire);
 }
 
 /// Scratch a caller lends `renderTranscript` for the redacted form. Comfortably over the
@@ -175,13 +210,53 @@ test "an empty transcript still renders its size, and a full accumulator fits th
 }
 
 test "the log's redaction policy round-trips through the publisher" {
-    const saved = logTranscripts(); // other tests share the process-wide flag
+    const saved = transcriptsVerbatim(); // other tests share the process-wide flag
     defer setLogTranscripts(saved);
 
     setLogTranscripts(true);
     try std.testing.expect(logTranscripts());
     setLogTranscripts(false);
     try std.testing.expect(!logTranscripts());
+}
+
+test "a suppressed Utterance keeps its words out of the log even under the verbatim opt-in" {
+    // The #286 posture's log half: `.log_transcripts = true` is the operator's opt-in, and
+    // suppression overrides it for one Utterance rather than being overridden by it.
+    const saved_verbatim = transcriptsVerbatim();
+    const saved_suppression = transcriptsSuppressed();
+    defer {
+        setLogTranscripts(saved_verbatim);
+        setTranscriptSuppression(saved_suppression);
+    }
+
+    setLogTranscripts(true);
+    setTranscriptSuppression(true);
+    try std.testing.expect(!logTranscripts());
+    try std.testing.expect(transcriptsVerbatim()); // the opt-in itself is untouched…
+
+    // …so a config swap republishing it mid-Utterance cannot lift the suppression: the two
+    // cells are separate and ANDed at the read.
+    setLogTranscripts(true);
+    try std.testing.expect(!logTranscripts());
+
+    setTranscriptSuppression(false);
+    try std.testing.expect(logTranscripts()); // and the opt-in resumes when the Utterance ends
+}
+
+test "suppression alone redacts, and says nothing about the operator's opt-in" {
+    const saved_verbatim = transcriptsVerbatim();
+    const saved_suppression = transcriptsSuppressed();
+    defer {
+        setLogTranscripts(saved_verbatim);
+        setTranscriptSuppression(saved_suppression);
+    }
+
+    setLogTranscripts(false);
+    setTranscriptSuppression(true);
+    try std.testing.expect(!logTranscripts());
+    // The narration reads the raw opt-in, not the policy: with the opt-in off there is no
+    // "words withheld from the log" clause to write, because they were never going to be.
+    try std.testing.expect(!transcriptsVerbatim());
 }
 
 // ---- clearing the log (#252) ------------------------------------------------

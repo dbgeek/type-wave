@@ -385,6 +385,8 @@ const AppKitChrome = struct {
     history_entries: [recent_insertions.capacity]id = @splat(null), // one label row each
     history_alt_entries: [recent_insertions.capacity]id = @splat(null), // the ⌥-alternate twin per row (fires reveal)
     history_reveal_items: [recent_insertions.capacity]id = @splat(null), // the in-submenu "Reveal text" item per row
+    history_copy_items: [recent_insertions.capacity]id = @splat(null), // the in-submenu "Copy" item per row
+    history_reinsert_items: [recent_insertions.capacity]id = @splat(null), // the in-submenu "Re-insert here" item per row
 
     pub fn apply(self: *AppKitChrome, p: *const status_item.Presentation) void {
         const pool = objc_autoreleasePoolPush();
@@ -473,6 +475,15 @@ const AppKitChrome = struct {
 
             const entry = h.rows[i].entry;
             const revealed = h.rows[i].revealed;
+            // A withheld record (#286) has no bytes behind it: the three text actions are shown
+            // disabled rather than hidden, so the row reads as deliberate rather than broken —
+            // the reveal item carries the reason. `setAutoenablesItems:` is off for these
+            // submenus, so an explicit `setEnabled:` is what decides.
+            const text_available = h.rows[i].text_available;
+            msgBool(self.history_copy_items[i], "setEnabled:", text_available);
+            msgBool(self.history_reinsert_items[i], "setEnabled:", text_available);
+            msgBool(self.history_reveal_items[i], "setEnabled:", text_available);
+            msgBool(self.history_alt_entries[i], "setEnabled:", text_available);
             const label = if (revealed) label: {
                 // On-demand text fetch (spec §4.1 / §5): the `inserted` bytes are read from the
                 // authoritative ring under its leaf lock — never from a projected value — keyed
@@ -485,8 +496,8 @@ const AppKitChrome = struct {
             msg1v(row, "setTitle:", nsstr(label.ptr));
             // Keep the ⌥-alternate's title in lockstep so the row doesn't jump on ⌥-hold.
             msg1v(self.history_alt_entries[i], "setTitle:", nsstr(label.ptr));
-            // The in-submenu affordance mirrors the toggle state.
-            msg1v(self.history_reveal_items[i], "setTitle:", nsstr(status_item.revealItemTitle(revealed).ptr));
+            // The in-submenu affordance mirrors the toggle state — or names why there is none.
+            msg1v(self.history_reveal_items[i], "setTitle:", nsstr(status_item.revealItemTitle(revealed, text_available).ptr));
         }
     }
 };
@@ -703,6 +714,7 @@ pub const Menu = struct {
             msg1v(copy_it, "setTarget:", self.target);
             msgLong(copy_it, "setTag:", @intCast(i));
             msg1v(row_sub, "addItem:", copy_it);
+            self.chrome.history_copy_items[i] = copy_it;
             // Re-insert here (spec §5.1): fires the shared `onHistoryReinsert:` selector, tagged
             // with this row's fixed newest-first index. The handler defers the actual replay until
             // the menu closes (so it lands at the then-frontmost Focused Target, §5.1.5); the
@@ -711,6 +723,7 @@ pub const Menu = struct {
             msg1v(reinsert_it, "setTarget:", self.target);
             msgLong(reinsert_it, "setTag:", @intCast(i));
             msg1v(row_sub, "addItem:", reinsert_it);
+            self.chrome.history_reinsert_items[i] = reinsert_it;
             // "Reveal text" — the discoverable equivalent of the ⌥-click reveal (spec §4). Its
             // title flips to "Hide text" while revealed; both fire the shared `onHistoryEntry:`
             // toggle, tagged with this row's fixed newest-first index.

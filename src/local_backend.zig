@@ -718,6 +718,15 @@ const IntegrationFeedback = struct {
     }
 };
 
+/// Secure Event Input, never held in these integration runs: the local-backend suite is about
+/// Segments reaching the Coordinator, and a held flag would only withhold their transcripts
+/// (#286). Its own tests cover the marked path.
+const IntegrationSecureInput = struct {
+    pub fn active(_: *IntegrationSecureInput) bool {
+        return false;
+    }
+};
+
 const IntegrationDeps = struct {
     audio: *IntegrationAudio,
     backends: *IntegrationBackends,
@@ -726,6 +735,7 @@ const IntegrationDeps = struct {
     deadline: *IntegrationDeadline,
     feedback: *IntegrationFeedback,
     recorder: *IntegrationRecorder,
+    secure_input: *IntegrationSecureInput,
 };
 const IntegrationCoordinator = coordinator.Coordinator(IntegrationDeps);
 
@@ -947,6 +957,7 @@ test "local Transcription Backend drives one Insertion and abandons empty or fai
     var deadline = IntegrationDeadline{};
     var surface = IntegrationFeedback{};
     var recorder = IntegrationRecorder{};
+    var secure_input = IntegrationSecureInput{};
     var co = IntegrationCoordinator.init(.{
         .audio = &audio,
         .backends = &backends,
@@ -955,6 +966,7 @@ test "local Transcription Backend drives one Insertion and abandons empty or fai
         .deadline = &deadline,
         .feedback = &surface,
         .recorder = &recorder,
+        .secure_input = &secure_input,
     });
     bridge.co = &co;
 

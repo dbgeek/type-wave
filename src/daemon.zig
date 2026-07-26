@@ -739,6 +739,17 @@ const DeadlineAdapter = struct {
     }
 };
 
+/// The Coordinator's Secure Event Input probe (#286): the impure half of the per-Utterance
+/// mark, kept behind a seam so the machine's own tests drive it from fed readings. One cheap
+/// in-process Carbon call — the same `insert.secureInputActive()` the Undo Runner probes with,
+/// and deliberately *not* the Supervisor's published `secure_input` state, whose ~3 s facts
+/// cadence cannot answer a question about one Utterance. Zero-sized: it holds nothing.
+const RealSecureInputProbe = struct {
+    pub fn active(_: *RealSecureInputProbe) bool {
+        return insertmod.secureInputActive();
+    }
+};
+
 // The Coordinator's dependency set, wired to the real adapters above.
 const RealDeps = struct {
     audio: *cap.Capture,
@@ -748,6 +759,7 @@ const RealDeps = struct {
     deadline: *DeadlineAdapter,
     feedback: *Surface,
     recorder: *recent_insertions.Ring,
+    secure_input: *RealSecureInputProbe,
 };
 const Coord = coord.Coordinator(RealDeps);
 
@@ -863,6 +875,11 @@ const Daemon = struct {
     /// its remedy visible, which is exactly what `secure_input.State` carries.
     secure_input_state: std.atomic.Value(u8) =
         std.atomic.Value(u8).init(@intFromEnum(secure_input_mod.State.clear)),
+    /// The Coordinator's own probe of the same flag (#286) — per-Utterance and fresh, where the
+    /// two fields above are session-wide and ~3 s old by design. Both readings exist because
+    /// they answer different questions: what to *tell* the user about the condition, and whether
+    /// *this* Utterance's transcript is retained.
+    secure_input_probe: RealSecureInputProbe = .{},
     provisioner_deps: LocalProvisionerDeps = undefined,
     provisioner: LocalProvisioner = undefined,
 
@@ -1476,6 +1493,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
         .deadline = &daemon.deadline,
         .feedback = &daemon.feedback_surface,
         .recorder = &daemon.recent_insertions,
+        .secure_input = &daemon.secure_input_probe,
     });
     // Reverse edges: the worker/timer threads re-enter the now-constructed Coordinator.
     daemon.insertion.deps.co_ctx = &daemon.coordinator;

@@ -105,6 +105,11 @@ pub const HistoryEntryView = struct {
     /// The record was undone by `⌃⌘⌫` (#225, single-shot model): the row renders dimmed and a
     /// re-insert of it acts as a redo. Masked like every other field — no transcript bytes.
     undone: bool = false,
+    /// The Utterance was spoken under a held Secure Event Input, so the ring stored none of its
+    /// text (#286). The row says so instead of showing a masked run, and `char_len` stays 0 —
+    /// the one row whose content is presumed a secret is the one row not to publish a length
+    /// for.
+    withheld: bool = false,
 };
 
 /// Project one authoritative Insertion Record to its text-free view. Reads the record's
@@ -113,11 +118,13 @@ pub fn historyEntryView(rec: *const recent_insertions.Record) HistoryEntryView {
     const bytes = rec.inserted();
     const chars = std.unicode.utf8CountCodepoints(bytes) catch bytes.len;
     return .{
-        .char_len = @intCast(@min(chars, std.math.maxInt(u16))),
+        // A withheld record has no bytes to count, and publishes no length either way.
+        .char_len = if (rec.withheld) 0 else @intCast(@min(chars, std.math.maxInt(u16))),
         .app = rec.focused_app,
         .timestamp = rec.timestamp,
         .outcome = rec.outcome,
         .undone = rec.undone,
+        .withheld = rec.withheld,
     };
 }
 
@@ -212,6 +219,10 @@ pub const HistoryEntry = struct {
     timestamp: i64 = 0,
     /// Undone by `⌃⌘⌫` (#225): the row renders dimmed with an `[undone]` marker; re-insert redoes.
     undone: bool = false,
+    /// Spoken under a held Secure Event Input (#286): the body reads `not retained` and the row
+    /// trails a `[secure input]` marker. Orthogonal to `tag`, which reports the *outcome* — a
+    /// withheld Insertion can equally have landed, failed or been refused.
+    withheld: bool = false,
 };
 
 /// The rendered Recent Insertions View: newest-first entries, `[0..count]` live.
@@ -274,6 +285,7 @@ fn deriveHistory(s: Snapshot) HistoryView {
             .app = entry.app,
             .timestamp = entry.timestamp,
             .undone = entry.undone,
+            .withheld = entry.withheld,
         };
     }
     return view;
@@ -503,6 +515,17 @@ fn historyUndoneSuffix(entry: HistoryEntry) []const u8 {
     return if (entry.undone) "  [undone]" else "";
 }
 
+/// The withheld marker (#286). Its own suffix rather than a `HistoryTag` variant because the tag
+/// answers *what happened to the Insertion* and this answers *whether its text was kept* — a
+/// withheld row still carries its own `[failed]` or `[refused]` when it has one.
+fn historySecureSuffix(entry: HistoryEntry) []const u8 {
+    return if (entry.withheld) "  [secure input]" else "";
+}
+
+/// The body of a withheld row: what the `•` run and char count are replaced by. The run means
+/// "text is here, masked", so showing it would promise a reveal that cannot happen.
+const withheld_body = "not retained";
+
 /// Assemble one history row: `<dot> <body> · <App> · <time>  [<tag>]  [undone]`, the shared
 /// shape of the masked and revealed labels — only `body` differs (the `•` run + char count vs
 /// the actual text). An undone entry (#225) leads with a dimmed glyph and trails with an
@@ -511,18 +534,19 @@ fn historyUndoneSuffix(entry: HistoryEntry) []const u8 {
 fn historyRowLabel(buf: []u8, entry: HistoryEntry, body: []const u8, now_ms: i64) [:0]const u8 {
     const dot = historyLeadGlyph(entry);
     const tag = historyTagSuffix(entry.tag);
+    const secure = historySecureSuffix(entry);
     const undone = historyUndoneSuffix(entry);
     var when: [24]u8 = undefined;
     const ago = relativeTime(&when, now_ms - entry.timestamp);
     const mid = " \xc2\xb7 "; // " · " (U+00B7)
     if (entry.app) |app| {
         if (app.displayName().len > 0)
-            return std.fmt.bufPrintSentinel(buf, "{s} {s}{s}{s}{s}{s}{s}{s}", .{
-                dot, body, mid, app.displayName(), mid, ago, tag, undone,
+            return std.fmt.bufPrintSentinel(buf, "{s} {s}{s}{s}{s}{s}{s}{s}{s}", .{
+                dot, body, mid, app.displayName(), mid, ago, tag, secure, undone,
             }, 0) catch dot;
     }
-    return std.fmt.bufPrintSentinel(buf, "{s} {s}{s}{s}{s}{s}", .{
-        dot, body, mid, ago, tag, undone,
+    return std.fmt.bufPrintSentinel(buf, "{s} {s}{s}{s}{s}{s}{s}", .{
+        dot, body, mid, ago, tag, secure, undone,
     }, 0) catch dot;
 }
 
@@ -531,6 +555,9 @@ fn historyRowLabel(buf: []u8, entry: HistoryEntry, body: []const u8, now_ms: i64
 /// for the hidden receipt, and `char_len` reports its length. Returns a sentinel-terminated
 /// slice for `NSString`; `now_ms` is the caller's clock.
 pub fn historyLabel(buf: []u8, entry: HistoryEntry, now_ms: i64) [:0]const u8 {
+    // A withheld row (#286) has no receipt to stand in for and no length to report.
+    if (entry.withheld) return historyRowLabel(buf, entry, withheld_body, now_ms);
+
     var bullets: [8 * 3]u8 = undefined; // •, U+2022, is 3 bytes; capped at 8
     const runs: usize = @max(@as(usize, 1), @min(@as(usize, entry.char_len), 8));
     var bi: usize = 0;
@@ -844,8 +871,11 @@ fn historyParentText(empty: bool) []const u8 {
     return if (empty) "No recent insertions" else "Recent Insertions";
 }
 
-/// The in-submenu reveal affordance, mirroring the row's toggle state (spec §4).
-pub fn revealItemTitle(revealed: bool) [:0]const u8 {
+/// The in-submenu reveal affordance, mirroring the row's toggle state (spec §4). A row with no
+/// text behind it (#286) gets the reason in place of the affordance: the item is disabled either
+/// way, and a disabled "Reveal text" would leave the user guessing which of the two it means.
+pub fn revealItemTitle(revealed: bool, text_available: bool) [:0]const u8 {
+    if (!text_available) return "No text retained — spoken under Secure Event Input";
     return if (revealed) "Hide text" else "Reveal text";
 }
 
@@ -941,6 +971,12 @@ pub const HistoryRow = struct {
     entry: HistoryEntry = .{},
     revealed: bool = false,
     hidden: bool = true,
+    /// Whether this row has transcript bytes behind it at all. False only for a withheld record
+    /// (#286): reveal, Copy and Re-insert are then shown **disabled**, so the row explains
+    /// itself rather than offering actions that would find nothing. The ring returning zero
+    /// bytes for such a stamp is the floor under this, not the gate — the gate is here, in the
+    /// Presentation, where it is tested.
+    text_available: bool = true,
 };
 
 pub const History = struct {
@@ -1090,8 +1126,12 @@ fn presentHistory(out: *History, view: HistoryView, reveal: RevealSet) void {
     for (view.entries[0..view.count], 0..) |entry, i| {
         out.rows[i] = .{
             .entry = entry,
-            .revealed = reveal.contains(entry.timestamp),
+            // A withheld row can never be revealed, whatever the RevealSet holds — a stale
+            // toggle on its stamp (or one aimed at an evicted entry that reused it) must not
+            // put an empty body where the reason belongs.
+            .revealed = !entry.withheld and reveal.contains(entry.timestamp),
             .hidden = false,
+            .text_available = !entry.withheld,
         };
     }
 }
@@ -1424,6 +1464,19 @@ test "historyEntryView carries the record's undone flag into the masked view (#2
     try std.testing.expect(historyEntryView(&rec).undone);
 }
 
+test "historyEntryView publishes no length for a withheld record (#286)" {
+    // A withheld record stores no bytes, so there is nothing to count — and nothing to publish
+    // either: the one row whose content is presumed a secret does not report its length.
+    var rec = record("", .ok, coord.AppIdentity.init("com.apple.Terminal", "Terminal"));
+    rec.withheld = true;
+    const view = historyEntryView(&rec);
+    try std.testing.expect(view.withheld);
+    try std.testing.expectEqual(@as(u16, 0), view.char_len);
+    // The rest of the metadata still crosses: the row is a real row.
+    try std.testing.expectEqualStrings("Terminal", view.app.?.displayName());
+    try std.testing.expectEqual(@as(i64, 1000), view.timestamp);
+}
+
 fn history(views: []const HistoryEntryView) Snapshot {
     var s = snap(.{});
     for (views, 0..) |v, i| s.history[i] = v;
@@ -1531,6 +1584,56 @@ test "historyRevealedLabel also dims an undone entry (#225)" {
     try std.testing.expect(std.mem.indexOf(u8, label, "hello") != null); // the redo text still shows
     try std.testing.expect(std.mem.indexOf(u8, label, "\xe2\x9a\xaa") != null); // ⚪ dimmed lead glyph
     try std.testing.expect(std.mem.indexOf(u8, label, "[undone]") != null);
+}
+
+test "historyLabel renders a withheld row as 'not retained' with no run and no count (#286)" {
+    var buf: [256]u8 = undefined;
+    const entry = HistoryEntry{
+        .dot = .ok,
+        .tag = .none,
+        .char_len = 0,
+        .app = coord.AppIdentity.init("com.apple.Terminal", "Terminal"),
+        .timestamp = 0,
+        .withheld = true,
+    };
+    const label = historyLabel(&buf, entry, 120_000);
+    try std.testing.expect(std.mem.indexOf(u8, label, "not retained") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "[secure input]") != null);
+    // No masked run: it means "text is here, masked", and would promise a reveal that cannot
+    // happen. No count either — not even the "0 chars" the count would have rendered.
+    try std.testing.expect(std.mem.indexOf(u8, label, "\xe2\x80\xa2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "chars") == null);
+    // Still a full row otherwise: where it went, and when.
+    try std.testing.expect(std.mem.indexOf(u8, label, "Terminal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "2m ago") != null);
+}
+
+test "a withheld row keeps its own outcome tag and undone marker (#286)" {
+    // Withholding answers *was the text kept*; the tag answers *what happened to the Insertion*.
+    // Both are true at once, so both show.
+    var buf: [256]u8 = undefined;
+    const entry = HistoryEntry{
+        .dot = .failed,
+        .tag = .refused,
+        .char_len = 0,
+        .app = null,
+        .timestamp = 0,
+        .undone = true,
+        .withheld = true,
+    };
+    const label = historyLabel(&buf, entry, 0);
+    try std.testing.expect(std.mem.indexOf(u8, label, "not retained") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "[refused]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "[secure input]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "[undone]") != null);
+}
+
+test "an ordinary row carries no withheld marker" {
+    var buf: [256]u8 = undefined;
+    const entry = HistoryEntry{ .dot = .ok, .tag = .none, .char_len = 4, .app = null, .timestamp = 0 };
+    const label = historyLabel(&buf, entry, 0);
+    try std.testing.expect(std.mem.indexOf(u8, label, "[secure input]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, label, "not retained") == null);
 }
 
 test "historyLabel omits the app segment when no App Identity was captured" {
@@ -1981,6 +2084,27 @@ test "a history row carries no transcript bytes — reveal is a flag, not text" 
     try std.testing.expect(!@hasField(HistoryRow, "inserted"));
 }
 
+test "a withheld row offers no text actions, and cannot be revealed by a stale toggle (#286)" {
+    var reveal = RevealSet{};
+    reveal.toggle(30); // the user had revealed this stamp — or an evicted entry that reused it
+    const s = history(&.{
+        .{ .char_len = 0, .outcome = .ok, .timestamp = 30, .withheld = true },
+        .{ .char_len = 5, .outcome = .ok, .timestamp = 20 },
+    });
+    var p: Presentation = undefined;
+    present(&p, s, settingsFor(.{}), reveal);
+
+    // The gate lives here, in the Presentation, where it is tested — the ring returning zero
+    // bytes for the stamp is only the floor under it.
+    try std.testing.expect(!p.history.rows[0].text_available);
+    try std.testing.expect(!p.history.rows[0].revealed); // whatever the RevealSet holds
+    try std.testing.expect(p.history.rows[0].entry.withheld);
+    // The row itself is present and clickable-through — only its text actions are not.
+    try std.testing.expect(!p.history.rows[0].hidden);
+    // An ordinary neighbour is untouched.
+    try std.testing.expect(p.history.rows[1].text_available);
+}
+
 test "a reveal toggle on an evicted stamp leaves every row masked" {
     var reveal = RevealSet{};
     reveal.toggle(999); // a stamp the ring no longer holds
@@ -1991,8 +2115,14 @@ test "a reveal toggle on an evicted stamp leaves every row masked" {
 }
 
 test "the reveal affordance mirrors the row's state" {
-    try std.testing.expectEqualStrings("Reveal text", revealItemTitle(false));
-    try std.testing.expectEqualStrings("Hide text", revealItemTitle(true));
+    try std.testing.expectEqualStrings("Reveal text", revealItemTitle(false, true));
+    try std.testing.expectEqualStrings("Hide text", revealItemTitle(true, true));
+    // A withheld row says why there is nothing to reveal, whatever the toggle holds (#286).
+    for ([_]bool{ false, true }) |revealed| {
+        const title = revealItemTitle(revealed, false);
+        try std.testing.expect(std.mem.indexOf(u8, title, "No text retained") != null);
+        try std.testing.expect(std.mem.indexOf(u8, title, "Secure Event Input") != null);
+    }
 }
 
 test "RevealSet toggles one entry on and off, keyed by timestamp" {

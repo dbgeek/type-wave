@@ -328,7 +328,11 @@ pub fn InsertionRunner(comptime Deps: type) type {
             var resolved: [recent_insertions.max_bytes]u8 = undefined;
             const n = self.ring.textForStamp(job.stamp, &resolved);
             if (n == 0) {
-                feedback.log("  {s}: the Insertion Record was evicted — nothing to do\n", .{@tagName(job.action)});
+                // Either the record was evicted since the menu's projection was taken, or it is
+                // a withheld one that never held text (#286) — the menu shows those actions
+                // disabled, so this arm is the floor under that rather than the gate, and it
+                // must not claim an eviction it did not observe.
+                feedback.log("  {s}: no text is available for that Insertion Record — nothing to do\n", .{@tagName(job.action)});
                 self.deps.actionRefused();
                 return;
             }
@@ -898,8 +902,7 @@ test "a successful re-insert clears the undone flag — the redo edge (#225)" {
     try std.testing.expect(runner.runOnce());
 
     // The text came back, so the row stops rendering dimmed.
-    var buf: [recent_insertions.max_bytes]u8 = undefined;
-    const target = ring.newestForUndo(&buf).?;
+    const target = ring.newestForUndo().?;
     try std.testing.expect(!target.undone);
 }
 
@@ -915,8 +918,7 @@ test "a FAILED re-insert leaves the record undone" {
     // The join ADR-0009 exists for: the flag flips only *after* a replay posted, so nothing
     // can un-dim a record whose text never came back. Flipping it at submit time — on the
     // producer's thread, before the worker ran — is what made this reachable.
-    var buf: [recent_insertions.max_bytes]u8 = undefined;
-    const target = ring.newestForUndo(&buf).?;
+    const target = ring.newestForUndo().?;
     try std.testing.expect(target.undone);
     // And the click earns a verdict rather than vanishing.
     try std.testing.expectEqual(@as(usize, 1), runner.deps.refuses);

@@ -71,6 +71,40 @@ best-effort as **plain text**, so rich or promised contents do not survive an In
 And **Copy** in the Recent Insertions menu is a deliberate, ordinary, permanent clipboard
 write — a copy you asked for should behave like one.
 
+### Dictation is not blocked while a secure text field has focus
+
+macOS exposes **Secure Event Input**: a flag an app raises while it owns a password field, and
+the OS's strongest available signal that somebody in your login session is typing a secret.
+type-wave does not stop dictating while it is held, and that is deliberate. The flag is
+**session-wide** — Terminal's Secure Keyboard Entry, a password prompt in any app, the login
+window: any one of them holds it for the whole session, and a hard gate would kill dictation
+everywhere for as long as anything anywhere shows a password field. That cure is worse than the
+condition, and it is not the condition you would expect either: while the flag is held the Talk
+Key keeps working perfectly (modifier events still flow) while the recovery chord `⌃⌘⌫` never
+reaches type-wave at all, because the WindowServer withholds key events from every event tap.
+
+What type-wave does instead is refuse to **retain** what you said. An Utterance spoken while the
+flag was held at either edge — when you pressed the Talk Key, or when you released it — is
+marked, and for that Utterance:
+
+- **Recent Insertions keeps the entry but stores none of its text.** The row reads
+  `not retained … [secure input]`, and Reveal, Copy and Re-insert are shown disabled, because
+  there is nothing behind them. The row's own length is not published either.
+- **`⌃⌘⌫` still undoes it.** The entry carries how many characters to delete, never the
+  characters, so the one recovery that matters here — taking a dictated password back out of the
+  field — still works. Once the hold clears, at least: nothing can observe the chord while it is
+  held.
+- **The words stay out of the log**, even with `.log_transcripts = true` set for debugging. The
+  log line says so rather than silently ignoring your opt-in.
+- **A log line names the condition** at the Utterance, so this is not something you discover
+  from an empty row.
+
+What this does **not** do: the transient exposures are unchanged. The audio still goes to your
+selected Transcription Backend — the OpenAI cloud Session when that is the one selected — and a
+pasted Insertion still transits the general pasteboard for ~300 ms (above). Those mirror what
+typing into the field would have risked anyway; the retained, re-openable, revealable ring entry
+is the part with no non-dictation analogue, and it is the part refused.
+
 ### The daemon's log is not sanitised for terminal escape sequences
 
 Strings the transcription endpoint chooses reach `~/Library/Logs/type-wave.log` verbatim:

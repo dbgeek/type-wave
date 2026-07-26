@@ -146,7 +146,14 @@ target); and a best-effort **App Identity** hint (`focused_app` — bundle id
 deliberately app-level only: the Undo effort (#209) ruled Accessibility field-level
 Focused Target capture out of scope and gates on `focused_app` instead, so a record never
 names the text field it landed in.
-_Avoid_: history entry, log entry (vague); transcript (that's the Final Transcript, not the receipt)
+
+A record can also be **withheld** (#286): an Utterance spoken while **Secure Event Input** was
+held at either edge of the hold is recorded with *no transcript bytes at all* — neither
+`inserted` nor `raw` — because its words are presumed a secret. What survives is everything
+that is not the words: the outcome, the stamp, the App Identity, and the grapheme-cluster
+count, which is counted at `record` time (ADR-0006's amendment) precisely so Undo still works
+on it. Reveal, Copy and Re-insert have nothing to offer such a record and are disabled.
+_Avoid_: history entry, log entry (vague); transcript (that's the Final Transcript, not the receipt); redacted (that's the log's word for a size-only rendering — a withheld record has no text at all)
 
 **App Identity**:
 The frontmost application at Insertion time as recorded in an Insertion Record's
@@ -160,9 +167,11 @@ focus.
 **Recent Insertions View**:
 The **text-free, masked projection** of the Recent Insertions ring that rides through the
 pure Status Item pipeline (`status_item.project` / `derive` / `present`) for rendering — one
-`HistoryEntryView` per entry: `{ char_len, app: AppIdentity, timestamp, outcome, undone }`, no
+`HistoryEntryView` per entry: `{ char_len, app: AppIdentity, timestamp, outcome, undone,
+withheld }`, no
 transcript bytes (`undone` marks a record undone by `⌃⌘⌫`, rendered dimmed where a re-insert
-redoes it). It is fixed-size and `std.meta.eql`-comparable so the Chrome's
+redoes it; `withheld` marks one whose text the ring never stored, rendered `not retained` with
+no run and no count, and `char_len` stays 0 for it). It is fixed-size and `std.meta.eql`-comparable so the Chrome's
 early-out keeps working, and it keeps transcript text out of the projected `Snapshot`
 entirely (privacy by construction): the actual `inserted` / `raw` text is fetched from the
 authoritative ring on demand only at reveal / copy / re-insert. That rule is why the
@@ -422,6 +431,12 @@ once per hold, again if the holder or its kind changes, once on release. It dist
 it) and from an unattributable hold. It observes and narrates; it gates nothing. Lives in
 `src/secure_input.zig`; its transitions reach the log with the holder named, and the Status
 Item as a row while the condition holds.
+
+It is not the only reading of that flag, and the two must not be confused. This one is
+**session-wide and ~3 s old by design**, and answers *what to tell the user about the
+condition*. The Coordinator takes its own **fresh, per-Utterance** reading at the press and
+release edges (#286), and answers a different question: *is this Utterance's transcript
+retained* (see **Insertion Record**'s withheld case). Neither gates dictation.
 _Avoid_: secure input guard/gate (it blocks nothing), keyboard lock
 
 **Configuration Phase**:
