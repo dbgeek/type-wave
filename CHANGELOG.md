@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.5](https://github.com/dbgeek/type-wave/compare/v0.3.4...v0.3.5) (2026-07-26)
+
+
+### Bug Fixes
+
+* **build:** the websocket client is pinned by a verifiable hash, in exactly one place ([#290](https://github.com/dbgeek/type-wave/issues/290)) ([#291](https://github.com/dbgeek/type-wave/issues/291)) ([53719ce](https://github.com/dbgeek/type-wave/commit/53719cea0d1d90a11f920b94ebd58a498826d5e9))
+* **capture:** a hold whose release edge is lost still stops the microphone ([#272](https://github.com/dbgeek/type-wave/issues/272)) ([#277](https://github.com/dbgeek/type-wave/issues/277)) ([11967cb](https://github.com/dbgeek/type-wave/commit/11967cb9b3260dd734318f755145bf3d33e5b1fc))
+* **config:** the env-file migration takes the plaintext key off disk ([#283](https://github.com/dbgeek/type-wave/issues/283)) ([1ab85ed](https://github.com/dbgeek/type-wave/commit/1ab85ed541f3bf6b0c8f7403941314c189c90705))
+* **insert:** quitting waits for the pasteboard restore the Insert Worker still owes ([#273](https://github.com/dbgeek/type-wave/issues/273)) ([#278](https://github.com/dbgeek/type-wave/issues/278)) ([2506142](https://github.com/dbgeek/type-wave/commit/25061422874fcffa17c2bedbcc6033e5287fd639))
+* **local:** the daemon proves the Whisper Helper's Signing Identity before spawning it ([#284](https://github.com/dbgeek/type-wave/issues/284)) ([#287](https://github.com/dbgeek/type-wave/issues/287)) ([9a53392](https://github.com/dbgeek/type-wave/commit/9a533923143029ce2dabf43eb0c508110e3560bf))
+* **model:** an interrupted removal completes later ([#276](https://github.com/dbgeek/type-wave/issues/276)) ([#281](https://github.com/dbgeek/type-wave/issues/281)) ([748f99d](https://github.com/dbgeek/type-wave/commit/748f99d484aafbe2a1bc7355cc5f7580948b4b65))
+* **model:** an over-long child line is skipped, not read as end of stream ([#275](https://github.com/dbgeek/type-wave/issues/275)) ([#280](https://github.com/dbgeek/type-wave/issues/280)) ([2ae2317](https://github.com/dbgeek/type-wave/commit/2ae231770c8aacca7ee9009c47a65a954974a302))
+* **security:** an Utterance spoken under Secure Event Input is not retained ([#286](https://github.com/dbgeek/type-wave/issues/286)) ([#289](https://github.com/dbgeek/type-wave/issues/289)) ([f936a01](https://github.com/dbgeek/type-wave/commit/f936a0184564d7a4006d6f75afdc4311a37f91c1))
+* **session:** a server-sent expires_at is proved sane before it becomes the session deadline ([#274](https://github.com/dbgeek/type-wave/issues/274)) ([#279](https://github.com/dbgeek/type-wave/issues/279)) ([f09ab0a](https://github.com/dbgeek/type-wave/commit/f09ab0a189e21bf4bd8977be6e5d8b624e8a37d9))
+* **whisper:** the helper's pipe fds are closed by the threads that hold them ([#269](https://github.com/dbgeek/type-wave/issues/269)) ([#270](https://github.com/dbgeek/type-wave/issues/270)) ([56ac4ef](https://github.com/dbgeek/type-wave/commit/56ac4efac8ee1b98302b311b71508766d25e4dfc))
+
 ## [0.3.4](https://github.com/dbgeek/type-wave/compare/v0.3.3...v0.3.4) (2026-07-25)
 
 
