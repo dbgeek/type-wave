@@ -61,7 +61,7 @@ Also decided, and load-bearing for the shape:
 
 - **The two real formulas become unit-tested** from fed facts: the `capture_enabled`
   truth table (the Talk Key press gate) and the `post_probe` three-term gate, plus
-  `rearm_tap`, `remove_superseded`, and the announce/report forwarding.
+  `rearm_tap`, `reclaim_model_storage`, and the announce/report forwarding.
 - **The fact-gathering stays untested daemon glue.** Mapping OS probes
   (`tap.isEnabled()`, `listenGranted()`, `postEventGranted()`, `available()`) into `Facts`
   is inherently impure and unreachable by a unit test; the pure-tick choice accepts this

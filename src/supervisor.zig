@@ -4,7 +4,7 @@
 //! The daemon's self-heal loop (daemon.zig `supervisorLoop`) polls OS and adapter facts
 //! ~every 3 s, drives the Backend Router and the grant sequence, then must decide four
 //! things: whether to re-arm a dead Talk Key tap, whether to fire a PostEvent probe,
-//! whether to reclaim a superseded Model Installation, and — the load-bearing one —
+//! whether to reclaim model storage nobody owns, and — the load-bearing one —
 //! whether a Talk Key press may fire this tick (the capture-enable gate). Those decisions
 //! used to live inline in the loop, reachable only by running the real daemon against live
 //! TCC and the tap. They are now this one pure function, fed a `Facts` snapshot and
@@ -44,8 +44,8 @@ pub const Facts = struct {
     grants_reached_post_event: bool,
     /// PostEvent is provably granted (observe latch OR a trustworthy-when-true preflight).
     post_event_granted: bool,
-    /// No Utterance is in flight (Backend Router `activeId() == 0`), so reclaiming a
-    /// superseded Model Installation cannot disturb dictation.
+    /// No Utterance is in flight (Backend Router `activeId() == 0`), so deleting model
+    /// storage nobody owns cannot disturb dictation.
     no_utterance_in_flight: bool,
     /// The selected Transcription Backend has an authoritative resource this tick.
     backend_available: bool,
@@ -68,8 +68,11 @@ pub const Actions = struct {
     rearm_tap: bool,
     /// Fire `insertmod.postTaggedProbe()` — the PostEvent attempt-then-observe probe (#129).
     post_probe: bool,
-    /// Fire `provisioner.removeSuperseded()` — reclaim a superseded Model Installation.
-    remove_superseded: bool,
+    /// Fire `provisioner.reclaimModelStorage()` — reclaim model storage nobody owns: a
+    /// superseded Model Installation, or one an interrupted removal never finished
+    /// deleting (#276). *Which* reclaims exist is the model store's business; the
+    /// Supervisor decides only that this is a tick where deleting model bytes is safe.
+    reclaim_model_storage: bool,
     /// The Capture watchdog (#272): feed the Coordinator the `.release` the tap never
     /// delivered, ending a hold whose key is demonstrably up.
     end_lost_hold: bool,
@@ -91,7 +94,7 @@ pub fn tick(facts: Facts, outcome: configuration_phase.Outcome) Actions {
         // Probe once the sequence has reached PostEvent, the tap is live to observe the
         // round-trip, and the grant is not already proven.
         .post_probe = facts.grants_reached_post_event and facts.tap_enabled and !facts.post_event_granted,
-        .remove_superseded = facts.no_utterance_in_flight,
+        .reclaim_model_storage = facts.no_utterance_in_flight,
         // The Capture watchdog: a hold is open, and the key holding it open is up. Only
         // the release edge stops the microphone, so an edge the tap never delivered — a
         // dead tap, or a Talk Key change that predates the hold-matched release filter —
@@ -177,14 +180,14 @@ test "rearm_tap is exactly a dead tap" {
     try testing.expect(tick(dead, configuredOutcome()).rearm_tap);
 }
 
-test "remove_superseded is gated on no Utterance in flight" {
+test "reclaim_model_storage is gated on no Utterance in flight" {
     var idle = okFacts();
     idle.no_utterance_in_flight = true;
-    try testing.expect(tick(idle, configuredOutcome()).remove_superseded);
+    try testing.expect(tick(idle, configuredOutcome()).reclaim_model_storage);
 
     var busy = okFacts();
     busy.no_utterance_in_flight = false;
-    try testing.expect(!tick(busy, configuredOutcome()).remove_superseded);
+    try testing.expect(!tick(busy, configuredOutcome()).reclaim_model_storage);
 }
 
 test "end_lost_hold is exactly an open hold whose key is up" {

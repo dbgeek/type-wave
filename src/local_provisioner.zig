@@ -17,7 +17,9 @@
 //!   abandon(*Install)                   — release the lease on any early return (a no-op
 //!                                         once a success took it).
 //!   installationProbe() bool            — lightweight presence check (no lease).
-//!   removeSuperseded()                  — drain-gated cleanup of superseded Installations.
+//!   reclaimModelStorage()               — drain-gated cleanup of model storage nobody owns:
+//!                                         superseded Installations, and one an interrupted
+//!                                         removal never finished deleting.
 //!   note(Event)                         — narration for the caller's log.
 
 const std = @import("std");
@@ -167,10 +169,12 @@ pub fn LocalProvisioner(comptime Deps: type) type {
             return self.recovery.retry() != .none;
         }
 
-        /// Drain-gated cleanup of superseded Model Installations (effect only; the drain gate
-        /// stays with the Backend Router state the daemon reads).
-        pub fn removeSuperseded(self: *Self) void {
-            self.deps.removeSuperseded();
+        /// Drain-gated cleanup of model storage nobody owns — superseded Model Installations,
+        /// and one an interrupted removal left half-deleted behind a stranded intent marker
+        /// (#276). Effect only; the drain gate stays with the Backend Router state the daemon
+        /// reads, and which reclaims exist stays with the model store.
+        pub fn reclaimModelStorage(self: *Self) void {
+            self.deps.reclaimModelStorage();
         }
 
         pub fn recoveryState(self: *Self) recovery_mod.State {
@@ -232,7 +236,7 @@ const FakeDeps = struct {
     pub fn installationProbe(_: *FakeDeps) bool {
         return true;
     }
-    pub fn removeSuperseded(_: *FakeDeps) void {}
+    pub fn reclaimModelStorage(_: *FakeDeps) void {}
     pub fn note(self: *FakeDeps, event: Event) void {
         if (self.events_len < self.events.len) {
             self.events[self.events_len] = std.meta.activeTag(event);
