@@ -223,7 +223,7 @@ fn installModel(environ: std.process.Environ, resume_partial: bool, update_only:
     var threaded = std.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const update_available = try model_store.updateAvailable(io, root, model_store.pinned_manifest);
+    const update_available = model_store.observe(io, root, model_store.pinned_manifest).update_available;
     if (update_only and !update_available) {
         std.debug.print("Model Installation: already matches the embedded identity; no update available.\n", .{});
         return;
@@ -250,7 +250,7 @@ fn installModel(environ: std.process.Environ, resume_partial: bool, update_only:
     _ = signal(SIGTERM, onModelCancel);
 
     const recovery = try operation.recover();
-    if (recovery.phase == .paused and !resume_partial) {
+    if (recovery.work == .paused and !resume_partial) {
         std.debug.print(
             "Model Operation: paused at {d}/{d} bytes; choose --resume-model or --discard-model.\n",
             .{ recovery.bytes.completed, recovery.bytes.total },
@@ -420,13 +420,13 @@ fn reportPausedModel(io: std.Io, environ: std.process.Environ, show_idle: bool) 
     const home = environ.getPosix("HOME") orelse return error.HomeDirectoryUnavailable;
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try model_store.rootPath(home, &root_buffer);
-    const recovery = try model_store.recoveryState(io, root, model_store.pinned_manifest);
-    if (recovery.phase == .paused) {
+    const reading = model_store.observe(io, root, model_store.pinned_manifest);
+    if (reading.work == .paused) {
         std.debug.print(
             "Model Operation: paused at {d}/{d} bytes (no network activity); Resume: --resume-model; Discard: --discard-model.\n",
-            .{ recovery.bytes.completed, recovery.bytes.total },
+            .{ reading.bytes.completed, reading.bytes.total },
         );
-    } else if (try model_store.updateAvailable(io, root, model_store.pinned_manifest)) {
+    } else if (reading.update_available) {
         std.debug.print("Model Installation: update available; the working installation remains ready. Run --update-model to stage it explicitly.\n", .{});
     } else if (show_idle) {
         std.debug.print("Model Operation: no paused work.\n", .{});

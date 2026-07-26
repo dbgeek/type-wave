@@ -23,6 +23,7 @@ const std = @import("std");
 const backend = @import("transcription_backend.zig");
 const config = @import("config.zig");
 const installation_identity = @import("installation_identity.zig");
+const local_model_recovery = @import("local_model_recovery.zig");
 const readiness = @import("readiness.zig");
 const coord = @import("coordinator.zig");
 const recent_insertions = @import("recent_insertions.zig");
@@ -336,11 +337,12 @@ pub const Observation = struct {
 pub const Readings = struct {
     selected_backend: backend.Backend,
     health: readiness.Health,
-    terminal_backend_failure: bool = false,
-    local_runtime_failure: bool = false,
+    /// The Local Provisioner's recovery state, raw. `project` derives all three things that
+    /// used to be computed in the daemon's untested gather from it: the corrupt override,
+    /// `local_runtime_failure`, and `terminal_backend_failure` (ADR-0012).
+    recovery_state: local_model_recovery.State = .ready,
     /// The on-disk installation view before the corrupt override (absent/ready/update).
     installation: Installation = .absent,
-    recovery_is_corrupt: bool = false,
     /// The on-disk operation view before the runner override.
     operation: Operation = .idle,
     operation_bytes: ?ByteProgress = null,
@@ -362,7 +364,12 @@ pub const Readings = struct {
 /// stay in the daemon.
 pub fn project(r: Readings) Snapshot {
     var installation = r.installation;
-    if (r.recovery_is_corrupt) installation = .corrupt;
+    if (r.recovery_state == .corrupt) installation = .corrupt;
+
+    // A local runtime failure is terminal only for the backend that is actually selected —
+    // the same failure while OpenAI is selected is worth reporting but retires nothing.
+    const local_runtime_failure = r.recovery_state == .runtime_failure;
+    const terminal_backend_failure = local_runtime_failure and r.selected_backend == .local;
 
     var operation = r.operation;
     var operation_bytes = r.operation_bytes;
@@ -382,8 +389,8 @@ pub fn project(r: Readings) Snapshot {
         .selected_backend = r.selected_backend,
         .health = r.health,
         .secure_input = r.secure_input,
-        .terminal_backend_failure = r.terminal_backend_failure,
-        .local_runtime_failure = r.local_runtime_failure,
+        .terminal_backend_failure = terminal_backend_failure,
+        .local_runtime_failure = local_runtime_failure,
         .installation = installation,
         .operation = operation,
         .operation_bytes = operation_bytes,
@@ -1356,18 +1363,19 @@ test "icon dims on the readiness attention signal and the backend-failure headli
 }
 
 fn reads(fields: struct {
+    selected_backend: backend.Backend = .local,
+    recovery_state: local_model_recovery.State = .ready,
     installation: Installation = .ready,
-    recovery_is_corrupt: bool = false,
     operation: Operation = .idle,
     operation_bytes: ?ByteProgress = null,
     provisioner_failure_detail: ?FailureDetail = null,
     observed: ?Observation = null,
 }) Readings {
     return .{
-        .selected_backend = .local,
+        .selected_backend = fields.selected_backend,
         .health = .{ .paused = false, .status = .ready_offline },
+        .recovery_state = fields.recovery_state,
         .installation = fields.installation,
-        .recovery_is_corrupt = fields.recovery_is_corrupt,
         .operation = fields.operation,
         .operation_bytes = fields.operation_bytes,
         .provisioner_failure_detail = fields.provisioner_failure_detail,
@@ -1375,9 +1383,22 @@ fn reads(fields: struct {
     };
 }
 
-test "project: the corrupt recovery flag overrides the on-disk installation view" {
-    try std.testing.expectEqual(Installation.corrupt, project(reads(.{ .installation = .ready, .recovery_is_corrupt = true })).installation);
-    try std.testing.expectEqual(Installation.ready, project(reads(.{ .installation = .ready, .recovery_is_corrupt = false })).installation);
+test "project: a corrupt recovery state overrides the on-disk installation view" {
+    try std.testing.expectEqual(Installation.corrupt, project(reads(.{ .installation = .ready, .recovery_state = .corrupt })).installation);
+    try std.testing.expectEqual(Installation.ready, project(reads(.{ .installation = .ready, .recovery_state = .ready })).installation);
+}
+
+test "project: a runtime failure is local_runtime_failure whichever backend is selected" {
+    try std.testing.expect(project(reads(.{ .recovery_state = .runtime_failure, .selected_backend = .local })).local_runtime_failure);
+    try std.testing.expect(project(reads(.{ .recovery_state = .runtime_failure, .selected_backend = .openai })).local_runtime_failure);
+}
+
+test "project: a runtime failure is terminal only for the selected local backend" {
+    // The derivation ADR-0012 moved out of daemon.menuStatus, where no test could reach it.
+    try std.testing.expect(project(reads(.{ .recovery_state = .runtime_failure, .selected_backend = .local })).terminal_backend_failure);
+    try std.testing.expect(!project(reads(.{ .recovery_state = .runtime_failure, .selected_backend = .openai })).terminal_backend_failure);
+    try std.testing.expect(!project(reads(.{ .recovery_state = .ready, .selected_backend = .local })).terminal_backend_failure);
+    try std.testing.expect(!project(reads(.{ .recovery_state = .corrupt, .selected_backend = .local })).terminal_backend_failure);
 }
 
 test "project: an active runner observation overrides the on-disk operation and bytes" {

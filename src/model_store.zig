@@ -95,15 +95,18 @@ pub const Manifest = struct {
     }
 };
 
-pub const OperationPhase = enum {
-    idle,
-    downloading,
+/// What the models root says about work in progress *on disk* — the only three states a
+/// reading of it can distinguish (ADR-0012). Every richer phase the Status Item shows
+/// (verifying, activating, removing…) comes from the Model Operation Runner's live
+/// observation of its own child, which `status_item.project` gives precedence to; the disk
+/// only ever answers "is there resumable or foreign work here?".
+pub const Work = enum {
+    /// Nothing staged and no operation running.
+    none,
+    /// A resumable partial download is staged, with no live writer.
     paused,
-    verifying,
-    smoke_testing,
-    activating,
-    removing,
-    failed,
+    /// Another process holds the operation lock right now.
+    foreign,
 };
 
 pub const ByteProgress = struct {
@@ -112,8 +115,50 @@ pub const ByteProgress = struct {
 };
 
 pub const Recovery = struct {
-    phase: OperationPhase,
+    work: Work,
     bytes: ByteProgress,
+};
+
+/// A **Models Root Reading** — one non-mutating look at the models root (ADR-0012).
+///
+/// Everything the daemon needs to know about the on-disk Model Installation, answered by a
+/// single `active.receipt` read: whether an installation is present and where its artifact
+/// lives, its Installation Receipt identities, whether this release supersedes it, whether a
+/// removal is pending, and what work is staged. It replaces four public near-passthroughs
+/// that each re-opened and re-parsed that same receipt.
+///
+/// It **cannot fail and cannot mutate**. An unreadable root reads as an absent one, which is
+/// what every former caller already did with the error it swallowed; and no reader creates
+/// the models root, takes an exclusive gate, or discards a staging directory. That work is
+/// the Supervisor's reclaim pass — see `discardSupersededStages`.
+///
+/// The artifact path is carried as an owned buffer rather than a slice because the value is
+/// returned by value: `modelPath()` rebuilds the slice against the copy the caller holds.
+pub const Reading = struct {
+    model_buf: [std.fs.max_path_bytes]u8 = undefined,
+    model_len: usize = 0,
+    /// True when a receipt names an artifact whose bytes are present and match it.
+    present: bool = false,
+    /// The active receipt does not match this release's pinned Manifest.
+    update_available: bool = false,
+    /// A removal published its intent and has not finished — every lease refuses.
+    removal_pending: bool = false,
+    artifact: ?ArtifactIdentity = null,
+    identity: ?InstallationIdentity = null,
+    work: Work = .none,
+    bytes: ByteProgress = .{ .completed = 0, .total = 0 },
+
+    /// The active model artifact's path, or null when no usable installation is present.
+    pub fn modelPath(self: *const Reading) ?[]const u8 {
+        if (!self.present) return null;
+        return self.model_buf[0..self.model_len];
+    }
+
+    /// The daemon's one definition of a live installation: an artifact is present and no
+    /// removal is draining it out from under the caller.
+    pub fn installationLive(self: *const Reading) bool {
+        return self.present and !self.removal_pending;
+    }
 };
 
 pub const ArtifactIdentity = artifact_identity.Identity;
@@ -822,34 +867,83 @@ fn isIncompatibleResumeFailure(failure: anyerror) bool {
 fn recoverPartial(io: std.Io, root: []const u8, manifest: Manifest) !Recovery {
     const partial = try loadPartial(io, root, manifest);
     return if (partial) |valid|
-        .{ .phase = .paused, .bytes = .{ .completed = valid.offset, .total = manifest.size } }
+        .{ .work = .paused, .bytes = .{ .completed = valid.offset, .total = manifest.size } }
     else
-        .{ .phase = .idle, .bytes = .{ .completed = 0, .total = manifest.size } };
+        .{ .work = .none, .bytes = .{ .completed = 0, .total = manifest.size } };
 }
 
-pub fn recoveryState(io: std.Io, root: []const u8, manifest: Manifest) !Recovery {
+/// The **mutating** recover, taken under the operation lock: it discards stale stages and an
+/// unresumable partial before reporting what is left. Private since ADR-0012 — the only
+/// caller is `Operation.recover`, which already holds the gate and is entitled to mutate.
+/// Readers take a Models Root Reading instead, which answers the same question without the
+/// lock, the `mkdir`, or the `deleteTree`.
+fn recoveryState(io: std.Io, root: []const u8, manifest: Manifest) !Recovery {
     try std.Io.Dir.cwd().createDirPath(io, root);
     var lock_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const lock_path = try Layout.init(root).child(operation_lock_name, &lock_path_buffer);
     var lock = std.Io.Dir.cwd().createFile(io, lock_path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |failure| switch (failure) {
-        error.WouldBlock => return .{ .phase = .downloading, .bytes = .{ .completed = 0, .total = manifest.size } },
+        error.WouldBlock => return .{ .work = .foreign, .bytes = .{ .completed = 0, .total = manifest.size } },
         else => return failure,
     };
     defer lock.close(io);
-    try discardStaleStages(io, root, manifest);
+    _ = try discardStaleStages(io, root, manifest);
     return recoverPartial(io, root, manifest);
 }
 
-fn discardStaleStages(io: std.Io, root: []const u8, manifest: Manifest) !void {
+/// Staging directories left behind by a *superseded* manifest — an upgrade changed the
+/// pinned installation id and the old download's bytes belong to nobody. Returns how many
+/// were removed. The caller must hold the operation lock.
+fn discardStaleStages(io: std.Io, root: []const u8, manifest: Manifest) !usize {
     var desired_buffer: [std.fs.max_name_bytes]u8 = undefined;
     const desired = try Layout.stagingName(manifest.installation_id, &desired_buffer);
-    var root_dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    var root_dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |failure| switch (failure) {
+        error.FileNotFound => return 0,
+        else => return failure,
+    };
     defer root_dir.close(io);
+    var removed: usize = 0;
     var entries = root_dir.iterate();
     while (try entries.next(io)) |entry| {
         if (entry.kind != .directory or !Layout.isStagingDir(entry.name) or std.mem.eql(u8, entry.name, desired)) continue;
         try root_dir.deleteTree(io, entry.name);
+        removed += 1;
     }
+    return removed;
+}
+
+/// The Supervisor's idle reclaim of superseded staging directories (ADR-0012). This is where
+/// the discarding that used to ride the menu's status probe now lives: destructive, gated,
+/// off the run loop, and retried next tick when the lock is busy — beside
+/// `completeStrandedRemoval` and `removeInactiveInstallations`, which already work this way.
+pub fn discardSupersededStages(io: std.Io, root: []const u8, manifest: Manifest) !usize {
+    // Cheap pre-check, in `completeStrandedRemoval`'s idiom: the common case — nothing staged —
+    // costs one directory scan, no lock churn, and no models root conjured on a machine that
+    // never installed a model.
+    if (!try supersededStagePresent(io, root, manifest)) return 0;
+    var lock_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const lock_path = try Layout.init(root).child(operation_lock_name, &lock_path_buffer);
+    var lock = std.Io.Dir.cwd().createFile(io, lock_path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |failure| switch (failure) {
+        error.WouldBlock => return error.ModelOperationInProgress,
+        else => return failure,
+    };
+    defer lock.close(io);
+    return discardStaleStages(io, root, manifest);
+}
+
+fn supersededStagePresent(io: std.Io, root: []const u8, manifest: Manifest) !bool {
+    var desired_buffer: [std.fs.max_name_bytes]u8 = undefined;
+    const desired = try Layout.stagingName(manifest.installation_id, &desired_buffer);
+    var root_dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |failure| switch (failure) {
+        error.FileNotFound => return false,
+        else => return failure,
+    };
+    defer root_dir.close(io);
+    var entries = root_dir.iterate();
+    while (try entries.next(io)) |entry| {
+        if (entry.kind != .directory or !Layout.isStagingDir(entry.name) or std.mem.eql(u8, entry.name, desired)) continue;
+        return true;
+    }
+    return false;
 }
 
 pub fn discardIncomplete(io: std.Io, root: []const u8, manifest: Manifest) !void {
@@ -883,40 +977,45 @@ fn manifestIdentity(manifest: Manifest) receipt.Identity {
 }
 
 fn loadPartial(io: std.Io, root: []const u8, manifest: Manifest) !?Partial {
+    const found = try readPartial(io, root, manifest);
+    if (found != null) return found;
+    var stage_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const stage = try Layout.init(root).stagingDir(manifest.installation_id, &stage_buffer);
+    try discardStage(io, stage);
+    return null;
+}
+
+/// The resumability rule, with **no** discarding: null means "not resumable", and only a
+/// real I/O failure is an error. `loadPartial` adds the discard on null; a Models Root
+/// Reading takes the same verdict and leaves the bytes alone (ADR-0012). One rule, one
+/// place — the two callers cannot drift on what counts as resumable.
+fn readPartial(io: std.Io, root: []const u8, manifest: Manifest) !?Partial {
     var stage_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const stage = try Layout.init(root).stagingDir(manifest.installation_id, &stage_buffer);
     var metadata_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const metadata_path = try Layout.dir(stage).partialMeta(&metadata_path_buffer);
     var metadata_buffer: [4096]u8 = undefined;
     const metadata = std.Io.Dir.cwd().readFile(io, metadata_path, &metadata_buffer) catch |failure| switch (failure) {
-        error.FileNotFound => {
-            try discardStage(io, stage);
-            return null;
-        },
+        error.FileNotFound => return null,
         else => return failure,
     };
-    const parsed = receipt.Partial.parse(metadata) orelse return discardInvalidPartial(io, stage);
+    const parsed = receipt.Partial.parse(metadata) orelse return null;
     const validator = if (parsed.etag) |etag|
-        Validator.init(.etag, etag) catch return discardInvalidPartial(io, stage)
+        Validator.init(.etag, etag) catch return null
     else if (parsed.last_modified) |last_modified|
-        Validator.init(.last_modified, last_modified) catch return discardInvalidPartial(io, stage)
+        Validator.init(.last_modified, last_modified) catch return null
     else
-        return discardInvalidPartial(io, stage);
+        return null;
     if (!parsed.matches(manifestIdentity(manifest)) or parsed.offset == 0 or parsed.offset > manifest.size)
-        return discardInvalidPartial(io, stage);
+        return null;
 
     var model_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const model_path = try Layout.dir(stage).model(manifest.artifact, &model_path_buffer);
-    var model = std.Io.Dir.cwd().openFile(io, model_path, .{}) catch return discardInvalidPartial(io, stage);
+    var model = std.Io.Dir.cwd().openFile(io, model_path, .{}) catch return null;
     defer model.close(io);
-    const stat = model.stat(io) catch return discardInvalidPartial(io, stage);
-    if (stat.size != parsed.offset) return discardInvalidPartial(io, stage);
+    const stat = model.stat(io) catch return null;
+    if (stat.size != parsed.offset) return null;
     return .{ .offset = parsed.offset, .validator = validator };
-}
-
-fn discardInvalidPartial(io: std.Io, stage: []const u8) !?Partial {
-    try discardStage(io, stage);
-    return null;
 }
 
 fn writePartialMetadata(io: std.Io, stage: []const u8, manifest: Manifest, offset: u64, validator: Validator) !void {
@@ -1001,7 +1100,7 @@ fn publishReceiptForDirectory(io: std.Io, root: []const u8, manifest: Manifest, 
     try std.Io.Dir.renameAbsolute(tmp, active, io);
 }
 
-pub fn activeInstallationPresent(io: std.Io, root: []const u8, manifest: Manifest) !bool {
+fn activeInstallationPresent(io: std.Io, root: []const u8, manifest: Manifest) !bool {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     if ((try activeModelPath(io, root, &path_buffer)) == null) return false;
 
@@ -1150,6 +1249,19 @@ pub fn activeModelPath(io: std.Io, root: []const u8, buffer: []u8) !?[]const u8 
     var receipt_buffer: [1024]u8 = undefined;
     const actual = (try activeReceipt(io, root, &receipt_buffer)) orelse return null;
     const parsed = receipt.Receipt.parse(actual) orelse return null;
+    return modelPathFrom(io, root, actual, parsed, buffer);
+}
+
+/// Resolve the artifact path from an *already-read* receipt. Split out so a Models Root
+/// Reading resolves the path from the same bytes it already parsed rather than re-opening
+/// `active.receipt` — the duplicate read ADR-0012 removes.
+fn modelPathFrom(
+    io: std.Io,
+    root: []const u8,
+    actual: []const u8,
+    parsed: receipt.Receipt,
+    buffer: []u8,
+) !?[]const u8 {
     if (parsed.directory_id) |directory_id|
         return validateReceiptPath(io, root, actual, directory_id, parsed.artifact, parsed.identity.size, parsed.mtime_ns, buffer);
 
@@ -1199,30 +1311,7 @@ fn validateReceiptPath(
     return path;
 }
 
-/// Update availability is a comparison between the independently usable active receipt
-/// and the complete identity embedded in this type-wave release.
-pub fn updateAvailable(io: std.Io, root: []const u8, desired: Manifest) !bool {
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    if ((try activeModelPath(io, root, &path_buffer)) == null) return false;
-    var receipt_buffer: [1024]u8 = undefined;
-    const actual = (try activeReceipt(io, root, &receipt_buffer)) orelse return false;
-    return !receiptMatchesManifest(actual, desired);
-}
-
-pub fn activeArtifact(io: std.Io, root: []const u8) !?ArtifactIdentity {
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    if ((try activeModelPath(io, root, &path_buffer)) == null) return null;
-    var receipt_buffer: [1024]u8 = undefined;
-    const actual = (try activeReceipt(io, root, &receipt_buffer)) orelse return null;
-    return receiptArtifact(actual);
-}
-
-pub fn activeInstallationIdentity(io: std.Io, root: []const u8) !?InstallationIdentity {
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    if ((try activeModelPath(io, root, &path_buffer)) == null) return null;
-    var receipt_buffer: [1024]u8 = undefined;
-    const actual = (try activeReceipt(io, root, &receipt_buffer)) orelse return null;
-    const parsed = receipt.Receipt.parse(actual) orelse return null;
+fn installationIdentityFrom(parsed: receipt.Receipt) ?InstallationIdentity {
     return .{
         .repository = installation_identity.Text.init(parsed.repository orelse return null) catch return null,
         .revision = installation_identity.Text.init(parsed.revision orelse return null) catch return null,
@@ -1234,6 +1323,58 @@ pub fn activeInstallationIdentity(io: std.Io, root: []const u8) !?InstallationId
         .artifact_sha256 = parsed.identity.sha256,
         .installed_by = installation_identity.Text.init(parsed.installed_by orelse return null) catch return null,
     };
+}
+
+/// Is another process driving a Model Operation right now?
+///
+/// A **shared, non-creating** probe (ADR-0012): the lock file is opened, never created, so a
+/// machine that has never installed a model is not given a models root as a side effect of
+/// being looked at; and the shared side excludes nothing, so two readings never contend with
+/// each other and neither can stall a real operation. `WouldBlock` is the whole signal — some
+/// process holds the exclusive side.
+fn operationInProgress(io: std.Io, root: []const u8) bool {
+    var lock_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const lock_path = Layout.init(root).child(operation_lock_name, &lock_path_buffer) catch return false;
+    var lock = std.Io.Dir.cwd().openFile(io, lock_path, .{ .lock = .shared, .lock_nonblocking = true }) catch |failure| switch (failure) {
+        error.WouldBlock => return true,
+        else => return false,
+    };
+    lock.close(io);
+    return false;
+}
+
+/// Take a **Models Root Reading** — the daemon's one look at the models root (ADR-0012).
+///
+/// One `active.receipt` read answers every question the four former public reads answered
+/// separately, and nothing here mutates: no `mkdir`, no exclusive gate, no `deleteTree`.
+/// Safe to call on the run loop, which is what the Status Item does every chrome tick.
+pub fn observe(io: std.Io, root: []const u8, desired: Manifest) Reading {
+    var reading: Reading = .{};
+    reading.bytes = .{ .completed = 0, .total = desired.size };
+    reading.removal_pending = modelRemovalPending(io, root);
+
+    var receipt_buffer: [1024]u8 = undefined;
+    if (activeReceipt(io, root, &receipt_buffer) catch null) |actual| {
+        if (receipt.Receipt.parse(actual)) |parsed| {
+            if (modelPathFrom(io, root, actual, parsed, &reading.model_buf) catch null) |path| {
+                reading.present = true;
+                reading.model_len = path.len;
+                reading.update_available = !receiptMatchesManifest(actual, desired);
+                reading.artifact = receiptArtifact(actual);
+                reading.identity = installationIdentityFrom(parsed);
+            }
+        }
+    }
+
+    // Foreign work outranks staged work: while another process holds the gate, whatever is
+    // on disk is mid-flight and its offset is not a resume point the user can act on.
+    if (operationInProgress(io, root)) {
+        reading.work = .foreign;
+    } else if (readPartial(io, root, desired) catch null) |partial| {
+        reading.work = .paused;
+        reading.bytes = .{ .completed = partial.offset, .total = desired.size };
+    }
+    return reading;
 }
 
 /// Retire superseded immutable installations after the old helper has drained and shut
@@ -1512,7 +1653,7 @@ test "Model Operation verifies and smoke-tests before publishing the active rece
     try std.testing.expect(std.mem.indexOf(u8, published, "https://") == null);
     try std.testing.expect(std.mem.indexOf(u8, published, "runtime_sha256=5a5a5a5a") != null);
 
-    const identity = (try activeInstallationIdentity(std.testing.io, root_buf[0..root_len])).?;
+    const identity = observe(std.testing.io, root_buf[0..root_len], test_manifest).identity.?;
     try std.testing.expectEqualStrings(test_manifest.repository, identity.repository.value());
     try std.testing.expectEqualStrings(test_manifest.revision, identity.revision.value());
     try std.testing.expectEqualStrings(test_manifest.runtime, identity.runtime.value());
@@ -1766,7 +1907,7 @@ test "failed verification or smoke test cannot replace the active receipt" {
     var bad_digest = Operation(BadTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &bad_transport, &smoke);
     try std.testing.expectError(error.ModelDigestMismatch, bad_digest.install());
     try std.testing.expect(!smoke.called);
-    try std.testing.expectEqual(OperationPhase.idle, (try bad_digest.recover()).phase);
+    try std.testing.expectEqual(Work.none, (try bad_digest.recover()).work);
 
     var transport = FakeTransport{};
     var failing_smoke = FailingSmoke{};
@@ -1786,7 +1927,7 @@ test "a working older Model Installation remains active when the embedded identi
     try installTestModel(root);
     const desired = replacementManifest();
 
-    try std.testing.expect(try updateAvailable(std.testing.io, root, desired));
+    try std.testing.expect(observe(std.testing.io, root, desired).update_available);
     var active_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const active_path = (try activeModelPath(std.testing.io, root, &active_path_buf)).?;
     try std.testing.expect(std.mem.endsWith(u8, active_path, "/installations/test-installation/ggml-model.bin"));
@@ -1799,7 +1940,7 @@ test "a working older Model Installation remains active when the embedded identi
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = active_path, .data = "binned test model" });
     try verifier.repair(.allow_network);
     try std.testing.expect((try verifier.verify()) == .usable);
-    try std.testing.expect(try updateAvailable(std.testing.io, root, desired));
+    try std.testing.expect(observe(std.testing.io, root, desired).update_available);
 }
 
 test "a schema-one receipt remains usable and reports an embedded replacement" {
@@ -1828,7 +1969,7 @@ test "a schema-one receipt remains usable and reports an embedded replacement" {
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = provenance_path, .data = old_receipt });
 
     const desired = replacementManifest();
-    try std.testing.expect(try updateAvailable(std.testing.io, root, desired));
+    try std.testing.expect(observe(std.testing.io, root, desired).update_available);
     var active_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     try std.testing.expect((try activeModelPath(std.testing.io, root, &active_path_buf)) != null);
 }
@@ -1847,7 +1988,7 @@ test "a failed replacement leaves the working Model Installation unchanged and u
     var replacement = Operation(FakeTransport, FailingSmoke).init(std.testing.allocator, std.testing.io, root, desired, &replacement_transport, &failing_smoke);
 
     try std.testing.expectError(error.HelperSmokeTestFailed, replacement.install());
-    try std.testing.expect(try updateAvailable(std.testing.io, root, desired));
+    try std.testing.expect(observe(std.testing.io, root, desired).update_available);
     var active_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const active_path = (try activeModelPath(std.testing.io, root, &active_path_buf)).?;
     try std.testing.expect(std.mem.endsWith(u8, active_path, "/installations/test-installation/ggml-model.bin"));
@@ -1873,7 +2014,7 @@ test "replacement activation waits for the active inference lease to drain" {
 
     try std.testing.expect(drain.released);
     try std.testing.expectEqual(@as(usize, 1), drain.waits);
-    try std.testing.expect(!try updateAvailable(std.testing.io, root, desired));
+    try std.testing.expect(!observe(std.testing.io, root, desired).update_available);
     try std.testing.expect(try activeInstallationPresent(std.testing.io, root, desired));
     var previous_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const previous_path = try Layout.init(root).installationDir(test_manifest.installation_id, &previous_path_buf);
@@ -2165,10 +2306,17 @@ test "restart exposes a validator-bound partial as paused without network activi
     var operation = Operation(CountingTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
     const recovery = try operation.recover();
 
-    try std.testing.expectEqual(OperationPhase.paused, recovery.phase);
+    try std.testing.expectEqual(Work.paused, recovery.work);
     try std.testing.expectEqual(@as(u64, 6), recovery.bytes.completed);
     try std.testing.expectEqual(test_manifest.size, recovery.bytes.total);
     try std.testing.expectEqual(@as(usize, 0), transport.requests);
+
+    // The same resume point, read without the gate or the discard (ADR-0012): one rule in
+    // `readPartial` answers both, so the menu and the operation cannot disagree about it.
+    const reading = observe(std.testing.io, root, test_manifest);
+    try std.testing.expectEqual(Work.paused, reading.work);
+    try std.testing.expectEqual(@as(u64, 6), reading.bytes.completed);
+    try std.testing.expectEqual(test_manifest.size, reading.bytes.total);
 }
 
 test "restart discards a partial whose immutable identity no longer matches" {
@@ -2195,7 +2343,7 @@ test "restart discards a partial whose immutable identity no longer matches" {
     var operation = Operation(CountingTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
     const recovery = try operation.recover();
 
-    try std.testing.expectEqual(OperationPhase.idle, recovery.phase);
+    try std.testing.expectEqual(Work.none, recovery.work);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stage, .{}));
     try std.testing.expectEqual(@as(usize, 0), transport.requests);
 }
@@ -2248,7 +2396,7 @@ test "resume discards a partial when the server validator does not match" {
     var smoke = FakeSmoke{};
     var operation = Operation(MismatchedResumeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
     try std.testing.expectError(error.ResumeResponseMismatch, operation.resumePartial());
-    try std.testing.expectEqual(OperationPhase.idle, (try operation.recover()).phase);
+    try std.testing.expectEqual(Work.none, (try operation.recover()).work);
     try std.testing.expect(!smoke.called);
 }
 
@@ -2264,7 +2412,7 @@ test "resume discards a partial when the server range is incompatible" {
     var smoke = FakeSmoke{};
     var operation = Operation(IncompatibleRangeTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
     try std.testing.expectError(error.ModelDownloadRangeMismatch, operation.resumePartial());
-    try std.testing.expectEqual(OperationPhase.idle, (try operation.recover()).phase);
+    try std.testing.expectEqual(Work.none, (try operation.recover()).work);
 }
 
 test "resume discards a partial when the server validator is malformed" {
@@ -2279,7 +2427,7 @@ test "resume discards a partial when the server validator is malformed" {
     var smoke = FakeSmoke{};
     var operation = Operation(MalformedValidatorTransport, FakeSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
     try std.testing.expectError(error.InvalidModelValidator, operation.resumePartial());
-    try std.testing.expectEqual(OperationPhase.idle, (try operation.recover()).phase);
+    try std.testing.expectEqual(Work.none, (try operation.recover()).work);
 }
 
 test "range response validation requires exact 206 identity validator and byte interval" {
@@ -2402,7 +2550,7 @@ test "cancellation during hashing preserves the active installation boundary" {
     try std.testing.expectEqualStrings("previous installation\n", receipt_text);
     try std.testing.expect(!smoke.called);
     const recovery = try operation.recover();
-    try std.testing.expectEqual(OperationPhase.paused, recovery.phase);
+    try std.testing.expectEqual(Work.paused, recovery.work);
     try std.testing.expectEqual(test_manifest.size, recovery.bytes.completed);
 }
 
@@ -2436,12 +2584,138 @@ test "cancellation during smoke testing pauses the verified download before acti
     var operation = Operation(FakeTransport, CancellingSmoke).init(std.testing.allocator, std.testing.io, root, test_manifest, &transport, &smoke);
 
     try std.testing.expectError(error.ModelOperationCancelled, operation.install());
-    try std.testing.expectEqual(OperationPhase.paused, (try operation.recover()).phase);
+    try std.testing.expectEqual(Work.paused, (try operation.recover()).work);
     try std.testing.expect(!try activeInstallationPresent(std.testing.io, root, test_manifest));
 }
 
 const test_bytes = "pinned test model";
 const test_manifest = Manifest.forTest();
+
+// =====================================================================================
+// The Models Root Reading (ADR-0012) — one non-mutating look at the models root. These
+// assert both halves of the contract: what it answers, and what it refuses to touch.
+// =====================================================================================
+
+test "a Models Root Reading of an absent root is empty and creates nothing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var parent_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const parent_len = try tmp.dir.realPath(std.testing.io, &parent_buf);
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "{s}/never-installed", .{parent_buf[0..parent_len]});
+
+    const reading = observe(std.testing.io, root, test_manifest);
+
+    try std.testing.expect(!reading.present);
+    try std.testing.expect(!reading.installationLive());
+    try std.testing.expectEqual(@as(?[]const u8, null), reading.modelPath());
+    try std.testing.expectEqual(Work.none, reading.work);
+    try std.testing.expect(!reading.update_available);
+
+    // The whole point: looking does not bring the models root into existence. The probe this
+    // replaced called createDirPath, so merely opening the menu created this directory.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, root, .{}));
+}
+
+test "a Models Root Reading names the installed artifact, its identity, and no update" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    try installTestModel(root);
+
+    const reading = observe(std.testing.io, root, test_manifest);
+
+    try std.testing.expect(reading.present);
+    try std.testing.expect(reading.installationLive());
+    try std.testing.expect(std.mem.endsWith(u8, reading.modelPath().?, "/installations/test-installation/ggml-model.bin"));
+    try std.testing.expect(!reading.update_available);
+    try std.testing.expectEqualStrings(test_manifest.repository, reading.identity.?.repository.value());
+    try std.testing.expectEqual(test_manifest.size, reading.artifact.?.size);
+    try std.testing.expectEqual(Work.none, reading.work);
+}
+
+test "a Models Root Reading reports a superseded installation as update_available" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    try installTestModel(root);
+
+    const reading = observe(std.testing.io, root, replacementManifest());
+
+    try std.testing.expect(reading.present); // the working installation stays usable
+    try std.testing.expect(reading.update_available);
+}
+
+test "a Models Root Reading of a malformed receipt reads as absent, not as a failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    try installTestModel(root);
+    var receipt_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const receipt_path = try Layout.init(root).activeReceipt(&receipt_path_buf);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = receipt_path, .data = "not a receipt at all" });
+
+    // Total, not fallible: every former caller swallowed the error into exactly this state.
+    const reading = observe(std.testing.io, root, test_manifest);
+    try std.testing.expect(!reading.present);
+    try std.testing.expectEqual(@as(?[]const u8, null), reading.modelPath());
+}
+
+test "a Models Root Reading leaves a superseded staging directory alone" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    var stale_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const stale = try Layout.init(root).stagingDir("superseded-installation", &stale_buf);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, stale);
+
+    _ = observe(std.testing.io, root, test_manifest);
+
+    // The regression ADR-0012 closes: this ran on the run loop every ~2 s and deleteTree'd.
+    try std.Io.Dir.cwd().access(std.testing.io, stale, .{});
+
+    // The reclaim pass owns the discard now, and it does happen.
+    try std.testing.expectEqual(@as(usize, 1), try discardSupersededStages(std.testing.io, root, test_manifest));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stale, .{}));
+}
+
+test "a Models Root Reading sees a foreign Model Operation without excluding it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+    try installTestModel(root);
+    // Something for the reclaim pass to want, so it reaches the gate rather than short-circuiting.
+    var stale_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const stale = try Layout.init(root).stagingDir("superseded-installation", &stale_buf);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, stale);
+
+    var lock_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock_path = try Layout.init(root).child(operation_lock_name, &lock_path_buf);
+    var held = try std.Io.Dir.cwd().createFile(std.testing.io, lock_path, .{ .lock = .exclusive });
+
+    const reading = observe(std.testing.io, root, test_manifest);
+    try std.testing.expectEqual(Work.foreign, reading.work);
+    // Shared and non-blocking: a second reading never contends with the first.
+    try std.testing.expectEqual(Work.foreign, observe(std.testing.io, root, test_manifest).work);
+    // The reclaim pass defers rather than fighting the live operation for the gate.
+    try std.testing.expectError(
+        error.ModelOperationInProgress,
+        discardSupersededStages(std.testing.io, root, test_manifest),
+    );
+
+    held.close(std.testing.io);
+    try std.testing.expectEqual(Work.none, observe(std.testing.io, root, test_manifest).work);
+}
 
 fn installTestModel(root: []const u8) !void {
     var transport = FakeTransport{};

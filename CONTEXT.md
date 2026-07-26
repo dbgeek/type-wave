@@ -351,6 +351,26 @@ owns every read/write; the Layout owns only the names. Distinct from the Install
 which is the record; the Layout is its address.
 _Avoid_: paths helper, fs utils (they name a grab-bag, not the single owner)
 
+**Models Root Reading**:
+The daemon's one look at the models root — a single `active.receipt` read answering
+everything it needs to know about the on-disk Model Installation: whether an artifact is
+present and where, its Installation Receipt identities, whether this release supersedes it,
+whether a removal is pending, and what work is staged (`model_store.observe`, ADR-0012). It
+**cannot fail and cannot mutate**: an unreadable root reads as an absent one — which is what
+every caller already did with the error it swallowed — and no reading creates the models
+root, takes a gate, or discards a staging directory. That is what makes it safe on the run
+loop the Talk Key tap shares, where the Status Item takes one every chrome tick. It replaced
+four public near-passthroughs that each re-opened and re-parsed the same receipt, and with
+them the three different definitions of *is the installation live?* the daemon carried; the
+one definition is now `installationLive()`. Its `Work` answer is deliberately three-valued —
+`none` / `paused` / `foreign` — because that is all a *reading* of disk can distinguish; every
+richer phase the Status Item shows comes from the Model Operation Runner's live observation of
+its own child, which `status_item.project` gives precedence to anyway. Distinct from the
+Installation Receipt, which is the record, and the Models Layout, which is its address: this is
+one look at what is actually there.
+_Avoid_: model status, recovery state (that named the mutating recover it replaced),
+observation (that is the Model Operation Runner's live view of its child)
+
 **Model Operation**:
 A user-authorized acquisition, verification, activation, repair, or removal acting on a
 Model Installation. An operation may be in progress while the current Model Installation
@@ -449,7 +469,9 @@ _Avoid_: setup state, readiness state, configured flag
 **Supervisor**:
 The pure per-tick decider of the daemon's self-heal nudges — the Talk Key tap re-arm and
 the PostEvent probe (#127/#129) — plus the model-storage reclaim (a superseded Model
-Installation, or one an interrupted removal never finished deleting, #276), the
+Installation, one an interrupted removal never finished deleting, #276, or a staging
+directory left by a superseded manifest — ADR-0012 moved that third job here off the Status
+Item's status probe), the
 capture-enable gate (the Talk Key press gate: `configured` AND a live backend AND not
 paused), and the Capture watchdog (a hold open while its key is up: `hold_open AND
 NOT talk_key_down`, #272). Fed a `Facts` snapshot and the Configuration Phase `Outcome`, it returns an
