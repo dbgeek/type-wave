@@ -89,7 +89,6 @@ const supervisor = @import("supervisor.zig");
 const grants_mod = @import("grants.zig");
 const backend = @import("transcription_backend.zig");
 const backend_router = @import("backend_router.zig");
-const operation_channel = @import("operation_channel.zig");
 const model_operation = @import("model_operation.zig");
 const local_backend = @import("local_backend.zig");
 const whisper_process_helper = @import("whisper_process_helper.zig");
@@ -169,10 +168,16 @@ const ModelOperationRunnerDeps = struct {
         _ = posixKill(pid, SIGTERM);
     }
 
-    /// Narration for the daemon log: the child's stderr prose, and the terminal line.
+    /// Narration for the daemon log: the child's stderr prose, what a drain had to drop,
+    /// and the terminal line.
     pub fn log(_: *ModelOperationRunnerDeps, note: model_operation.Note) void {
         switch (note) {
             .stderr => |line| feedback.log("  model: {s}\n", .{line}),
+            .skipped => |skip| feedback.log("  menu: Model Operation {s} line too long — {d} bytes skipped\n", .{
+                @tagName(skip.stream),
+                skip.bytes,
+            }),
+            .read_failed => |stream| feedback.log("  menu: Model Operation {s} read failed — that stream ends here\n", .{@tagName(stream)}),
             .finished => |finished| feedback.log("  menu: Model Operation {s} {s}\n", .{
                 @tagName(finished.action),
                 if (finished.succeeded) "finished" else "failed",
@@ -186,6 +191,9 @@ const ModelOperationRunner = model_operation.Runner(ModelOperationRunnerDeps);
 /// channel drain, streams the child's stderr prose into the Runner (failure fallback + log),
 /// then joins the channel drain and reports the terminal outcome. Re-enters the Runner via
 /// the pointer it is handed — the Runner must not move (model_operation.zig).
+///
+/// The buffer and the fd are this thread's; what counts as a line, and what an over-long
+/// one costs (#275), is the Runner's — so both threads are plumbing around its drains.
 fn drainModelOperation(io: std.Io, child_value: std.process.Child, runner: *ModelOperationRunner) void {
     var child = child_value;
     const channel_thread: ?std.Thread = std.Thread.spawn(.{}, drainOperationChannel, .{ io, child.stdout.?, runner }) catch null;
@@ -193,22 +201,19 @@ fn drainModelOperation(io: std.Io, child_value: std.process.Child, runner: *Mode
         feedback.log("  menu: Model Operation channel reader unavailable — progress will not update\n", .{});
     var read_buffer: [2048]u8 = undefined;
     var stderr_reader = child.stderr.?.readerStreaming(io, &read_buffer);
-    while (stderr_reader.interface.takeDelimiter('\n') catch null) |line| runner.onStderr(line);
+    runner.drainStderr(&stderr_reader.interface);
     if (channel_thread) |thread| thread.join(); // both pipes hit EOF at child exit
     const term = child.wait(io) catch return runner.onTerminal(false);
     runner.onTerminal(term.success());
 }
 
 /// The stdout channel drain thread (the other of the two): decoded operation-channel events
-/// drive the Runner's observation — phase and byte progress; anything undecodable on this
-/// stream is silently skipped.
+/// drive the Runner's observation — phase and byte progress.
 fn drainOperationChannel(io: std.Io, stdout_value: std.Io.File, runner: *ModelOperationRunner) void {
     var stdout = stdout_value;
     var read_buffer: [2048]u8 = undefined;
     var reader = stdout.readerStreaming(io, &read_buffer);
-    while (reader.interface.takeDelimiter('\n') catch null) |line| {
-        if (operation_channel.decode(line)) |event| runner.onChannelEvent(event);
-    }
+    runner.drainChannel(&reader.interface);
 }
 
 // ---- tuning ----------------------------------------------------------------

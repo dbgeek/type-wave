@@ -28,6 +28,12 @@
 //! It consumes the operation-channel wire (operation_channel.zig); it does NOT warm the
 //! local helper — that is the Backend Router's path.
 //!
+//! It also owns the *reading* of those two pipes — `drainStderr` / `drainChannel`, over a
+//! `std.Io.Reader` the caller supplies. The daemon hands each the child's pipe; tests hand
+//! them a scripted stream, so the line policy (#275: an over-long line is skipped, never
+//! mistaken for end-of-stream) is exercised without a subprocess. Reading a supplied
+//! Reader is not an effect: the drains produce the same fed events by another route.
+//!
 //! # Threads & the atomic observation
 //!
 //! In the daemon these entry points run on two thread groups: the main thread calls
@@ -56,10 +62,20 @@ pub const LaunchRequest = struct {
     confirmation: ?[]const u8,
 };
 
+/// Which of the child's two pipes a drain note is about.
+pub const Stream = enum { stderr, channel };
+
 /// Narration for the caller's log — every effect the Runner surfaces beyond launch/kill.
 pub const Note = union(enum) {
     /// One line of the child's stderr prose (the daemon log; also the failure fallback).
     stderr: []const u8,
+    /// A line too long for the drain's buffer, discarded through its newline (#275):
+    /// `bytes` of it, delimiter excluded. The operation keeps running — the loss is one
+    /// line of narration or observation, and it is said out loud rather than silent.
+    skipped: struct { stream: Stream, bytes: usize },
+    /// A drain's read failed, so that stream ends here — ahead of the child's exit, and
+    /// unlike a clean EOF worth naming.
+    read_failed: Stream,
     /// The operation reached its terminal outcome.
     finished: struct { action: ModelAction, succeeded: bool },
 };
@@ -221,6 +237,52 @@ fn launchSpec(action: ModelAction) ?LaunchSpec {
     };
 }
 
+/// One step of a drain over a child's pipe. `line` borrows the reader's buffer, so it is
+/// invalid after the next step.
+const Line = union(enum) {
+    line: []const u8,
+    /// A line longer than the reader's buffer, discarded through its newline: this many
+    /// bytes of it, delimiter excluded. The drain continues with the line after it.
+    skipped: usize,
+    /// The child's end of the pipe reached end of stream — the drain is done.
+    end,
+    /// The read itself failed. The drain is done too, but this is not the ordinary way a
+    /// child's pipe closes, so the caller says so.
+    read_failed,
+};
+
+/// The one place a line comes off a child's pipe, so the two drains cannot diverge.
+///
+/// `takeDelimiter` reports `error.StreamTooLong` for a line that does not fit the reader's
+/// buffer, and folding that into "clean EOF" is what wedged an operation (#275): the drain
+/// stopped while the child was alive and writing, the pipe filled at 64 KiB, the child
+/// blocked in `write(2)` mid-operation — and with neither pipe ever reaching EOF the waiter
+/// never reaped it, so `onTerminal` never fired and the busy guard never cleared.
+///
+/// An over-long line is just another undecodable line, which is the policy the channel
+/// already has for bad input. The std leaves the stream unmodified when it reports
+/// `StreamTooLong`, so the over-long line is still entirely ahead: discard it through its
+/// newline and read the next one as usual.
+fn nextLine(reader: *std.Io.Reader) Line {
+    if (reader.takeDelimiter('\n')) |taken| {
+        return if (taken) |line| .{ .line = line } else .end;
+    } else |err| switch (err) {
+        error.ReadFailed => return .read_failed,
+        error.StreamTooLong => {
+            const skipped = reader.discardDelimiterExclusive('\n') catch return .read_failed;
+            // Exclusive stops *at* the delimiter, or at the end of the stream — and which
+            // of the two happened is exactly the "is the delimiter buffered?" question the
+            // std says to ask. Consume it so the next step starts on the next line.
+            const remaining = reader.buffered();
+            if (remaining.len > 0) {
+                std.debug.assert(remaining[0] == '\n');
+                reader.toss(1);
+            }
+            return .{ .skipped = skipped };
+        },
+    }
+}
+
 pub fn Runner(comptime Deps: type) type {
     return struct {
         const Self = @This();
@@ -287,6 +349,34 @@ pub fn Runner(comptime Deps: type) type {
             self.observation.finish(succeeded);
             self.deps.log(.{ .finished = .{ .action = action, .succeeded = succeeded } });
         }
+
+        // ---- the drains: the child's two pipes, read as lines -------------------------
+
+        /// Feed the child's stderr prose — log narration and the failure fallback — until
+        /// that pipe ends. Prose is where an over-long line is actually plausible: a
+        /// provisioner error can embed remote material, and the smoke test's Whisper Helper
+        /// writes its diagnostics here too. One such line costs one line, not the operation.
+        pub fn drainStderr(self: *Self, reader: *std.Io.Reader) void {
+            while (true) switch (nextLine(reader)) {
+                .line => |line| self.onStderr(line),
+                .skipped => |bytes| self.deps.log(.{ .skipped = .{ .stream = .stderr, .bytes = bytes } }),
+                .end => return,
+                .read_failed => return self.deps.log(.{ .read_failed = .stderr }),
+            };
+        }
+
+        /// Feed the child's operation channel — the sole source of phase and byte progress —
+        /// until that pipe ends. Anything undecodable is skipped; the over-long case is the
+        /// one that gets a log line, because it is the one that loses an observation the
+        /// child did send.
+        pub fn drainChannel(self: *Self, reader: *std.Io.Reader) void {
+            while (true) switch (nextLine(reader)) {
+                .line => |line| if (operation_channel.decode(line)) |event| self.onChannelEvent(event),
+                .skipped => |bytes| self.deps.log(.{ .skipped = .{ .stream = .channel, .bytes = bytes } }),
+                .end => return,
+                .read_failed => return self.deps.log(.{ .read_failed = .channel }),
+            };
+        }
     };
 }
 
@@ -342,9 +432,55 @@ const FakeDeps = struct {
         };
         return false;
     }
+    fn skips(self: *const FakeDeps, stream: Stream) usize {
+        var count: usize = 0;
+        for (self.notes[0..self.note_count]) |note| switch (note) {
+            .skipped => |skip| if (skip.stream == stream) {
+                count += 1;
+            },
+            else => {},
+        };
+        return count;
+    }
+    fn sawReadFailed(self: *const FakeDeps, stream: Stream) bool {
+        for (self.notes[0..self.note_count]) |note| switch (note) {
+            .read_failed => |seen| if (seen == stream) return true,
+            else => {},
+        };
+        return false;
+    }
 };
 
 const TestRunner = Runner(FakeDeps);
+
+/// A scripted stand-in for a child's pipe: a slice delivered in short reads over a buffer as
+/// small as the test needs, so an over-long line is over-long the way a real one is rather
+/// than by arrangement. `fail_at` makes the read itself fail once that many bytes are gone.
+const ScriptedPipe = struct {
+    reader: std.Io.Reader,
+    data: []const u8,
+    pos: usize = 0,
+    fail_at: ?usize = null,
+
+    fn init(buffer: []u8, data: []const u8) ScriptedPipe {
+        return .{
+            .reader = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 },
+            .data = data,
+        };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *ScriptedPipe = @alignCast(@fieldParentPtr("reader", r));
+        if (self.fail_at) |at| if (self.pos >= at) return error.ReadFailed;
+        if (self.pos >= self.data.len) return error.EndOfStream;
+        // Short reads on purpose: a pipe hands over whatever has arrived, not the rest.
+        var chunk = self.data[self.pos..];
+        if (chunk.len > 7) chunk = chunk[0..7];
+        const n = try w.write(limit.sliceConst(chunk));
+        self.pos += n;
+        return n;
+    }
+};
 
 // ---- the observation's own behaviour (moved from daemon.zig) --------------------
 
@@ -539,4 +675,96 @@ test "a full install lifecycle drives phase, bytes, prose, and a clean finish" {
     try std.testing.expect(runner.current() == null); // success clears the observation
     try std.testing.expect(deps.sawStderr("Model Operation: preparing model files"));
     try std.testing.expect(deps.sawFinished(.install, true));
+}
+
+// ---- the drains: lines off the child's pipes (#275) ------------------------------
+
+/// A run with no newline in it, three times the widest buffer any drain test uses — so an
+/// over-long line is over-long however the short reads happen to land.
+const filler: [200]u8 = @splat('x');
+
+test "the channel drain delivers every decodable line and skips the rest" {
+    var deps = FakeDeps{};
+    var runner = TestRunner.init(&deps);
+    runner.startAction(.install);
+
+    var buffer: [64]u8 = undefined;
+    var pipe = ScriptedPipe.init(&buffer,
+        \\tw-op1 downloading 100 1000
+        \\Model Operation: downloading
+        \\tw-op1 verifying 1000 1000
+        \\
+    );
+    runner.drainChannel(&pipe.reader);
+
+    try std.testing.expectEqual(status_item.Operation.verifying, runner.current().?.phase);
+    try std.testing.expectEqual(@as(usize, 0), deps.skips(.channel)); // nothing was over-long
+}
+
+test "a line too long for the buffer is skipped — the drain keeps going" {
+    var deps = FakeDeps{};
+    var runner = TestRunner.init(&deps);
+    runner.startAction(.install);
+
+    // Over 200 bytes with no newline among them: over-long for a 64-byte buffer, where the
+    // old `takeDelimiter(…) catch null` read `error.StreamTooLong` as end-of-stream and quit.
+    const over_long = "tw-op1 " ++ filler;
+    var buffer: [64]u8 = undefined;
+    var pipe = ScriptedPipe.init(&buffer, "tw-op1 downloading 100 1000\n" ++ over_long ++ "\ntw-op1 verifying 1000 1000\n");
+    runner.drainChannel(&pipe.reader);
+
+    // The event *after* the over-long line still landed — the drain did not stop at it.
+    try std.testing.expectEqual(status_item.Operation.verifying, runner.current().?.phase);
+    try std.testing.expectEqual(@as(usize, 1), deps.skips(.channel)); // logged once, not per read
+}
+
+test "an over-long line at the very end of a stream ends the drain cleanly" {
+    var deps = FakeDeps{};
+    var runner = TestRunner.init(&deps);
+    runner.startAction(.install);
+
+    // The child died mid-line: the over-long run never gets its newline.
+    var buffer: [64]u8 = undefined;
+    var pipe = ScriptedPipe.init(&buffer, "tw-op1 downloading 100 1000\n" ++ filler);
+    runner.drainChannel(&pipe.reader);
+
+    try std.testing.expectEqualDeep(status_item.ByteProgress{ .completed = 100, .total = 1_000 }, runner.current().?.bytes.?);
+    try std.testing.expectEqual(@as(usize, 1), deps.skips(.channel));
+    try std.testing.expect(!deps.sawReadFailed(.channel)); // a truncated last line is EOF, not failure
+}
+
+test "an over-long stderr line costs one line, not the operation's terminal outcome" {
+    var deps = FakeDeps{};
+    var runner = TestRunner.init(&deps);
+    runner.startAction(.install);
+
+    var buffer: [64]u8 = undefined;
+    var pipe = ScriptedPipe.init(
+        &buffer,
+        "Model Operation: downloading\n" ++ filler ++ "\n--install-model: ModelDownloadRejected\n",
+    );
+    runner.drainStderr(&pipe.reader);
+    // The drain returned at the child's EOF, so the waiter reaches `wait` and reports it.
+    runner.onTerminal(false);
+
+    try std.testing.expectEqual(@as(usize, 1), deps.skips(.stderr));
+    try std.testing.expectEqualStrings("--install-model: ModelDownloadRejected", runner.current().?.failure_detail.?.value());
+    try std.testing.expect(deps.sawFinished(.install, false));
+
+    runner.startAction(.update); // the busy guard cleared: the next operation launches
+    try std.testing.expectEqual(@as(usize, 2), deps.launch_count);
+}
+
+test "a failed read ends a drain and says so, rather than passing for end of stream" {
+    var deps = FakeDeps{};
+    var runner = TestRunner.init(&deps);
+    runner.startAction(.install);
+
+    var buffer: [64]u8 = undefined;
+    var pipe = ScriptedPipe.init(&buffer, "tw-op1 downloading 100 1000\ntw-op1 verifying 1000 1000\n");
+    pipe.fail_at = "tw-op1 downloading 100 1000\n".len; // the first line lands, then the read fails
+    runner.drainChannel(&pipe.reader);
+
+    try std.testing.expectEqualDeep(status_item.ByteProgress{ .completed = 100, .total = 1_000 }, runner.current().?.bytes.?);
+    try std.testing.expect(deps.sawReadFailed(.channel));
 }
