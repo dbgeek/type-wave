@@ -10,7 +10,8 @@
 //! created itself (`type-wave --set-key`), prompt-free.
 //!
 //! The legacy `~/.config/type-wave/env` file is retired as a source: a key still found
-//! there is auto-migrated into the keychain once (and the file can then be deleted).
+//! there is auto-migrated into the keychain once, and the plaintext file is then taken off
+//! disk by the daemon rather than left for the user to delete (#282).
 //!
 //! Resilience (issue #10's self-healing ethos): a missing OR malformed config.zon
 //! yields all defaults with a logged warning — a config typo must never keep the
@@ -41,6 +42,9 @@ const insert = @import("insert.zig");
 const feedback = @import("feedback.zig");
 const keychain = @import("keychain.zig");
 const backend = @import("transcription_backend.zig");
+/// Imported for `scrub`: the migration's round-trip check reads the stored key back, and a
+/// key copy this module makes owes the same zero-before-release the Key Holder gives its own.
+const api_key = @import("api_key.zig");
 
 /// Non-secret settings. The field names + types ARE the accepted `config.zon` schema
 /// (std.zon parses the file straight into this struct). Every field has a default, so
@@ -196,6 +200,10 @@ fn loadApiKey(io: std.Io, gpa: std.mem.Allocator) ?[:0]u8 {
     switch (keychain.readKey(gpa)) {
         .key => |key| {
             last_keychain_err = 0; // healthy again — a later failure re-logs
+            // A legacy plaintext file beside a working keychain item is an *unfinished*
+            // migration, not a second source: this arm is the one every already-migrated
+            // machine takes, and it is the only place that ever sees them together (#282).
+            retireLegacyEnvFile(io);
             return key;
         },
         .absent => return migrateEnvFile(io, gpa),
@@ -220,12 +228,13 @@ fn logKeychainErrOnce(st: keychain.OSStatus) void {
     );
 }
 
-/// One-time migration (wayfinder #33): the keychain has no item, but the retired
-/// `~/.config/type-wave/env` file may still hold the key from the pre-keychain era. If it
-/// does, store it in the keychain and hand it to this run. Once the store succeeds the
-/// keychain hit wins every later lookup, so the file is never read again — that's what
-/// makes the migration one-time. A failed store still returns the key (the daemon should
-/// work today); the migration simply retries on a later poll or the next start.
+/// One-time migration (wayfinder #33, finished by #282): the keychain has no item, but the
+/// retired `~/.config/type-wave/env` file may still hold the key from the pre-keychain era.
+/// If it does, store it in the keychain, prove the keychain hands it back, take the plaintext
+/// file off disk, and hand the key to this run. Once the store succeeds the keychain hit wins
+/// every later lookup, so the file is never read again — that's what makes the migration
+/// one-time, and it is exactly why the file has to go *now* rather than on a user's to-do
+/// list: this code path is not coming back.
 ///
 /// ACL note: the migrating process becomes the item's creator, so this is meant to run in
 /// the installed signed daemon. Foreground dev runs export OPENAI_API_KEY and never get
@@ -235,10 +244,79 @@ fn migrateEnvFile(io: std.Io, gpa: std.mem.Allocator) ?[:0]u8 {
     var path_buf: [4096]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ home, env_rel }) catch return null;
 
-    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_file)) catch |e| {
-        if (e != error.FileNotFound)
-            std.debug.print("config: could not read {s}: {s}\n", .{ path, @errorName(e) });
-        return null; // no legacy file (the normal case once migrated) => no key anywhere
+    var vault: LoginKeychain = .{};
+    const attempt = migrateEnvFileAt(LoginKeychain, &vault, io, gpa, path);
+    narrateMigration(attempt.outcome, path);
+    return attempt.key;
+}
+
+/// The migration's seam onto the login keychain — the two calls it makes, asserted by name
+/// here and invoked by `migrateEnvFileAt` itself, in the `grants.zig` / `undo.zig` idiom.
+/// It exists so the **file** handling this module now owns can be driven against a fake:
+/// Security.framework is unreachable from an unsigned test binary, and the decision that
+/// matters (delete only on proof) has to be exercised on every arm, not just the happy one.
+fn assertVault(comptime Vault: type) void {
+    const required = [_][]const u8{ "storeKey", "readKey" };
+    inline for (required) |name| {
+        if (!@hasDecl(Vault, name))
+            @compileError("type '" ++ @typeName(Vault) ++ "' is not a key Vault: missing method '" ++ name ++ "'");
+    }
+}
+
+/// The production adapter: the real login keychain, stateless because `keychain.zig` is.
+const LoginKeychain = struct {
+    pub fn storeKey(_: *LoginKeychain, key: []const u8) keychain.OSStatus {
+        return keychain.storeKey(key);
+    }
+    pub fn readKey(_: *LoginKeychain, gpa: std.mem.Allocator) keychain.ReadResult {
+        return keychain.readKey(gpa);
+    }
+};
+
+/// What one attempt at the migration achieved. Returned rather than logged so
+/// `narrateMigration` is the single place any of it reaches the user, and so a test can
+/// assert the outcome without reading stderr.
+const Migration = struct {
+    /// The key for this run, when the file yielded one — owned by the caller, which owes it
+    /// an `api_key.scrub` (#254). Present even on the arms that failed to store it: the
+    /// daemon should work today whatever the keychain did.
+    key: ?[:0]u8 = null,
+    outcome: Outcome,
+
+    /// The whole decision table. Each arm is a different thing to tell the user, and — the
+    /// point of the split — a different answer to *may the plaintext file go?*
+    const Outcome = union(enum) {
+        /// No legacy file (the normal case, and the state every machine ends in), or a file
+        /// with no `OPENAI_API_KEY` assignment in it. Silent.
+        nothing_to_migrate,
+        /// The file is there but its key could not be lifted out of it. Nothing was stored
+        /// and nothing was deleted.
+        unreadable: anyerror,
+        /// Stored, proved readable back, and the plaintext copy is off disk. Done, for good.
+        completed,
+        /// Stored and proved, but the file could not be removed — the one arm that leaves
+        /// the user something to finish by hand, so it says so imperatively.
+        file_stranded: anyerror,
+        /// The store failed, so the keychain does not hold the key: the file stays, because
+        /// it is the only copy we can prove exists. A later poll retries.
+        store_failed: keychain.OSStatus,
+        /// The store reported success but the key did not read back. Handled exactly like a
+        /// failed store — the proof is what licenses the delete, not the report.
+        unverified,
+    };
+};
+
+fn migrateEnvFileAt(
+    comptime Vault: type,
+    vault: *Vault,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    path: []const u8,
+) Migration {
+    comptime assertVault(Vault);
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_file)) catch |failure| return switch (failure) {
+        error.FileNotFound => .{ .outcome = .nothing_to_migrate },
+        else => .{ .outcome = .{ .unreadable = failure } },
     };
     // The whole file is a key copy for as long as it is mapped: zero it before it goes
     // back to the allocator, exactly as the Key Holder does to the copies it owns (#254).
@@ -246,23 +324,127 @@ fn migrateEnvFile(io: std.Io, gpa: std.mem.Allocator) ?[:0]u8 {
         std.crypto.secureZero(u8, raw);
         gpa.free(raw);
     }
-    const val = parseEnvKey(raw) orelse return null;
-    const key = gpa.dupeSentinel(u8, val, 0) catch return null;
+    const val = parseEnvKey(raw) orelse return .{ .outcome = .nothing_to_migrate };
+    const key = gpa.dupeSentinel(u8, val, 0) catch return .{ .outcome = .{ .unreadable = error.OutOfMemory } };
 
-    const st = keychain.storeKey(key);
-    if (st == keychain.errSecSuccess) {
-        std.debug.print(
-            "config: migrated the API key from {s} into the login keychain — the file is no longer used and can be deleted.\n",
+    const st = vault.storeKey(key);
+    if (st != keychain.errSecSuccess) return .{ .key = key, .outcome = .{ .store_failed = st } };
+    if (!vaultHoldsKey(Vault, vault, gpa, key)) return .{ .key = key, .outcome = .unverified };
+
+    // The file provably existed — it is what we just read the key out of — so "was there
+    // anything to remove?" is not a question this path has.
+    _ = removePlaintextKeyFile(io, path) catch |failure|
+        return .{ .key = key, .outcome = .{ .file_stranded = failure } };
+    return .{ .key = key, .outcome = .completed };
+}
+
+/// Prove the keychain hands back the very key we just stored. This is what licenses the
+/// delete: `storeKey` reporting success is a claim, and the file is the only copy whose
+/// existence we have checked ourselves. Comparing the bytes rather than merely counting a
+/// hit also catches a store that landed on some other item.
+///
+/// The read is itself a plaintext copy of the secret, so it is scrubbed before release.
+fn vaultHoldsKey(comptime Vault: type, vault: *Vault, gpa: std.mem.Allocator, key: [:0]const u8) bool {
+    switch (vault.readKey(gpa)) {
+        .key => |stored| {
+            defer api_key.scrub(gpa, stored);
+            return std.mem.eql(u8, stored, key);
+        },
+        .absent, .err => return false,
+    }
+}
+
+/// Take the retired plaintext key file off disk: overwrite its bytes, then unlink it.
+/// Returns whether there was a file to remove — `false` is the normal, quiet case.
+///
+/// The overwrite is **best effort and cannot be otherwise**. On APFS a write may land in
+/// fresh blocks (copy-on-write) and an SSD's wear levelling can keep the old ones alive, so
+/// no userland scrub can promise the bytes are unrecoverable — a backup already taken is
+/// beyond reach either way. What it does buy is the thing the finding is actually about: the
+/// live, readable copy that every process running as this user could simply `open` is gone.
+/// So the overwrite never decides the outcome; only the unlink does.
+fn removePlaintextKeyFile(io: std.Io, path: []const u8) !bool {
+    scrub: {
+        var file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .write_only }) catch break :scrub;
+        defer file.close(io);
+        const len = file.length(io) catch break :scrub;
+        const zeros: [1024]u8 = @splat(0);
+        var written: u64 = 0;
+        while (written < len) {
+            const n: usize = @intCast(@min(len - written, zeros.len));
+            file.writePositionalAll(io, zeros[0..n], written) catch break :scrub;
+            written += n;
+        }
+        file.sync(io) catch {};
+    }
+    std.Io.Dir.cwd().deleteFile(io, path) catch |failure| switch (failure) {
+        error.FileNotFound => return false,
+        else => return failure,
+    };
+    return true;
+}
+
+/// The sweep is attempted at most once per process: the legacy file is a retired artifact
+/// that cannot reappear, so one attempt is enough — and a failed one must not re-log every
+/// 3 s tick. Atomic rather than a plain flag because `loadApiKey` is *not* single-threaded:
+/// the supervisor's Key Holder poll and the Rewrite worker both reach it. A single `swap`
+/// makes the attempt exactly-once with nothing left to reason about.
+var legacy_sweep_attempted = std.atomic.Value(bool).init(false);
+
+/// Finish a migration that already happened. Everyone who migrated under the old code has a
+/// live API key sitting in cleartext at `~/.config/type-wave/env` right now, and `migrateEnvFile`
+/// will never run for them again — the keychain hit wins first. This is that path's other
+/// half: called only from the arm that has *positive proof* the keychain holds a key, so the
+/// file we delete is provably redundant rather than merely presumed to be.
+fn retireLegacyEnvFile(io: std.Io) void {
+    if (legacy_sweep_attempted.swap(true, .monotonic)) return;
+    const home = homeDir() orelse return;
+    var path_buf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ home, env_rel }) catch return;
+
+    // Never read the file: there is nothing in it we need, and reading would make one more
+    // plaintext copy of the secret to have to scrub.
+    if (removePlaintextKeyFile(io, path)) |removed| {
+        if (removed) std.debug.print(
+            "config: the login keychain holds the API key, so the retired {s} was removed — its plaintext copy is off disk.\n",
             .{path},
         );
-    } else {
-        var buf: [256]u8 = undefined;
-        std.debug.print(
-            "config: found the API key in {s} but storing it in the keychain failed: {s} — using it for this run; migration will retry.\n",
-            .{ path, keychain.describe(st, &buf) },
-        );
+    } else |failure| std.debug.print(
+        "config: {s} still holds your API key in cleartext and could not be removed: {s} — delete it now: {s}\n",
+        .{ path, @errorName(failure), path },
+    );
+}
+
+/// Every word the migration says, in one place. The imperative on `file_stranded` is
+/// deliberate: the old message told the user the file "can be deleted", which is how a live
+/// key survives in cleartext for the life of a machine.
+fn narrateMigration(outcome: Migration.Outcome, path: []const u8) void {
+    switch (outcome) {
+        .nothing_to_migrate => {},
+        .unreadable => |failure| std.debug.print(
+            "config: could not read {s}: {s}\n",
+            .{ path, @errorName(failure) },
+        ),
+        .completed => std.debug.print(
+            "config: migrated the API key from {s} into the login keychain and removed the file — its plaintext copy is off disk.\n",
+            .{path},
+        ),
+        .file_stranded => |failure| std.debug.print(
+            "config: migrated the API key from {s} into the login keychain, but could not remove the file: {s} — it still holds your key in cleartext. Delete it now: {s}\n",
+            .{ path, @errorName(failure), path },
+        ),
+        .store_failed => |st| {
+            var buf: [256]u8 = undefined;
+            std.debug.print(
+                "config: found the API key in {s} but storing it in the keychain failed: {s} — using it for this run; the file is left in place on purpose and migration will retry.\n",
+                .{ path, keychain.describe(st, &buf) },
+            );
+        },
+        .unverified => std.debug.print(
+            "config: stored the API key from {s} in the keychain but could not read it back — the file is left in place on purpose and migration will retry.\n",
+            .{path},
+        ),
     }
-    return key;
 }
 
 fn apiKeyFromEnv(gpa: std.mem.Allocator) ?[:0]u8 {
@@ -659,6 +841,186 @@ test "parseEnvKey: last assignment wins, blanks and comments ignored" {
 test "parseEnvKey ignores a near-miss key and an absent key" {
     try std.testing.expect(parseEnvKey("OPENAI_API_KEY_OTHER=nope") == null);
     try std.testing.expect(parseEnvKey("# nothing here\nFOO=bar") == null);
+}
+
+// ---- env-file migration: the plaintext key comes off disk (#282) ---------------
+
+const legacy_key = "sk-legacy-0123456789";
+
+/// Stands in for the login keychain so every arm of the migration's decision table can be
+/// driven from a test. `store_status` fails the store outright; `swallow` makes a store
+/// report success while holding nothing — the arm where the report is a lie, and the one
+/// that proves the delete follows the round-trip rather than the return code.
+const FakeVault = struct {
+    stored: ?[]u8 = null,
+    store_status: keychain.OSStatus = keychain.errSecSuccess,
+    swallow: bool = false,
+
+    /// SecBase.h's errSecAllocate, the status keychain.zig reports for a failed copy.
+    const alloc_failed: keychain.OSStatus = -108;
+
+    fn deinit(self: *FakeVault) void {
+        if (self.stored) |held| talloc.free(held);
+        self.stored = null;
+    }
+
+    pub fn storeKey(self: *FakeVault, key: []const u8) keychain.OSStatus {
+        if (self.store_status != keychain.errSecSuccess) return self.store_status;
+        if (self.swallow) return keychain.errSecSuccess;
+        self.deinit();
+        self.stored = talloc.dupe(u8, key) catch return alloc_failed;
+        return keychain.errSecSuccess;
+    }
+
+    pub fn readKey(self: *FakeVault, gpa: std.mem.Allocator) keychain.ReadResult {
+        const held = self.stored orelse return .absent;
+        return .{ .key = gpa.dupeSentinel(u8, held, 0) catch return .{ .err = alloc_failed } };
+    }
+};
+
+/// Write `contents` to `<tmp>/env` and return its absolute path: the migration takes a path,
+/// so none of this needs a real `$HOME` or the real keychain.
+fn writeLegacyEnvFile(tmp: *std.testing.TmpDir, buf: []u8, contents: []const u8) ![]const u8 {
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "env", .data = contents });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    return std.fmt.bufPrint(buf, "{s}/env", .{root_buf[0..root_len]});
+}
+
+fn expectOutcome(want: std.meta.Tag(Migration.Outcome), attempt: Migration) !void {
+    try std.testing.expectEqual(want, std.meta.activeTag(attempt.outcome));
+}
+
+test "a completed migration takes the plaintext key off disk" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try writeLegacyEnvFile(&tmp, &path_buf, "export OPENAI_API_KEY=" ++ legacy_key ++ "\n");
+    var vault: FakeVault = .{};
+    defer vault.deinit();
+
+    const attempt = migrateEnvFileAt(FakeVault, &vault, std.testing.io, talloc, path);
+    defer api_key.scrub(talloc, attempt.key.?);
+
+    try expectOutcome(.completed, attempt);
+    try std.testing.expectEqualStrings(legacy_key, attempt.key.?); // this run still works
+    try std.testing.expectEqualStrings(legacy_key, vault.stored.?);
+    // The whole point: the next poll takes the ordinary FileNotFound path, forever.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "env", .{}));
+}
+
+test "a failed store leaves the plaintext file exactly where it was" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const original = "OPENAI_API_KEY=" ++ legacy_key ++ "\n";
+    const path = try writeLegacyEnvFile(&tmp, &path_buf, original);
+    // A locked keychain: the status that must never be read as a cue to change anything.
+    var vault: FakeVault = .{ .store_status = keychain.errSecInteractionNotAllowed };
+    defer vault.deinit();
+
+    const attempt = migrateEnvFileAt(FakeVault, &vault, std.testing.io, talloc, path);
+    defer api_key.scrub(talloc, attempt.key.?);
+
+    try expectOutcome(.store_failed, attempt);
+    try std.testing.expectEqualStrings(legacy_key, attempt.key.?); // the daemon works today
+    var read_buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(original, try tmp.dir.readFile(std.testing.io, "env", &read_buf));
+}
+
+test "a store that does not read back does not license the delete" {
+    // The finding's inverse hazard: deleting the only copy we can prove exists, on the
+    // strength of a return code. `storeKey` says success and the item is not there.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const original = "OPENAI_API_KEY=" ++ legacy_key ++ "\n";
+    const path = try writeLegacyEnvFile(&tmp, &path_buf, original);
+    var vault: FakeVault = .{ .swallow = true };
+    defer vault.deinit();
+
+    const attempt = migrateEnvFileAt(FakeVault, &vault, std.testing.io, talloc, path);
+    defer api_key.scrub(talloc, attempt.key.?);
+
+    try expectOutcome(.unverified, attempt);
+    var read_buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(original, try tmp.dir.readFile(std.testing.io, "env", &read_buf));
+}
+
+test "a file that cannot be removed is reported as stranded, and its bytes are gone anyway" {
+    if (std.c.geteuid() == 0) return error.SkipZigTest; // root unlinks out of any directory
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try writeLegacyEnvFile(&tmp, &path_buf, "OPENAI_API_KEY=" ++ legacy_key ++ "\n");
+    var vault: FakeVault = .{};
+    defer vault.deinit();
+
+    // An unlink needs write permission on the *directory*; the file itself stays writable, so
+    // the overwrite lands and only the unlink fails. Restored before cleanup runs (LIFO).
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &dir_buf);
+    const dir_path = dir_buf[0..dir_len];
+    try std.Io.Dir.cwd().setFilePermissions(std.testing.io, dir_path, .fromMode(0o500), .{});
+    defer std.Io.Dir.cwd().setFilePermissions(std.testing.io, dir_path, .fromMode(0o700), .{}) catch {};
+
+    const attempt = migrateEnvFileAt(FakeVault, &vault, std.testing.io, talloc, path);
+    defer api_key.scrub(talloc, attempt.key.?);
+
+    try expectOutcome(.file_stranded, attempt);
+    try std.testing.expectEqualStrings(legacy_key, vault.stored.?); // the keychain copy is good
+    // The overwrite is best effort against the storage layer, but it is not best effort
+    // against `cat`: whatever is still at that path no longer reads as the key.
+    var read_buf: [128]u8 = undefined;
+    const left = try tmp.dir.readFile(std.testing.io, "env", &read_buf);
+    try std.testing.expect(std.mem.indexOf(u8, left, legacy_key) == null);
+    for (left) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "a file with no key assignment in it is not ours to delete" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const original = "# migrated long ago\nSOMETHING_ELSE=1\n";
+    const path = try writeLegacyEnvFile(&tmp, &path_buf, original);
+    var vault: FakeVault = .{};
+    defer vault.deinit();
+
+    const attempt = migrateEnvFileAt(FakeVault, &vault, std.testing.io, talloc, path);
+
+    try expectOutcome(.nothing_to_migrate, attempt);
+    try std.testing.expect(attempt.key == null);
+    var read_buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(original, try tmp.dir.readFile(std.testing.io, "env", &read_buf));
+}
+
+test "the migration stays one-time and idempotent: a missing file is the silent normal case" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/env", .{root_buf[0..root_len]});
+    var vault: FakeVault = .{};
+    defer vault.deinit();
+
+    try expectOutcome(.nothing_to_migrate, migrateEnvFileAt(FakeVault, &vault, std.testing.io, talloc, path));
+    // And the sweep that finishes an already-done migration says nothing when there is
+    // nothing there — it runs on every start of every already-migrated machine.
+    try std.testing.expect(!try removePlaintextKeyFile(std.testing.io, path));
+}
+
+test "the sweep removes a stranded file left beside a working keychain item" {
+    // Everyone who migrated under the old code is in exactly this state: the keychain holds
+    // the key, so `migrateEnvFile` never runs again, and the plaintext copy stays forever.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try writeLegacyEnvFile(&tmp, &path_buf, "OPENAI_API_KEY=" ++ legacy_key ++ "\n");
+
+    try std.testing.expect(try removePlaintextKeyFile(std.testing.io, path));
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "env", .{}));
 }
 
 // ---- config.zon patcher tests (wayfinder #34) ---------------------------------

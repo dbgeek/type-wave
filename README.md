@@ -188,6 +188,10 @@ Secrets do not live in `config.zon`. Key precedence is:
 2. The login keychain item created by the menu or `~/.local/bin/type-wave --set-key`.
 3. One-time migration from the retired `~/.config/type-wave/env` file, if present.
 
+The migration finishes the job: once the keychain provably hands the key back, the daemon
+overwrites and deletes that plaintext file rather than leaving it on disk. A file left over
+from an earlier migration is removed the next time the daemon reads the keychain.
+
 The pinned local Model Installation (Whisper Large v3 Turbo) downloads credential-free.
 Explicitly start the Model Operation:
 

@@ -122,8 +122,12 @@ prompts (and the entries in **System Settings → Privacy & Security**) are attr
 > `type-wave dev` signature and every later read is prompt-free (see `src/keychain.zig`).
 > **No plist `EnvironmentVariables` secret hack is needed**; never put the key in a committed
 > plist. A key still sitting in the legacy `~/.config/type-wave/env` file is auto-migrated
-> into the keychain the first time the daemon looks for it (the log says when the file can
-> be deleted). A missing key is not fatal: the self-heal supervisor polls until one appears.
+> into the keychain the first time the daemon looks for it, and the plaintext file is then
+> overwritten and deleted — the daemon finishes the migration instead of leaving a live key
+> in cleartext on disk. That also applies retroactively: a file left behind by an earlier
+> migration is removed the next time the daemon reads the key from the keychain. Only a
+> removal that *fails* leaves you something to do, and the log says so imperatively.
+> A missing key is not fatal: the self-heal supervisor polls until one appears.
 
 The pinned local model artifact is downloaded credential-free from its exact pinned
 Hugging Face coordinates; no second Keychain item exists for it. Interrupted work stays

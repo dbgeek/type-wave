@@ -256,7 +256,10 @@ page). A **hand-off** is the one way a copy legitimately outlives it: a connecte
 Transcription Session retains its key for the process lifetime, so ownership moves at the
 moment `connect` returns and no later refresh can pull it out from under a live holder. Its
 `Source` seam is the real env-then-keychain read (config.zig), so the lifetime rule is
-driven against counted fake copies rather than against the login keychain.
+driven against counted fake copies rather than against the login keychain. It owns copies in
+*memory*; the one durable plaintext copy the daemon ever met — the retired
+`~/.config/type-wave/env` file — is the migration's to end (config.zig), and it ends it
+rather than telling the user they may.
 _Avoid_: key cache, key manager, secret store (that names the keychain item)
 
 **Transcription Backend**:
