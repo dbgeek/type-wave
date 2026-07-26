@@ -1,0 +1,26 @@
+# Keeps the SHA-pinned GitHub Actions from rotting (ticket #292, finding 3 of map #249).
+#
+# A commit SHA is an identity nobody upstream can re-point — which is the whole reason the
+# workflows pin them — but it is also frozen, so the pins would quietly age into unpatched
+# action code. Dependabot reads the `# v4.4.0` comment beside each pin, and opens a PR that
+# advances the SHA *and* the comment together, so the pins move by review rather than by
+# someone else's push.
+#
+# `github-actions` at the repo root covers every file in `.github/workflows/`.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Squash-only merges make the PR title the commit subject on main, and the title is a
+    # required Conventional-Commits check (pr-title-lint.yml) — so the prefix is not cosmetic:
+    # without it Dependabot's "Bump …" title fails the check on every one of these PRs.
+    commit-message:
+      prefix: ci
+    # One PR for the lot: these are reviewed as a set (does the gate still pass?), and a
+    # single run of the gate answers that for all of them.
+    groups:
+      github-actions:
+        patterns:
+          - "*"

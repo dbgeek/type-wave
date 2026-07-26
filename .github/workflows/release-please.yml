@@ -24,7 +24,9 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
-      - uses: googleapis/release-please-action@v4
+      # SHA-pinned (ticket #292): this step is handed RELEASE_PLEASE_TOKEN, so whatever the
+      # ref resolves to holds push-to-main. It is the pin with the largest blast radius here.
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
         id: release
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}

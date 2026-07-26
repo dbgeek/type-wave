@@ -38,6 +38,12 @@
 #
 # The changed-file list comes straight from the PR API rather than a third-party filter
 # action, so the decision to skip the release gate depends on nothing outside this file.
+#
+# Every `uses:` here — and in every workflow — is pinned to a full commit SHA with the
+# release in a trailing comment (ticket #292). A tag or a branch is a name its author can
+# re-point, so an unpinned action decides what runs on this runner tomorrow with no change
+# on our side. `.github/dependabot.yml` advances the pins by reviewed PR;
+# PackagingTests.test_every_action_is_pinned_to_a_commit fails if a new one arrives unpinned.
 
 name: CI
 
@@ -63,7 +69,7 @@ jobs:
     runs-on: macos-15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Single gate switch: run the full suite unless every file this PR touches is inert.
       - name: Decide whether to run the gate
@@ -118,18 +124,18 @@ jobs:
       # Reproduce the exact pinned dev shell (Zig + cmake/ninja/python3/mypy) from flake.lock.
       - name: Install Nix
         if: steps.gate.outputs.run == 'true'
-        uses: DeterminateSystems/nix-installer-action@main
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
       # Free, ephemeral Nix-store speed cache (GitHub Actions cache backed).
       - name: Magic Nix Cache
         if: steps.gate.outputs.run == 'true'
-        uses: DeterminateSystems/magic-nix-cache-action@main
+        uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
 
       # Zig global cache — memoizes compilation and the whisper Metal build output.
       # Keyed on the toolchain/build inputs; falls back to the newest partial match.
       - name: Cache ~/.cache/zig
         if: steps.gate.outputs.run == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/zig
           key: zig-cache-${{ runner.os }}-${{ hashFiles('flake.lock', 'build.zig.zon', 'build.zig', 'tools/build-whisper-runtime.sh') }}-${{ github.sha }}

@@ -268,6 +268,37 @@ exit 0
         for doc in sorted(read_docs):
             self.assertIn(doc, covered, f"{doc} is a gate input but ci.yml would skip PRs touching it")
 
+    # A tag or a branch is a name upstream can re-point, so an action named that way decides
+    # what runs in our CI tomorrow with no change here — and one of these steps holds a PAT
+    # that can write to main. The pins are only worth having if the next workflow edit cannot
+    # forget them, so the invariant is a test rather than a comment: every remote `uses:`
+    # names a full commit SHA, with the release it corresponds to in a trailing comment
+    # (the form Dependabot reads and advances — see .github/dependabot.yml).
+    def test_every_action_is_pinned_to_a_commit(self) -> None:
+        workflows = sorted((REPO_ROOT / ".github/workflows").glob("*.yml"))
+        self.assertTrue(workflows, "expected at least one workflow to check")
+
+        seen = 0
+        for workflow in workflows:
+            where = workflow.relative_to(REPO_ROOT)
+            for number, line in enumerate(workflow.read_text().splitlines(), start=1):
+                stripped = line.strip()
+                if stripped.startswith("#") or "uses:" not in stripped:
+                    continue
+                reference = stripped.split("uses:", maxsplit=1)[1].strip()
+                # Local composite actions live in this tree and are covered by review of it.
+                if reference.startswith(("./", "docker://")):
+                    continue
+                seen += 1
+                self.assertRegex(
+                    reference,
+                    r"^[\w.-]+/[\w./-]+@[0-9a-f]{40} +# \S+$",
+                    f"{where}:{number} does not pin the action to a full commit SHA "
+                    "with a version comment (owner/action@<40-hex> # vX.Y.Z)",
+                )
+
+        self.assertTrue(seen, "expected the workflows to use at least one third-party action")
+
 
 if __name__ == "__main__":
     unittest.main()
