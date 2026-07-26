@@ -6,16 +6,21 @@
     // the flake-locked nightly. NOT a ceiling — forward drift is caught by flake.lock.
     .minimum_zig_version = "0.17.0-dev.1267+300116b02",
     .dependencies = .{
-        // Vendored at dev commit 4b475a8 — the §3.5 TLS-read fix is now upstream
-        // (karlseguin/websocket.zig "Don't poll if tls has buffered client", closes #106),
-        // so the vendored one-line patch is dropped. See docs/toolchain.md.
-        .websocket = .{ .path = "vendor/websocket.zig" },
+        // karlseguin/websocket.zig, `dev` @ 4b475a8 — the §3.5 TLS-read fix is upstream
+        // ("Don't poll if tls has buffered client", closes #106), so there is no local
+        // patch and nothing to vendor. This url+hash pair IS the pin: the package manager
+        // verifies the content hash on every fetch, which is the integrity identity the
+        // committed tree never had (#290). Bump it with the compiler, never alone —
+        // see docs/toolchain.md.
+        .websocket = .{
+            .url = "https://github.com/karlseguin/websocket.zig/archive/4b475a8683f9769bd12f0221e5e87141c9a9175f.tar.gz",
+            .hash = "websocket-0.1.0-ZPISdcLsBACOaekLXhXYDzDwZhmXVcH0Afmcyf-cdQWs",
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
         "tools",
-        "vendor",
     },
 }

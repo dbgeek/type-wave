@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
     // Factored so the exe and the `zig build test` artifact stay in lockstep.
     const linkFrameworks = struct {
         fn apply(mod: *std.Build.Module, sdk_path: []const u8, bb: *std.Build) void {
-            // Transcription Session's vendored websocket rides std.crypto.tls (no extra
+            // Transcription Session's websocket client rides std.crypto.tls (no extra
             // framework); Capture's AudioQueue lives in AudioToolbox.
             mod.linkFramework("AudioToolbox", .{});
             mod.linkFramework("AVFoundation", .{}); // non-prompting Microphone authorization status

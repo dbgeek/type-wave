@@ -376,13 +376,13 @@ src/                 daemon source
 docs/                toolchain, packaging, ADRs, research notes, agent docs
 packaging/           Info.plist, LaunchAgent plist, install script, config example
 prototypes/          spikes that proved capture, insertion, menu, and HUD behavior
-vendor/              vendored karlseguin/websocket.zig
+build.zig.zon        the url+hash pin for karlseguin/websocket.zig
 flake.nix            development shell pinning the Zig nightly
 ```
 
 ## Notes
 
-- The Zig nightly and vendored `websocket.zig` commit move together. Read
+- The Zig nightly and the `websocket.zig` commit move together. Read
   [docs/toolchain.md](./docs/toolchain.md) before bumping either.
 - Architecture decisions live in [docs/adr](./docs/adr).
 - Research crib sheets live in [docs/research](./docs/research).
@@ -399,8 +399,10 @@ Entirely optional — issues and small PRs are just as welcome.
 type-wave is released under the [MIT License](./LICENSE), Copyright (c) 2026
 Björn Ahl.
 
-It builds on MIT-licensed third-party components (vendored `websocket.zig`,
-whisper.cpp, and the Whisper large-v3-turbo model). Their attributions and
-license-text locations are listed in
-[THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md); pinned revisions and hashes
-are in [packaging/share/type-wave/PROVENANCE](./packaging/share/type-wave/PROVENANCE).
+It builds on MIT-licensed third-party components (`websocket.zig`, whisper.cpp,
+and the Whisper large-v3-turbo model), none of them vendored into this tree.
+Their attributions and license-text locations are listed in
+[THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md), which also says where each
+one's pin lives: `build.zig.zon` for the Zig dependency,
+[packaging/share/type-wave/PROVENANCE](./packaging/share/type-wave/PROVENANCE)
+for the two artifacts our own tooling downloads.

@@ -36,11 +36,18 @@ against a nightly we need and can't easily patch.
 | Component | Pin | Where it's pinned |
 |---|---|---|
 | Zig compiler | `0.17.0-dev.1267+300116b02` | `flake.lock` → `zig-overlay` rev `be62cd684cf34f701cd1b91f2aa0c056c29fafa1` (locked 2026-07-07), which resolves `zig-overlay.packages.<system>.master` to this nightly |
-| websocket.zig | `dev` @ commit `4b475a8` (the §3.5 TLS-read fix is now upstream) | vendored as plain files under `vendor/websocket.zig` (root) and `prototypes/cli-dictation/vendor/websocket.zig` (a `.path` dependency), so the pin *is* the committed tree |
+| websocket.zig | `dev` @ commit `4b475a8` (the §3.5 TLS-read fix is now upstream) | a `url` + `hash` dependency in `build.zig.zon` — the root one and the cli-dictation prototype's, carrying the identical pair. The Zig package manager verifies the content hash on every fetch |
 | Floor guard | `minimum_zig_version = "0.17.0-dev.1267+300116b02"` | every `build.zig.zon` in the repo |
 
-Two things to understand about how the pin actually holds:
+Three things to understand about how the pin actually holds:
 
+- **The websocket pin is machine-verified, and used to not be.** Until [#290](https://github.com/dbgeek/type-wave/issues/290)
+  the library was vendored as plain files in *two* independently-editable trees, and the pin
+  "was" the committed tree — meaning nothing tied those bytes to the upstream commit they
+  claimed to be, and a fix applied to one copy could silently miss the other. The reason for
+  vendoring had already evaporated (see below: the local patch went upstream, leaving an
+  unmodified snapshot), so the trees are gone and the pin is the `url` + `hash` pair the
+  package manager checks. A tampered mirror fails the fetch; a stale copy cannot exist.
 - **flake.lock is the real lock.** `flake.nix` selects `zig-overlay…master` (the idiomatic way
   to get a nightly — zig-overlay exposes named attrs for `master` and *released* versions, not
   for arbitrary nightly strings), and `flake.lock` freezes which nightly `master` means. Anyone
@@ -64,8 +71,10 @@ his own fix rather than merging our one-liner
 His fix is a **strict superset** of the one-line patch we carried: it gates the poll-skip on a
 `hasBufferedTlsRecord` helper that fires only when a *complete* TLS record is buffered, so it also
 handles the *partial*-record case (still polls, to honor the read timeout) that our cruder
-"any buffered bytes" check got subtly wrong. So the vendored one-line patch is **dropped** — the
-tree is now plain upstream `4b475a8`, no local delta.
+"any buffered bytes" check got subtly wrong. So the one-line patch is **dropped** — and with it
+the only reason we ever vendored. Having no local delta is what made [#290](https://github.com/dbgeek/type-wave/issues/290)'s
+swap to a package-manager pin a lossless one: the vendored trees were proved byte-identical to
+upstream `4b475a8` before they were deleted.
 
 ## Bump procedure
 
@@ -81,38 +90,51 @@ trusting it.
    ```
 
 2. **Bump websocket.zig to a `dev` commit that matches that nightly.** Find a `dev` commit
-   built against the same/nearby zig-master, then refresh the vendored tree:
+   built against the same/nearby zig-master, then re-pin to that commit's archive:
 
    ```sh
-   # in a scratch checkout:
-   zig fetch --save git+https://github.com/karlseguin/websocket.zig#dev   # resolves & prints the commit
+   zig fetch --save=websocket \
+     https://github.com/karlseguin/websocket.zig/archive/<full-commit-sha>.tar.gz
    ```
 
-   Replace the files under **both** `vendor/websocket.zig` (root) and
-   `prototypes/cli-dictation/vendor/websocket.zig` with that commit's tree, and update the
-   `// Vendored at … commit` comment in each `build.zig.zon` to the new hash. The §3.5 TLS-read
-   fix is upstream as of `dev` `4b475a8`, so there is no longer a local patch to re-apply — the
-   vendored tree should be plain upstream. (If a future bump ever lands on a commit *before* the
-   fix, re-check `Stream.read`/`hasBufferedTlsRecord` in `src/client/client.zig`.)
+   That rewrites the root `build.zig.zon`'s `url` + `hash` pair. Copy the same pair into
+   `prototypes/cli-dictation/build.zig.zon` — the two must stay identical, which is the one
+   thing this arrangement asks of you in exchange for there being no second tree to sync — and
+   update the surrounding comment to the new commit. Pin the **full 40-character sha**, not the
+   short one: the short form resolves today and the long form is what stays unambiguous.
+
+   The §3.5 TLS-read fix is upstream as of `dev` `4b475a8`, so there is no local patch to
+   re-apply. (If a future bump ever lands on a commit *before* the fix, re-check
+   `Stream.read`/`hasBufferedTlsRecord` in `src/client/client.zig`. A bump that *does* need a
+   local delta means re-vendoring — and re-reading [#290](https://github.com/dbgeek/type-wave/issues/290)
+   first, because a vendored tree owes the integrity story the package manager was giving you
+   for free.)
+
+   Upstream's `build.zig.zon` `.paths` does not ship `LICENSE`, so the fetched package has no
+   license text. Ours lives at `packaging/share/type-wave/LICENSES/websocket.zig-MIT.txt`;
+   re-check it against upstream's `LICENSE` on a bump.
 
 3. **Raise the floor.** Set `minimum_zig_version` to the new nightly string in **every**
    `build.zig.zon` (currently the two prototypes; later the root too).
 
-4. **Rebuild clean and re-prove.** Clear stale caches and rebuild — a patched `.path` dep is
-   easy to serve stale (research §3.5):
+4. **Rebuild clean and re-prove.** Clear stale caches and rebuild:
 
    ```sh
    rm -rf .zig-cache prototypes/*/.zig-cache
    nix develop --command zig build   # per project
    ```
 
+   The stale-`.path`-dep hazard research §3.5 warns about is gone with the vendor trees — a
+   hash-addressed package cannot be served stale under a changed pin, because a changed pin is
+   a different cache entry.
+
    Then re-run the live end-to-end check (the CLI dictation loop against
    `wss://api.openai.com/v1/realtime`). If `dev` hasn't caught up to the new nightly yet
    (`std.Io` API breakage — expected per websocket.zig's readme), either wait for an upstream
    `dev` commit that has, or hold the pair on the previous nightly.
 
-5. **Commit compiler + library together** (`flake.lock`, the vendored tree, and every
-   `build.zig.zon`) in one commit, so the pair is never split across history.
+5. **Commit compiler + library together** (`flake.lock` and every `build.zig.zon`) in one
+   commit, so the pair is never split across history.
 
 If a bump can't be made to work, the sanctioned fallback is **not** the 0.16.0 pair but a
 hand-rolled RFC 6455 client over `std.crypto.tls` (research §7) — std TLS ↔ api.openai.com is

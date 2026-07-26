@@ -14,3 +14,12 @@ offered under the MIT License (© 2022 OpenAI); the complete text is in
 The private `type-wave-whisper` helper statically links whisper.cpp v1.9.1. Its exact source
 archive identity is recorded in `PROVENANCE`; its MIT license is in
 `LICENSES/whisper.cpp-MIT.txt`.
+
+## websocket.zig
+
+The `type-wave` daemon statically links `karlseguin/websocket.zig` — the client that carries
+the Transcription Session to the server. Unlike the two above it is not fetched by our own
+tooling and so is not in `PROVENANCE`: it is a Zig source dependency, pinned by URL and
+content hash in the daemon's `build.zig.zon` and verified by the Zig package manager on every
+fetch. Copyright (c) 2024 Karl Seguin; its MIT license is in
+`LICENSES/websocket.zig-MIT.txt`.
