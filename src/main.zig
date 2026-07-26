@@ -204,7 +204,9 @@ const HelperSmoke = struct {
 
     pub fn run(self: *HelperSmoke, model: []const u8, cancel: *const model_store.CancelToken) ![32]u8 {
         if (cancel.isRequested()) return error.ModelOperationCancelled;
-        try whisper_process_helper.smokeTest(self.allocator, self.io, self.executable, model, cancel.signalFlag());
+        // The smoke test is where `runtime_sha256` is recorded, so the binary that earns that
+        // record proves itself on the same terms a warm demands of it.
+        try whisper_process_helper.smokeTest(self.allocator, self.io, self.executable, model, cancel.signalFlag(), .by_self_signature);
         if (cancel.isRequested()) return error.ModelOperationCancelled;
         return model_store.sha256File(self.io, self.executable);
     }

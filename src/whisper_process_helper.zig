@@ -10,6 +10,7 @@ const ipc = @import("whisper_ipc.zig");
 const helper_core = @import("whisper_helper_core.zig");
 const helper_supervisor = @import("whisper_supervisor.zig");
 const local_backend = @import("local_backend.zig");
+const signing_identity = @import("signing_identity.zig");
 
 const HelperEvents = local_backend.Events;
 
@@ -60,7 +61,13 @@ fn spawnWarm(
     model: []const u8,
     artifact: helper_core.Artifact,
     cancel: ?*const std.atomic.Value(bool),
+    gate: signing_identity.Gate,
 ) !ProcessInstance {
+    // Every spawn proves the binary, not just the first: `launch` re-resolves this same path
+    // string through the `current` pair pointer, so a warm-time proof would be a proof about
+    // a file a later relaunch need not open (#284).
+    try gate.check(executable);
+
     var helper_environment = std.process.Environ.Map.init(allocator);
     defer helper_environment.deinit();
     var child = try std.process.spawn(io, .{
@@ -127,8 +134,9 @@ pub fn smokeTest(
     executable: []const u8,
     model: []const u8,
     cancel: *const std.atomic.Value(bool),
+    gate: signing_identity.Gate,
 ) !void {
-    var process = try spawnWarm(allocator, io, executable, model, helper_core.pinnedArtifact(), cancel);
+    var process = try spawnWarm(allocator, io, executable, model, helper_core.pinnedArtifact(), cancel, gate);
     process.child.kill(io);
     // No reader or writer thread exists here, so this thread owns both ends.
     _ = std.c.close(process.stdin_fd);
@@ -141,10 +149,14 @@ fn spawnWarmWithRecovery(
     executable: []const u8,
     model: []const u8,
     artifact: helper_core.Artifact,
+    gate: signing_identity.Gate,
 ) !RecoveredInstance {
     var recovery = helper_supervisor.RecoveryBudget{};
     while (true) {
-        const process = spawnWarm(allocator, io, executable, model, artifact, null) catch |failure| {
+        const process = spawnWarm(allocator, io, executable, model, artifact, null, gate) catch |failure| {
+            // A refusal is a verdict on the file, not a transient spawn failure: retrying
+            // opens the same bytes, so it leaves the budget alone and goes straight out.
+            if (signing_identity.isRefusal(failure)) return failure;
             const delay = recovery.failed() orelse return failure;
             var waited_ms: u32 = 0;
             while (waited_ms < delay) : (waited_ms += 50) _ = usleep(50_000);
@@ -171,6 +183,8 @@ pub const ProcessHelper = struct {
     executable: []u8,
     model: []u8,
     artifact: helper_core.Artifact,
+    /// Carried so a relaunch proves the binary on the same terms the first spawn did.
+    gate: signing_identity.Gate,
     mu: std.Io.Mutex = .init,
     write_mu: std.Io.Mutex = .init,
     events: ?HelperEvents = null,
@@ -194,8 +208,9 @@ pub const ProcessHelper = struct {
         executable: []const u8,
         model: []const u8,
         artifact: helper_core.Artifact,
+        gate: signing_identity.Gate,
     ) !*ProcessHelper {
-        const recovered = try spawnWarmWithRecovery(allocator, io, executable, model, artifact);
+        const recovered = try spawnWarmWithRecovery(allocator, io, executable, model, artifact, gate);
         var instance = recovered.process;
         errdefer {
             instance.child.kill(io);
@@ -219,6 +234,7 @@ pub const ProcessHelper = struct {
             .executable = executable_copy,
             .model = model_copy,
             .artifact = artifact,
+            .gate = gate,
             .recovery = recovered.recovery,
         };
 
@@ -531,7 +547,7 @@ pub const ProcessHelper = struct {
     /// ends stay open until this point, so the replacement helper's pipes — created in
     /// `spawnWarm` above, before `write_mu` is held — cannot take their numbers.
     fn launch(self: *ProcessHelper) !void {
-        var instance = try spawnWarm(self.allocator, self.io, self.executable, self.model, self.artifact, null);
+        var instance = try spawnWarm(self.allocator, self.io, self.executable, self.model, self.artifact, null, self.gate);
         errdefer {
             instance.child.kill(self.io);
             _ = std.c.close(instance.stdin_fd);
@@ -572,6 +588,30 @@ pub const ProcessHelper = struct {
     }
 };
 
+test "a refused Signing Identity spawns nothing, and does not spend the recovery budget" {
+    // The same executable every other test here starts successfully — so if `start` returns
+    // the refusal, the refusal is what stopped it, before `std.process.spawn`.
+    const Refusing = struct {
+        fn prove(_: []const u8) signing_identity.Verdict {
+            return .{ .refused = signing_identity.Refusal.HelperSignedByAnotherIdentity };
+        }
+    };
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    const outcome = ProcessHelper.start(
+        std.testing.allocator,
+        std.testing.io,
+        "acceptance/local_backend/stalling_helper.py",
+        "stall",
+        helper_core.pinnedArtifact(),
+        .{ .prove = Refusing.prove },
+    );
+    try std.testing.expectError(signing_identity.Refusal.HelperSignedByAnotherIdentity, outcome);
+    // A verdict on the file is not a transient failure: the ladder must not sit through its
+    // backoff delays re-opening the same bytes.
+    const elapsed_ms = @divTrunc(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started, 1_000_000);
+    try std.testing.expect(elapsed_ms < 1_000);
+}
+
 test "hard cancellation terminates a non-responsive helper process" {
     var helper = try ProcessHelper.start(
         std.testing.allocator,
@@ -579,6 +619,7 @@ test "hard cancellation terminates a non-responsive helper process" {
         "acceptance/local_backend/stalling_helper.py",
         "stall",
         helper_core.pinnedArtifact(),
+        .unproved, // a Python stub, never signed and never handed a microphone
     );
     defer {
         helper.shutdown();
@@ -611,6 +652,7 @@ test "a hard cancel of a Segment blocked mid-write fails the Utterance, not the 
         "acceptance/local_backend/stalling_helper.py",
         "deaf", // becomes ready, then never drains stdin again
         helper_core.pinnedArtifact(),
+        .unproved, // a Python stub, never signed and never handed a microphone
     );
     defer {
         helper.shutdown();
@@ -650,6 +692,7 @@ test "a hard cancel never frees descriptor numbers under the parked writer" {
         "acceptance/local_backend/stalling_helper.py",
         "deaf", // becomes ready, then never drains stdin again
         helper_core.pinnedArtifact(),
+        .unproved, // a Python stub, never signed and never handed a microphone
     );
     defer {
         helper.shutdown();
@@ -716,6 +759,7 @@ test "helper crash malformed IPC and inference failure abandon active Utterances
             "acceptance/local_backend/stalling_helper.py",
             mode,
             helper_core.pinnedArtifact(),
+            .unproved, // a Python stub, never signed and never handed a microphone
         );
         var events = AtomicFaultRecorder{};
         var adapter = local_backend.Adapter(ProcessHelper).init(std.testing.allocator, std.testing.io, helper, events.events());

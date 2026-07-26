@@ -39,6 +39,7 @@ pub const Event = union(enum) {
     load_failed: anyerror,
     runtime_failure: anyerror,
     runtime_failure_after_verify: anyerror,
+    identity_refused: anyerror,
     adapter_unavailable,
 };
 
@@ -46,12 +47,14 @@ pub const Event = union(enum) {
 /// `no_adapter` = the process spawned but the adapter could not be built (the process has
 /// been shut down) — a load success from the recovery machine's view, but no resource to
 /// return this attempt; `spawn_failed` = the process did not spawn (drives the verify/retry
-/// latch).
+/// latch); `identity_refused` = the helper binary did not prove its Signing Identity, so no
+/// spawn was attempted at all.
 pub fn StartOutcome(comptime Resource: type) type {
     return union(enum) {
         started: *Resource,
         no_adapter,
         spawn_failed: anyerror,
+        identity_refused: anyerror,
     };
 }
 
@@ -88,6 +91,7 @@ pub fn LocalProvisioner(comptime Deps: type) type {
             switch (self.deps.startHelper(&install)) {
                 .started => |resource| return self.loaded(resource),
                 .no_adapter => return self.loadedButUnavailable(),
+                .identity_refused => |err| return self.identityRefused(err),
                 .spawn_failed => |err| {
                     // First failure from `ready` verifies once; a failure while already
                     // retrying a verified load latches runtime_failure.
@@ -101,6 +105,7 @@ pub fn LocalProvisioner(comptime Deps: type) type {
                     switch (self.deps.startHelper(&install)) {
                         .started => |resource| return self.loaded(resource),
                         .no_adapter => return self.loadedButUnavailable(),
+                        .identity_refused => |retry_err| return self.identityRefused(retry_err),
                         .spawn_failed => |retry_err| {
                             _ = self.recovery.loadFailed(); // retrying_verified_load → runtime_failure
                             self.failure.setError("Local runtime load failed", retry_err);
@@ -110,6 +115,19 @@ pub fn LocalProvisioner(comptime Deps: type) type {
                     }
                 },
             }
+        }
+
+        /// The helper binary did not prove its Signing Identity. This is a verdict on the
+        /// *runtime*, so it skips the verify/retry ladder entirely: verifying would spend a
+        /// full model hash on the one thing that is not in question, and a retry would open
+        /// the same bytes. It latches like any other runtime failure — the Model Installation
+        /// stays usable, the Status Item shows the reason, and a SIGHUP Retry is the way back
+        /// once the user has reinstalled the pair.
+        fn identityRefused(self: *Self, err: anyerror) ?*Resource {
+            self.recovery.runtimeRefused();
+            self.failure.setError("Whisper Helper identity refused", err);
+            self.deps.note(.{ .identity_refused = err });
+            return null;
         }
 
         fn loaded(self: *Self, resource: *Resource) ?*Resource {
@@ -200,11 +218,12 @@ const FakeDeps = struct {
     pub const Install = struct {};
     pub const LocalResource = FakeResource;
 
-    const Start = union(enum) { started, no_adapter, spawn_failed: anyerror };
+    const Start = union(enum) { started, no_adapter, spawn_failed: anyerror, identity_refused: anyerror };
     const EventTag = std.meta.Tag(Event);
 
     resolve: ?Install = Install{},
     verify_outcome: anyerror!Integrity = Integrity{ .absent = {} },
+    verify_calls: u32 = 0,
     starts: []const Start = &.{},
     start_index: usize = 0,
     start_calls: u32 = 0,
@@ -221,6 +240,7 @@ const FakeDeps = struct {
         self.abandon_calls += 1;
     }
     pub fn verify(self: *FakeDeps, _: *const Install) !Integrity {
+        self.verify_calls += 1;
         return self.verify_outcome;
     }
     pub fn startHelper(self: *FakeDeps, _: *Install) StartOutcome(FakeResource) {
@@ -231,6 +251,7 @@ const FakeDeps = struct {
             .started => .{ .started = &self.resource },
             .no_adapter => .no_adapter,
             .spawn_failed => |err| .{ .spawn_failed = err },
+            .identity_refused => |err| .{ .identity_refused = err },
         };
     }
     pub fn installationProbe(_: *FakeDeps) bool {
@@ -368,6 +389,52 @@ test "a spawn that leaves no adapter counts as loaded but returns nothing" {
     try testing.expect(resource == null);
     try testing.expectEqual(recovery_mod.State.ready, prov.recoveryState()); // spawn succeeded
     try testing.expect(deps.sawEvent(.adapter_unavailable));
+}
+
+test "a helper that cannot prove its identity latches without spending a verification" {
+    var deps = FakeDeps{
+        .starts = &.{.{ .identity_refused = error.HelperSignedByAnotherIdentity }},
+        // Set up so a *spawn failure* would verify — proving the refusal took the other path.
+        .verify_outcome = Integrity{ .usable = undefined },
+    };
+    var prov = Provisioner.init(&deps);
+
+    try testing.expect(prov.warm() == null);
+    try testing.expectEqual(recovery_mod.State.runtime_failure, prov.recoveryState());
+    try testing.expect(prov.failureDetail() != null);
+    try testing.expect(deps.sawEvent(.identity_refused));
+    // The model is not what failed: no hash of a 1.6 GB artifact, and no second attempt at
+    // the same bytes.
+    try testing.expectEqual(@as(u32, 0), deps.verify_calls);
+    try testing.expectEqual(@as(u32, 1), deps.start_calls);
+    // The installation itself stays usable — the Configuration Phase still has its model.
+    try testing.expect(prov.recovery.installationUsable());
+}
+
+test "a refusal on the post-verify retry latches there too, rather than falling through" {
+    var deps = FakeDeps{
+        .starts = &.{
+            .{ .spawn_failed = error.HelperSpawnFailed },
+            .{ .identity_refused = error.HelperUnsigned },
+        },
+        .verify_outcome = Integrity{ .usable = undefined },
+    };
+    var prov = Provisioner.init(&deps);
+
+    try testing.expect(prov.warm() == null);
+    try testing.expectEqual(recovery_mod.State.runtime_failure, prov.recoveryState());
+    try testing.expect(deps.sawEvent(.identity_refused));
+    try testing.expect(!deps.sawEvent(.runtime_failure_after_verify));
+}
+
+test "a SIGHUP Retry re-arms a refused runtime, so a reinstalled pair warms" {
+    var deps = FakeDeps{ .starts = &.{ .{ .identity_refused = error.HelperUnsigned }, .started } };
+    var prov = Provisioner.init(&deps);
+    try testing.expect(prov.warm() == null);
+
+    try testing.expect(prov.requestRetry());
+    try testing.expect(prov.warm() != null);
+    try testing.expectEqual(recovery_mod.State.ready, prov.recoveryState());
 }
 
 test "entering mid-verify (a corrupt retry) verifies, then loads" {

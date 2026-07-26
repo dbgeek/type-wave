@@ -48,6 +48,15 @@ pub const Recovery = struct {
         if (self.current() == .verifying) self.state.store(.runtime_failure, .release);
     }
 
+    /// The runtime was refused outright rather than tried and found wanting — today, a
+    /// helper binary that did not prove its Signing Identity (#284). Unlike a load failure
+    /// there is nothing to learn from verifying the model or from a second attempt, so this
+    /// latches from wherever it is called, leaving `installationUsable` true: the
+    /// installation is fine, the code that would load it is not.
+    pub fn runtimeRefused(self: *Recovery) void {
+        self.state.store(.runtime_failure, .release);
+    }
+
     pub fn retry(self: *Recovery) Action {
         return switch (self.current()) {
             .runtime_failure => action: {
