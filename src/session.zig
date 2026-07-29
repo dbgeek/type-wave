@@ -31,6 +31,7 @@ const std = @import("std");
 const websocket = @import("websocket");
 const feedback = @import("feedback.zig");
 const backend = @import("transcription_backend.zig");
+const vocab = @import("vocab.zig");
 
 pub const host = "api.openai.com";
 
@@ -177,12 +178,15 @@ pub const TranscriptObserver = struct {
 /// gpt-live-transcribe payload since the #303 flip; pinning "gpt-realtime-whisper"
 /// reproduces the exact string proven live in #8. `noise_reduction` is null when
 /// disabled (emits JSON `null`); `language` empty means auto-detect (the field is
-/// omitted from the JSON).
+/// omitted from the JSON). `keywords` is the raw shared vocabulary — a zero-copy
+/// slice into the leak-by-design Settings Snapshot, exactly like `language` —
+/// emitted as the `keywords` biasing field on capable models (#326).
 pub const TranscriptionParams = struct {
     model: []const u8 = "gpt-live-transcribe",
     language: []const u8 = "en",
     delay: []const u8 = "low",
     noise_reduction: ?[]const u8 = "near_field",
+    keywords: []const []const u8 = &.{},
 };
 
 /// Where the Session gets its TranscriptionParams — re-invoked at EVERY connect attempt
@@ -202,39 +206,53 @@ fn modelSpeaksLanguages(model: []const u8) bool {
         std.mem.eql(u8, model, "gpt-transcribe");
 }
 
-/// Manual-commit transcription config (crib sheet §2). turn_detection:null is
-/// mandatory for gpt-realtime-whisper, verified on gpt-live-transcribe in the #298
-/// A/B benchmark, and maps 1:1 onto hold-to-talk. Built from `params`; with
-/// `.model = "gpt-realtime-whisper"` pinned it is byte-identical to the #8-proven
-/// constant (a scratchpad check asserted this against the literal before it was
-/// inlined; the pinned-model golden test keeps it honest).
-const session_update_fmt = "{{\"type\":\"session.update\",\"session\":{{\"type\":\"transcription\",\"audio\":{{\"input\":{{\"format\":{{\"type\":\"audio/pcm\",\"rate\":24000}},\"transcription\":{{\"model\":\"{s}\",{s}\"delay\":\"{s}\"}},\"turn_detection\":null,\"noise_reduction\":{s}}}}}}}}}";
-
-fn renderNoiseReduction(buf: []u8, noise_reduction: ?[]const u8) ![]const u8 {
-    return if (noise_reduction) |t|
-        try std.fmt.bufPrint(buf, "{{\"type\":\"{s}\"}}", .{t})
-    else
-        "null";
+/// Does this model accept the `keywords` biasing field? Allowlist, withhold on
+/// unknown (openai-biasing-spec §3): a rejection bounces the *whole* session.update
+/// with an uncorrelatable error, stranding the session on server defaults, while
+/// withholding from a future capable model merely loses biasing — a one-line
+/// follow-up here. Exported for the menu's capability signal (#328).
+pub fn modelSpeaksKeywords(model: []const u8) bool {
+    return std.mem.eql(u8, model, "gpt-live-transcribe") or
+        std.mem.eql(u8, model, "gpt-transcribe");
 }
 
-fn renderLanguage(buf: []u8, params: TranscriptionParams) ![]const u8 {
-    return if (params.language.len == 0)
-        "" // auto-detect: omit the field entirely (wayfinder #34's Language preset)
-    else if (modelSpeaksLanguages(params.model))
-        try std.fmt.bufPrint(buf, "\"languages\":[\"{s}\"],", .{params.language})
-    else
-        try std.fmt.bufPrint(buf, "\"language\":\"{s}\",", .{params.language});
+/// Manual-commit transcription config (crib sheet §2), streamed into any writer.
+/// turn_detection:null is mandatory for gpt-realtime-whisper, verified on
+/// gpt-live-transcribe in the #298 A/B benchmark, and maps 1:1 onto hold-to-talk.
+/// With `.model = "gpt-realtime-whisper"` pinned it is byte-identical to the
+/// #8-proven constant (the pinned-model golden test keeps it honest). On
+/// keywords-capable models the `keywords` field is **always present** — `[]` when
+/// the vocabulary is empty — so a connect payload and a re-bias push can never
+/// differ, and `session.update`'s field-wise merge can always clear a
+/// previously-bound set (openai-biasing-spec §2).
+fn writeSessionUpdate(w: *std.Io.Writer, params: TranscriptionParams) std.Io.Writer.Error!void {
+    try w.print("{{\"type\":\"session.update\",\"session\":{{\"type\":\"transcription\",\"audio\":{{\"input\":{{\"format\":{{\"type\":\"audio/pcm\",\"rate\":24000}},\"transcription\":{{\"model\":\"{s}\",", .{params.model});
+    if (params.language.len != 0) {
+        // auto-detect (empty) omits the field entirely (wayfinder #34's Language preset)
+        if (modelSpeaksLanguages(params.model)) {
+            try w.print("\"languages\":[\"{s}\"],", .{params.language});
+        } else {
+            try w.print("\"language\":\"{s}\",", .{params.language});
+        }
+    }
+    try w.print("\"delay\":\"{s}\"", .{params.delay});
+    if (modelSpeaksKeywords(params.model)) {
+        try w.writeAll(",\"keywords\":");
+        try vocab.writeKeywordsJson(w, params.keywords);
+    }
+    try w.writeAll("},\"turn_detection\":null,\"noise_reduction\":");
+    if (params.noise_reduction) |t| {
+        try w.print("{{\"type\":\"{s}\"}}", .{t});
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll("}}}}");
 }
 
 pub fn formatSessionUpdate(buf: []u8, params: TranscriptionParams) ![]const u8 {
-    var nr_buf: [128]u8 = undefined;
-    var lang_buf: [160]u8 = undefined;
-    return std.fmt.bufPrint(buf, session_update_fmt, .{
-        params.model,
-        try renderLanguage(&lang_buf, params),
-        params.delay,
-        try renderNoiseReduction(&nr_buf, params.noise_reduction),
-    });
+    var w = std.Io.Writer.fixed(buf);
+    try writeSessionUpdate(&w, params);
+    return w.buffered();
 }
 
 /// The connect-path build (spec §2 "Allocating payload build"): same payload, heap
@@ -242,14 +260,10 @@ pub fn formatSessionUpdate(buf: []u8, params: TranscriptionParams) ![]const u8 {
 /// push, never per audio frame — sized by the allocator because the escaped
 /// keywords worst case (~26 KB realistic) outgrows any sensible fixed buffer.
 pub fn formatSessionUpdateAlloc(alloc: std.mem.Allocator, params: TranscriptionParams) ![]u8 {
-    var nr_buf: [128]u8 = undefined;
-    var lang_buf: [160]u8 = undefined;
-    return std.fmt.allocPrint(alloc, session_update_fmt, .{
-        params.model,
-        try renderLanguage(&lang_buf, params),
-        params.delay,
-        try renderNoiseReduction(&nr_buf, params.noise_reduction),
-    });
+    var out = std.Io.Writer.Allocating.init(alloc);
+    errdefer out.deinit();
+    try writeSessionUpdate(&out.writer, params);
+    return out.toOwnedSlice();
 }
 
 extern "c" fn usleep(usec: c_uint) c_int;
@@ -1458,10 +1472,13 @@ fn deliverServerMessage(sess: anytype, json: []const u8) void {
 // ---- tests (backfilled with the coordinator work, 2026-07-08) ----------------
 
 test "formatSessionUpdate defaults speak gpt-live-transcribe (#303 flip, golden payload)" {
+    // "keywords":[] is always present on capable models even with no vocabulary
+    // (#326): the single always-emit shape keeps connect ≡ re-bias push and lets a
+    // future push clear a previously-bound set under session.update's field-wise merge.
     var buf: [2048]u8 = undefined;
     const out = try formatSessionUpdate(&buf, .{});
     try std.testing.expectEqualStrings(
-        "{\"type\":\"session.update\",\"session\":{\"type\":\"transcription\",\"audio\":{\"input\":{\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},\"transcription\":{\"model\":\"gpt-live-transcribe\",\"languages\":[\"en\"],\"delay\":\"low\"},\"turn_detection\":null,\"noise_reduction\":{\"type\":\"near_field\"}}}}}",
+        "{\"type\":\"session.update\",\"session\":{\"type\":\"transcription\",\"audio\":{\"input\":{\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},\"transcription\":{\"model\":\"gpt-live-transcribe\",\"languages\":[\"en\"],\"delay\":\"low\",\"keywords\":[]},\"turn_detection\":null,\"noise_reduction\":{\"type\":\"near_field\"}}}}}",
         out,
     );
 }
@@ -1491,9 +1508,43 @@ test "formatSessionUpdate speaks plural languages for gpt-live-transcribe (golde
     var buf: [2048]u8 = undefined;
     const out = try formatSessionUpdate(&buf, .{ .model = "gpt-live-transcribe", .language = "en" });
     try std.testing.expectEqualStrings(
-        "{\"type\":\"session.update\",\"session\":{\"type\":\"transcription\",\"audio\":{\"input\":{\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},\"transcription\":{\"model\":\"gpt-live-transcribe\",\"languages\":[\"en\"],\"delay\":\"low\"},\"turn_detection\":null,\"noise_reduction\":{\"type\":\"near_field\"}}}}}",
+        "{\"type\":\"session.update\",\"session\":{\"type\":\"transcription\",\"audio\":{\"input\":{\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},\"transcription\":{\"model\":\"gpt-live-transcribe\",\"languages\":[\"en\"],\"delay\":\"low\",\"keywords\":[]},\"turn_detection\":null,\"noise_reduction\":{\"type\":\"near_field\"}}}}}",
         out,
     );
+}
+
+test "formatSessionUpdate carries the vocabulary as keywords on gpt-live-transcribe (#326 golden payload)" {
+    var buf: [2048]u8 = undefined;
+    const out = try formatSessionUpdate(&buf, .{
+        .keywords = &.{ "Bjorn", "config.zon", "whisper.cpp" },
+    });
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"session.update\",\"session\":{\"type\":\"transcription\",\"audio\":{\"input\":{\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},\"transcription\":{\"model\":\"gpt-live-transcribe\",\"languages\":[\"en\"],\"delay\":\"low\",\"keywords\":[\"Bjorn\",\"config.zon\",\"whisper.cpp\"]},\"turn_detection\":null,\"noise_reduction\":{\"type\":\"near_field\"}}}}}",
+        out,
+    );
+}
+
+test "formatSessionUpdate JSON-escapes keywords and drops banned items whole (#326)" {
+    var buf: [2048]u8 = undefined;
+    const out = try formatSessionUpdate(&buf, .{
+        .keywords = &.{ "say \"hi\"", "Vec<T>", "ok" },
+    });
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"keywords\":[\"say \\\"hi\\\"\",\"ok\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Vec") == null);
+}
+
+test "the capability gate withholds keywords from non-capable and unknown models (#326)" {
+    // Emitting to an incapable model would bounce the whole session.update and strand
+    // the session on server defaults; unknown/future models are withheld too
+    // (allowlist, openai-biasing-spec §3) — even with a vocabulary configured.
+    var buf: [2048]u8 = undefined;
+    for ([_][]const u8{ "gpt-realtime-whisper", "gpt-future-transcribe" }) |model| {
+        const out = try formatSessionUpdate(&buf, .{
+            .model = model,
+            .keywords = &.{ "Bjorn", "config.zon" },
+        });
+        try std.testing.expect(std.mem.indexOf(u8, out, "keywords") == null);
+    }
 }
 
 test "formatSessionUpdate speaks plural languages for the gpt-transcribe sibling" {
@@ -1529,6 +1580,8 @@ test "formatSessionUpdateAlloc is byte-identical to the fixed-buffer formatter" 
         .{ .model = "gpt-realtime-whisper", .language = "" },
         .{ .model = "gpt-live-transcribe", .language = "" },
         .{ .noise_reduction = null },
+        .{ .keywords = &.{ "Bjorn", "config.zon", "say \"hi\"", "Vec<T>" } },
+        .{ .model = "gpt-realtime-whisper", .keywords = &.{"Bjorn"} },
     };
     for (cases) |params| {
         var buf: [2048]u8 = undefined;

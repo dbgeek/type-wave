@@ -1161,7 +1161,9 @@ const Daemon = struct {
 
     /// session.ParamsProvider: invoked at EVERY connect attempt (session.zig), so a
     /// cycled session always speaks the freshest snapshot. Snapshot strings leak by
-    /// design, so handing them to the Session is lifetime-safe.
+    /// design, so handing them to the Session is lifetime-safe. `vocabulary` rides
+    /// along as `keywords` (#326), so biasing binds at first connect and survives
+    /// every reconnect and 60-minute cycle for free.
     fn getParams(ctx: ?*anyopaque) session_mod.TranscriptionParams {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
         const s = self.store.current();
@@ -1170,6 +1172,7 @@ const Daemon = struct {
             .language = s.language,
             .delay = s.delay,
             .noise_reduction = s.noiseReductionType(),
+            .keywords = s.vocabulary,
         };
     }
 
