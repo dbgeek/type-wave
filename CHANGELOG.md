@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/dbgeek/type-wave/compare/v0.3.5...v0.4.0) (2026-07-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* **config:** gpt-live-transcribe is the default transcription model ([#308](https://github.com/dbgeek/type-wave/issues/308))
+
+### Features
+
+* **config:** gpt-live-transcribe is the default transcription model ([#308](https://github.com/dbgeek/type-wave/issues/308)) ([cc35d05](https://github.com/dbgeek/type-wave/commit/cc35d053bae013feb34cf3316f5e2fea9732db15))
+
 ## [0.3.5](https://github.com/dbgeek/type-wave/compare/v0.3.4...v0.3.5) (2026-07-26)
 
 
