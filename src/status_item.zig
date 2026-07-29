@@ -28,6 +28,7 @@ const readiness = @import("readiness.zig");
 const coord = @import("coordinator.zig");
 const recent_insertions = @import("recent_insertions.zig");
 const secure_input = @import("secure_input.zig");
+const session = @import("session.zig");
 const tapmod = @import("tap.zig");
 const insertmod = @import("insert.zig");
 
@@ -720,6 +721,12 @@ pub const SettingsView = struct {
     backtrack: bool = false,
     overlay: bool = true,
     vocabulary_count: usize = 0,
+    /// Does the configured model take the `keywords` biasing field? One bool rather than the
+    /// model string, so the `Presentation` stays `std.meta.eql`-comparable; the answer comes
+    /// from the same predicate the session.update payload gates on (#328). Defaults **false**
+    /// to mirror that gate's withhold-on-unknown posture: a view built without an answer must
+    /// not drop the ` — local only` suffix and claim biasing the payload would withhold.
+    keywords_capable: bool = false,
 };
 
 /// Project the live Settings Snapshot to its scalar view. The per-group search is the one
@@ -730,6 +737,7 @@ pub fn settingsView(s: *const config.Settings) SettingsView {
         .backtrack = s.backtrack,
         .overlay = s.overlay,
         .vocabulary_count = s.vocabulary.len,
+        .keywords_capable = session.modelSpeaksKeywords(s.model),
     };
     for (0..group_count) |gi| view.selected[gi] = currentOption(s, gi);
     return view;
@@ -861,19 +869,26 @@ fn failureFallbackText(failure: ModelFailure) []const u8 {
     };
 }
 
-/// The Vocabulary menu-item title from the live term count and the active backend. Local:
-/// `Vocabulary (off)` / `Vocabulary (3 terms)…`. OpenAI: the same with a ` — local only`
-/// suffix that replaces the disclosure ellipsis — the list is editable but inert there
-/// until you switch to Local (spec §4). Static fallback on the (unreachable) format overflow.
+/// The Vocabulary menu-item title from the live term count and where the list actually
+/// applies: `Vocabulary (off)` / `Vocabulary (3 terms)…`, plus a ` — local only` suffix that
+/// replaces the disclosure ellipsis wherever the list is inert.
+///
+/// Inert means OpenAI **on a model that cannot take `keywords`** — since #326 a capable model
+/// binds the same terms as biasing, so the row drops the suffix and reads identically to Local
+/// (openai-biasing-spec §3). The flag marks inertness only; the normal case gets no
+/// `— biasing active` chrome, and the absence of the warning is the positive signal. For the
+/// incapable cell ` — local only` stays literally true, so the learned string is kept rather
+/// than a second phrase minted. Static fallback on the (unreachable) format overflow.
 const local_only_suffix = " \xe2\x80\x94 local only";
 const dialog_ellipsis = "\xe2\x80\xa6";
-fn vocabularyText(buf: []u8, count: usize, selected: backend.Backend) []const u8 {
+fn vocabularyText(buf: []u8, count: usize, selected: backend.Backend, keywords_capable: bool) []const u8 {
+    const inert = selected == .openai and !keywords_capable;
     if (count == 0)
         return std.fmt.bufPrint(buf, "Vocabulary (off){s}", .{
-            if (selected == .openai) local_only_suffix else "",
+            if (inert) local_only_suffix else "",
         }) catch "Vocabulary";
     const unit = if (count == 1) "term" else "terms";
-    const tail = if (selected == .openai) local_only_suffix else dialog_ellipsis;
+    const tail = if (inert) local_only_suffix else dialog_ellipsis;
     return std.fmt.bufPrint(buf, "Vocabulary ({d} {s}){s}", .{ count, unit, tail }) catch "Vocabulary";
 }
 
@@ -1085,7 +1100,7 @@ pub fn present(out: *Presentation, s: Snapshot, sv: SettingsView, reveal: Reveal
     out.backtrack.checked = sv.backtrack;
     setText(&out.backtrack_backend, backtrackLine2(sv.selected_backend, sv.backtrack));
     var vocab_buf: [max_title]u8 = undefined;
-    setText(&out.vocabulary, vocabularyText(&vocab_buf, sv.vocabulary_count, sv.selected_backend));
+    setText(&out.vocabulary, vocabularyText(&vocab_buf, sv.vocabulary_count, sv.selected_backend, sv.keywords_capable));
 
     setText(&out.installation, installationText(s.installation));
     const identity_hidden = s.installation_identity == null;
@@ -1739,6 +1754,7 @@ fn settingsFor(fields: struct {
     backtrack: bool = false,
     overlay: bool = true,
     vocabulary_count: usize = 0,
+    keywords_capable: bool = false, // mirrors the field's withhold-on-unknown default
 }) SettingsView {
     return .{
         .selected = fields.selected,
@@ -1746,6 +1762,7 @@ fn settingsFor(fields: struct {
         .backtrack = fields.backtrack,
         .overlay = fields.overlay,
         .vocabulary_count = fields.vocabulary_count,
+        .keywords_capable = fields.keywords_capable,
     };
 }
 
@@ -2009,17 +2026,57 @@ test "the settings-shaped rows are worded from the live Settings, not the Snapsh
     try std.testing.expectEqualStrings("Not applying \xe2\x80\x94 needs the OpenAI backend", on_local.backtrack_backend.text());
     try std.testing.expectEqualStrings("Vocabulary (1 term)\xe2\x80\xa6", on_local.vocabulary.text());
 
-    // OpenAI: the ` — local only` suffix replaces the disclosure ellipsis (§4), and Backtrack
-    // states the cloud reality identically whether on or off.
+    // OpenAI on a model that cannot take keywords: the ` — local only` suffix replaces the
+    // disclosure ellipsis (§4), and Backtrack states the cloud reality identically whether on or off.
     const openai = presented(snap(.{ .selected_backend = .openai, .health = .{ .paused = false, .status = .ready } }), settingsFor(.{
         .selected_backend = .openai,
         .backtrack = true,
         .overlay = false,
         .vocabulary_count = 3,
+        .keywords_capable = false,
     }));
     try std.testing.expectEqualStrings("Vocabulary (3 terms) \xe2\x80\x94 local only", openai.vocabulary.text());
     try std.testing.expectEqualStrings("Needs internet; unavailable on the Local backend", openai.backtrack_backend.text());
     try std.testing.expect(!openai.overlay.checked);
+}
+
+test "the Vocabulary suffix tracks the model's keywords capability, not the backend (#328)" {
+    // The row is worded from the SettingsView alone, so one Snapshot serves all three rows of
+    // the matrix — what varies is the backend and whether the configured model speaks keywords.
+    const s = snap(.{});
+
+    // Local: unchanged. The capability flag is about the OpenAI payload and says nothing here.
+    for ([_]bool{ true, false }) |capable| {
+        const local = presented(s, settingsFor(.{ .vocabulary_count = 3, .keywords_capable = capable }));
+        try std.testing.expectEqualStrings("Vocabulary (3 terms)\xe2\x80\xa6", local.vocabulary.text());
+    }
+
+    // OpenAI on a keywords-capable model: the list is live, so the inertness flag vanishes and
+    // the row reads identically to Local — the absence of the warning is the positive signal.
+    const capable = presented(s, settingsFor(.{
+        .selected_backend = .openai,
+        .vocabulary_count = 3,
+        .keywords_capable = true,
+    }));
+    try std.testing.expectEqualStrings("Vocabulary (3 terms)\xe2\x80\xa6", capable.vocabulary.text());
+
+    // OpenAI on gpt-realtime-whisper or an unknown model: the learned wording stays, unchanged.
+    const incapable = presented(s, settingsFor(.{
+        .selected_backend = .openai,
+        .vocabulary_count = 3,
+        .keywords_capable = false,
+    }));
+    try std.testing.expectEqualStrings("Vocabulary (3 terms) \xe2\x80\x94 local only", incapable.vocabulary.text());
+
+    // The empty-list wording follows the same condition.
+    try std.testing.expectEqualStrings("Vocabulary (off)", presented(s, settingsFor(.{
+        .selected_backend = .openai,
+        .keywords_capable = true,
+    })).vocabulary.text());
+    try std.testing.expectEqualStrings("Vocabulary (off) \xe2\x80\x94 local only", presented(s, settingsFor(.{
+        .selected_backend = .openai,
+        .keywords_capable = false,
+    })).vocabulary.text());
 }
 
 test "the radio checkmark follows the selected option, and a hand-edited value shows none" {
@@ -2044,6 +2101,20 @@ test "settingsView reads each group back, marking the flipped default model acti
     try std.testing.expectEqual(@as(?u8, 0), v.selected[6]); // .paste
     try std.testing.expectEqual(backend.Backend.openai, v.selected_backend);
     try std.testing.expectEqual(@as(usize, 0), v.vocabulary_count);
+    try std.testing.expect(v.keywords_capable); // the default model takes keywords
+}
+
+test "settingsView reads the keywords capability off the configured model (#328)" {
+    // One predicate, shared with the payload builder — the menu cannot claim biasing the
+    // session.update would withhold.
+    const live = config.Settings{ .model = "gpt-live-transcribe" };
+    const batch = config.Settings{ .model = "gpt-transcribe" };
+    const whisper = config.Settings{ .model = "gpt-realtime-whisper" };
+    const unknown = config.Settings{ .model = "gpt-6-transcribe-someday" };
+    try std.testing.expect(settingsView(&live).keywords_capable);
+    try std.testing.expect(settingsView(&batch).keywords_capable);
+    try std.testing.expect(!settingsView(&whisper).keywords_capable);
+    try std.testing.expect(!settingsView(&unknown).keywords_capable);
 }
 
 test "a pinned gpt-realtime-whisper still resolves to its own picker row" {
