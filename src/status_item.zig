@@ -653,6 +653,7 @@ pub const groups = [_]GroupDef{
         .{ .label = "Globe (fn)", .zon = ".globe" },
     } },
     .{ .title = "Model", .field = "model", .session_shaped = true, .openai_only = true, .opts = &.{
+        .{ .label = "gpt-live-transcribe", .zon = "\"gpt-live-transcribe\"" },
         .{ .label = "gpt-realtime-whisper", .zon = "\"gpt-realtime-whisper\"" },
     } },
     .{ .title = "Language", .field = "language", .session_shaped = true, .opts = &.{
@@ -692,6 +693,9 @@ pub const model_action_count = std.meta.fieldNames(ModelAction).len;
 /// `settingsView` reads them back to decide which option is checked.
 pub const talk_keys = [_]tapmod.TalkKey{ .right_option, .left_option, .globe };
 pub const backends = [_]backend.Backend{ .openai, .local };
+// gpt-live-transcribe first: the #303 default. gpt-realtime-whisper stays curated as
+// the config-only rollback (pin it to keep the pre-0.4.0 behavior).
+pub const models = [_][]const u8{ "gpt-live-transcribe", "gpt-realtime-whisper" };
 pub const languages = [_][]const u8{ "en", "sv", "" }; // "" = auto-detect (session omits the field)
 // "minimal" earned its slot via the issue #36 benchmark: ~30-50ms faster to Final
 // Transcript than "low" but measurably worse WER on quiet speech, so "low" stays the
@@ -719,8 +723,7 @@ pub const SettingsView = struct {
 };
 
 /// Project the live Settings Snapshot to its scalar view. The per-group search is the one
-/// place that knows a hand-edited value can match no preset; group 2 (`model`) has a single
-/// curated option, so it matches by string rather than by index.
+/// place that knows a hand-edited value can match no preset.
 pub fn settingsView(s: *const config.Settings) SettingsView {
     var view = SettingsView{
         .selected_backend = s.transcription_backend,
@@ -740,7 +743,9 @@ fn currentOption(s: *const config.Settings, gi: usize) ?u8 {
         1 => for (talk_keys, 0..) |k, i| {
             if (s.talk_key == k) return @intCast(i);
         },
-        2 => if (std.mem.eql(u8, s.model, "gpt-realtime-whisper")) return 0,
+        2 => for (models, 0..) |m, i| {
+            if (std.mem.eql(u8, s.model, m)) return @intCast(i);
+        },
         3 => for (languages, 0..) |l, i| {
             if (std.mem.eql(u8, s.language, l)) return @intCast(i);
         },
@@ -2027,18 +2032,35 @@ test "the radio checkmark follows the selected option, and a hand-edited value s
     for (0..max_group_opts) |oi| try std.testing.expect(!p.group_checked[0][oi]);
 }
 
-test "settingsView reads each group back, including the single-option model group" {
+test "settingsView reads each group back, marking the flipped default model active" {
     const defaults = config.Settings{};
     const v = settingsView(&defaults);
     try std.testing.expectEqual(@as(?u8, 0), v.selected[0]); // .openai
     try std.testing.expectEqual(@as(?u8, 0), v.selected[1]); // .right_option
-    try std.testing.expectEqual(@as(?u8, 0), v.selected[2]); // the one curated model
+    try std.testing.expectEqual(@as(?u8, 0), v.selected[2]); // "gpt-live-transcribe" (#303 default)
     try std.testing.expectEqual(@as(?u8, 0), v.selected[3]); // "en"
     try std.testing.expectEqual(@as(?u8, 1), v.selected[4]); // "low" is the second delay tier
     try std.testing.expectEqual(@as(?u8, 0), v.selected[5]); // .near_field
     try std.testing.expectEqual(@as(?u8, 0), v.selected[6]); // .paste
     try std.testing.expectEqual(backend.Backend.openai, v.selected_backend);
     try std.testing.expectEqual(@as(usize, 0), v.vocabulary_count);
+}
+
+test "a pinned gpt-realtime-whisper still resolves to its own picker row" {
+    // Configs that pinned the old default keep behaving — and keep their checkmark.
+    const pinned = config.Settings{ .model = "gpt-realtime-whisper" };
+    try std.testing.expectEqual(@as(?u8, 1), settingsView(&pinned).selected[2]);
+}
+
+test "the model picker rows and their typed twins agree" {
+    // menu.zig indexes `models` with the clicked row; the labels/zon text must be the
+    // same strings in the same order or the write path drifts from the presentation.
+    const model_group = groups[2];
+    try std.testing.expectEqual(models.len, model_group.opts.len);
+    for (models, model_group.opts) |m, opt| {
+        try std.testing.expectEqualStrings(m, std.mem.span(opt.label));
+        try std.testing.expect(std.mem.indexOf(u8, opt.zon, m) != null);
+    }
 }
 
 test "settingsView reports no checkmark for a hand-edited value outside the curated presets" {
