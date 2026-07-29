@@ -213,11 +213,24 @@ unintelligible rendition, which is the only thing this pass is offered as eviden
 `both`-is-worse gap and its total `wayfinder` failure did **not** survive voice pinning and
 should not be cited.
 
-## Open — real-voice confirmation
+## Scope — synthesized speech only, deliberately
 
-Everything above is synthesized speech. A confirmation pass on the author's own voice,
-mic, and dictation pace (`--audio-dir`, via `record.swift`) is outstanding; the ticket's
-brief called for real dictation audio, and TTS articulates jargon more cleanly than a human
-does, which if anything *understates* how much headroom `keywords` recovers. The direction
-of the result is not in doubt — a 40% → 92% recall gap does not invert — but the magnitude
-on real speech is unmeasured.
+Everything above is `say`-synthesized audio. The ticket's brief called for real dictation,
+and a confirmation pass on the author's own voice and mic was built (`--audio-dir`, via
+`record.swift`) but **consciously not run**: the 40% → 92% recall gap is far too large to
+invert, and the decisions waiting on this benchmark (which lever ships, whether a leakage
+guard is needed) turn on its direction, not its magnitude.
+
+What that leaves unmeasured, should it ever matter:
+
+- **The size of the `keywords` win on real speech.** TTS articulates jargon more cleanly
+  than a human does, so this pass most likely *understates* the recovered headroom — but
+  that is an argument, not a measurement.
+- **Leakage under real-world non-speech.** The provocations here were digital silence and
+  synthetic noise. Real room tone, keyboard clatter, and half-swallowed false starts are a
+  harder test, and the clean zero should be read as "does not reproduce under deliberate
+  provocation" rather than "cannot happen".
+- **`type-wave`'s hyphen** under a human's own pronunciation of the compound.
+
+The harness takes real audio unchanged (`--audio-dir DIR` with `L1.wav`…`L6.wav`), so any
+of these can be answered later without rebuilding anything.
