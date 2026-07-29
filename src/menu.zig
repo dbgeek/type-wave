@@ -808,8 +808,10 @@ fn onRadio(_: id, _: SEL, sender: id) callconv(.c) void {
     var next = m.store.current().*;
     applyOption(&next, gi, oi);
     m.commitSettings(next, g.field, g.opts[oi].zon, g.session_shaped);
-    // One apply re-checkmarks the group and re-words everything that tracks the backend —
-    // the Backtrack disclosure line and the Vocabulary item's `— local only` suffix (§4).
+    // One apply re-checkmarks the group and re-words everything that tracks the settings —
+    // the Backtrack disclosure line, and the Vocabulary item's `— local only` suffix, which
+    // follows the backend *and* the picked model's keywords capability
+    // (§4; openai-biasing-spec §3, #328).
     m.refreshSettings();
     feedback.log("  menu: {s} → {s}{s}\n", .{
         g.title,                                                                 g.opts[oi].label,

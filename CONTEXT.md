@@ -567,7 +567,10 @@ _Avoid_: renderer, painter (mechanism); menu, view, item (AppKit nouns)
 The scalar projection of the Settings Snapshot that `present` words the settings-shaped rows
 from — which curated option each radio group has selected (null where a hand-edited value
 matches no preset, so that group shows no checkmark), the Backtrack and Overlay flags, the
-vocabulary term count, and the settings-side backend. It exists because `config.Settings`
+vocabulary term count, the settings-side backend, and whether the configured model takes
+`keywords` biasing (one bool, from the same predicate the session.update payload gates on, so
+the Vocabulary row's `— local only` suffix marks only genuine inertness).
+It exists because `config.Settings`
 holds slices, which no comparable value can carry: reducing them to scalars is what keeps
 the Presentation comparable, and therefore what keeps the Chrome's early-out honest. The
 radio-group table lives beside it in `status_item.zig` — which option *reads* as selected is
