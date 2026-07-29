@@ -318,47 +318,6 @@ fn droppedItemsMessage(buf: []u8, dropped: usize) [:0]const u8 {
     return std.fmt.bufPrintSentinel(buf, "Dropped {d} {s} over the limit (100 characters per term, 128 terms max). The rest were saved.", .{ dropped, unit }, 0) catch "Some terms over the limit were dropped.";
 }
 
-/// Scratch size for `vocabularyInfoText`. The longest cell of the matrix below (149 bytes)
-/// plus the longest budget hint at the largest estimate the 128 × 100 load clamp can reach
-/// (74 bytes) is 223; the slack absorbs a copy edit without silently costing the hint, and a
-/// test proves the worst case still fits.
-const vocabulary_info_max = 256;
-
-/// The half of the dialog body that no axis moves — hoisted so the three arms below differ
-/// only where they actually differ.
-const vocabulary_guidance = "One term per line, most important first.";
-
-/// The dialog's informativeText (spec §3/§6): the always-present "one term per line"
-/// guidance plus the read-at-use behaviour, and — when the current list is near/over the
-/// conservative Whisper token budget (§2) — a soft, non-blocking truncation hint carrying
-/// the estimate. Advisory only; Save never blocks on it.
-///
-/// The behaviour half splits on the same axis as the row's ` — local only` suffix
-/// (openai-biasing-spec §3, #328): since #326 the shared list rides `session.update` as
-/// `keywords` on a keywords-capable model, and #327 re-binds it on a warm session, so on
-/// that cell the dialog opened from the row must not still say OpenAI ignores it. The
-/// incapable cell keeps the learned string for the same reason the row keeps its suffix —
-/// with that model selected the sentence is still true.
-///
-/// The budget hints stay unconditional. Their wording is already local-scoped, and the list
-/// is *shared*: an over-budget list really would have its tail truncated for local Whisper
-/// whichever backend happens to be selected today. There is no OpenAI-side budget hint —
-/// the live probe (#312) swallowed ~262 KB of keywords without complaint, leaving the
-/// 128 × 100 load clamp as the single size authority.
-fn vocabularyInfoText(buf: []u8, list: []const []const u8, selected: backend.Backend, keywords_capable: bool) [:0]const u8 {
-    const base = if (selected == .local)
-        vocabulary_guidance ++ " Biases the Local (Whisper) backend at your next dictation."
-    else if (keywords_capable)
-        vocabulary_guidance ++ " Biases OpenAI transcription from your next dictation, and the Local (Whisper) backend when you switch to it."
-    else
-        vocabulary_guidance ++ " Biases the Local (Whisper) backend at your next dictation; ignored on OpenAI.";
-    return switch (vocab.budget(list)) {
-        .ok => std.fmt.bufPrintSentinel(buf, "{s}", .{base}, 0) catch base,
-        .near => std.fmt.bufPrintSentinel(buf, "{s} Getting long (~{d} tokens) — nearing the local Whisper limit.", .{ base, vocab.estimateTokens(list) }, 0) catch base,
-        .over => std.fmt.bufPrintSentinel(buf, "{s} Long list (~{d} tokens) — the tail may be truncated for local Whisper.", .{ base, vocab.estimateTokens(list) }, 0) catch base,
-    };
-}
-
 // =====================================================================================
 // The Menu. One instance for the process lifetime; the C-ABI action handlers reach it
 // through the module-level pointer (they receive only ObjC's self/_cmd/sender).
@@ -1208,74 +1167,6 @@ test "droppedItemsMessage pluralizes and names the structural caps" {
     try std.testing.expect(std.mem.indexOf(u8, many, "128 terms max") != null);
 }
 
-/// Filler terms — sized, not realistic, so the budget arithmetic below stays legible.
-/// `budget_filler` at 50 chars parks a list on a chosen `vocab.budget` cell (× 10 is `.near`,
-/// × 20 is `.over`); `max_item_filler` is `config.clampVocabulary`'s 100-char ceiling.
-fn fillerTerm(comptime n: usize) [n]u8 {
-    var b: [n]u8 = undefined;
-    @memset(&b, 'a');
-    return b;
-}
-const budget_filler = fillerTerm(50);
-const max_item_filler = fillerTerm(100);
-
-test "vocabularyInfoText always guides, and adds a soft hint only when near/over budget" {
-    var buf: [vocabulary_info_max]u8 = undefined;
-    const short = vocabularyInfoText(&buf, &.{ "type-wave", "whisper.cpp" }, .local, false);
-    try std.testing.expect(std.mem.indexOf(u8, short, "One term per line") != null);
-    try std.testing.expect(std.mem.indexOf(u8, short, "tokens") == null); // no hint when well within budget
-
-    // A list past the conservative Whisper budget trips the soft, non-blocking hint (§6).
-    const backing: [20][]const u8 = @splat(&budget_filler);
-    const long = vocabularyInfoText(&buf, &backing, .local, false);
-    try std.testing.expect(std.mem.indexOf(u8, long, "truncated") != null);
-    try std.testing.expect(std.mem.indexOf(u8, long, "tokens") != null);
-}
-
-test "vocabularyInfoText words the base sentence for where the list actually applies" {
-    // The three cells of the openai-biasing-spec §3 matrix, each crossed with one budget
-    // state — the hints are backend-blind, so a cell's base sentence must survive them.
-    var buf: [vocabulary_info_max]u8 = undefined;
-    const backing: [20][]const u8 = @splat(&budget_filler);
-
-    // local, .ok — the dialog claims nothing at all about OpenAI. The row reads `local | any`,
-    // so capability must not reach the sentence at all on this backend.
-    for ([_]bool{ true, false }) |capable| {
-        try std.testing.expectEqualStrings(
-            "One term per line, most important first. Biases the Local (Whisper) backend at your next dictation.",
-            vocabularyInfoText(&buf, &.{"type-wave"}, .local, capable),
-        );
-    }
-
-    // openai + keywords-capable, .near — the list rides session.update there (#326/#327),
-    // so the stale "ignored on OpenAI" clause is gone.
-    const capable = vocabularyInfoText(&buf, backing[0..10], .openai, true);
-    try std.testing.expect(std.mem.indexOf(u8, capable, "Biases OpenAI transcription from your next dictation") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capable, "ignored on OpenAI") == null);
-    try std.testing.expect(std.mem.indexOf(u8, capable, "nearing the local Whisper limit") != null);
-
-    // openai + incapable, .over — byte-identical to the learned pre-#326 string, plus the
-    // unchanged over-budget hint.
-    const incapable = vocabularyInfoText(&buf, &backing, .openai, false);
-    try std.testing.expect(std.mem.startsWith(
-        u8,
-        incapable,
-        "One term per line, most important first. Biases the Local (Whisper) backend at your next dictation; ignored on OpenAI.",
-    ));
-    try std.testing.expect(std.mem.indexOf(u8, incapable, "the tail may be truncated for local Whisper") != null);
-}
-
-test "vocabulary_info_max holds the longest sentence the matrix can produce" {
-    // The fallback on overflow silently drops the budget hint, so the buffer is sized here
-    // rather than eyeballed: worst case is the longest base + the longest hint at a token
-    // estimate the 128 x 100 load clamp can actually reach.
-    const backing: [128][]const u8 = @splat(&max_item_filler); // config.clampVocabulary's caps
-    var buf: [vocabulary_info_max]u8 = undefined;
-    const longest = vocabularyInfoText(&buf, &backing, .openai, true);
-    try std.testing.expect(std.mem.indexOf(u8, longest, "tokens") != null); // no fallback taken
-    try std.testing.expect(longest.len < vocabulary_info_max);
-}
-
 test "the Status Item Chrome contract holds for the production adapter" {
     // Unlike the Helper and Session Transport seams, whose contracts nothing invokes, this one
     // is asserted by StatusItem(Chrome) itself — including for AppKitChrome, which no test can
@@ -1348,17 +1239,18 @@ fn onVocabulary(_: id, _: SEL, _: id) callconv(.c) void {
 
     const alert = msg(msg(cls("NSAlert"), "alloc"), "init");
     msg1v(alert, "setMessageText:", nsstr("Edit Vocabulary"));
-    var info_buf: [vocabulary_info_max]u8 = undefined;
-    // The body's two axes come off `settingsView` rather than the raw Settings, so the dialog
-    // and the row that opened it read *the same* backend and the same `keywords_capable` —
-    // including its withhold-on-unknown default — instead of a second derivation that could
-    // drift (§3, #333; ADR-0011's defect 9 is what that would re-create).
+    var info_buf: [status_item.vocabulary_info_max]u8 = undefined;
+    // The body is worded from the *same* `VocabularyReach` the row that opened it carries —
+    // one verdict off `settingsView`, including its withhold-on-unknown default, rather than a
+    // second derivation that could drift (§3, #333; ADR-0011's defect 9 is what that would
+    // re-create). The wording itself lives in status_item.zig, as every Status Item string
+    // does; only the on-demand call is here, because the budget hint needs the live term list
+    // the Presentation deliberately does not carry.
     const view = status_item.settingsView(current);
-    msg1v(alert, "setInformativeText:", nsstr(vocabularyInfoText(
+    msg1v(alert, "setInformativeText:", nsstr(status_item.vocabularyInfoText(
         &info_buf,
         current.vocabulary,
-        view.selected_backend,
-        view.keywords_capable,
+        view.vocabulary_reach,
     ).ptr));
     _ = msg1(alert, "addButtonWithTitle:", nsstr("Save"));
     _ = msg1(alert, "addButtonWithTitle:", nsstr("Cancel"));

@@ -225,6 +225,42 @@ Worker, which is what serializes a deletion against dictation. Sibling of the In
 Runner, which owns the other three cursor paths under the same rule (ADR-0009).
 _Avoid_: undo manager, deletion engine, trigger (that named only the discarded run-loop half)
 
+**Vocabulary**:
+The user-curated flat list of terms that nudges the recognizer's spelling of names, jargon
+and code identifiers (docs/vocab-biasing-spec.md). One list, **two shapes**, because the two
+Transcription Backends take biasing differently: the local backend gets a bare comma glossary
+as Whisper's `initial_prompt`, self-truncated **drop-tail / keep-head** at whole-term
+boundaries to a conservative token budget so Whisper's own silent head-drop (#162) never eats
+the user's leading — most important — terms; OpenAI gets a JSON string array as the
+`session.update` `keywords` field, never truncated, with any term containing `<`, `>`, CR or
+LF **dropped whole** because one such term bounces the entire update (openai-biasing-spec).
+Read at Talk Key press and pinned with the Lease on the local path; on OpenAI it binds at
+connect and re-binds on a warm session when the list is edited (#327). Structurally clamped
+once at load — 100 chars per term, 128 terms, no dedup, order preserved (`config.zig`) — and
+turned into each backend's shape by `vocab.zig`, whose thresholds are private: callers want
+the verdict, not the numbers.
+_Avoid_: glossary (that names only the Whisper shape), keywords (only the OpenAI shape),
+phrase list, custom words
+
+**Vocabulary Reach**:
+Where a Vocabulary actually reaches, given the selected Transcription Backend and whether the
+configured model takes `keywords` — the single **verdict** both the Status Item's Vocabulary
+row and the dialog it opens are worded from, derived once in `settingsView`. Three values:
+`local` (Local is selected, so it biases Whisper at the next dictation and OpenAI's capability
+is beside the point), `both` (OpenAI on a capable model — the terms ride `session.update` now
+*and* bias Whisper on a switch), and `local_only` (OpenAI on a model that takes no `keywords`:
+the list is **inert on the backend actually transcribing**). Only that third cell earns the
+row's ` — local only` suffix and the dialog's "ignored on OpenAI" clause — which is the whole
+point of the verdict existing: the row and the dialog previously re-derived inertness from the
+raw axes in two different shapes, and a dialog opened from a row must never contradict it
+(ADR-0011's defect 9). It defaults to `local_only`, mirroring the payload gate's
+withhold-on-unknown posture: a view built without an answer keeps the warning rather than
+claiming a biasing the payload would withhold. `local` and `local_only` both mean "only
+Whisper is biased today" and differ *only* in whether OpenAI is selected and ignoring the
+list — which is exactly what the user needs told.
+_Avoid_: keywords capability (that is one of the two axes, not the verdict), inert flag
+(names only the third cell), biasing mode
+
 **Backtrack**:
 The opt-in rewrite pass between an Utterance's Final Transcript and its Insertion
 (docs/backtrack-spec.md): one OpenAI call applies spoken self-corrections ("at 20:00 no
@@ -567,9 +603,8 @@ _Avoid_: renderer, painter (mechanism); menu, view, item (AppKit nouns)
 The scalar projection of the Settings Snapshot that `present` words the settings-shaped rows
 from — which curated option each radio group has selected (null where a hand-edited value
 matches no preset, so that group shows no checkmark), the Backtrack and Overlay flags, the
-vocabulary term count, the settings-side backend, and whether the configured model takes
-`keywords` biasing (one bool, from the same predicate the session.update payload gates on, so
-the Vocabulary row's `— local only` suffix marks only genuine inertness).
+vocabulary term count, the settings-side backend, and the **Vocabulary Reach** — the verdict
+the Vocabulary row and its dialog are both worded from, rather than the two axes behind it.
 It exists because `config.Settings`
 holds slices, which no comparable value can carry: reducing them to scalars is what keeps
 the Presentation comparable, and therefore what keeps the Chrome's early-out honest. The

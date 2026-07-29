@@ -8,30 +8,32 @@
 //!     never bites the user's most-important (leading) terms.
 //!   * `writeKeywordsJson` — the JSON string array carried as the OpenAI
 //!     `session.update` `keywords` field (openai-biasing-spec §2).
-//!   * `estimateTokens` / `budget` — the conservative token projection that drives the
-//!     menu's soft, non-blocking "long list" hint. Whisper-only: the OpenAI path has
-//!     no truncation and no budget state (openai-biasing-spec §2).
+//!   * `budget` — the conservative token projection that drives the menu's soft,
+//!     non-blocking "long list" hint. Whisper-only: the OpenAI path has no truncation
+//!     and no budget state (openai-biasing-spec §2).
 //!
 //! The chars→token heuristic is single-homed here (spec §2: "numbers tunable and
 //! centralized") so construction and the menu hint can never disagree about the budget.
+//! The thresholds are **private**: they are tuning, not interface, and every caller wants
+//! the verdict rather than the numbers behind it.
 
 const std = @import("std");
 
 /// Conservative chars→token divisor. Real English runs ~4 chars/token; glossary terms
 /// (names, jargon, code identifiers) tokenize worse, so dividing by 3 **over-counts**
 /// tokens and buys head-room below Whisper's hard cap. Tunable.
-pub const chars_per_token: usize = 3;
+const chars_per_token: usize = 3;
 
 /// Target token budget for the constructed glossary — the ceiling `buildPrompt`
 /// truncates to. Sized well below Whisper's ~223-BPE cap (#162, 448/2) so the string we
 /// actually send always survives Whisper's own truncation intact, keeping keep-head
 /// safe. Tunable.
-pub const target_tokens: usize = 180;
+const target_tokens: usize = 180;
 
 /// "Getting long" advisory threshold for the menu hint — below `target_tokens` so the
 /// user sees the soft warning on the run-up, before construction actually starts
 /// dropping tail items. Tunable.
-pub const near_tokens: usize = 150;
+const near_tokens: usize = 150;
 
 /// Character budget the glossary is truncated to: target tokens × chars/token.
 const budget_chars: usize = target_tokens * chars_per_token;
@@ -39,8 +41,11 @@ const budget_chars: usize = target_tokens * chars_per_token;
 /// The glossary joiner. `buildPrompt` and the char-counting helpers must agree on it.
 const separator = ", ";
 
-/// Tri-state budget signal for the dialog's soft, non-blocking hint (spec §6).
-pub const Budget = enum { ok, near, over };
+/// Tri-state budget signal for the dialog's soft, non-blocking hint (spec §6). The token
+/// estimate rides the two arms that actually print one: the `.ok` cell shows no number, so
+/// it carries none, and a caller cannot obtain an estimate it is not going to display —
+/// nor forget one where the wording needs it.
+pub const Budget = union(enum) { ok, near: usize, over: usize };
 
 /// Total character length of the bare comma glossary for `list`, without building it —
 /// each item's own bytes plus a 2-byte ", " before every item after the first. Empty
@@ -56,8 +61,10 @@ fn glossaryChars(list: []const []const u8) usize {
 
 /// Conservative token estimate for the **full, untruncated** glossary built from `list` —
 /// what the menu warns against, before `buildPrompt` truncates to fit. Ceil-divides so a
-/// non-empty list is never estimated at zero tokens; empty list ⇒ 0.
-pub fn estimateTokens(list: []const []const u8) usize {
+/// non-empty list is never estimated at zero tokens; empty list ⇒ 0. Private: it reaches
+/// callers inside the `Budget` arms that print it, so the estimate and the classification
+/// it was made against are always the same list's.
+fn estimateTokens(list: []const []const u8) usize {
     const chars = glossaryChars(list);
     if (chars == 0) return 0;
     return (chars + chars_per_token - 1) / chars_per_token; // ceil-divide, conservative
@@ -68,8 +75,8 @@ pub fn estimateTokens(list: []const []const u8) usize {
 /// `.near` on the advisory run-up, `.ok` otherwise. Advisory only — never blocks a Save.
 pub fn budget(list: []const []const u8) Budget {
     const est = estimateTokens(list);
-    if (est > target_tokens) return .over;
-    if (est > near_tokens) return .near;
+    if (est > target_tokens) return .{ .over = est };
+    if (est > near_tokens) return .{ .near = est };
     return .ok;
 }
 
@@ -205,9 +212,16 @@ test "budget crosses ok → near → over at the expected list sizes" {
     var first_near: ?usize = null;
     var first_over: ?usize = null;
     for (1..backing.len + 1) |n| {
-        const b = budget(backing[0..n]);
-        if (b != .ok and first_near == null) first_near = n;
-        if (b == .over and first_over == null) first_over = n;
+        switch (budget(backing[0..n])) {
+            .ok => {},
+            .near => if (first_near == null) {
+                first_near = n;
+            },
+            .over => {
+                if (first_near == null) first_near = n;
+                if (first_over == null) first_over = n;
+            },
+        }
     }
     try std.testing.expect(first_near != null);
     try std.testing.expect(first_over != null);
@@ -218,11 +232,25 @@ test "budget crosses ok → near → over at the expected list sizes" {
     try std.testing.expect(estimateTokens(backing[0 .. first_over.? - 1]) <= target_tokens);
 }
 
+test "the budget carries the estimate on exactly the arms that print one" {
+    // The whole point of the union: `.ok` has no number to show, and `.near` / `.over`
+    // carry the estimate for the very list they classified — the menu can no longer hint
+    // with a token count taken from a different list than the one it judged.
+    try std.testing.expectEqual(Budget.ok, budget(&.{}));
+    const term = repeated('t', 30);
+    var backing: [40][]const u8 = undefined;
+    for (&backing) |*slot| slot.* = term;
+    switch (budget(&backing)) {
+        .over => |tokens| try std.testing.expectEqual(estimateTokens(&backing), tokens),
+        else => return error.ExpectedOverBudget,
+    }
+}
+
 test "budget agrees with buildPrompt: an .over list is the one that gets truncated" {
     const term = repeated('a', 50);
     var backing: [15][]const u8 = undefined;
     for (&backing) |*slot| slot.* = term;
-    try std.testing.expectEqual(Budget.over, budget(&backing));
+    try std.testing.expect(budget(&backing) == .over);
 
     const prompt = try buildPrompt(talloc, &backing);
     defer talloc.free(prompt);
