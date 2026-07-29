@@ -31,6 +31,7 @@ const secure_input = @import("secure_input.zig");
 const session = @import("session.zig");
 const tapmod = @import("tap.zig");
 const insertmod = @import("insert.zig");
+const vocab = @import("vocab.zig");
 
 pub const Installation = enum {
     absent,
@@ -801,13 +802,39 @@ pub const SettingsView = struct {
     backtrack: bool = false,
     overlay: bool = true,
     vocabulary_count: usize = 0,
-    /// Does the configured model take the `keywords` biasing field? One bool rather than the
-    /// model string, so the `Presentation` stays `std.meta.eql`-comparable; the answer comes
-    /// from the same predicate the session.update payload gates on (#328). Defaults **false**
-    /// to mirror that gate's withhold-on-unknown posture: a view built without an answer must
-    /// not drop the ` — local only` suffix and claim biasing the payload would withhold.
-    keywords_capable: bool = false,
+    /// Where the vocabulary reaches — the verdict, not the axes it is read from. Defaults to
+    /// `.local_only` so a view built without an answer keeps the ` — local only` suffix
+    /// rather than claiming biasing the payload would withhold (see `VocabularyReach`).
+    vocabulary_reach: VocabularyReach = .local_only,
 };
+
+/// Where a non-empty vocabulary actually reaches, given the selected backend and whether the
+/// configured model takes OpenAI's `keywords` biasing field. The **verdict** both the
+/// Vocabulary row and the dialog it opens are worded from — derived once, in `settingsView`,
+/// so neither can re-branch on the raw axes and drift from the other (#328; ADR-0011 defect 9
+/// is what a second derivation would re-create).
+///
+/// `.local` and `.local_only` both mean "only local Whisper is biased today"; they differ in
+/// whether OpenAI is *selected and ignoring the list*, which is the entire reason the row
+/// carries a warning suffix in one case and not the other.
+pub const VocabularyReach = enum {
+    /// Local is the selected backend: the list biases it at the next dictation. OpenAI's
+    /// capability is beside the point — it is not transcribing.
+    local,
+    /// OpenAI is selected on a keywords-capable model: the list rides `session.update` as
+    /// `keywords` now (#326) and biases local Whisper too when the user switches.
+    both,
+    /// OpenAI is selected on a model that takes no `keywords`: the list is **inert** on the
+    /// backend actually transcribing, and only biases local Whisper. The one cell that earns
+    /// the ` — local only` suffix and the "ignored on OpenAI" sentence.
+    local_only,
+};
+
+/// The one derivation of the reach verdict from the live settings.
+fn vocabularyReach(s: *const config.Settings) VocabularyReach {
+    if (s.transcription_backend == .local) return .local;
+    return if (session.modelSpeaksKeywords(s.model)) .both else .local_only;
+}
 
 /// Project the live Settings Snapshot to its scalar view. The per-group search is the one
 /// place that knows a hand-edited value can match no preset.
@@ -817,7 +844,7 @@ pub fn settingsView(s: *const config.Settings) SettingsView {
         .backtrack = s.backtrack,
         .overlay = s.overlay,
         .vocabulary_count = s.vocabulary.len,
-        .keywords_capable = session.modelSpeaksKeywords(s.model),
+        .vocabulary_reach = vocabularyReach(s),
     };
     for (0..group_count) |gi| view.selected[gi] = currentOption(s, gi);
     return view;
@@ -942,16 +969,17 @@ fn failureFallbackText(failure: ModelFailure) []const u8 {
 /// applies: `Vocabulary (off)` / `Vocabulary (3 terms)…`, plus a ` — local only` suffix that
 /// replaces the disclosure ellipsis wherever the list is inert.
 ///
-/// Inert means OpenAI **on a model that cannot take `keywords`** — since #326 a capable model
-/// binds the same terms as biasing, so the row drops the suffix and reads identically to Local
-/// (openai-biasing-spec §3). The flag marks inertness only; the normal case gets no
-/// `— biasing active` chrome, and the absence of the warning is the positive signal. For the
-/// incapable cell ` — local only` stays literally true, so the learned string is kept rather
-/// than a second phrase minted. Static fallback on the (unreachable) format overflow.
+/// Inert is `VocabularyReach.local_only` — OpenAI **on a model that cannot take `keywords`**.
+/// Since #326 a capable model binds the same terms as biasing, so the row drops the suffix and
+/// reads identically to Local (openai-biasing-spec §3). The suffix marks inertness only; the
+/// normal case gets no `— biasing active` chrome, and the absence of the warning is the
+/// positive signal. For the incapable cell ` — local only` stays literally true, so the learned
+/// string is kept rather than a second phrase minted. Static fallback on the (unreachable)
+/// format overflow.
 const local_only_suffix = " \xe2\x80\x94 local only";
 const dialog_ellipsis = "\xe2\x80\xa6";
-fn vocabularyText(buf: []u8, count: usize, selected: backend.Backend, keywords_capable: bool) []const u8 {
-    const inert = selected == .openai and !keywords_capable;
+fn vocabularyText(buf: []u8, count: usize, reach: VocabularyReach) []const u8 {
+    const inert = reach == .local_only;
     if (count == 0)
         return std.fmt.bufPrint(buf, "Vocabulary (off){s}", .{
             if (inert) local_only_suffix else "",
@@ -959,6 +987,51 @@ fn vocabularyText(buf: []u8, count: usize, selected: backend.Backend, keywords_c
     const unit = if (count == 1) "term" else "terms";
     const tail = if (inert) local_only_suffix else dialog_ellipsis;
     return std.fmt.bufPrint(buf, "Vocabulary ({d} {s}){s}", .{ count, unit, tail }) catch "Vocabulary";
+}
+
+/// Scratch size for `vocabularyInfoText`. The longest cell of the matrix below (149 bytes)
+/// plus the longest budget hint at the largest estimate the 128 × 100 load clamp can reach
+/// (74 bytes) is 223; the slack absorbs a copy edit without silently costing the hint, and a
+/// test proves the worst case still fits.
+pub const vocabulary_info_max = 256;
+
+/// The half of the dialog body that no axis moves — hoisted so the three arms below differ
+/// only where they actually differ.
+const vocabulary_guidance = "One term per line, most important first.";
+
+/// The Vocabulary dialog's informativeText (spec §3/§6): the always-present "one term per
+/// line" guidance plus the read-at-use behaviour, and — when the current list is near/over the
+/// conservative Whisper token budget (§2) — a soft, non-blocking truncation hint carrying the
+/// estimate. Advisory only; Save never blocks on it.
+///
+/// It is worded from the **same `VocabularyReach`** as the row's ` — local only` suffix, one
+/// arm per variant, because the dialog opened from a row must not contradict it: since #326
+/// the shared list rides `session.update` as `keywords` on a capable model and #327 re-binds
+/// it on a warm session, so on that cell the dialog must not still say OpenAI ignores it. The
+/// `.local_only` arm keeps the learned sentence for the same reason the row keeps its suffix —
+/// with that model selected it is still true.
+///
+/// The wording lives here rather than in menu.zig (ADR-0011: every string the Status Item
+/// shows is decided in this module) but is called on demand when the dialog opens, not
+/// projected: it needs the live term list for `vocab.budget`, and the `Presentation`
+/// deliberately carries only `vocabulary_count`.
+///
+/// The budget hints stay unconditional. Their wording is already local-scoped, and the list
+/// is *shared*: an over-budget list really would have its tail truncated for local Whisper
+/// whichever backend happens to be selected today. There is no OpenAI-side budget hint —
+/// the live probe (#312) swallowed ~262 KB of keywords without complaint, leaving the
+/// 128 × 100 load clamp as the single size authority.
+pub fn vocabularyInfoText(buf: []u8, list: []const []const u8, reach: VocabularyReach) [:0]const u8 {
+    const base = switch (reach) {
+        .local => vocabulary_guidance ++ " Biases the Local (Whisper) backend at your next dictation.",
+        .both => vocabulary_guidance ++ " Biases OpenAI transcription from your next dictation, and the Local (Whisper) backend when you switch to it.",
+        .local_only => vocabulary_guidance ++ " Biases the Local (Whisper) backend at your next dictation; ignored on OpenAI.",
+    };
+    return switch (vocab.budget(list)) {
+        .ok => std.fmt.bufPrintSentinel(buf, "{s}", .{base}, 0) catch base,
+        .near => |tokens| std.fmt.bufPrintSentinel(buf, "{s} Getting long (~{d} tokens) — nearing the local Whisper limit.", .{ base, tokens }, 0) catch base,
+        .over => |tokens| std.fmt.bufPrintSentinel(buf, "{s} Long list (~{d} tokens) — the tail may be truncated for local Whisper.", .{ base, tokens }, 0) catch base,
+    };
 }
 
 /// The Recent Insertions parent row: an empty ring reads as a disabled row with no arrow,
@@ -1169,7 +1242,7 @@ pub fn present(out: *Presentation, s: Snapshot, sv: SettingsView, reveal: Reveal
     out.backtrack.checked = sv.backtrack;
     setText(&out.backtrack_backend, backtrackLine2(sv.selected_backend, sv.backtrack));
     var vocab_buf: [max_title]u8 = undefined;
-    setText(&out.vocabulary, vocabularyText(&vocab_buf, sv.vocabulary_count, sv.selected_backend, sv.keywords_capable));
+    setText(&out.vocabulary, vocabularyText(&vocab_buf, sv.vocabulary_count, sv.vocabulary_reach));
 
     setText(&out.installation, installationText(s.installation));
     const identity_hidden = s.installation_identity == null;
@@ -1823,7 +1896,11 @@ fn settingsFor(fields: struct {
     backtrack: bool = false,
     overlay: bool = true,
     vocabulary_count: usize = 0,
-    keywords_capable: bool = false, // mirrors the field's withhold-on-unknown default
+    /// `.local` to stay consistent with this fixture's `.local` backend default — the two are
+    /// one verdict in production, so a fixture pairing Local with `.local_only` would assert
+    /// against a state `settingsView` cannot produce. The real field's withhold-on-unknown
+    /// default is `.local_only` and is tested on `SettingsView{}` directly.
+    vocabulary_reach: VocabularyReach = .local,
 }) SettingsView {
     return .{
         .selected = fields.selected,
@@ -1831,7 +1908,7 @@ fn settingsFor(fields: struct {
         .backtrack = fields.backtrack,
         .overlay = fields.overlay,
         .vocabulary_count = fields.vocabulary_count,
-        .keywords_capable = fields.keywords_capable,
+        .vocabulary_reach = fields.vocabulary_reach,
     };
 }
 
@@ -2102,30 +2179,29 @@ test "the settings-shaped rows are worded from the live Settings, not the Snapsh
         .backtrack = true,
         .overlay = false,
         .vocabulary_count = 3,
-        .keywords_capable = false,
+        .vocabulary_reach = .local_only,
     }));
     try std.testing.expectEqualStrings("Vocabulary (3 terms) \xe2\x80\x94 local only", openai.vocabulary.text());
     try std.testing.expectEqualStrings("Needs internet; unavailable on the Local backend", openai.backtrack_backend.text());
     try std.testing.expect(!openai.overlay.checked);
 }
 
-test "the Vocabulary suffix tracks the model's keywords capability, not the backend (#328)" {
-    // The row is worded from the SettingsView alone, so one Snapshot serves all three rows of
-    // the matrix — what varies is the backend and whether the configured model speaks keywords.
+test "the Vocabulary suffix marks the one reach that is inert (#328)" {
+    // The row is worded from the SettingsView alone, so one Snapshot serves all three cells —
+    // what varies is only where the list reaches.
     const s = snap(.{});
 
-    // Local: unchanged. The capability flag is about the OpenAI payload and says nothing here.
-    for ([_]bool{ true, false }) |capable| {
-        const local = presented(s, settingsFor(.{ .vocabulary_count = 3, .keywords_capable = capable }));
-        try std.testing.expectEqualStrings("Vocabulary (3 terms)\xe2\x80\xa6", local.vocabulary.text());
-    }
+    // Local selected: no suffix. Reaching `.local` is what says the capability never mattered
+    // here — it is not a term in that verdict at all.
+    const local = presented(s, settingsFor(.{ .vocabulary_count = 3, .vocabulary_reach = .local }));
+    try std.testing.expectEqualStrings("Vocabulary (3 terms)\xe2\x80\xa6", local.vocabulary.text());
 
     // OpenAI on a keywords-capable model: the list is live, so the inertness flag vanishes and
     // the row reads identically to Local — the absence of the warning is the positive signal.
     const capable = presented(s, settingsFor(.{
         .selected_backend = .openai,
         .vocabulary_count = 3,
-        .keywords_capable = true,
+        .vocabulary_reach = .both,
     }));
     try std.testing.expectEqualStrings("Vocabulary (3 terms)\xe2\x80\xa6", capable.vocabulary.text());
 
@@ -2133,19 +2209,99 @@ test "the Vocabulary suffix tracks the model's keywords capability, not the back
     const incapable = presented(s, settingsFor(.{
         .selected_backend = .openai,
         .vocabulary_count = 3,
-        .keywords_capable = false,
+        .vocabulary_reach = .local_only,
     }));
     try std.testing.expectEqualStrings("Vocabulary (3 terms) \xe2\x80\x94 local only", incapable.vocabulary.text());
 
     // The empty-list wording follows the same condition.
     try std.testing.expectEqualStrings("Vocabulary (off)", presented(s, settingsFor(.{
         .selected_backend = .openai,
-        .keywords_capable = true,
+        .vocabulary_reach = .both,
     })).vocabulary.text());
     try std.testing.expectEqualStrings("Vocabulary (off) \xe2\x80\x94 local only", presented(s, settingsFor(.{
         .selected_backend = .openai,
-        .keywords_capable = false,
+        .vocabulary_reach = .local_only,
     })).vocabulary.text());
+}
+
+/// Filler terms — sized, not realistic, so the budget arithmetic below stays legible.
+/// `budget_filler` at 50 chars parks a list on a chosen `vocab.budget` cell (× 10 is `.near`,
+/// × 20 is `.over`); `max_item_filler` is `config.clampVocabulary`'s 100-char ceiling.
+fn fillerTerm(comptime n: usize) [n]u8 {
+    var b: [n]u8 = undefined;
+    @memset(&b, 'a');
+    return b;
+}
+const budget_filler = fillerTerm(50);
+const max_item_filler = fillerTerm(100);
+
+test "vocabularyInfoText always guides, and adds a soft hint only when near/over budget" {
+    var buf: [vocabulary_info_max]u8 = undefined;
+    const short = vocabularyInfoText(&buf, &.{ "type-wave", "whisper.cpp" }, .local);
+    try std.testing.expect(std.mem.indexOf(u8, short, "One term per line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, short, "tokens") == null); // no hint when well within budget
+
+    // A list past the conservative Whisper budget trips the soft, non-blocking hint (§6).
+    const backing: [20][]const u8 = @splat(&budget_filler);
+    const long = vocabularyInfoText(&buf, &backing, .local);
+    try std.testing.expect(std.mem.indexOf(u8, long, "truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, long, "tokens") != null);
+}
+
+test "vocabularyInfoText words the base sentence for where the list actually reaches" {
+    // One arm per reach, each crossed with one budget state — the hints are reach-blind, so a
+    // cell's base sentence must survive them.
+    var buf: [vocabulary_info_max]u8 = undefined;
+    const backing: [20][]const u8 = @splat(&budget_filler);
+
+    // .local, .ok — the dialog claims nothing at all about OpenAI.
+    try std.testing.expectEqualStrings(
+        "One term per line, most important first. Biases the Local (Whisper) backend at your next dictation.",
+        vocabularyInfoText(&buf, &.{"type-wave"}, .local),
+    );
+
+    // .both, .near — the list rides session.update there (#326/#327), so the stale
+    // "ignored on OpenAI" clause is gone.
+    const capable = vocabularyInfoText(&buf, backing[0..10], .both);
+    try std.testing.expect(std.mem.indexOf(u8, capable, "Biases OpenAI transcription from your next dictation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capable, "ignored on OpenAI") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capable, "nearing the local Whisper limit") != null);
+
+    // .local_only, .over — byte-identical to the learned pre-#326 string, plus the unchanged
+    // over-budget hint.
+    const incapable = vocabularyInfoText(&buf, &backing, .local_only);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        incapable,
+        "One term per line, most important first. Biases the Local (Whisper) backend at your next dictation; ignored on OpenAI.",
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, incapable, "the tail may be truncated for local Whisper") != null);
+}
+
+test "the dialog and the row agree on every reach" {
+    // The pairing ADR-0011's defect 9 is about: both are worded from one verdict, so the cell
+    // that warns in the row is exactly the cell that says "ignored on OpenAI" in the dialog.
+    var info_buf: [vocabulary_info_max]u8 = undefined;
+    var row_buf: [128]u8 = undefined;
+    for ([_]VocabularyReach{ .local, .both, .local_only }) |reach| {
+        const row = vocabularyText(&row_buf, 3, reach);
+        const info = vocabularyInfoText(&info_buf, &.{"type-wave"}, reach);
+        try std.testing.expectEqual(
+            std.mem.indexOf(u8, row, "local only") != null,
+            std.mem.indexOf(u8, info, "ignored on OpenAI") != null,
+        );
+    }
+}
+
+test "vocabulary_info_max holds the longest sentence the matrix can produce" {
+    // The fallback on overflow silently drops the budget hint, so the buffer is sized here
+    // rather than eyeballed: worst case is the longest base + the longest hint at a token
+    // estimate the 128 x 100 load clamp can actually reach.
+    const backing: [128][]const u8 = @splat(&max_item_filler); // config.clampVocabulary's caps
+    var buf: [vocabulary_info_max]u8 = undefined;
+    const longest = vocabularyInfoText(&buf, &backing, .both);
+    try std.testing.expect(std.mem.indexOf(u8, longest, "tokens") != null); // no fallback taken
+    try std.testing.expect(longest.len < vocabulary_info_max);
 }
 
 test "the radio checkmark follows the selected option, and a hand-edited value shows none" {
@@ -2170,20 +2326,35 @@ test "settingsView reads each group back, marking the flipped default model acti
     try std.testing.expectEqual(@as(?u8, 0), v.selected[6]); // .paste
     try std.testing.expectEqual(backend.Backend.openai, v.selected_backend);
     try std.testing.expectEqual(@as(usize, 0), v.vocabulary_count);
-    try std.testing.expect(v.keywords_capable); // the default model takes keywords
+    try std.testing.expectEqual(VocabularyReach.both, v.vocabulary_reach); // default model takes keywords
 }
 
-test "settingsView reads the keywords capability off the configured model (#328)" {
-    // One predicate, shared with the payload builder — the menu cannot claim biasing the
-    // session.update would withhold.
-    const live = config.Settings{ .model = "gpt-live-transcribe" };
-    const batch = config.Settings{ .model = "gpt-transcribe" };
-    const whisper = config.Settings{ .model = "gpt-realtime-whisper" };
-    const unknown = config.Settings{ .model = "gpt-6-transcribe-someday" };
-    try std.testing.expect(settingsView(&live).keywords_capable);
-    try std.testing.expect(settingsView(&batch).keywords_capable);
-    try std.testing.expect(!settingsView(&whisper).keywords_capable);
-    try std.testing.expect(!settingsView(&unknown).keywords_capable);
+test "the reach verdict covers every backend x capability cell (#328)" {
+    // The whole truth table, derived in one place. The capability half still comes from the
+    // predicate the session.update payload gates on, so the menu cannot claim biasing the
+    // payload would withhold — but the row and the dialog now read the verdict, not the axes.
+    const cases = [_]struct { m: []const u8, b: backend.Backend, want: VocabularyReach }{
+        // Local selected: capability is beside the point, the list biases Whisper either way.
+        .{ .m = "gpt-live-transcribe", .b = .local, .want = .local },
+        .{ .m = "gpt-realtime-whisper", .b = .local, .want = .local },
+        .{ .m = "gpt-6-transcribe-someday", .b = .local, .want = .local },
+        // OpenAI on a capable model: the list rides session.update as keywords (#326).
+        .{ .m = "gpt-live-transcribe", .b = .openai, .want = .both },
+        .{ .m = "gpt-transcribe", .b = .openai, .want = .both },
+        // OpenAI on a model that takes none — including an unknown one, which withholds.
+        .{ .m = "gpt-realtime-whisper", .b = .openai, .want = .local_only },
+        .{ .m = "gpt-6-transcribe-someday", .b = .openai, .want = .local_only },
+    };
+    for (cases) |c| {
+        const s = config.Settings{ .model = c.m, .transcription_backend = c.b };
+        try std.testing.expectEqual(c.want, settingsView(&s).vocabulary_reach);
+    }
+}
+
+test "an unanswered view withholds rather than claiming OpenAI biasing" {
+    // The default must be the inert cell: a view built without an answer keeps the suffix,
+    // mirroring the payload gate's withhold-on-unknown posture.
+    try std.testing.expectEqual(VocabularyReach.local_only, (SettingsView{}).vocabulary_reach);
 }
 
 test "a pinned gpt-realtime-whisper still resolves to its own picker row" {
