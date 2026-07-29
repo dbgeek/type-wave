@@ -213,7 +213,7 @@ frontmost read, so a post of none is a refusal that leaves the record retryable 
 green cue over unchanged text, while a burst that stopped partway commits (its Backspaces
 already landed, and a retry would eat earlier text) (#244). It gates on its own prerequisites —
 not paused, plus the Grant Observer's PostEvent fact — never on the Configuration Phase or the
-Supervisor's capture-enable gate. It holds
+Capture-Enable Gate. It holds
 the Recent Insertions ring concretely (ADR-0006 keeps ownership with the daemon) and reaches
 every effect through a six-method seam it is handed, so the whole sequence is exercised by
 fed values rather than by a live tap. The gate is re-proved **as the burst runs** (#256): a
@@ -443,7 +443,8 @@ _Avoid_: recording
 **Utterance Coordinator**:
 The state machine that drives one Utterance from Talk Key press to a resolved
 Insertion, across the Capture / Transcription / Insertion / Feedback seams. It owns
-the lifecycle policy (the overlap guard, poison abandonment, the release-anchored
+the lifecycle policy (the overlap guard, the backend-not-ready refusal — audible, and the
+sole owner of that verdict since ADR-0013 — poison abandonment, the release-anchored
 deadline, empty/failed handling) and nothing else — it reaches every side effect
 through a seam it is handed, so it is exercised by feeding it events, not hardware.
 _Avoid_: controller, manager, orchestrator
@@ -502,14 +503,27 @@ prerequisite: an OpenAI API key or a verified local Model Installation; transien
 readiness and pause state affect status, but do not define this phase.
 _Avoid_: setup state, readiness state, configured flag
 
+**Capture-Enable Gate**:
+Whether a Talk Key press may open an Utterance — and deliberately **not one fact in one
+place**. It is the conjunction of three terms, each read from the owner that can actually act
+on it: the **Configuration Phase**'s `configured`, cached per Supervisor tick because it is the
+only term with no live owner (TCC probes and disk); the **pause** flag, read live at the tap;
+and the backend's readiness to take an Utterance, which is not consulted here at all — the
+Utterance Coordinator's lease acquisition owns it, refuses audibly, and says so in the log. A
+cached copy of a term that has a live owner is what this gate is defined *against* (ADR-0013):
+each such copy the gate held was a Talk Key that went silently dead for up to one tick after
+the condition cleared.
+_Avoid_: press gate (the code's second name for it — this is the one), capture gate,
+talk-key gate
+
 **Supervisor**:
 The pure per-tick decider of the daemon's self-heal nudges — the Talk Key tap re-arm and
 the PostEvent probe (#127/#129) — plus the model-storage reclaim (a superseded Model
 Installation, one an interrupted removal never finished deleting, #276, or a staging
 directory left by a superseded manifest — ADR-0012 moved that third job here off the Status
 Item's status probe), the
-capture-enable gate (the Talk Key press gate: `configured` AND a live backend AND not
-paused), and the Capture watchdog (a hold open while its key is up: `hold_open AND
+**Capture-Enable Gate**'s one cached term (`configured` — the only term with no live
+owner), and the Capture watchdog (a hold open while its key is up: `hold_open AND
 NOT talk_key_down`, #272). Fed a `Facts` snapshot and the Configuration Phase `Outcome`, it returns an
 `Actions` bundle the daemon's self-heal loop executes; it reads the Configuration Phase
 and sits beside the grant sequence but owns neither — those stay peer machines the daemon

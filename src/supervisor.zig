@@ -1,11 +1,13 @@
 //! supervisor.zig — the Supervisor: the pure per-tick decider of the daemon's self-heal
-//! nudges and the capture-enable gate.
+//! nudges and the Capture-Enable Gate's one cached term.
 //!
 //! The daemon's self-heal loop (daemon.zig `supervisorLoop`) polls OS and adapter facts
 //! ~every 3 s, drives the Backend Router and the grant sequence, then must decide four
 //! things: whether to re-arm a dead Talk Key tap, whether to fire a PostEvent probe,
-//! whether to reclaim model storage nobody owns, and — the load-bearing one —
-//! whether a Talk Key press may fire this tick (the capture-enable gate). Those decisions
+//! whether to reclaim model storage nobody owns, and — the load-bearing one — the one
+//! tick-cached term of the Capture-Enable Gate (ADR-0013: `configured`, the only term
+//! with no live owner; pause is read live at the tap and backend readiness is the
+//! Utterance Coordinator's to refuse, audibly, at lease acquisition). Those decisions
 //! used to live inline in the loop, reachable only by running the real daemon against live
 //! TCC and the tap. They are now this one pure function, fed a `Facts` snapshot and
 //! returning an `Actions` bundle the daemon thread executes.
@@ -32,9 +34,8 @@ const std = @import("std");
 const configuration_phase = @import("configuration_phase.zig");
 const readiness = @import("readiness.zig");
 
-/// One poll tick's live facts, gathered by the daemon after the Backend Router has ticked
-/// (so `backend_available` reflects any resource warmed this tick) and after the grant
-/// sequence has advanced (so `grants_reached_post_event` is current).
+/// One poll tick's live facts, gathered by the daemon after the grant sequence has
+/// advanced (so `grants_reached_post_event` is current).
 pub const Facts = struct {
     /// The Talk Key tap is live. False means Input Monitoring is denied or the port was
     /// created-while-denied; the re-arm is the only thing that re-consults tccd (#127).
@@ -47,9 +48,9 @@ pub const Facts = struct {
     /// No Utterance is in flight (Backend Router `activeId() == 0`), so deleting model
     /// storage nobody owns cannot disturb dictation.
     no_utterance_in_flight: bool,
-    /// The selected Transcription Backend has an authoritative resource this tick.
-    backend_available: bool,
-    /// The menu-bar "Pause dictation" toggle is on (#34).
+    /// The menu-bar "Pause dictation" toggle is on (#34). Deliberately not a term in any
+    /// decision here since ADR-0013 — the tap reads pause live, and the Capture watchdog
+    /// must end a hold mid-pause — it stays a fact so the tests can pin that non-influence.
     paused: bool,
     /// A Talk Key hold is open (`tap.Hold`): the adapter forwarded a press and has not
     /// matched a release to it, so Capture is running.
@@ -76,16 +77,19 @@ pub const Actions = struct {
     /// The Capture watchdog (#272): feed the Coordinator the `.release` the tap never
     /// delivered, ending a hold whose key is demonstrably up.
     end_lost_hold: bool,
-    /// The Talk Key press gate: the tap callback consults this before starting Capture.
-    capture_enabled: bool,
+    /// The Capture-Enable Gate's one cached term (ADR-0013): the Configuration Phase's
+    /// `configured`, with no conjunction. The tap callback consults it before starting
+    /// Capture, beside its live pause check; backend readiness is not consulted at all —
+    /// the Utterance Coordinator's lease acquisition owns that refusal, and says so.
+    capture_configured: bool,
     /// Forwarded from the Configuration Phase: log the READY line this tick.
     announce_ready: bool,
     /// Forwarded from the Configuration Phase: report the missing prerequisites this tick.
     report_missing: ?readiness.Report,
 };
 
-/// Decide this tick's self-heal nudges and the capture-enable gate from the live facts and
-/// the Configuration Phase outcome the Backend Router produced mid-tick.
+/// Decide this tick's self-heal nudges and the Capture-Enable Gate's cached term from the
+/// live facts and the Configuration Phase outcome the Backend Router produced mid-tick.
 pub fn tick(facts: Facts, outcome: configuration_phase.Outcome) Actions {
     return .{
         // A dead tap is re-armed unconditionally — the preflight the Configuration Phase
@@ -102,8 +106,8 @@ pub fn tick(facts: Facts, outcome: configuration_phase.Outcome) Actions {
         // deliberately not a term: a long hold is legitimate, and "the key is up" is
         // cheap, direct evidence that this one is not one.
         .end_lost_hold = facts.hold_open and !facts.talk_key_down,
-        // The press gate: configured AND a live backend AND not paused.
-        .capture_enabled = outcome.configured and facts.backend_available and !facts.paused,
+        // The Capture-Enable Gate caches only what has no live owner (ADR-0013).
+        .capture_configured = outcome.configured,
         .announce_ready = outcome.actions.announce_ready,
         .report_missing = outcome.actions.report_missing,
     };
@@ -122,34 +126,32 @@ fn notConfiguredOutcome() configuration_phase.Outcome {
     return .{ .actions = .{}, .health = .{ .paused = false, .status = .no_key }, .configured = false };
 }
 
-/// All-healthy facts: tap live, PostEvent granted, nothing in flight, backend available,
-/// not paused. Tests override one axis at a time.
+/// All-healthy facts: tap live, PostEvent granted, nothing in flight, not paused.
+/// Tests override one axis at a time.
 fn okFacts() Facts {
     return .{
         .tap_enabled = true,
         .grants_reached_post_event = true,
         .post_event_granted = true,
         .no_utterance_in_flight = true,
-        .backend_available = true,
         .paused = false,
         .hold_open = false,
         .talk_key_down = false,
     };
 }
 
-test "capture_enabled is the AND of configured, backend_available, and not-paused" {
-    // The full truth table over the three inputs to the Talk Key press gate.
+test "capture_configured equals configured exactly, unmoved by the pause flag" {
+    // ADR-0013: the gate's other two terms have live owners — pause is read at the tap,
+    // and backend readiness is the Coordinator's lease acquisition to refuse — so the
+    // cached term is `configured` alone, with no conjunction.
     for ([_]bool{ false, true }) |configured| {
-        for ([_]bool{ false, true }) |available| {
-            for ([_]bool{ false, true }) |paused| {
-                var facts = okFacts();
-                facts.backend_available = available;
-                facts.paused = paused;
-                const outcome = if (configured) configuredOutcome() else notConfiguredOutcome();
+        for ([_]bool{ false, true }) |paused| {
+            var facts = okFacts();
+            facts.paused = paused;
+            const outcome = if (configured) configuredOutcome() else notConfiguredOutcome();
 
-                const acts = tick(facts, outcome);
-                try testing.expectEqual(configured and available and !paused, acts.capture_enabled);
-            }
+            const acts = tick(facts, outcome);
+            try testing.expectEqual(configured, acts.capture_configured);
         }
     }
 }
@@ -221,7 +223,7 @@ test "the watchdog is independent of pause and of the capture gate" {
     facts.paused = true;
 
     const acts = tick(facts, notConfiguredOutcome());
-    try testing.expect(!acts.capture_enabled);
+    try testing.expect(!acts.capture_configured);
     try testing.expect(acts.end_lost_hold);
 }
 

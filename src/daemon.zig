@@ -588,8 +588,9 @@ const RealUndoDeps = struct {
     /// pointer into the daemon struct, wired at construction below.
     surface: *Surface,
 
-    /// Undo's own prerequisites (ADR-0008) — deliberately *not* the Configuration Phase and
-    /// *not* the Supervisor's capture-enable gate. `⌃⌘⌫` is a system-wide chord and
+    /// Undo's own prerequisites (ADR-0008) — deliberately *not* the Configuration Phase's
+    /// `configured` (since ADR-0013 also the Capture-Enable Gate's only cached term).
+    /// `⌃⌘⌫` is a system-wide chord and
     /// Backspaces are destructive, so a paused daemon must stay inert; and without the
     /// PostEvent grant `deleteChars` would post nothing while the confirm cue claimed a
     /// deletion had happened. An OpenAI key or a Model Installation is irrelevant to deleting
@@ -810,7 +811,13 @@ const Daemon = struct {
     /// Menu-bar "Pause dictation" (#34): a paused daemon ignores Talk Key presses (the
     /// key keeps its normal OS meaning). Runtime-only — not a config.zon field.
     paused: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    capture_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// The Capture-Enable Gate's one cached term (ADR-0013): the Configuration Phase's
+    /// `configured`, published once per Supervisor tick — the only term with no live
+    /// owner (TCC probes and disk, too slow for the tap's run-loop thread). Pause is
+    /// read live at the tap, and backend readiness is not consulted at all: the
+    /// Utterance Coordinator's lease acquisition refuses a cold backend audibly.
+    capture_configured: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     /// The open hold (tap.zig, #272): which Talk Key press was forwarded to the
     /// Coordinator and has not been matched by a release. It is what the release edge is
@@ -961,7 +968,10 @@ const Daemon = struct {
         const self: *Daemon = @ptrCast(@alignCast(ctx.?));
         if (key != self.store.current().talk_key) return; // key filtering stays in the adapter
         if (self.paused.load(.acquire)) return; // menu-paused: ignore the Talk Key (#34)
-        if (!self.capture_enabled.load(.acquire)) return;
+        // The Capture-Enable Gate's one cached term (ADR-0013). A press that passes here
+        // with a cold backend reaches the Coordinator, which refuses it with a log line
+        // and the error cue — deliberately not silently, and not decided from a cache.
+        if (!self.capture_configured.load(.acquire)) return;
         // Claim before forwarding, and keep an older hold if one is somehow still open —
         // the Coordinator's overlap guard drops this press anyway, and re-pointing the
         // hold would leave the key the user is actually holding unable to end it.
@@ -1048,9 +1058,9 @@ const Daemon = struct {
     }
 
     /// Gather this tick's Supervisor facts — the impure OS/router/grant reads the pure
-    /// Supervisor decides on. Read at end-of-tick (after the grant sequence advanced and
-    /// the Backend Router prepared) so backend/grant facts are current. ADR-0005 keeps
-    /// this gathering in the daemon rather than behind a Supervisor seam.
+    /// Supervisor decides on. Read at end-of-tick (after the grant sequence advanced) so
+    /// the grant facts are current. ADR-0005 keeps this gathering in the daemon rather
+    /// than behind a Supervisor seam.
     fn supervisorFacts(self: *Daemon) supervisor.Facts {
         // The hold first, the key state second, and never the other way round: reading the
         // key before the hold could pair "no key down" from before a press with "a hold is
@@ -1063,7 +1073,6 @@ const Daemon = struct {
             .grants_reached_post_event = self.grants.reached(.post_event),
             .post_event_granted = self.grants.granted(.post_event),
             .no_utterance_in_flight = self.transcription.activeId() == 0,
-            .backend_available = self.transcription.available(),
             .paused = self.paused.load(.acquire),
             .hold_open = held != null,
             .talk_key_down = if (held) |key| tapmod.keyIsDown(key) else false,
@@ -1090,8 +1099,8 @@ const Daemon = struct {
             // the state users see at the end of this poll tick.
             if (changed_facts) outcome = self.gatherOutcome();
 
-            // The Supervisor decides this tick's self-heal nudges + the capture-enable
-            // gate; the daemon runs the effects here. The rearm/probe nudges are async —
+            // The Supervisor decides this tick's self-heal nudges + the Capture-Enable
+            // Gate's cached term; the daemon runs the effects here. The rearm/probe nudges are async —
             // scheduleRecreate posts to the tap's run-loop thread, postTaggedProbe posts a
             // synthetic event — so their outcomes land next tick regardless of where in
             // the tick they fire (#127/#129). See ADR-0005.
@@ -1110,7 +1119,7 @@ const Daemon = struct {
             // within the tick — it runs the Coordinator's release path here, on this
             // thread, exactly as the tap's run-loop thread would have.
             if (acts.end_lost_hold) self.endLostHold();
-            self.capture_enabled.store(acts.capture_enabled, .release);
+            self.capture_configured.store(acts.capture_configured, .release);
             self.observeSecureInput();
         }
     }
@@ -1195,9 +1204,11 @@ const Daemon = struct {
 
     // menu.Host callbacks — all run on the main thread (menu action / chrome pump).
 
+    // No hand-sync of `capture_configured` here (ADR-0013): the Supervisor is its single
+    // publisher. A press before the next tick reflects the switch reaches the Coordinator,
+    // which refuses a cold backend with a log line and the error cue.
     fn menuSelectBackend(ctx: *anyopaque, selected: backend.Backend) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
-        self.capture_enabled.store(false, .release);
         self.transcription.select(selected);
     }
 

@@ -210,10 +210,10 @@ pub fn Undo(comptime Deps: type) type {
         /// fires the refuse cue, so a press is never silently swallowed.
         fn run(self: *Self) void {
             // ADR-0008: `⌃⌘⌫` is a system-wide chord, so it is gated like the Talk Key —
-            // but on Undo's *own* prerequisites. Not `configured` (that bundles an OpenAI
+            // but on Undo's *own* prerequisites. Not `configured` — since ADR-0013 also
+            // the Capture-Enable Gate's only cached term — because that bundles an OpenAI
             // key or a Model Installation, neither of which deleting already-landed text
-            // needs) and not the Supervisor's `capture_enabled` (that would refuse an Undo
-            // because a Transcription Backend dropped).
+            // needs.
             if (!self.deps.enabled()) {
                 self.refuse(.paused, "dictation is paused or the PostEvent grant is missing");
                 return;

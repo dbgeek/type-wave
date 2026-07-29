@@ -131,8 +131,13 @@ const Selection = struct {
         return .{ .id = active.id, .backend = active.backend };
     }
 
+    /// Warmth only (ADR-0013): preparation has published a live resource for the
+    /// selected Backend and it has not been invalidated. Deliberately no lease term —
+    /// a lease is out for the whole of every Utterance, and callers that need a drained
+    /// route (the staleness probe, the teardowns) state that term themselves. Lease
+    /// contention is `acquire`'s to refuse, where the Coordinator can hear it.
     pub fn isReady(self: *const Selection) bool {
-        return self.active == null and self.readiness == .ready;
+        return self.readiness == .ready;
     }
 };
 
@@ -191,6 +196,11 @@ pub fn Router(comptime Deps: type) type {
             _ = self.selection.resolve(id);
         }
 
+        /// The selected Backend can take an Utterance *once the route is free*: the
+        /// Selection is warm and the resource says it is ready. Deliberately true while
+        /// a lease is out (ADR-0013) — this feeds tick-cached facts (the Configuration
+        /// Phase's `backend_ready`), and an availability that dipped for the whole of
+        /// every Utterance read as a backend outage one tick later.
         pub fn available(self: *Self) bool {
             self.lock();
             const ready = self.selection.isReady();
@@ -297,11 +307,12 @@ pub fn Router(comptime Deps: type) type {
             self.selection.select(selected_backend);
 
             // Staleness: only a ready, drained resource of the selected Backend can go
-            // stale; `Selection.invalidate` re-checks under the same guards after the
-            // unlocked stillValid probe (which may touch the filesystem).
+            // stale — the drained term is explicit since ADR-0013 took it out of
+            // `isReady`; `Selection.invalidate` re-checks under the same guards after
+            // the unlocked stillValid probe (which may touch the filesystem).
             var probe_session: ?*Deps.SessionResource = null;
             var probe_local: ?*Deps.LocalResource = null;
-            if (self.selection.isReady()) switch (selected_backend) {
+            if (self.selection.activeRoute() == null and self.selection.isReady()) switch (selected_backend) {
                 .openai => probe_session = self.session,
                 .local => probe_local = self.local,
             };
@@ -715,6 +726,46 @@ test "failed preparation stays unavailable and retries on a later tick" {
     try std.testing.expect(!local_router.tick(.local));
     try std.testing.expect(local_deps.sawEvent(.{ .prepare_failed = .{ .which = .local, .err = null } }));
     try std.testing.expect(!local_router.available());
+}
+
+test "availability holds while a lease is out, and follows the resource's own readiness" {
+    var deps = FakeDeps{};
+    var router = testRouter(&deps, .openai);
+    deps.pending_wants = .{ .connect_openai = true };
+    try std.testing.expect(router.tick(.openai));
+
+    // The regression (#338): a lease is out for the whole of every Utterance, and an
+    // availability that went false with it fed the Capture-Enable Gate a stale
+    // "backend down" — the Talk Key stayed silently dead until the next tick. Availability is warmth,
+    // not lease-freedom (ADR-0013); lease contention is the Coordinator's to refuse.
+    _ = router.acquire(7).?;
+    try std.testing.expect(router.available());
+    router.resolve(7);
+    try std.testing.expect(router.available());
+
+    // It still tracks the resource's own readiness (e.g. a reconnecting session).
+    deps.sessions[0].ready = false;
+    try std.testing.expect(!router.available());
+}
+
+test "the staleness probe still requires a drained route" {
+    var deps = FakeDeps{};
+    var router = testRouter(&deps, .local);
+    deps.pending_wants = .{ .prepare_local = true };
+    try std.testing.expect(router.tick(.local));
+
+    // A new Model Installation activates mid-Utterance: the pinned route must drain
+    // before the old resource may be invalidated and torn down.
+    _ = router.acquire(5).?;
+    deps.locals[0].valid = false;
+    try std.testing.expect(!router.tick(.local));
+    try std.testing.expect(!deps.sawEvent(.{ .stale = .local }));
+    try std.testing.expectEqual(@as(u32, 0), deps.locals[0].shutdowns);
+
+    router.resolve(5);
+    try std.testing.expect(router.tick(.local)); // drained: invalidate, tear down, re-warm
+    try std.testing.expect(deps.sawEvent(.{ .stale = .local }));
+    try std.testing.expectEqual(@as(u32, 1), deps.locals[0].shutdowns);
 }
 
 test "a Model Installation swap under the warm helper invalidates, drains, and re-warms in one tick" {
