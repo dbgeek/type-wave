@@ -21,7 +21,8 @@
 //!   Deps.SessionResource / Deps.LocalResource — resource types satisfying the uniform
 //!     contract: isReady() bool, shutdown() void, stillValid() bool,
 //!     acquire(id, language) ?backend.Lease, appendAudio(id, pcm) !void
-//!     (SessionResource additionally: markParamsDirty(); LocalResource: retry()).
+//!     (SessionResource additionally: markParamsDirty(), markRebiasDirty();
+//!     LocalResource: retry()).
 //!   deps.connectOpenai() anyerror!*SessionResource — establish the OpenAI resource.
 //!   deps.prepareLocal() ?*LocalResource — warm the local resource (null = failed;
 //!     the provisioner reports its own details).
@@ -263,6 +264,17 @@ pub fn Router(comptime Deps: type) type {
             if (session) |s| s.markParamsDirty();
         }
 
+        /// The vocabulary changed in the Settings Snapshot: the OpenAI resource
+        /// re-binds `keywords` on the warm link at its next idle tick — a push, never
+        /// a cycle (openai-biasing-spec §1). Local leases pin the list at press, so
+        /// only the session cares.
+        pub fn vocabularyChanged(self: *Self) void {
+            self.lock();
+            const session = self.session;
+            self.unlock();
+            if (session) |s| s.markRebiasDirty();
+        }
+
         /// SIGHUP/menu Retry, deliberately local-only (a failed connect simply retries
         /// on the next tick). Returns whether a warm local resource took the retry.
         pub fn retryLocal(self: *Self) bool {
@@ -443,6 +455,7 @@ const FakeSession = struct {
     ready: bool = true,
     shutdowns: u32 = 0,
     params_dirty: bool = false,
+    rebias_dirty: bool = false,
     appended_id: backend.UtteranceId = 0,
     appended_bytes: usize = 0,
 
@@ -469,6 +482,9 @@ const FakeSession = struct {
     }
     fn markParamsDirty(self: *FakeSession) void {
         self.params_dirty = true;
+    }
+    fn markRebiasDirty(self: *FakeSession) void {
+        self.rebias_dirty = true;
     }
     fn acquire(self: *FakeSession, id: backend.UtteranceId, language: backend.Language) ?backend.Lease {
         return .{
@@ -773,7 +789,7 @@ test "audio routes to the active Utterance's resource and nowhere else" {
     try std.testing.expectEqual(@as(backend.UtteranceId, 10), deps.locals[0].appended_id);
 }
 
-test "the pragmatic surface: retryLocal, settingsChanged, resourcePresent, shutdown" {
+test "the pragmatic surface: retryLocal, settingsChanged, vocabularyChanged, resourcePresent, shutdown" {
     var deps = FakeDeps{};
     var router = testRouter(&deps, .local);
     try std.testing.expect(!router.retryLocal()); // no warm local: the caller falls back to recovery
@@ -786,10 +802,13 @@ test "the pragmatic surface: retryLocal, settingsChanged, resourcePresent, shutd
     try std.testing.expect(!router.resourcePresent(.openai));
 
     router.settingsChanged(); // no session: a no-op
+    router.vocabularyChanged(); // likewise
     deps.pending_wants = .{ .connect_openai = true };
     try std.testing.expect(router.tick(.openai));
     router.settingsChanged();
     try std.testing.expect(deps.sessions[0].params_dirty);
+    router.vocabularyChanged();
+    try std.testing.expect(deps.sessions[0].rebias_dirty);
 
     router.shutdown();
     try std.testing.expectEqual(@as(u32, 1), deps.sessions[0].shutdowns);

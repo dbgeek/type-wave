@@ -202,6 +202,11 @@ pub const Host = struct {
     /// A session-shaped setting changed (menu write or hand-edit found on open) —
     /// mark the Transcription Session dirty so it cycles when idle.
     markSessionDirty: *const fn (ctx: *anyopaque) void,
+    /// The vocabulary changed (menu edit or hand-edit found on open) — ask the warm
+    /// OpenAI session to re-bind `keywords` at its next idle tick: a session.update
+    /// push, never a cycle (openai-biasing-spec §1). The local path is untouched
+    /// (read-at-use, Lease-pinned at press).
+    markSessionRebias: *const fn (ctx: *anyopaque) void,
     /// The Overlay toggle changed — lazy-build / enable / disable the HUD.
     setOverlay: *const fn (ctx: *anyopaque, on: bool) void,
     setPaused: *const fn (ctx: *anyopaque, paused: bool) void,
@@ -1230,9 +1235,9 @@ fn onSetApiKey(_: id, _: SEL, _: id) callconv(.c) void {
 /// The Vocabulary editor (spec §3): NSAlert + a multi-line NSTextView-in-NSScrollView
 /// accessory pre-filled with the current (clamped) list, one term per line. Save parses →
 /// trims → drops blanks → applies the §1 structural clamp → commits `session_shaped = false`
-/// (no session cycle; Whisper reads the list fresh at the next Talk-Key press). Cancel is a
-/// no-op. When the clamp dropped items, a follow-up alert names the count. The item edits on
-/// both backends; on OpenAI it is inert (§4) — the menu title already says `— local only`.
+/// (no session cycle; Whisper reads the list fresh at the next Talk-Key press, and a warm
+/// OpenAI session re-binds `keywords` via an idle push — openai-biasing-spec §1). Cancel is
+/// a no-op. When the clamp dropped items, a follow-up alert names the count.
 fn onVocabulary(_: id, _: SEL, _: id) callconv(.c) void {
     const m = g_menu orelse return;
     const pool = objc_autoreleasePoolPush();
@@ -1286,7 +1291,11 @@ fn onVocabulary(_: id, _: SEL, _: id) callconv(.c) void {
     next.vocabulary = committed;
     const value = config.serializeVocabularyValue(m.alloc, committed) orelse return;
     defer m.alloc.free(value);
+    const rebias = config.diffSettings(current, &next).rebias; // before the swap replaces `current`'s peer
     m.commitSettings(next, "vocabulary", value, false); // read-at-use — never session_shaped (§4)
+    // A real change re-binds the warm OpenAI session's keywords at the next idle tick
+    // (openai-biasing-spec §1) — a push, not a cycle; Save-without-change stays a no-op.
+    if (rebias) m.host.markSessionRebias(m.host.ctx);
     m.refreshSettings();
     feedback.log("  menu: Vocabulary → {d} terms{s}\n", .{ committed.len, if (dropped > 0) " (clamped)" else "" });
 
@@ -1321,6 +1330,7 @@ fn onMenuWillOpen(_: id, _: SEL, _: id) callconv(.c) void {
         feedback.log("  menu: picked up hand-edited config.zon\n", .{});
         if (d.backend_selection) m.host.selectBackend(m.host.ctx, fresh.transcription_backend);
         if (d.session_shaped) m.host.markSessionDirty(m.host.ctx);
+        if (d.rebias) m.host.markSessionRebias(m.host.ctx);
         if (d.overlay) m.host.setOverlay(m.host.ctx, fresh.overlay);
     }
     // Apply unconditionally: the Recent Insertions relative times are the one thing the
