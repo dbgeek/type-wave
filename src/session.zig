@@ -208,20 +208,48 @@ fn modelSpeaksLanguages(model: []const u8) bool {
 /// `.model = "gpt-realtime-whisper"` pinned it is byte-identical to the #8-proven
 /// constant (a scratchpad check asserted this against the literal before it was
 /// inlined; the pinned-model golden test keeps it honest).
-pub fn formatSessionUpdate(buf: []u8, params: TranscriptionParams) ![]const u8 {
-    var nr_buf: [128]u8 = undefined;
-    const nr = if (params.noise_reduction) |t|
-        try std.fmt.bufPrint(&nr_buf, "{{\"type\":\"{s}\"}}", .{t})
+const session_update_fmt = "{{\"type\":\"session.update\",\"session\":{{\"type\":\"transcription\",\"audio\":{{\"input\":{{\"format\":{{\"type\":\"audio/pcm\",\"rate\":24000}},\"transcription\":{{\"model\":\"{s}\",{s}\"delay\":\"{s}\"}},\"turn_detection\":null,\"noise_reduction\":{s}}}}}}}}}";
+
+fn renderNoiseReduction(buf: []u8, noise_reduction: ?[]const u8) ![]const u8 {
+    return if (noise_reduction) |t|
+        try std.fmt.bufPrint(buf, "{{\"type\":\"{s}\"}}", .{t})
     else
         "null";
-    var lang_buf: [160]u8 = undefined;
-    const lang = if (params.language.len == 0)
+}
+
+fn renderLanguage(buf: []u8, params: TranscriptionParams) ![]const u8 {
+    return if (params.language.len == 0)
         "" // auto-detect: omit the field entirely (wayfinder #34's Language preset)
     else if (modelSpeaksLanguages(params.model))
-        try std.fmt.bufPrint(&lang_buf, "\"languages\":[\"{s}\"],", .{params.language})
+        try std.fmt.bufPrint(buf, "\"languages\":[\"{s}\"],", .{params.language})
     else
-        try std.fmt.bufPrint(&lang_buf, "\"language\":\"{s}\",", .{params.language});
-    return std.fmt.bufPrint(buf, "{{\"type\":\"session.update\",\"session\":{{\"type\":\"transcription\",\"audio\":{{\"input\":{{\"format\":{{\"type\":\"audio/pcm\",\"rate\":24000}},\"transcription\":{{\"model\":\"{s}\",{s}\"delay\":\"{s}\"}},\"turn_detection\":null,\"noise_reduction\":{s}}}}}}}}}", .{ params.model, lang, params.delay, nr });
+        try std.fmt.bufPrint(buf, "\"language\":\"{s}\",", .{params.language});
+}
+
+pub fn formatSessionUpdate(buf: []u8, params: TranscriptionParams) ![]const u8 {
+    var nr_buf: [128]u8 = undefined;
+    var lang_buf: [160]u8 = undefined;
+    return std.fmt.bufPrint(buf, session_update_fmt, .{
+        params.model,
+        try renderLanguage(&lang_buf, params),
+        params.delay,
+        try renderNoiseReduction(&nr_buf, params.noise_reduction),
+    });
+}
+
+/// The connect-path build (spec §2 "Allocating payload build"): same payload, heap
+/// bytes owned by the caller. A cold path — once per connect attempt or re-bias
+/// push, never per audio frame — sized by the allocator because the escaped
+/// keywords worst case (~26 KB realistic) outgrows any sensible fixed buffer.
+pub fn formatSessionUpdateAlloc(alloc: std.mem.Allocator, params: TranscriptionParams) ![]u8 {
+    var nr_buf: [128]u8 = undefined;
+    var lang_buf: [160]u8 = undefined;
+    return std.fmt.allocPrint(alloc, session_update_fmt, .{
+        params.model,
+        try renderLanguage(&lang_buf, params),
+        params.delay,
+        try renderNoiseReduction(&nr_buf, params.noise_reduction),
+    });
 }
 
 extern "c" fn usleep(usec: c_uint) c_int;
@@ -522,8 +550,10 @@ pub fn Session(comptime Transport: type) type {
         /// The config-built session.update, re-formatted from the live snapshot at every
         /// connect attempt (openClient, before the read loop starts — wayfinder #32) and
         /// replayed on every `session.created` (the read-loop thread sends it).
-        su_buf: [2048]u8 = undefined,
-        su_len: usize = 0,
+        /// Heap-owned by the Session (spec §2: the escaped-keywords worst case outgrows
+        /// any fixed buffer); each rebuild frees the previous payload — safe because the
+        /// prior connection's read loop has ended before openClient runs again.
+        su: []const u8 = &.{},
 
         handler: Handler = undefined,
         read: ?Transport.Reader = null,
@@ -561,6 +591,8 @@ pub fn Session(comptime Transport: type) type {
             };
             self.handler = .{ .session = self };
 
+            // openClient can fail after it has already allocated the session.update.
+            errdefer alloc.free(self.su);
             try self.openClient(); // first connection: init + handshake + start read loop
 
             // The sender drains the outbound ring for the rest of the run; the maintenance
@@ -572,6 +604,7 @@ pub fn Session(comptime Transport: type) type {
 
         /// Free memory. Assumes `shutdown` already ran (link + threads torn down).
         pub fn deinit(self: *Self) void {
+            self.alloc.free(self.su);
             self.alloc.free(self.out);
             self.alloc.destroy(self);
         }
@@ -588,7 +621,9 @@ pub fn Session(comptime Transport: type) type {
             // then costs at most one redundant idle cycle later.
             self.params_dirty.store(false, .release);
             const params = self.params_provider.get(self.params_provider.ctx);
-            self.su_len = (try formatSessionUpdate(&self.su_buf, params)).len;
+            const su = try formatSessionUpdateAlloc(self.alloc, params);
+            self.alloc.free(self.su);
+            self.su = su;
             self.params_mu.lockUncancelable(self.io);
             self.configured_language = params.language;
             self.params_mu.unlock(self.io);
@@ -716,13 +751,15 @@ pub fn Session(comptime Transport: type) type {
         }
 
         fn sendControl(self: *Self, text: []const u8) !void {
-            var buf: [2048]u8 = undefined; // fits the config-built session.update (su_buf)
-            std.debug.assert(text.len <= buf.len);
-            @memcpy(buf[0..text.len], text);
+            // The transport masks in place, so it needs a mutable copy; heap-allocated
+            // because the stored session.update this replays has no fixed size bound
+            // (spec §2). Control sends are cold — never per audio frame.
+            const buf = try self.alloc.dupe(u8, text);
+            defer self.alloc.free(buf);
             self.write_mu.lockUncancelable(self.io);
             defer self.write_mu.unlock(self.io);
             if (!self.link_open) return;
-            try self.transport.write(buf[0..text.len]);
+            try self.transport.write(buf);
         }
 
         /// Prepare the transport for an accepted Utterance. Call on Talk Key press, before
@@ -1115,7 +1152,7 @@ pub fn Session(comptime Transport: type) type {
                         .absent => {},
                         .rejected => feedback.log("  session.created: expires_at is not a usable deadline — keeping the provisional one\n", .{}),
                     };
-                    try s.sendControl(s.su_buf[0..s.su_len]);
+                    try s.sendControl(s.su);
                     feedback.log("  session.created -> sent session.update\n", .{});
                 } else if (std.mem.eql(u8, typ, "session.updated")) {
                     s.markReady();
@@ -1481,6 +1518,27 @@ test "formatSessionUpdate auto-detect omits both language shapes for gpt-live-tr
     try std.testing.expect(std.mem.indexOf(u8, out, "\"model\":\"gpt-live-transcribe\",\"delay\":\"low\"") != null);
 }
 
+test "formatSessionUpdateAlloc is byte-identical to the fixed-buffer formatter" {
+    // The allocating build (spec §2) must not change a single byte of any payload —
+    // sweep every shape the golden tests above pin, comparing the two formatters.
+    const cases = [_]TranscriptionParams{
+        .{},
+        .{ .model = "gpt-realtime-whisper" },
+        .{ .model = "gpt-live-transcribe", .language = "en" },
+        .{ .model = "gpt-transcribe", .language = "sv" },
+        .{ .model = "gpt-realtime-whisper", .language = "" },
+        .{ .model = "gpt-live-transcribe", .language = "" },
+        .{ .noise_reduction = null },
+    };
+    for (cases) |params| {
+        var buf: [2048]u8 = undefined;
+        const golden = try formatSessionUpdate(&buf, params);
+        const allocated = try formatSessionUpdateAlloc(std.testing.allocator, params);
+        defer std.testing.allocator.free(allocated);
+        try std.testing.expectEqualStrings(golden, allocated);
+    }
+}
+
 test "OpenAI item identities keep late and out-of-order Final Transcripts tagged" {
     var ids = IdentityMap{};
     try std.testing.expect(ids.push(41));
@@ -1599,11 +1657,35 @@ test "session.created replays the configured session.update through the transpor
     var sess: Session(FakeTransport) = undefined;
     initFake(&sess, &out_buf, &rec);
     sess.link_open = true; // the read loop only writes when the link is up
-    sess.su_len = (try formatSessionUpdate(&sess.su_buf, .{})).len;
+    sess.su = try formatSessionUpdateAlloc(std.testing.allocator, .{});
+    defer std.testing.allocator.free(sess.su);
 
     deliverServerMessage(&sess, "{\"type\":\"session.created\",\"session\":{\"expires_at\":0}}");
 
     try std.testing.expect(std.mem.indexOf(u8, sess.transport.written(), "\"type\":\"session.update\"") != null);
+}
+
+fn defaultTestParams(_: ?*anyopaque) TranscriptionParams {
+    return .{};
+}
+
+test "openClient rebuilds the Session-owned session.update on every connect attempt" {
+    // The stored-payload contract (spec §2): the Session owns the bytes, and each
+    // connect attempt replaces them. testing.allocator flags it if a rebuild leaks
+    // the previous payload or the final one outlives the defer below.
+    var out_buf: [8]OutRecord = undefined;
+    var rec = Recorder{};
+    var sess: Session(FakeTransport) = undefined;
+    initFake(&sess, &out_buf, &rec);
+    sess.params_provider = .{ .ctx = null, .get = defaultTestParams };
+    defer std.testing.allocator.free(sess.su);
+
+    var buf: [2048]u8 = undefined;
+    const golden = try formatSessionUpdate(&buf, .{});
+    try sess.openClient(); // first connect
+    try std.testing.expectEqualStrings(golden, sess.su);
+    try sess.openClient(); // reconnect: the rebuild replaces (frees) the first payload
+    try std.testing.expectEqualStrings(golden, sess.su);
 }
 
 // ---- the session deadline: remote numbers proved before they are believed (#274) ----
@@ -1666,7 +1748,8 @@ test "a hostile expires_at leaves the provisional deadline standing and the sess
     var sess: Session(FakeTransport) = undefined;
     initFake(&sess, &out_buf, &rec);
     sess.link_open = true;
-    sess.su_len = (try formatSessionUpdate(&sess.su_buf, .{})).len;
+    sess.su = try formatSessionUpdateAlloc(std.testing.allocator, .{});
+    defer std.testing.allocator.free(sess.su);
 
     // Every shape a JSON body can spell that the old code ran through an unchecked cast or an
     // unchecked ×1000. None may move the deadline, and none may cost the session its handshake.
@@ -1694,7 +1777,8 @@ test "a sane expires_at still replaces the provisional deadline exactly as befor
     var sess: Session(FakeTransport) = undefined;
     initFake(&sess, &out_buf, &rec);
     sess.link_open = true;
-    sess.su_len = (try formatSessionUpdate(&sess.su_buf, .{})).len;
+    sess.su = try formatSessionUpdateAlloc(std.testing.allocator, .{});
+    defer std.testing.allocator.free(sess.su);
 
     sess.expires_at_ms.store(1_234_567, .release);
     deliverServerMessage(&sess, "{\"type\":\"session.created\",\"session\":{\"expires_at\":1800000000}}");
