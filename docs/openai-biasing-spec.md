@@ -4,6 +4,10 @@
   tickets [#311](https://github.com/dbgeek/type-wave/issues/311)–[#319](https://github.com/dbgeek/type-wave/issues/319)
   and [#323](https://github.com/dbgeek/type-wave/issues/323), assembled in
   [#319](https://github.com/dbgeek/type-wave/issues/319))
+- Amended post-lock: §3 gained the
+  [Edit Vocabulary dialog](#edit-vocabulary-dialog--the-same-split-333) at build time
+  ([#333](https://github.com/dbgeek/type-wave/issues/333)) — a surface the locked §3
+  never covered, not a decision reopened.
 - Scope: this is the **spec** a fresh implementation effort picks up without
   reopening any decision. Implementation and deployment are a separate effort
   (see [Branching & handoff](#branching--handoff)). The map is planning-only —
@@ -257,6 +261,25 @@ a second phrase.
 Plumbing: `SettingsView` gains one field, **`keywords_capable: bool`**, computed
 in `settingsView` by the exported predicate on `s.model`; `Presentation` stays
 value-comparable and the pump's early-out stays honest.
+
+### Edit Vocabulary dialog — the same split ([#333](https://github.com/dbgeek/type-wave/issues/333))
+
+Added after the row shipped: the section above covered only the row, leaving the
+dialog opened *from* that row still saying `ignored on OpenAI` and contradicting
+it. `vocabularyInfoText` (`src/menu.zig`) takes the backend and the same
+capability bool, and its base sentence splits on the same axis:
+
+| Backend | Model speaks keywords? | Base sentence (after the always-present `One term per line, most important first.`) |
+|---|---|---|
+| local | any | `Biases the Local (Whisper) backend at your next dictation.` |
+| openai | yes | `Biases OpenAI transcription from your next dictation, and the Local (Whisper) backend when you switch to it.` |
+| openai | no | `Biases the Local (Whisper) backend at your next dictation; ignored on OpenAI.` — wording unchanged |
+
+The **near/over-budget hints stay unconditional**. Their wording is already
+local-scoped, and the list is shared, so an over-budget list really would have
+its tail truncated for local Whisper whichever backend is selected today. No
+OpenAI-side budget hint, per §2: the live probe accepted ~262 KB of keywords, so
+the 128 × 100 load clamp is the single size authority.
 
 ### Status Item — nothing beyond the row suffix
 
