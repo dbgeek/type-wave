@@ -354,8 +354,8 @@ fn vocabularyInfoText(buf: []u8, list: []const []const u8, selected: backend.Bac
         vocabulary_guidance ++ " Biases the Local (Whisper) backend at your next dictation; ignored on OpenAI.";
     return switch (vocab.budget(list)) {
         .ok => std.fmt.bufPrintSentinel(buf, "{s}", .{base}, 0) catch base,
-        .near => std.fmt.bufPrintSentinel(buf, "{s} Getting long (~{d} tokens) — nearing the local Whisper limit.", .{ base, vocab.estimateTokens(list) }, 0) catch base,
-        .over => std.fmt.bufPrintSentinel(buf, "{s} Long list (~{d} tokens) — the tail may be truncated for local Whisper.", .{ base, vocab.estimateTokens(list) }, 0) catch base,
+        .near => |tokens| std.fmt.bufPrintSentinel(buf, "{s} Getting long (~{d} tokens) — nearing the local Whisper limit.", .{ base, tokens }, 0) catch base,
+        .over => |tokens| std.fmt.bufPrintSentinel(buf, "{s} Long list (~{d} tokens) — the tail may be truncated for local Whisper.", .{ base, tokens }, 0) catch base,
     };
 }
 
