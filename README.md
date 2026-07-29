@@ -169,7 +169,7 @@ cp packaging/config.example.zon ~/.config/type-wave/config.zon
 | --- | --- | --- |
 | `transcription_backend` | `.openai` | `.openai` or `.local`; selection is a hard audio boundary |
 | `talk_key` | `.right_option` | `.right_option`, `.left_option`, or `.globe` |
-| `model` | `"gpt-realtime-whisper"` | String, so model experiments do not require a rebuild |
+| `model` | `"gpt-live-transcribe"` | String, so model experiments do not require a rebuild |
 | `language` | `"en"` | `"en"`, `"sv"`, or `""` for auto-detect |
 | `delay` | `"low"` | `"minimal"`, `"low"`, `"medium"`, `"high"`; other strings stay hand-editable |
 | `noise_reduction` | `.near_field` | `.near_field`, `.far_field`, or `.off` |
@@ -177,6 +177,13 @@ cp packaging/config.example.zon ~/.config/type-wave/config.zon
 | `pre_paste_ms` | `25` | Pasteboard settle delay before Cmd-V |
 | `overlay` | `true` | Show the silent waveform/processing HUD |
 | `backtrack` | `false` | Opt-in OpenAI rewrite of spoken self-corrections and fillers; OpenAI backend only, sends transcript text to the cloud |
+
+> **Migrating from before 0.4.0:** the default model flipped from
+> `gpt-realtime-whisper` to `gpt-live-transcribe`
+> ([#303](https://github.com/dbgeek/type-wave/issues/303)). A config that pins
+> `.model` keeps its pinned model — delete the `.model` line from `config.zon` to
+> adopt the new default, or pin `"gpt-realtime-whisper"` to stay on the old one.
+> No rebuild either way.
 
 The menu bar is the live settings writer. It swaps in complete immutable settings
 snapshots and patches single fields in `config.zon` while preserving comments. Hand

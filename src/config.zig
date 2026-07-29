@@ -57,7 +57,10 @@ const api_key = @import("api_key.zig");
 pub const Settings = struct {
     transcription_backend: backend.Backend = .openai,
     talk_key: tap.TalkKey = .right_option,
-    model: []const u8 = "gpt-realtime-whisper",
+    /// Flipped to gpt-live-transcribe for 0.4.0 (#303, decision #299) on the A/B
+    /// benchmark's accuracy win. An explicit `.model` pin is honored unchanged —
+    /// pin "gpt-realtime-whisper" to keep the pre-0.4.0 behavior, no rebuild.
+    model: []const u8 = "gpt-live-transcribe",
     language: []const u8 = "en",
     delay: []const u8 = "low",
     noise_reduction: NoiseReduction = .near_field,

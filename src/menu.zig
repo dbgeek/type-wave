@@ -255,7 +255,7 @@ fn applyOption(s: *config.Settings, gi: usize, oi: usize) void {
     switch (gi) {
         0 => s.transcription_backend = status_item.backends[oi],
         1 => s.talk_key = status_item.talk_keys[oi],
-        2 => s.model = "gpt-realtime-whisper",
+        2 => s.model = status_item.models[oi],
         3 => s.language = status_item.languages[oi],
         4 => s.delay = status_item.delays[oi],
         5 => s.noise_reduction = status_item.noises[oi],
