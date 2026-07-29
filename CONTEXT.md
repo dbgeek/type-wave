@@ -574,5 +574,19 @@ It exists because `config.Settings`
 holds slices, which no comparable value can carry: reducing them to scalars is what keeps
 the Presentation comparable, and therefore what keeps the Chrome's early-out honest. The
 radio-group table lives beside it in `status_item.zig` — which option *reads* as selected is
-presentation — while `menu.zig` keeps the write path that turns a click into a field.
+presentation — while `menu.zig` keeps the write path that turns a click into a field
+(ADR-0011).
+
+The table is the **single source for both directions**. One curated option is written down
+once — its row label and the typed value it sets — and everything else is derived: its
+`config.zon` text (`.tag` for the closed enums, a quoted literal for the string-shaped
+fields), `menu.applyOption`'s write, and `currentOption`'s read-back. That is why the table
+carries two names, `specs` and the `groups` projected from it: a homogeneous `[_]GroupDef`
+**cannot** hold the typed values, because `[]const TalkKey` and `[]const []const u8` share no
+element type, so a tuple holds them and the array serves the loops that index by a runtime
+group index. Collapsing the two back into one array is the regression to avoid — it is what
+evicted the typed values into seven parallel arrays coupled by index alone, leaving three
+representations of one option that could silently disagree. Now a label paired with the wrong
+value, a value that contradicts the bytes persisted, a group inserted mid-table, and a `field`
+naming nothing are all compile errors rather than things a test has to catch.
 _Avoid_: settings snapshot (that is the live `Settings` the daemon reads), config view

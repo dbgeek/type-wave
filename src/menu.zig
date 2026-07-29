@@ -254,20 +254,24 @@ pub const Host = struct {
 
 const groups = status_item.groups;
 
-/// Set group `gi`'s option `oi` on a Settings under construction. The typed option tables
-/// live beside the group table in status_item.zig, so this and `settingsView`'s read-back
-/// can never drift apart.
+/// Set group `gi`'s option `oi` on a Settings under construction — the write half of the
+/// radio table (ADR-0011 keeps it here; the table itself is presentation and lives in
+/// status_item.zig). Generated from the same `specs` `currentOption` reads back, so the two
+/// directions cannot drift: the option's label, the field it writes and the `config.zon`
+/// bytes that persist are one literal, and a `field` naming nothing is a compile error.
 fn applyOption(s: *config.Settings, gi: usize, oi: usize) void {
-    switch (gi) {
-        0 => s.transcription_backend = status_item.backends[oi],
-        1 => s.talk_key = status_item.talk_keys[oi],
-        2 => s.model = status_item.models[oi],
-        3 => s.language = status_item.languages[oi],
-        4 => s.delay = status_item.delays[oi],
-        5 => s.noise_reduction = status_item.noises[oi],
-        6 => s.insertion = status_item.insertions[oi],
-        else => unreachable,
+    inline for (status_item.specs, 0..) |spec, i| {
+        if (gi == i) {
+            inline for (spec.opts, 0..) |c, j| {
+                if (oi == j) {
+                    @field(s, spec.field) = c.value;
+                    return;
+                }
+            }
+            unreachable; // the tag was encoded from this group's own opts
+        }
     }
+    unreachable;
 }
 
 // =====================================================================================
@@ -1080,6 +1084,20 @@ fn runAlert(content: Confirmation, second_button: ?[*:0]const u8) c_long {
     _ = msg(win, "orderFrontRegardless");
 
     return msgLongR(alert, "runModal");
+}
+
+test "every radio row a click can set reads back as that same row" {
+    // The write half (here) and the read half (status_item.currentOption) are generated from
+    // one table, so this mostly re-proves the compiler — but it is what pins the *pairing*:
+    // clicking row `oi` of group `gi` must leave the snapshot showing row `oi` checked, or
+    // the menu re-renders a different option than the one the user picked.
+    inline for (status_item.specs, 0..) |spec, gi| {
+        inline for (spec.opts, 0..) |_, oi| {
+            var s = config.Settings{};
+            applyOption(&s, gi, oi);
+            try std.testing.expectEqual(@as(?u8, @intCast(oi)), status_item.settingsView(&s).selected[gi]);
+        }
+    }
 }
 
 test "Install confirmation names the pinned large artifact and its privacy boundary" {
