@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/dbgeek/type-wave/compare/v0.4.1...v0.4.2) (2026-07-29)
+
+
+### Bug Fixes
+
+* **supervisor:** the press gate caches only what has no live owner ([#338](https://github.com/dbgeek/type-wave/issues/338)) ([#339](https://github.com/dbgeek/type-wave/issues/339)) ([6dffb18](https://github.com/dbgeek/type-wave/commit/6dffb181c9da24cce073ab7f64d27a14f003df66))
+
 ## [0.4.1](https://github.com/dbgeek/type-wave/compare/v0.4.0...v0.4.1) (2026-07-29)
 
 
