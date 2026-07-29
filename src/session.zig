@@ -192,6 +192,14 @@ pub const ParamsProvider = struct {
     get: *const fn (ctx: ?*anyopaque) TranscriptionParams,
 };
 
+/// gpt-live-transcribe and gpt-transcribe take a `languages` array instead of the
+/// singular `language` field — never both (OpenAI transcription guide, issue #302).
+/// The config knob stays one string; it is emitted as a one-element array.
+fn modelSpeaksLanguages(model: []const u8) bool {
+    return std.mem.eql(u8, model, "gpt-live-transcribe") or
+        std.mem.eql(u8, model, "gpt-transcribe");
+}
+
 /// Manual-commit transcription config (crib sheet §2). turn_detection:null is
 /// mandatory for gpt-realtime-whisper and maps 1:1 onto hold-to-talk. Built from
 /// `params`; with the defaults it is byte-identical to the #8-proven constant
@@ -205,6 +213,8 @@ pub fn formatSessionUpdate(buf: []u8, params: TranscriptionParams) ![]const u8 {
     var lang_buf: [160]u8 = undefined;
     const lang = if (params.language.len == 0)
         "" // auto-detect: omit the field entirely (wayfinder #34's Language preset)
+    else if (modelSpeaksLanguages(params.model))
+        try std.fmt.bufPrint(&lang_buf, "\"languages\":[\"{s}\"],", .{params.language})
     else
         try std.fmt.bufPrint(&lang_buf, "\"language\":\"{s}\",", .{params.language});
     return std.fmt.bufPrint(buf, "{{\"type\":\"session.update\",\"session\":{{\"type\":\"transcription\",\"audio\":{{\"input\":{{\"format\":{{\"type\":\"audio/pcm\",\"rate\":24000}},\"transcription\":{{\"model\":\"{s}\",{s}\"delay\":\"{s}\"}},\"turn_detection\":null,\"noise_reduction\":{s}}}}}}}}}", .{ params.model, lang, params.delay, nr });
@@ -1415,11 +1425,35 @@ test "formatSessionUpdate defaults reproduce the #8-proven string" {
     );
 }
 
+test "formatSessionUpdate speaks plural languages for gpt-live-transcribe (golden payload)" {
+    var buf: [2048]u8 = undefined;
+    const out = try formatSessionUpdate(&buf, .{ .model = "gpt-live-transcribe", .language = "en" });
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"session.update\",\"session\":{\"type\":\"transcription\",\"audio\":{\"input\":{\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},\"transcription\":{\"model\":\"gpt-live-transcribe\",\"languages\":[\"en\"],\"delay\":\"low\"},\"turn_detection\":null,\"noise_reduction\":{\"type\":\"near_field\"}}}}}",
+        out,
+    );
+}
+
+test "formatSessionUpdate speaks plural languages for the gpt-transcribe sibling" {
+    var buf: [2048]u8 = undefined;
+    const out = try formatSessionUpdate(&buf, .{ .model = "gpt-transcribe", .language = "sv" });
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"languages\":[\"sv\"],") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"language\":") == null);
+}
+
 test "formatSessionUpdate omits language entirely for auto-detect (empty string)" {
     var buf: [2048]u8 = undefined;
     const out = try formatSessionUpdate(&buf, .{ .language = "" });
     try std.testing.expect(std.mem.indexOf(u8, out, "\"language\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"model\":\"gpt-realtime-whisper\",\"delay\":\"low\"") != null);
+}
+
+test "formatSessionUpdate auto-detect omits both language shapes for gpt-live-transcribe" {
+    var buf: [2048]u8 = undefined;
+    const out = try formatSessionUpdate(&buf, .{ .model = "gpt-live-transcribe", .language = "" });
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"language\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"languages\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"model\":\"gpt-live-transcribe\",\"delay\":\"low\"") != null);
 }
 
 test "OpenAI item identities keep late and out-of-order Final Transcripts tagged" {
