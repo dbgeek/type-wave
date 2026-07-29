@@ -1313,6 +1313,15 @@ const Daemon = struct {
         self.transcription.settingsChanged();
     }
 
+    /// The vocabulary changed: ask the warm OpenAI session to re-bind `keywords` at
+    /// its next idle tick — a session.update push on the warm link, never a cycle
+    /// (openai-biasing-spec §1). Before the first connect there is nothing to mark —
+    /// that connect reads the snapshot.
+    fn menuMarkSessionRebias(ctx: *anyopaque) void {
+        const self: *Daemon = @ptrCast(@alignCast(ctx));
+        self.transcription.vocabularyChanged();
+    }
+
     /// The Overlay toggle (#32 decision 3): lazy-build on first enable — menu actions
     /// run exactly where the HUD must be built (main thread, so its render pump joins
     /// this run loop); init failure degrades to sound-only like startup. Disable keeps
@@ -1544,6 +1553,7 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
         .status = Daemon.menuStatus,
         .selectBackend = Daemon.menuSelectBackend,
         .markSessionDirty = Daemon.menuMarkSessionDirty,
+        .markSessionRebias = Daemon.menuMarkSessionRebias,
         .setOverlay = Daemon.menuSetOverlay,
         .setPaused = Daemon.menuSetPaused,
         .storeApiKey = Daemon.menuStoreApiKey,

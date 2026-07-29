@@ -301,12 +301,17 @@ const MaintenanceFacts = struct {
     last_pong_ms: i64,
     read_ended: bool,
     params_dirty: bool,
+    rebias_dirty: bool,
 };
 
 const MaintenanceAction = union(enum) {
     idle,
     ping,
     reconnect: ?ReconnectReason,
+    /// Re-bind the biasing config on the warm link: a session.update push, never a
+    /// cycle (openai-biasing-spec §1). Idle-gated like reconnect, and superseded by
+    /// every reconnect trigger — a reconnect re-reads the whole snapshot anyway.
+    rebias,
 };
 
 const MaintenanceDecision = struct {
@@ -352,6 +357,10 @@ fn maintenanceDecision(f: MaintenanceFacts) MaintenanceDecision {
             return .{ .action = .{ .reconnect = .no_pong }, .awaiting_pong = awaiting };
         }
     }
+    // After every reconnect trigger: a pending cycle supersedes a pending push (the
+    // connect re-reads the snapshot and openClient clears both flags), and a push onto
+    // a link about to be cycled would be wasted anyway.
+    if (f.rebias_dirty) return .{ .action = .rebias, .awaiting_pong = awaiting };
     if (f.now - f.last_ping_ms >= ping_interval_ms) return .{ .action = .ping, .awaiting_pong = awaiting };
     return .{ .action = .idle, .awaiting_pong = awaiting };
 }
@@ -543,6 +552,14 @@ pub fn Session(comptime Transport: type) type {
         /// in-flight Capture stream always completes on the old params.
         params_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+        /// The vocabulary changed in the live snapshot (openai-biasing-spec §1). Set by
+        /// the menu via `markRebiasDirty`; the maintenance loop re-binds `keywords` on
+        /// the warm link at its next idle tick — a session.update push, never a
+        /// reconnect. An in-flight Utterance always finishes under the set bound when
+        /// it began (one keywords set per Utterance). A pending cycle (`params_dirty`)
+        /// supersedes a pending push; `openClient` clears both.
+        rebias_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
         /// Utterance start, for relative event timestamps. Set by prepareUtterance.
         t0_ms: i64 = 0,
 
@@ -630,10 +647,13 @@ pub fn Session(comptime Transport: type) type {
         fn openClient(self: *Self) !void {
             // Re-read the live Settings snapshot and rebuild the session.update NOW — every
             // connect (first and reconnect alike) speaks the freshest params (wayfinder #32).
-            // Clear the dirty flag first: a change landing after the clear is still picked up
-            // by this very read (the provider loads the current snapshot), and the stale flag
-            // then costs at most one redundant idle cycle later.
+            // Clear the dirty flags first: a change landing after the clear is still picked up
+            // by this very read (the provider loads the current snapshot), and a stale flag
+            // then costs at most one redundant idle cycle or push later. The cycle covers a
+            // pending re-bias push — the connect payload carries the same keywords — so both
+            // clear here (openai-biasing-spec §1 precedence).
             self.params_dirty.store(false, .release);
+            self.rebias_dirty.store(false, .release);
             const params = self.params_provider.get(self.params_provider.ctx);
             const su = try formatSessionUpdateAlloc(self.alloc, params);
             self.alloc.free(self.su);
@@ -693,8 +713,10 @@ pub fn Session(comptime Transport: type) type {
             return @ptrCast(@alignCast(ctx));
         }
         fn leaseBegin(ctx: *anyopaque, id: backend.UtteranceId, language: backend.Language, vocabulary: backend.Vocabulary) !void {
-            // Vocabulary biasing is local-Whisper-only; the OpenAI session ignores the pinned
-            // list (docs/vocab-biasing-spec.md §4 — inert with a menu signal, not wired).
+            // The Lease does not carry vocabulary on the OpenAI path: the session's
+            // currently-bound `keywords` set is the pin — bound at connect (#326) and
+            // re-bound between Utterances by the idle re-bias push (openai-biasing-spec
+            // §1, bound-at-begin / fresher-on-replay accepted).
             _ = vocabulary;
             try leaseSelf(ctx).beginUtterance(id, language);
         }
@@ -737,6 +759,14 @@ pub fn Session(comptime Transport: type) type {
         /// in-flight Utterance (the maintenance loop's existing idle gate).
         pub fn markParamsDirty(self: *Self) void {
             self.params_dirty.store(true, .release);
+        }
+
+        /// The vocabulary changed (openai-biasing-spec §1) — request an idle keywords
+        /// push so the next Utterance is biased under the new set, with no reconnect.
+        /// Safe from any thread; never disturbs an in-flight Utterance (the maintenance
+        /// loop's existing idle gate), symmetric with `markParamsDirty`.
+        pub fn markRebiasDirty(self: *Self) void {
+            self.rebias_dirty.store(true, .release);
         }
 
         fn notifyLinkDropped(self: *Self) void {
@@ -1008,6 +1038,7 @@ pub fn Session(comptime Transport: type) type {
                 .last_pong_ms = self.last_pong_ms.load(.acquire),
                 .read_ended = self.read_ended.load(.acquire),
                 .params_dirty = self.params_dirty.load(.acquire),
+                .rebias_dirty = self.rebias_dirty.load(.acquire),
             };
         }
 
@@ -1024,6 +1055,7 @@ pub fn Session(comptime Transport: type) type {
                         if (reason) |r| feedback.log("  {s}\n", .{reconnectMessage(r)});
                         self.reconnect();
                     },
+                    .rebias => self.pushRebias(),
                 }
             }
         }
@@ -1043,6 +1075,33 @@ pub fn Session(comptime Transport: type) type {
             }
             self.last_ping_ms = nowMs();
             self.awaiting_pong = true;
+        }
+
+        /// The `.rebias` effect (openai-biasing-spec §1): rebuild the full always-emit
+        /// session.update from the live snapshot and push it on the warm link — byte-
+        /// identical to a connect payload by construction, so the field-wise merge
+        /// re-binds `keywords` (an explicit `[]` clears). Maintenance-thread-only, one
+        /// tick at a time, so at most one re-bias is ever in flight. The Session-owned
+        /// `su` is NOT touched: the read loop replays it on session.created, and every
+        /// connect rebuilds it anyway — this push's bytes live and die here. Failure is
+        /// log-and-degrade: the previously-bound set keeps running; the next edit or
+        /// natural reconnect is the retry (a server rejection arrives as an `error`
+        /// event, which the read loop already logs without tearing anything down).
+        fn pushRebias(self: *Self) void {
+            // Clear first: an edit landing after the clear is still picked up by this
+            // very read; a stale flag costs at most one redundant push later.
+            self.rebias_dirty.store(false, .release);
+            const params = self.params_provider.get(self.params_provider.ctx);
+            const su = formatSessionUpdateAlloc(self.alloc, params) catch |e| {
+                feedback.log("  session: re-bias payload build failed: {s} — keeping the bound keywords\n", .{@errorName(e)});
+                return;
+            };
+            defer self.alloc.free(su);
+            self.sendControl(su) catch |e| {
+                feedback.log("  session: re-bias push failed: {s} — keeping the bound keywords\n", .{@errorName(e)});
+                return;
+            };
+            feedback.log("  session: vocabulary changed — re-binding keywords on the warm session\n", .{});
         }
 
         /// Cycle the connection. Runs on the maintenance thread only (or, at shutdown, on the
@@ -1741,6 +1800,45 @@ test "openClient rebuilds the Session-owned session.update on every connect atte
     try std.testing.expectEqualStrings(golden, sess.su);
 }
 
+test "the re-bias push sends a connect-identical session.update and clears the flag (#327)" {
+    // The warm-link re-bind (openai-biasing-spec §1): the push rebuilds the full
+    // always-emit payload from the provider snapshot, so it is byte-identical to what
+    // a connect would send — and no session cycle is involved (no transport churn).
+    var out_buf: [8]OutRecord = undefined;
+    var rec = Recorder{};
+    var sess: Session(FakeTransport) = undefined;
+    initFake(&sess, &out_buf, &rec);
+    sess.params_provider = .{ .ctx = null, .get = defaultTestParams };
+    sess.link_open = true;
+    sess.markRebiasDirty();
+
+    sess.pushRebias();
+
+    var buf: [2048]u8 = undefined;
+    const golden = try formatSessionUpdate(&buf, .{});
+    try std.testing.expectEqualStrings(golden, sess.transport.written());
+    try std.testing.expect(!sess.rebias_dirty.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), sess.transport.reads_started); // pushed, not cycled
+}
+
+test "openClient covers a pending re-bias: the cycle clears both dirty flags (#327)" {
+    // Precedence (openai-biasing-spec §1): a reconnect re-reads the snapshot and its
+    // connect payload carries the same keywords, so a superseded push must not fire
+    // again after the cycle.
+    var out_buf: [8]OutRecord = undefined;
+    var rec = Recorder{};
+    var sess: Session(FakeTransport) = undefined;
+    initFake(&sess, &out_buf, &rec);
+    sess.params_provider = .{ .ctx = null, .get = defaultTestParams };
+    defer std.testing.allocator.free(sess.su);
+
+    sess.markParamsDirty();
+    sess.markRebiasDirty();
+    try sess.openClient();
+    try std.testing.expect(!sess.params_dirty.load(.acquire));
+    try std.testing.expect(!sess.rebias_dirty.load(.acquire));
+}
+
 // ---- the session deadline: remote numbers proved before they are believed (#274) ----
 
 /// Parse a session object the way `serverMessage` does, then read its deadline. The reading
@@ -1944,6 +2042,7 @@ fn healthyReady() MaintenanceFacts {
         .last_pong_ms = 100_000,
         .read_ended = false,
         .params_dirty = false,
+        .rebias_dirty = false,
     };
 }
 
@@ -1987,6 +2086,36 @@ test "maintenance reconnects a ready idle session on params change, drop, cap, a
     f.last_ping_ms = f.now - pong_timeout_ms; // waited out the pong window…
     f.last_pong_ms = f.now - pong_timeout_ms - 1; // …and the last pong predates the ping
     try std.testing.expectEqual(@as(?ReconnectReason, .no_pong), maintenanceDecision(f).action.reconnect);
+}
+
+test "maintenance re-bias push is idle-gated and superseded by every reconnect trigger" {
+    // A ready, idle session with a pending re-bias pushes (openai-biasing-spec §1).
+    var f = healthyReady();
+    f.rebias_dirty = true;
+    try std.testing.expectEqual(MaintenanceAction.rebias, maintenanceDecision(f).action);
+
+    // Never mid-Utterance: the push waits for idle, so an in-flight Utterance always
+    // finishes under the set bound when it began.
+    f.streaming = true;
+    try std.testing.expectEqual(MaintenanceAction.idle, maintenanceDecision(f).action);
+
+    // A pending cycle supersedes the push — the reconnect re-reads everything anyway
+    // (openClient clears both flags).
+    f.streaming = false;
+    f.params_dirty = true;
+    try std.testing.expectEqual(@as(?ReconnectReason, .params_changed), maintenanceDecision(f).action.reconnect);
+
+    // So does every other reconnect trigger: a push onto a link about to cycle is waste.
+    f = healthyReady();
+    f.rebias_dirty = true;
+    f.read_ended = true;
+    try std.testing.expectEqual(@as(?ReconnectReason, .link_dropped), maintenanceDecision(f).action.reconnect);
+
+    // And a re-bias never fires while the session is not warm.
+    f = healthyReady();
+    f.rebias_dirty = true;
+    f.state = .connecting;
+    try std.testing.expectEqual(MaintenanceAction.idle, maintenanceDecision(f).action);
 }
 
 test "maintenance clears the probe when a healthy pong arrived, and pings on cadence" {

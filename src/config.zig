@@ -510,12 +510,17 @@ pub const Store = struct {
 };
 
 /// What changed between two snapshots — drives what the swap must trigger: a
-/// session-shaped change marks the Transcription Session dirty (idle reconnect), an
-/// overlay change flips the HUD. Simple fields need nothing (read-at-use).
+/// session-shaped change marks the Transcription Session dirty (idle reconnect), a
+/// rebias change asks the warm OpenAI session for an idle keywords push (never a
+/// cycle), an overlay change flips the HUD. Simple fields need nothing (read-at-use).
 pub const Diff = struct {
     any: bool = false,
     backend_selection: bool = false,
     session_shaped: bool = false, // model / language / delay / noise_reduction
+    /// vocabulary — read-at-use on both backends (never session-shaped), but the warm
+    /// OpenAI session must re-bind its `keywords` via a session.update push at the next
+    /// idle tick (openai-biasing-spec §1). The local path pins the list at press.
+    rebias: bool = false,
     overlay: bool = false,
 };
 
@@ -531,9 +536,9 @@ pub fn diffSettings(a: *const Settings, b: *const Settings) Diff {
     if (a.noise_reduction != b.noise_reduction) d.session_shaped = true;
     if (a.overlay != b.overlay) d.overlay = true;
     if (a.backtrack != b.backtrack) d.any = true; // pinned at press with the Lease — read-at-use
-    if (!vocabularyEql(a.vocabulary, b.vocabulary)) d.any = true; // read-at-use at press (Lease-pinned) — never session-shaped
+    if (!vocabularyEql(a.vocabulary, b.vocabulary)) d.rebias = true; // never session-shaped: local reads at press, OpenAI re-binds via idle push
     if (a.log_transcripts != b.log_transcripts) d.any = true; // the swap itself republishes the log policy (#250)
-    if (d.backend_selection or d.session_shaped or d.overlay) d.any = true;
+    if (d.backend_selection or d.session_shaped or d.rebias or d.overlay) d.any = true;
     return d;
 }
 
@@ -1145,7 +1150,7 @@ test "diffSettings flags a log_transcripts change as plain (the swap republishes
     var b = base;
     b.log_transcripts = true;
     const d = diffSettings(&base, &b);
-    try std.testing.expect(d.any and !d.session_shaped and !d.overlay and !d.backend_selection);
+    try std.testing.expect(d.any and !d.session_shaped and !d.overlay and !d.backend_selection and !d.rebias);
 }
 
 test "backtrack parses from config.zon and defaults off when absent" {
@@ -1161,7 +1166,7 @@ test "diffSettings flags a backtrack change as plain (pinned at press with the L
     var b = base;
     b.backtrack = true;
     const d = diffSettings(&base, &b);
-    try std.testing.expect(d.any and !d.session_shaped and !d.overlay and !d.backend_selection);
+    try std.testing.expect(d.any and !d.session_shaped and !d.overlay and !d.backend_selection and !d.rebias);
 }
 
 test "OpenAI is the default Transcription Backend when config omits selection" {
@@ -1346,12 +1351,12 @@ test "findZonField returns null on a multi-line vocabulary array (full re-serial
     try std.testing.expect(findZonField(src, "vocabulary") == null);
 }
 
-test "diffSettings flags a vocabulary change as read-at-use (never session-shaped)" {
+test "diffSettings flags a vocabulary change as rebias (never session-shaped)" {
     const base = Settings{};
     var b = base;
     b.vocabulary = &.{"type-wave"};
     const d = diffSettings(&base, &b);
-    try std.testing.expect(d.any and !d.session_shaped and !d.overlay and !d.backend_selection);
+    try std.testing.expect(d.any and d.rebias and !d.session_shaped and !d.overlay and !d.backend_selection);
     // an identical list is not a change
     var c = base;
     c.vocabulary = &.{};
@@ -1359,7 +1364,8 @@ test "diffSettings flags a vocabulary change as read-at-use (never session-shape
     // order matters — a reorder is a real change (the flat list has no weights)
     const e = Settings{ .vocabulary = &.{ "a", "b" } };
     const f = Settings{ .vocabulary = &.{ "b", "a" } };
-    try std.testing.expect(diffSettings(&e, &f).any);
+    const g = diffSettings(&e, &f);
+    try std.testing.expect(g.any and g.rebias);
 }
 
 test "diffSettings flags session-shaped and overlay changes" {
@@ -1368,17 +1374,17 @@ test "diffSettings flags session-shaped and overlay changes" {
     try std.testing.expect(!diffSettings(&base, &b).any);
     b.language = "sv";
     var d = diffSettings(&base, &b);
-    try std.testing.expect(d.any and d.session_shaped and !d.overlay);
+    try std.testing.expect(d.any and d.session_shaped and !d.overlay and !d.rebias);
     b = base;
     b.overlay = false;
     d = diffSettings(&base, &b);
-    try std.testing.expect(d.any and !d.session_shaped and d.overlay);
+    try std.testing.expect(d.any and !d.session_shaped and d.overlay and !d.rebias);
     b = base;
     b.transcription_backend = .local;
     d = diffSettings(&base, &b);
-    try std.testing.expect(d.any and d.backend_selection and !d.session_shaped and !d.overlay);
+    try std.testing.expect(d.any and d.backend_selection and !d.session_shaped and !d.overlay and !d.rebias);
     b = base;
     b.talk_key = .globe;
     d = diffSettings(&base, &b);
-    try std.testing.expect(d.any and !d.session_shaped and !d.overlay);
+    try std.testing.expect(d.any and !d.session_shaped and !d.overlay and !d.rebias);
 }
