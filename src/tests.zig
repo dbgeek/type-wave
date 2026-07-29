@@ -36,7 +36,7 @@ test {
     _ = @import("openai_rewrite.zig"); // the locked Responses call: request build + output extraction
     _ = @import("readiness.zig");
     _ = @import("configuration_phase.zig");
-    _ = @import("supervisor.zig"); // the Supervisor: self-heal nudges + the capture-enable gate, fed facts
+    _ = @import("supervisor.zig"); // the Supervisor: self-heal nudges + the Capture-Enable Gate's cached term, fed facts
     _ = @import("grants.zig"); // the Grant Observer + its pure cold-start request sequence (#130)
     _ = @import("receipt.zig"); // the Installation Receipt codec (active.receipt / MODEL_MANIFEST / partial.meta)
     _ = @import("layout.zig"); // the Models Layout: the on-disk path grammar of the models root
