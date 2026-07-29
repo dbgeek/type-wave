@@ -7,3 +7,6 @@
 /acceptance/local_backend/network_trace.dylib
 /.claude/
 /.mypy_cache/
+
+# Generated/recorded A/B audio (#313) — rebuildable via `ab.py synth`, never source.
+/prototypes/openai-biasing-probe/clips/
