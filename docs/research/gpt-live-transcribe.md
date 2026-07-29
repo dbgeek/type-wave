@@ -215,3 +215,35 @@ constraint for single-user dictation.
 7. **Whether `gpt-live-transcribe` supports VAD** at all (irrelevant to hold-to-talk, but the VAD
    guide hasn't been updated to say).
 8. **Billing of appended-but-uncommitted audio** — still undocumented for duration-billed models.
+
+## Addendum (2026-07-29, same day): `language` resolved — it's `languages`, and "Don't send both"
+
+A parallel pass over the same transcription guide surfaced lines the sections above missed. They
+resolve open questions 3 and 7 and **supersede the "bare swap is a config edit" bottom line**.
+Verbatim from the [transcription guide](https://developers.openai.com/api/docs/guides/realtime-transcription):
+
+> "`gpt-live-transcribe` uses `languages` instead of the singular `language` field. Don't send both."
+
+> "ISO 639-1 codes, such as `en`, `es`, and `fr`. Selected ISO 639-3 codes, such as `eng`, `spa`,
+> `yue`, and `cmn`. Regional `zh` locale codes, such as `zh-cn`, `zh-tw`, and `zh-hk`."
+
+> "The Realtime API rejects unsupported or incorrectly formatted language codes."
+
+Spec shape: `languages: array of string, minItems: 1`. Consequences for type-wave:
+
+- **A pinned language makes the swap a code change, not a config edit.** `formatSessionUpdate`
+  (`src/session.zig:199`) emits the singular `"language":"<code>"` whenever `language` is
+  non-empty — off-spec for this model, and the guide's rejection language suggests a refused
+  `session.update` is plausible. Open question 3 is answered at the docs level; only the exact
+  server behavior on an off-spec singular field remains untested.
+- **A no-code A/B benchmark survives**: `language = ""` already omits the field entirely
+  (`src/session.zig:206`, the auto-detect path from wayfinder #34), so
+  `.model = "gpt-live-transcribe"` + `.language = ""` is a valid config-only setup for map #296's
+  benchmark leg. For symmetry, run `gpt-realtime-whisper` with `.language = ""` too, or record
+  the asymmetry in the write-up.
+- **On switch, the language knob migrates**: pinning becomes `languages: ["<code>"]` — a
+  formatter change plus a small settings-semantics decision (single hint → list of possible
+  languages), folding into §4's `prompt`/`keywords` emission work.
+- **Open question 7 (VAD)**: the guide positions VAD as *optional* for this model ("configure
+  voice activity detection instead" of manual commit) — unlike `gpt-realtime-whisper`'s
+  mandatory-off. Irrelevant to hold-to-talk, which keeps manual commit.
