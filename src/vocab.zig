@@ -1,12 +1,16 @@
-//! vocab.zig — pure helpers turning a user vocabulary list into what the local Whisper
-//! backend and the menu need (docs/vocab-biasing-spec.md §2, §6). Two independently
-//! testable functions, allocation only on the built string, and **no wiring**:
+//! vocab.zig — pure helpers turning a user vocabulary list into what the backends
+//! and the menu need (docs/vocab-biasing-spec.md §2, §6; docs/openai-biasing-spec.md
+//! §2). Independently testable functions, allocation only on the built string, and
+//! **no wiring**:
 //!
 //!   * `buildPrompt` — the bare comma glossary sent as Whisper's `initial_prompt`,
 //!     self-truncated drop-tail / keep-head so Whisper's own silent head-drop (#162)
 //!     never bites the user's most-important (leading) terms.
+//!   * `writeKeywordsJson` — the JSON string array carried as the OpenAI
+//!     `session.update` `keywords` field (openai-biasing-spec §2).
 //!   * `estimateTokens` / `budget` — the conservative token projection that drives the
-//!     menu's soft, non-blocking "long list" hint.
+//!     menu's soft, non-blocking "long list" hint. Whisper-only: the OpenAI path has
+//!     no truncation and no budget state (openai-biasing-spec §2).
 //!
 //! The chars→token heuristic is single-homed here (spec §2: "numbers tunable and
 //! centralized") so construction and the menu hint can never disagree about the budget.
@@ -88,6 +92,40 @@ pub fn buildPrompt(allocator: std.mem.Allocator, list: []const []const u8) ![]u8
         try out.appendSlice(allocator, item);
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// Would sending this item reject the whole OpenAI `session.update`? Any `<`, `>`,
+/// CR, or LF anywhere in an item bounces the entire update with an uncorrelatable
+/// `invalid_value` error (probed live, openai-biasing-spec §Empirical foundations),
+/// which under log-and-degrade would silently cost the user *all* their terms.
+fn keywordSendable(item: []const u8) bool {
+    if (item.len == 0) return false; // legal on the wire but pointless; belt-and-braces
+    for (item) |c| switch (c) {
+        '<', '>', '\r', '\n' => return false,
+        else => {},
+    };
+    return true;
+}
+
+/// Write the vocabulary as the JSON string array the OpenAI `keywords` field carries
+/// (openai-biasing-spec §2), e.g. `["term1","term2"]`. Pure and allocation-free —
+/// streams into any `std.Io.Writer`. In **user list order** (flat/unweighted model, no
+/// dedup, no reordering); item content **verbatim** except JSON escaping; items
+/// containing `<`, `>`, CR, or LF are **dropped whole** — never stripped or mangled —
+/// as are empty items (local Whisper biasing of dropped items is untouched). Never
+/// truncates: the 128×100 load clamp (config.zig) is the single size authority. An
+/// empty (or fully-dropped) list writes `[]` — the caller always emits the field on
+/// keywords-capable models, so connect payload ≡ re-bias push by construction.
+pub fn writeKeywordsJson(w: *std.Io.Writer, list: []const []const u8) std.Io.Writer.Error!void {
+    try w.writeByte('[');
+    var first = true;
+    for (list) |item| {
+        if (!keywordSendable(item)) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try std.json.Stringify.encodeJsonString(item, .{}, w);
+    }
+    try w.writeByte(']');
 }
 
 const talloc = std.testing.allocator;
@@ -189,6 +227,49 @@ test "budget agrees with buildPrompt: an .over list is the one that gets truncat
     const prompt = try buildPrompt(talloc, &backing);
     defer talloc.free(prompt);
     try std.testing.expect(prompt.len < glossaryChars(&backing)); // actually dropped tail
+}
+
+/// Test-only: run `writeKeywordsJson` into a fixed buffer and return the written bytes.
+fn keywordsJson(buf: []u8, list: []const []const u8) ![]const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    try writeKeywordsJson(&w, list);
+    return w.buffered();
+}
+
+test "writeKeywordsJson emits a JSON string array in user list order, no dedup" {
+    var buf: [256]u8 = undefined;
+    const out = try keywordsJson(&buf, &.{ "Bjorn", "config.zon", "whisper.cpp", "Bjorn" });
+    try std.testing.expectEqualStrings("[\"Bjorn\",\"config.zon\",\"whisper.cpp\",\"Bjorn\"]", out);
+}
+
+test "writeKeywordsJson writes [] for an empty list" {
+    var buf: [8]u8 = undefined;
+    const out = try keywordsJson(&buf, &.{});
+    try std.testing.expectEqualStrings("[]", out);
+}
+
+test "writeKeywordsJson escapes quotes, backslashes and control chars per JSON" {
+    var buf: [256]u8 = undefined;
+    const out = try keywordsJson(&buf, &.{ "say \"hi\"", "C:\\path", "tab\there" });
+    try std.testing.expectEqualStrings("[\"say \\\"hi\\\"\",\"C:\\\\path\",\"tab\\there\"]", out);
+}
+
+test "writeKeywordsJson drops items containing < > CR LF whole, never mangles them" {
+    var buf: [256]u8 = undefined;
+    const out = try keywordsJson(&buf, &.{ "Vec<T>", "ok", "line\nbreak", "carriage\rreturn", "a>b", "also ok" });
+    try std.testing.expectEqualStrings("[\"ok\",\"also ok\"]", out);
+}
+
+test "writeKeywordsJson drops empty items and writes [] when everything is dropped" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "[\"kept\"]",
+        try keywordsJson(&buf, &.{ "", "kept", "" }),
+    );
+    try std.testing.expectEqualStrings(
+        "[]",
+        try keywordsJson(&buf, &.{ "", "Result<T, E>", "\n" }),
+    );
 }
 
 /// Test-only: a `[]const u8` of `n` copies of `c`, built at comptime (mirrors config.zig's
