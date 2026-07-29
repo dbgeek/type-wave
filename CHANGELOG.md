@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.1](https://github.com/dbgeek/type-wave/compare/v0.4.0...v0.4.1) (2026-07-29)
+
+
+### Features
+
+* **menu:** the Vocabulary dialog copy tracks keywords capability ([#333](https://github.com/dbgeek/type-wave/issues/333)) ([#335](https://github.com/dbgeek/type-wave/issues/335)) ([dbf7a48](https://github.com/dbgeek/type-wave/commit/dbf7a4817f4367248f6f5b767bc2c357462ef5cb))
+* **menu:** the Vocabulary suffix tracks keywords capability ([#328](https://github.com/dbgeek/type-wave/issues/328)) ([#334](https://github.com/dbgeek/type-wave/issues/334)) ([adc06f6](https://github.com/dbgeek/type-wave/commit/adc06f60f6be926f321ce61f2c63aec1f4c943a1))
+* **session:** vocabulary biases OpenAI transcription at connect ([#326](https://github.com/dbgeek/type-wave/issues/326)) ([#330](https://github.com/dbgeek/type-wave/issues/330)) ([debac9b](https://github.com/dbgeek/type-wave/commit/debac9b8c2ce1929083380533c68a98004231e51))
+* **session:** vocabulary edits re-bind the warm session (rebias push) ([#327](https://github.com/dbgeek/type-wave/issues/327)) ([#332](https://github.com/dbgeek/type-wave/issues/332)) ([349560b](https://github.com/dbgeek/type-wave/commit/349560bb9d337264731d9a6943b502a60c5ea6cc))
+
 ## [0.4.0](https://github.com/dbgeek/type-wave/compare/v0.3.5...v0.4.0) (2026-07-29)
 
 
