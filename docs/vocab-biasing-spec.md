@@ -8,6 +8,17 @@
   (see [Branching & handoff](#branching--handoff)). The map is planning-only —
   no code shipped by it.
 
+> **Premise stale (2026-07-29):** this spec locked while `gpt-realtime-whisper`
+> was the OpenAI default and reasons throughout from "the default transcription
+> model cannot accept a prompt." The 0.4.0 default flip to `gpt-live-transcribe`
+> ([#303](https://github.com/dbgeek/type-wave/issues/303), decision
+> [#299](https://github.com/dbgeek/type-wave/issues/299)) killed that premise:
+> the new default accepts `prompt`/`keywords`/`languages` biasing
+> ([research](research/gpt-live-transcribe.md)). The **server-side (OpenAI)
+> biasing path is therefore unblocked** — it awaits its own effort and is
+> deliberately not designed here. The local-Whisper design below is unaffected;
+> mentions of `gpt-realtime-whisper` as "the default" below are historical.
+
 ## What vocabulary biasing is
 
 Vocabulary biasing is an **opt-in, user-curated list of terms/phrases** — names,
@@ -16,9 +27,11 @@ speech recognizer to spell them the way you mean. The list is a single flat,
 shared, menu-editable set of strings; there are no per-language lists, no weights,
 no pronunciation hints (all ruled out of scope).
 
-The biasing **effect is local-Whisper-only**. The OpenAI backend cannot bias its
-default transcription model (`gpt-realtime-whisper`) and a model switch is ruled
-out (see [OpenAI backend](#4-openai-backend--inert-with-signal-167)), so on OpenAI
+The biasing **effect is local-Whisper-only**. At lock time the OpenAI backend
+could not bias the then-default transcription model (`gpt-realtime-whisper`) and
+a model switch was ruled out (see
+[OpenAI backend](#4-openai-backend--inert-with-signal-167); premise stale since
+the 0.4.0 flip — dated note above), so on OpenAI
 the feature is **inert with a menu signal**: the list is still editable and stored,
 but it changes nothing until you switch to the Local backend. When the list is
 empty — the default — biasing is a **pure no-op** on both backends, byte-identical
@@ -46,7 +59,7 @@ today. The two research tickets and a plumbing survey established:
 
 - **OpenAI**: the transcription-session JSON (`src/session.zig:210`) carries only
   `model`/`language`/`delay` — no `prompt`/`instructions`. Prompt support is
-  model-dependent; the default `gpt-realtime-whisper` **cannot** accept one, and
+  model-dependent; the then-default `gpt-realtime-whisper` **cannot** accept one, and
   the prompt-capable `gpt-4o(-mini)-transcribe` loses live Partial Transcripts.
 - **Whisper**: `whisper_full_params.initial_prompt` is never set
   (`src/whisper_bridge.cpp:75`), the C ABI (`whisper_bridge.h:19`) has no prompt
@@ -66,9 +79,11 @@ Two facts ground every budget and wiring decision below:
   do **not** disable it.
 - **OpenAI transcription prompt** exists only on `gpt-4o(-mini)-transcribe`
   (field `session.audio.input.transcription.prompt`, and those models drop `delay`
-  and the live Partial stream). The GA default `gpt-realtime-whisper` returns, in
-  OpenAI's words, *"Prompt is not supported… in GA Realtime sessions."* Biasing
-  OpenAI is therefore impossible without a model switch, which is rejected.
+  and the live Partial stream). The then-GA-default `gpt-realtime-whisper` returns,
+  in OpenAI's words, *"Prompt is not supported… in GA Realtime sessions."* Biasing
+  OpenAI was therefore impossible without a model switch, which was rejected.
+  (Stale since the [#303](https://github.com/dbgeek/type-wave/issues/303) flip —
+  see the dated note above.)
 
 ## 1. Config schema & data model ([#164](https://github.com/dbgeek/type-wave/issues/164))
 
@@ -302,8 +317,9 @@ fog: **structural** caps → clamp + count note; **token-budget** overrun → so
 **Vocabulary biasing is local-Whisper-only. The OpenAI backend gets no session
 wiring — the shared config field stays but is inert, and the menu says so.**
 
-In-band ASR biasing on the default `gpt-realtime-whisper` is impossible (§Research
-foundations), and switching to `gpt-4o-mini-transcribe` was **explicitly ruled out**
+In-band ASR biasing on the then-default `gpt-realtime-whisper` is impossible
+(§Research foundations; stale as a claim about *the default* since the 0.4.0
+flip — dated note above), and switching to `gpt-4o-mini-transcribe` was **explicitly ruled out**
 by the maintainer (unwilling to trade the streaming partials / `delay` knob).
 
 ### Do **not** build the OpenAI wiring
@@ -449,7 +465,8 @@ tests exercise the prompt path without a real child.
 
 Explicitly ruled **out of scope** by the map (never graduate here): per-language
 vocabulary lists; pronunciation hints / weighted terms; in-band OpenAI ASR biasing
-(impossible on `gpt-realtime-whisper`); output-side OpenAI correction via a
+(impossible on `gpt-realtime-whisper`; possible on the 0.4.0 default
+`gpt-live-transcribe` — see the dated note above); output-side OpenAI correction via a
 per-utterance `/v1/responses` pass.
 
 ## Branching & handoff

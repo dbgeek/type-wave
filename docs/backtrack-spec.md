@@ -68,8 +68,9 @@ These were locked when the map was charted and constrain every decision below:
   socket for no gain; prompt caching needs ≥1024 prompt tokens (our short fixed
   prompt won't trigger it and wouldn't benefit at this size).
 - **No reliable one-pass path.** The transcription `prompt` field is unsupported on
-  `gpt-realtime-whisper` and is only a vocabulary-biasing hint elsewhere — a
-  separate rewrite call is the only reliable mechanism.
+  the pre-0.4.0 default `gpt-realtime-whisper`, and where it exists — including on
+  `gpt-live-transcribe`, the 0.4.0 default — it is only a vocabulary-biasing hint,
+  not a rewrite mechanism; a separate rewrite call is the only reliable path.
 
 **Prompt.** The locked prompt is `prompt.txt` **v6** on the throwaway branch
 [`prototype/backtrack-prompt`](https://github.com/dbgeek/type-wave/tree/prototype/backtrack-prompt/prototypes/backtrack-prompt).
