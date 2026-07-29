@@ -15,9 +15,13 @@
 > [#299](https://github.com/dbgeek/type-wave/issues/299)) killed that premise:
 > the new default accepts `prompt`/`keywords`/`languages` biasing
 > ([research](research/gpt-live-transcribe.md)). The **server-side (OpenAI)
-> biasing path is therefore unblocked** — it awaits its own effort and is
-> deliberately not designed here. The local-Whisper design below is unaffected;
-> mentions of `gpt-realtime-whisper` as "the default" below are historical.
+> biasing path is now designed and locked** in its own spec —
+> [`openai-biasing-spec.md`](openai-biasing-spec.md) (map
+> [#310](https://github.com/dbgeek/type-wave/issues/310)): the shared
+> `vocabulary` list rides `session.update` as `keywords` on keywords-capable
+> models. The local-Whisper design below is unaffected; mentions of
+> `gpt-realtime-whisper` as "the default" below are historical, and §4's
+> inert-with-signal stance holds only for models that cannot take `keywords`.
 
 ## What vocabulary biasing is
 
