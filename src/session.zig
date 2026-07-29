@@ -1,6 +1,6 @@
-//! Transcription Session over the OpenAI Realtime API (gpt-realtime-whisper,
-//! manual commit). This module knows the OpenAI protocol and owns the websocket;
-//! it knows nothing about CoreAudio or the Talk Key.
+//! Transcription Session over the OpenAI Realtime API (gpt-live-transcribe by
+//! default since #303, manual commit). This module knows the OpenAI protocol and
+//! owns the websocket; it knows nothing about CoreAudio or the Talk Key.
 //!
 //! Graduated from prototypes/cli-dictation/src/session.zig (wayfinder #8), then grown
 //! into the **warm long-lived lifecycle** (wayfinder #17):
@@ -173,11 +173,13 @@ pub const TranscriptObserver = struct {
 };
 
 /// The transcription knobs that vary by config (wayfinder #16), fed to the
-/// session.update built at connect time. Defaults reproduce the exact string proven
-/// live in #8. `noise_reduction` is null when disabled (emits JSON `null`);
-/// `language` empty means auto-detect (the field is omitted from the JSON).
+/// session.update built at connect time. Defaults mirror config.Settings — the
+/// gpt-live-transcribe payload since the #303 flip; pinning "gpt-realtime-whisper"
+/// reproduces the exact string proven live in #8. `noise_reduction` is null when
+/// disabled (emits JSON `null`); `language` empty means auto-detect (the field is
+/// omitted from the JSON).
 pub const TranscriptionParams = struct {
-    model: []const u8 = "gpt-realtime-whisper",
+    model: []const u8 = "gpt-live-transcribe",
     language: []const u8 = "en",
     delay: []const u8 = "low",
     noise_reduction: ?[]const u8 = "near_field",
@@ -201,9 +203,11 @@ fn modelSpeaksLanguages(model: []const u8) bool {
 }
 
 /// Manual-commit transcription config (crib sheet §2). turn_detection:null is
-/// mandatory for gpt-realtime-whisper and maps 1:1 onto hold-to-talk. Built from
-/// `params`; with the defaults it is byte-identical to the #8-proven constant
-/// (a scratchpad check asserted this against the literal before it was inlined).
+/// mandatory for gpt-realtime-whisper, verified on gpt-live-transcribe in the #298
+/// A/B benchmark, and maps 1:1 onto hold-to-talk. Built from `params`; with
+/// `.model = "gpt-realtime-whisper"` pinned it is byte-identical to the #8-proven
+/// constant (a scratchpad check asserted this against the literal before it was
+/// inlined; the pinned-model golden test keeps it honest).
 pub fn formatSessionUpdate(buf: []u8, params: TranscriptionParams) ![]const u8 {
     var nr_buf: [128]u8 = undefined;
     const nr = if (params.noise_reduction) |t|
@@ -1416,9 +1420,30 @@ fn deliverServerMessage(sess: anytype, json: []const u8) void {
 
 // ---- tests (backfilled with the coordinator work, 2026-07-08) ----------------
 
-test "formatSessionUpdate defaults reproduce the #8-proven string" {
+test "formatSessionUpdate defaults speak gpt-live-transcribe (#303 flip, golden payload)" {
     var buf: [2048]u8 = undefined;
     const out = try formatSessionUpdate(&buf, .{});
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"session.update\",\"session\":{\"type\":\"transcription\",\"audio\":{\"input\":{\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},\"transcription\":{\"model\":\"gpt-live-transcribe\",\"languages\":[\"en\"],\"delay\":\"low\"},\"turn_detection\":null,\"noise_reduction\":{\"type\":\"near_field\"}}}}}",
+        out,
+    );
+}
+
+test "the session parameter default and the config default name the same model" {
+    // Production always flows Settings.model → daemon.getParams → TranscriptionParams,
+    // so these two defaults drifting apart would only ever show up in tests that rely
+    // on TranscriptionParams{}. Pin them together explicitly (#303).
+    const config = @import("config.zig");
+    const params = TranscriptionParams{};
+    const settings = config.Settings{};
+    try std.testing.expectEqualStrings(settings.model, params.model);
+}
+
+test "formatSessionUpdate pinned gpt-realtime-whisper reproduces the #8-proven string" {
+    // The config-only rollback path: pinning the old model must yield the exact
+    // pre-flip payload, byte for byte.
+    var buf: [2048]u8 = undefined;
+    const out = try formatSessionUpdate(&buf, .{ .model = "gpt-realtime-whisper" });
     try std.testing.expectEqualStrings(
         "{\"type\":\"session.update\",\"session\":{\"type\":\"transcription\",\"audio\":{\"input\":{\"format\":{\"type\":\"audio/pcm\",\"rate\":24000},\"transcription\":{\"model\":\"gpt-realtime-whisper\",\"language\":\"en\",\"delay\":\"low\"},\"turn_detection\":null,\"noise_reduction\":{\"type\":\"near_field\"}}}}}",
         out,
@@ -1443,7 +1468,7 @@ test "formatSessionUpdate speaks plural languages for the gpt-transcribe sibling
 
 test "formatSessionUpdate omits language entirely for auto-detect (empty string)" {
     var buf: [2048]u8 = undefined;
-    const out = try formatSessionUpdate(&buf, .{ .language = "" });
+    const out = try formatSessionUpdate(&buf, .{ .model = "gpt-realtime-whisper", .language = "" });
     try std.testing.expect(std.mem.indexOf(u8, out, "\"language\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"model\":\"gpt-realtime-whisper\",\"delay\":\"low\"") != null);
 }

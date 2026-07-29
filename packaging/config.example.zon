@@ -26,8 +26,10 @@
     // OpenAI transcription knobs. Strings, so you can A/B a different model with no
     // rebuild (wayfinder #11) — e.g. .model = "gpt-4o-mini-transcribe" (note: that
     // model supports prompt biasing but loses live Partial Transcripts).
+    // "gpt-live-transcribe" is the default since 0.4.0 (#303); pin
+    // "gpt-realtime-whisper" to keep the pre-0.4.0 behavior.
     // .language = "" means auto-detect (the field is omitted from the session).
-    .model = "gpt-realtime-whisper",
+    .model = "gpt-live-transcribe",
     .language = "en",
     .delay = "low",
 
