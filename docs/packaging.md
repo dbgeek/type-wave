@@ -28,6 +28,30 @@ Two more pieces make the identity whole, both already wired into the build:
 
 Out of scope for now (distribution — fog): hardened runtime, entitlements, notarization.
 
+## Forking / renaming the bundle identifier
+
+`me.ba78.type-wave` is a reverse-DNS bundle identifier derived from the maintainer's
+domain (`ba78.me`). **Cloning to build and run type-wave locally, you can leave it as-is** —
+it is harmless: the identifier only has to be internally consistent, and each build is signed
+with your *own* self-signed `type-wave dev` cert, so its Designated Requirement (identifier +
+your cert leaf) never collides with anyone else's install.
+
+Change it only if you **fork to distribute**, or want a namespace you own (e.g.
+`com.github.<you>.type-wave`). It is a plain string with no generator, so update every site
+and keep them identical — the daemon, the LaunchAgent, the keychain item, and the codesign
+identifier all key off this one value:
+
+| Site | What to change |
+| --- | --- |
+| `packaging/install.sh` | `BUNDLE_ID` and `LABEL` (both) |
+| `packaging/Info.plist` | the `CFBundleIdentifier` value |
+| `packaging/me.ba78.type-wave.plist` | the `<key>Label</key>` value **and the filename** — `install.sh` renders `packaging/$LABEL.plist`, so the file must match the new `LABEL` |
+| `src/keychain.zig` | the `service` constant (the login-keychain item name) |
+
+`src/info_plist.zig` only mentions the identifier in a doc comment — the real value is
+`@embedFile`d from `packaging/Info.plist` above — so update that comment for accuracy but
+nothing there is load-bearing.
+
 ## One-time: create the signing identity
 
 Create a self-signed **code-signing** certificate named **`type-wave dev`** in your
