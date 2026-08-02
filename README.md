@@ -15,7 +15,7 @@ foreground while developing, or as a signed per-user LaunchAgent for daily use.
        width="640">
 </p>
 
-> **Status:** experimental research project, `v0.1.2`, Apple Silicon macOS only.
+> **Status:** experimental research project, `v0.4.2`, Apple Silicon macOS only.
 > Single-maintainer, no support or SLA — small fixes welcome, larger changes worth
 > discussing first. The hold-to-talk -> transcribe -> insert pipeline works end-to-end
 > on either backend. Distribution hardening (hardened runtime, entitlements,
@@ -26,9 +26,9 @@ foreground while developing, or as a signed per-user LaunchAgent for daily use.
 ```mermaid
 flowchart TD
     TK([Hold Talk Key, speak, release]) --> CAP[CoreAudio Capture]
-    CAP --> ROUTER{Backend Router<br/>pins backend + settings<br/>for this Utterance}
-    ROUTER -->|OpenAI, default| OA[OpenAI Realtime<br/>Transcription Session]
-    ROUTER -->|Local, offline| LW[Local Whisper Backend<br/>Segmenter cuts at silences<br/>Whisper Helper transcribes<br/>Vocabulary biases spelling]
+    CAP --> ROUTER{Backend Router<br/>pins backend + settings + Vocabulary<br/>for this Utterance}
+    ROUTER -->|OpenAI, default| OA[OpenAI Realtime<br/>Transcription Session<br/>Vocabulary biases as keywords]
+    ROUTER -->|Local, offline| LW[Local Whisper Backend<br/>Segmenter cuts at silences<br/>Whisper Helper transcribes<br/>Vocabulary biases the prompt]
     OA --> FT[Final Transcript]
     LW --> FT
     FT --> BT{Backtrack on?<br/>OpenAI only}
@@ -61,8 +61,12 @@ Transcript on release. **Local Whisper** runs offline: its **Segmenter** cuts a 
 Utterance into **Segments** at silences and hands each to the warm **Whisper Helper**
 child process in the background, and the ordered **Segment Transcripts** concatenate into
 the Final Transcript. In local mode the audio never leaves the Mac. An optional
-**Vocabulary** — a hand-curated list of names, jargon, and identifiers edited from the menu
-bar — biases local Whisper's spelling toward your terms.
+**Vocabulary** — one hand-curated list of names, jargon, and identifiers edited from the menu
+bar — biases spelling toward your terms on both backends: local Whisper takes it as the
+Segment prompt, and OpenAI takes it as the `keywords` field of the session, re-bound on the
+warm session the next time you edit it. On OpenAI it applies only to models known to accept
+`keywords` (today `gpt-live-transcribe` and `gpt-transcribe`); with any other model pinned the
+list is inert and the menu says so.
 
 With the opt-in **Backtrack** setting on and OpenAI selected, one more stage sits between
 the Final Transcript and Insertion: a single OpenAI **Rewrite** pass applies spoken
@@ -85,6 +89,16 @@ earlier text. Every cursor path, dictation and menu action and Undo alike, is dr
 one **Insert Worker** thread (dictation first, Undo last), which is what keeps a deletion
 from landing in the middle of an Insertion. Nothing here is ever written to disk; the ring
 is cleared when the daemon quits.
+
+One Utterance is deliberately not remembered: one spoken while any app holds **Secure Event
+Input**, the session-wide mode a password field puts macOS into. type-wave probes at both Talk
+Key press and release, and a positive reading on either edge withholds that Insertion Record
+from the ring and keeps the transcript out of the log even under the `.log_transcripts` opt-in.
+The text still lands at the cursor — it is simply never retained, so it cannot be revealed,
+copied, re-inserted, or undone. While Secure Event Input is held the WindowServer also withholds
+key events from every event tap, so the `⌃⌘⌫` chord never reaches the daemon at all; the menu
+bar reports that state rather than leaving you to infer it from a chord that silently does
+nothing.
 
 Across the whole lifecycle the **Utterance Coordinator** owns the state machine from
 Talk Key press to a resolved Insertion. The floating **HUD** is silent visual feedback
@@ -177,6 +191,8 @@ cp packaging/config.example.zon ~/.config/type-wave/config.zon
 | `pre_paste_ms` | `25` | Pasteboard settle delay before Cmd-V |
 | `overlay` | `true` | Show the silent waveform/processing HUD |
 | `backtrack` | `false` | Opt-in OpenAI rewrite of spoken self-corrections and fillers; OpenAI backend only, sends transcript text to the cloud |
+| `vocabulary` | `.{}` | Phrase biasing on both backends; usually edited from the menu bar, empty = off |
+| `log_transcripts` | `false` | Debugging opt-in that logs the words; never applies to a Secure Event Input Utterance |
 
 > **Migrating from before 0.4.0:** the default model flipped from
 > `gpt-realtime-whisper` to `gpt-live-transcribe`
@@ -219,6 +235,8 @@ identity embedded in the running type-wave release. An older verified installati
 ready for offline dictation while `--update-model` stages, verifies, and smoke-tests its
 replacement. Activation waits for active local inference to drain, then atomically switches
 the receipt; failure or cancellation leaves the working installation selected and usable.
+`--remove-model` deletes the installation after an interactive confirmation; the Local backend
+stays selected if it was, and is simply unavailable until the next Install.
 
 Run `--verify-model` for a full offline integrity check of the active Model Installation.
 It hashes every model byte and reports the exact corrupt metadata/artifact class without
@@ -314,6 +332,7 @@ ADR-0009).
 | `src/whisper_ipc.zig` | Whisper Helper IPC frame protocol |
 | `src/whisper_process_helper.zig` | Parent-side warm helper process owner and relaunch ladder |
 | `src/whisper_supervisor.zig` | Whisper Helper event/state machine and recovery budget |
+| `src/signing_identity.zig` | Signing Identity gate: proves the Whisper Helper binary before it is spawned |
 
 **Local model provisioning & storage**
 
@@ -337,6 +356,7 @@ ADR-0009).
 | `src/configuration_phase.zig` | Setup readiness transitions and reporting |
 | `src/readiness.zig` | Pure readiness/status policy |
 | `src/grants.zig` | Grant Observer: the three TCC grant facts and their serialized cold-start request sequence |
+| `src/api_key.zig` | Key Holder: the daemon's single OpenAI key copy, zeroed before release |
 | `src/failure_observation.zig` | Cross-thread failure snapshot the status item reads |
 
 **Audio, insertion & input**
@@ -345,6 +365,7 @@ ADR-0009).
 | --- | --- |
 | `src/capture.zig` | CoreAudio capture |
 | `src/tap.zig` | Global Talk Key observation and the `⌃⌘⌫` recovery chord |
+| `src/secure_input.zig` | Secure Input Observer: pure decider that narrates a held Secure Event Input |
 | `src/insert.zig` | Clipboard paste and synthetic keystroke insertion |
 | `src/insertion_runner.zig` | Insertion Runner: dictation and menu cursor jobs, and the Insert Worker loop |
 | `src/app_focus.zig` | Best-effort App Identity read at insertion time |
@@ -374,6 +395,7 @@ ADR-0009).
 | `src/surface.zig` | HUD-vs-sound feedback arbitration |
 | `src/feedback.zig` | Sound cues and timestamped logging |
 | `src/keychain.zig` | OpenAI login-Keychain item |
+| `src/broken_pipe.zig` | Process-wide SIGPIPE disposition: a dead reader fails the write, not the process |
 | `src/info_plist.zig` | Embedded `Info.plist` Mach-O section |
 
 ## Repository Layout
@@ -382,6 +404,8 @@ ADR-0009).
 src/                 daemon source
 docs/                toolchain, packaging, ADRs, research notes, agent docs
 packaging/           Info.plist, LaunchAgent plist, install script, config example
+acceptance/          deterministic local-backend release-gate tests (zig build acceptance-test)
+tools/               whisper.cpp runtime build script and the helper probe
 prototypes/          spikes that proved capture, insertion, menu, and HUD behavior
 build.zig.zon        the url+hash pin for karlseguin/websocket.zig
 flake.nix            development shell pinning the Zig nightly

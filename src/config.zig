@@ -82,8 +82,10 @@ pub const Settings = struct {
     /// Custom vocabulary / phrase biasing (docs/vocab-biasing-spec.md §1): an opt-in,
     /// user-curated flat list of terms that nudges the recognizer's spelling. Default
     /// `&.{}` = "no biasing", mirroring how `language = ""` is the omission signal. The
-    /// effect is local-Whisper-only and read at Talk Key press (pinned with the Lease);
-    /// the list is structurally clamped at load (see `clampVocabulary`).
+    /// list reaches both backends (docs/openai-biasing-spec.md §1): local Whisper reads it
+    /// at Talk Key press (pinned with the Lease), and the OpenAI Session binds it as
+    /// `keywords` on a keywords-capable model, re-binding on an idle push when it changes.
+    /// The list is structurally clamped at load (see `clampVocabulary`).
     vocabulary: []const []const u8 = &.{},
     /// Write the spoken words to the log, not just the fact that an Utterance resolved
     /// (#250). Off by default: `~/Library/Logs/type-wave.log` is unrotated, uncapped
@@ -732,7 +734,7 @@ fn serializeInto(w: *std.Io.Writer, s: Settings) std.Io.Writer.Error!void {
         \\//   .overlay         = true | false
         \\//   .backtrack       = true | false  (rewrite self-corrections via OpenAI — transcript text leaves your Mac)
         \\//   .log_transcripts = true | false  (log the spoken words, not just that an Utterance resolved — off: the log is unrotated plaintext)
-        \\//   .vocabulary      = .{{ "term", ... }}  (local-Whisper-only phrase biasing; empty = off)
+        \\//   .vocabulary      = .{{ "term", ... }}  (phrase biasing on both backends — OpenAI only on a keywords-capable model; empty = off)
         \\.{{
         \\    .transcription_backend = .{s},
         \\    .talk_key = .{s},
