@@ -1425,7 +1425,7 @@ pub fn isHuggingFaceOrigin(url: []const u8) bool {
 fn isHuggingFaceUri(uri: std.Uri) bool {
     if (!isArtifactTransport(uri)) return false;
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = uri.getHost(&host_buffer) catch return false;
+    const host = std.Io.net.HostName.fromUri(uri, &host_buffer) catch return false;
     return std.ascii.eqlIgnoreCase(host.bytes, "huggingface.co");
 }
 
@@ -1459,7 +1459,7 @@ const huggingface_zones = [_][]const u8{ "huggingface.co", "hf.co" };
 fn isHuggingFaceRedirectTarget(uri: std.Uri) bool {
     if (!isArtifactTransport(uri)) return false;
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = uri.getHost(&host_buffer) catch return false;
+    const host = std.Io.net.HostName.fromUri(uri, &host_buffer) catch return false;
     for (huggingface_zones) |zone| if (hostInZone(host.bytes, zone)) return true;
     return false;
 }
@@ -2228,6 +2228,9 @@ test "acquisition starts only at the exact trusted artifact origin" {
     try std.testing.expect(!isHuggingFaceOrigin("https://us.aws.cdn.hf.co/xet-bridge-us/5a4b"));
     try std.testing.expect(!isHuggingFaceOrigin("https://huggingface.co.evil.example/model"));
     try std.testing.expect(!isHuggingFaceOrigin("http://huggingface.co/model"));
+    // A URI with no authority never reaches a host to compare, so the host check has
+    // nothing to answer with; it refuses rather than faulting on the absent component.
+    try std.testing.expect(!isHuggingFaceOrigin("https:/ggerganov/whisper.cpp/resolve/main/ggml.bin"));
 }
 
 test "a download follows a redirect only back into Hugging Face's own DNS" {
@@ -2238,7 +2241,7 @@ test "a download follows a redirect only back into Hugging Face's own DNS" {
     // that hop has to be followed or no Model Installation can be acquired at all.
     const cdn = try resolveRedirect(origin, "https://us.aws.cdn.hf.co/xet-bridge-us/5a4b?Signature=sig&Key-Pair-Id=key", &buffer);
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    try std.testing.expectEqualStrings("us.aws.cdn.hf.co", (try cdn.getHost(&host_buffer)).bytes);
+    try std.testing.expectEqualStrings("us.aws.cdn.hf.co", (try std.Io.net.HostName.fromUri(cdn, &host_buffer)).bytes);
 
     // Names Hugging Face has served this artifact from before, and may return to.
     _ = try resolveRedirect(origin, "https://cdn-lfs.huggingface.co/repos/artifact", &buffer);
