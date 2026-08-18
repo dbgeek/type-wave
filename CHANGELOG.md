@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.3](https://github.com/dbgeek/type-wave/compare/v0.4.2...v0.4.3) (2026-08-18)
+
+
+### Bug Fixes
+
+* **model-store:** the host allowlist reads its host through HostName.fromUri ([#343](https://github.com/dbgeek/type-wave/issues/343)) ([#344](https://github.com/dbgeek/type-wave/issues/344)) ([a4ec18e](https://github.com/dbgeek/type-wave/commit/a4ec18e8c32057c906c6f5453d790ebc0d2e4b23))
+
 ## [0.4.2](https://github.com/dbgeek/type-wave/compare/v0.4.1...v0.4.2) (2026-07-29)
 
 
