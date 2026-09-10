@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.4](https://github.com/dbgeek/type-wave/compare/v0.4.3...v0.4.4) (2026-09-10)
+
+
+### Performance Improvements
+
+* **whisper:** benchmark Segment resampling ([#346](https://github.com/dbgeek/type-wave/issues/346)) ([#348](https://github.com/dbgeek/type-wave/issues/348)) ([6c43d44](https://github.com/dbgeek/type-wave/commit/6c43d4487b6d8ed2b0979a89623c35e939915092))
+
 ## [0.4.3](https://github.com/dbgeek/type-wave/compare/v0.4.2...v0.4.3) (2026-08-18)
 
 
