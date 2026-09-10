@@ -26,6 +26,16 @@ mode with Metal and Accelerate. It should not be replaced by project-local SIMD.
 verification is another large linear operation, but Zig's standard library already selects its
 AArch64 SHA-2 instruction implementation when the target exposes that feature.
 
+### Follow-up: Segment resampling benchmark
+
+The requested Segment-resampling experiment is complete. The explicit Zig-vector candidate was
+bit-identical and about 4.7× faster in isolation, but saved only 0.414 ms at the 26 s helper-input
+ceiling—0.0131% of the accepted-corpus helper-path median. That is not a material whole-helper,
+CPU, or demonstrated energy improvement, so the decision is **no-ship**: keep the scalar
+production implementation and do not pursue vDSP. See
+[`segment-resampling-benchmark.md`](./segment-resampling-benchmark.md) for the reproducible
+measurements and qualification evidence.
+
 ## What SIMD means in this codebase
 
 Zig's `@Vector(N, T)` operations are element-wise and use SIMD instructions when the target can
@@ -157,9 +167,11 @@ memory copy implementation/compiler can use suitable bulk moves, and the surroun
 `@memcpy`, parsing, queue, menu, and state-machine loops are similarly small, branchy, blocking on
 I/O, or already routed through optimized standard-library primitives.
 
-## Benchmark-first next steps
+## Benchmark protocol and remaining next steps
 
-No production change is recommended yet. A bounded experiment should proceed in this order:
+No production change is recommended. The completed Segment-resampling experiment followed the
+first three steps below; the fourth remains the evidence gate for any future RMS work, and the
+fifth remains required after any candidate optimization:
 
 1. Add a test-only benchmark for `resample24To16Alloc` using 50 ms, 5 s, and maximum 26 s inputs.
    Compare the current scalar implementation, an explicit `@Vector` block implementation, and—if
