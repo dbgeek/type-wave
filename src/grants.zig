@@ -379,23 +379,23 @@ const FakeProbes = struct {
     requests: [8]Grant = undefined,
     request_count: usize = 0,
 
-    fn micGranted(self: *FakeProbes) bool {
+    pub fn micGranted(self: *FakeProbes) bool {
         return self.mic;
     }
-    fn listenGranted(self: *FakeProbes) bool {
+    pub fn listenGranted(self: *FakeProbes) bool {
         return self.listen;
     }
-    fn tapEnabled(self: *FakeProbes) bool {
+    pub fn tapEnabled(self: *FakeProbes) bool {
         return self.tap;
     }
-    fn postEventGranted(self: *FakeProbes) bool {
+    pub fn postEventGranted(self: *FakeProbes) bool {
         return self.post_event;
     }
-    fn request(self: *FakeProbes, grant: Grant) void {
+    pub fn request(self: *FakeProbes, grant: Grant) void {
         self.requests[self.request_count] = grant;
         self.request_count += 1;
     }
-    fn nowMs(self: *FakeProbes) i64 {
+    pub fn nowMs(self: *FakeProbes) i64 {
         return self.now;
     }
     fn requested(self: *FakeProbes) []const Grant {

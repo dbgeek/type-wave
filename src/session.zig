@@ -1440,40 +1440,40 @@ const FakeTransport = struct {
     write_buf: [1 << 14]u8 = undefined,
     write_len: usize = 0,
 
-    const Reader = struct {
+    pub const Reader = struct {
         pub fn join(_: Reader) void {}
     };
 
-    fn init(_: std.Io, _: std.mem.Allocator) FakeTransport {
+    pub fn init(_: std.Io, _: std.mem.Allocator) FakeTransport {
         return .{};
     }
-    fn connect(self: *FakeTransport, _: []const u8) !void {
+    pub fn connect(self: *FakeTransport, _: []const u8) !void {
         self.connected = true;
     }
-    fn startReadLoop(self: *FakeTransport, _: anytype) !Reader {
+    pub fn startReadLoop(self: *FakeTransport, _: anytype) !Reader {
         self.reads_started += 1;
         return .{};
     }
-    fn write(self: *FakeTransport, bytes: []u8) !void {
+    pub fn write(self: *FakeTransport, bytes: []u8) !void {
         self.writes += 1;
         if (self.write_len + bytes.len <= self.write_buf.len) {
             @memcpy(self.write_buf[self.write_len..][0..bytes.len], bytes);
             self.write_len += bytes.len;
         }
     }
-    fn writePing(self: *FakeTransport, _: []u8) !void {
+    pub fn writePing(self: *FakeTransport, _: []u8) !void {
         self.pings += 1;
     }
-    fn writePong(self: *FakeTransport, _: []u8) !void {
+    pub fn writePong(self: *FakeTransport, _: []u8) !void {
         self.pongs += 1;
     }
-    fn writeCloseFrame(self: *FakeTransport, _: []u8) !void {
+    pub fn writeCloseFrame(self: *FakeTransport, _: []u8) !void {
         self.close_frames += 1;
     }
-    fn forceClose(self: *FakeTransport) void {
+    pub fn forceClose(self: *FakeTransport) void {
         self.force_closes += 1;
     }
-    fn deinit(self: *FakeTransport) void {
+    pub fn deinit(self: *FakeTransport) void {
         self.connected = false;
     }
 
