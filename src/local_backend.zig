@@ -548,18 +548,18 @@ const FakeHelper = struct {
     reserve_error: bool = false,
     submit_error: bool = false,
 
-    fn isReady(_: *FakeHelper) bool {
+    pub fn isReady(_: *FakeHelper) bool {
         return true;
     }
-    fn setEvents(_: *FakeHelper, _: HelperEvents) void {}
-    fn reserveUtterance(self: *FakeHelper, id: backend.UtteranceId) !void {
+    pub fn setEvents(_: *FakeHelper, _: HelperEvents) void {}
+    pub fn reserveUtterance(self: *FakeHelper, id: backend.UtteranceId) !void {
         if (self.reserve_error) return error.NotReady;
         if (self.lease_id != null) return error.Busy;
         self.lease_id = id;
         self.reserves += 1;
     }
 
-    fn submit(self: *FakeHelper, id: backend.UtteranceId, language: ipc.Language, prompt: []const u8, pcm: []const u8) !void {
+    pub fn submit(self: *FakeHelper, id: backend.UtteranceId, language: ipc.Language, prompt: []const u8, pcm: []const u8) !void {
         if (self.submit_error) return error.BrokenPipe;
         if (self.lease_id != id) return error.WrongUtterance;
         self.ids[self.submits] = id;
@@ -572,25 +572,25 @@ const FakeHelper = struct {
         self.last_id = id;
         self.language = language;
     }
-    fn cancel(self: *FakeHelper, id: backend.UtteranceId) void {
+    pub fn cancel(self: *FakeHelper, id: backend.UtteranceId) void {
         self.cancels += 1;
         self.last_cancel_id = id;
         if (self.lease_id == id) self.lease_id = null;
     }
-    fn requestCancel(self: *FakeHelper, id: backend.UtteranceId) void {
+    pub fn requestCancel(self: *FakeHelper, id: backend.UtteranceId) void {
         self.cancellation_requests += 1;
         self.last_request_id = id;
     }
-    fn retry(self: *FakeHelper) void {
+    pub fn retry(self: *FakeHelper) void {
         self.retries += 1;
     }
     // The Adapter's segmentation tests never drive backend reselection or teardown, so these
     // two members of the Helper contract are inert here — present so the fake is a complete
     // Helper (asserted below), not a partial one.
-    fn usesModel(_: *FakeHelper, _: []const u8) bool {
+    pub fn usesModel(_: *FakeHelper, _: []const u8) bool {
         return true;
     }
-    fn shutdown(_: *FakeHelper) void {}
+    pub fn shutdown(_: *FakeHelper) void {}
 };
 
 comptime {

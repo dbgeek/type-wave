@@ -375,22 +375,22 @@ const FakeDeps = struct {
     undo_confirms: usize = 0,
     undo_refuses: usize = 0,
 
-    fn enabled(self: *FakeDeps) bool {
+    pub fn enabled(self: *FakeDeps) bool {
         self.enabled_reads += 1;
         return self.on;
     }
-    fn focusedApp(self: *FakeDeps) ?coord.AppIdentity {
+    pub fn focusedApp(self: *FakeDeps) ?coord.AppIdentity {
         self.focus_reads += 1;
         if (self.focus_switch_after) |k| {
             if (self.focus_reads > k) return self.focused_app_later;
         }
         return self.focused_app;
     }
-    fn secureInputActive(self: *FakeDeps) bool {
+    pub fn secureInputActive(self: *FakeDeps) bool {
         self.secure_reads += 1;
         return self.secure_input;
     }
-    fn deleteChars(self: *FakeDeps, n: usize) usize {
+    pub fn deleteChars(self: *FakeDeps, n: usize) usize {
         self.deletes += 1;
         self.last_delete_n = n;
         const available = if (self.delete_posts) |budget| budget -| self.posted_total else n;
@@ -398,10 +398,10 @@ const FakeDeps = struct {
         self.posted_total += got;
         return got;
     }
-    fn undoConfirmed(self: *FakeDeps) void {
+    pub fn undoConfirmed(self: *FakeDeps) void {
         self.undo_confirms += 1;
     }
-    fn undoRefused(self: *FakeDeps) void {
+    pub fn undoRefused(self: *FakeDeps) void {
         self.undo_refuses += 1;
     }
 };

@@ -455,11 +455,11 @@ const FakeDeps = struct {
     /// flight and its clipboard restore is still owed.
     quit_during_insert: bool = false,
 
-    fn insertionPlan(self: *FakeDeps) insertmod.Plan {
+    pub fn insertionPlan(self: *FakeDeps) insertmod.Plan {
         return self.plan;
     }
 
-    fn insert(self: *FakeDeps, plan: insertmod.Plan, text: [*:0]const u8) insertmod.InsertError!void {
+    pub fn insert(self: *FakeDeps, plan: insertmod.Plan, text: [*:0]const u8) insertmod.InsertError!void {
         if (self.quit_during_insert) self.quit = true;
         self.calls += 1;
         self.last_plan = plan;
@@ -469,7 +469,7 @@ const FakeDeps = struct {
         return self.result;
     }
 
-    fn complete(self: *FakeDeps, id: coord.UtteranceId, result: coord.InsertResult, focused_app: ?coord.AppIdentity, inserted: []const u8) void {
+    pub fn complete(self: *FakeDeps, id: coord.UtteranceId, result: coord.InsertResult, focused_app: ?coord.AppIdentity, inserted: []const u8) void {
         self.completions += 1;
         self.last_completion_id = id;
         self.last_completion = result;
@@ -478,17 +478,17 @@ const FakeDeps = struct {
         self.last_inserted_len = inserted.len;
     }
 
-    fn focusedApp(self: *FakeDeps) ?coord.AppIdentity {
+    pub fn focusedApp(self: *FakeDeps) ?coord.AppIdentity {
         self.focus_reads += 1;
         return self.focused_app;
     }
 
-    fn finishInsert(self: *FakeDeps) void {
+    pub fn finishInsert(self: *FakeDeps) void {
         self.finishes += 1;
         self.completions_at_finish = self.completions;
     }
 
-    fn copyToClipboard(self: *FakeDeps, text: [*:0]const u8) void {
+    pub fn copyToClipboard(self: *FakeDeps, text: [*:0]const u8) void {
         self.copies += 1;
         self.finishes_at_copy = self.finishes;
         const s = std.mem.span(text);
@@ -496,15 +496,15 @@ const FakeDeps = struct {
         self.last_copy_len = s.len;
     }
 
-    fn actionRefused(self: *FakeDeps) void {
+    pub fn actionRefused(self: *FakeDeps) void {
         self.refuses += 1;
     }
 
-    fn shouldQuit(self: *FakeDeps) bool {
+    pub fn shouldQuit(self: *FakeDeps) bool {
         return self.quit;
     }
 
-    fn idle(self: *FakeDeps) void {
+    pub fn idle(self: *FakeDeps) void {
         self.idles += 1;
         self.quit = true;
     }
