@@ -450,12 +450,16 @@ through a seam it is handed, so it is exercised by feeding it events, not hardwa
 _Avoid_: controller, manager, orchestrator
 
 **Settings Snapshot**:
-An immutable `Settings` value the daemon reads at any moment. The menu bar — the sole
-writer, on the main thread — swaps in a complete fresh snapshot per change; readers
-acquire-load once and see a coherent whole. Old snapshots leak by design, so a holder
-(e.g. a connected Transcription Session) is never invalidated. `config.zon` stays the
-canonical hand-editable form of the same settings.
+The immutable settings currently accepted by the daemon, shared coherently by its readers.
+A snapshot remains valid for every reader holding it, even after a newer one is published.
 _Avoid_: mutable config, live config object
+
+**Settings Snapshot Publication**:
+The shared acceptance of a menu edit or file reload as the live Settings Snapshot,
+including the resulting backend selection, Transcription Session changes, Vocabulary
+rebias and HUD enablement. A live edit may remain unsaved; a valid file reload replaces
+it, while a failed reload preserves it and an unaccepted edit has no resulting effects.
+_Avoid_: settings manager, config refresh (that names only the reload path)
 
 **Grant Observer**:
 The daemon's one owner of the three macOS TCC grant facts — Microphone, Input Monitoring,
@@ -623,19 +627,18 @@ It exists because `config.Settings`
 holds slices, which no comparable value can carry: reducing them to scalars is what keeps
 the Presentation comparable, and therefore what keeps the Chrome's early-out honest. The
 radio-group table lives beside it in `status_item.zig` — which option *reads* as selected is
-presentation — while `menu.zig` keeps the write path that turns a click into a field
-(ADR-0011).
+presentation — while the menu routes its typed choice through Settings Snapshot
+Publication.
 
 The table is the **single source for both directions**. One curated option is written down
 once — its row label and the typed value it sets — and everything else is derived: its
-`config.zon` text (`.tag` for the closed enums, a quoted literal for the string-shaped
-fields), `menu.applyOption`'s write, and `currentOption`'s read-back. That is why the table
-carries two names, `specs` and the `groups` projected from it: a homogeneous `[_]GroupDef`
+persistence through Settings Snapshot Publication, `menu.editOption`'s typed edit, and
+`currentOption`'s read-back. That is why the table carries two names, `specs` and the `groups` projected from it: a homogeneous `[_]GroupDef`
 **cannot** hold the typed values, because `[]const TalkKey` and `[]const []const u8` share no
 element type, so a tuple holds them and the array serves the loops that index by a runtime
 group index. Collapsing the two back into one array is the regression to avoid — it is what
 evicted the typed values into seven parallel arrays coupled by index alone, leaving three
-representations of one option that could silently disagree. Now a label paired with the wrong
-value, a value that contradicts the bytes persisted, a group inserted mid-table, and a `field`
-naming nothing are all compile errors rather than things a test has to catch.
+representations of one option that could silently disagree. The field type is checked at
+compilation; publication derives the bytes persisted from the same typed value, and a test follows every radio choice through publication, disk and
+read-back.
 _Avoid_: settings snapshot (that is the live `Settings` the daemon reads), config view

@@ -1562,10 +1562,13 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     const menu_up = daemon.menu.init(io, alloc, &daemon.store, .{
         .ctx = &daemon,
         .status = Daemon.menuStatus,
-        .selectBackend = Daemon.menuSelectBackend,
-        .markSessionDirty = Daemon.menuMarkSessionDirty,
-        .markSessionRebias = Daemon.menuMarkSessionRebias,
-        .setOverlay = Daemon.menuSetOverlay,
+        .settings = .{
+            .ctx = &daemon,
+            .selectBackend = Daemon.menuSelectBackend,
+            .markSessionDirty = Daemon.menuMarkSessionDirty,
+            .markSessionRebias = Daemon.menuMarkSessionRebias,
+            .setOverlay = Daemon.menuSetOverlay,
+        },
         .setPaused = Daemon.menuSetPaused,
         .storeApiKey = Daemon.menuStoreApiKey,
         .modelAction = Daemon.menuModelAction,

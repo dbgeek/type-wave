@@ -8,6 +8,10 @@
   (see [Branching & handoff](#branching--handoff)). The map is planning-only —
   no code shipped by it.
 
+> **Settings publication update (2026-09-13):** [Settings Snapshot Publication](settings-publication.md)
+> supersedes this document’s original commit helper, full-file fallback, and reload
+> failure behavior. Its rules apply to Vocabulary and every other setting.
+
 > **Premise stale (2026-07-29):** this spec locked while `gpt-realtime-whisper`
 > was the OpenAI default and reasons throughout from "the default transcription
 > model cannot accept a prompt." The 0.4.0 default flip to `gpt-live-transcribe`
@@ -121,8 +125,8 @@ In `loadSettingsOnly`, after parse:
 - Blank / whitespace-only items (`""`, `"  "`) → dropped.
 - **No dedup** at this layer.
 
-A *type* mismatch (e.g. `.vocabulary = 5`) still falls the whole file back to
-defaults via the existing `zonValid` / `std.zon` all-or-nothing path — unchanged.
+A *type* mismatch (e.g. `.vocabulary = 5`) uses defaults at startup. Live reload
+rejects the file and keeps the last accepted Settings Snapshot.
 
 ### In-place array patch — single-line, quote-aware (build it)
 
@@ -134,8 +138,9 @@ array literal's inner comma cuts the span and corrupts the file. Fix:
   tracking `"…"` so string-internal commas don't terminate the span.
 - The menu **always serializes `vocabulary` on one line**
   (`.vocabulary = .{ "a", "b" },`). A multi-line hand-formatted array returns
-  `null` → **full re-serialize fallback** (same as today's "value on the next line"
-  case at `config.zig:356`). Comments are preserved on the common single-line path.
+  `null` → **preserve the existing file and report an unsaved live edit**.
+  Settings Snapshot Publication supersedes the original full-file fallback; comments
+  are preserved on the common single-line path.
 - `patchZonField`'s absent-field insert path already writes
   `    .vocabulary = <value>,` on one line, so it works unchanged.
 
@@ -258,23 +263,22 @@ Placed in the bottom settings cluster, **just above "Open config file"**
 
 ### Live-edit flow through the single-writer swap
 
-On **Save**, entirely on the main thread (the menu is the sole Settings-Snapshot
-writer):
+On **Save**, entirely on the main thread:
 
-1. Read the `NSTextView` string.
-2. Split on newlines → trim each line → drop blank lines.
-3. Apply the §1 clamp: drop items > 100 chars; keep at most 128 items; no dedup.
-4. Build the `vocabulary: []const []const u8` value.
-5. `commitSettings(next, "vocabulary", <serialized array>, session_shaped = false)`
-   (`menu.zig:681`).
+1. Read the `NSTextView` string; split on newlines, trim, and drop blank lines.
+2. Submit the typed Vocabulary edit to Settings Snapshot Publication.
+3. Publication clamps and retains the terms, derives the change, publishes the complete
+   snapshot, dispatches effects, then attempts a single-field disk patch.
 
-`commitSettings` does the whole publish sequence: copies the live snapshot,
-`store.swap(heap)` publishes the new immutable snapshot (`config.zig:247`),
-`config.writeField` persists to `~/.config/type-wave/config.zon` (the **single-line
-quote-aware array patch** from §1; multi-line arrays fall back to full
-re-serialize). Because vocabulary is **`session_shaped = false`** (§4), there is
-**no `markSessionDirty`** — Whisper picks the new list up at the **next Talk-Key
-press**, pinned with the Lease. **Cancel** performs no swap and no write.
+An actual Vocabulary change requests a warm OpenAI rebias, never a session cycle;
+Whisper reads the list at the next Talk Key press, pinned with the Lease. Saving the same
+list retries persistence without publishing or dispatching effects. Preparation failure
+leaves everything unchanged. A failed patch keeps the live edit but preserves the existing
+file and reports that it was not saved; a complete file is created only when absent.
+**Cancel** performs no publication and no write.
+
+See [Settings Snapshot Publication](settings-publication.md) for reload authority and
+failure behavior shared by all settings.
 
 ### Empty / first-run state
 

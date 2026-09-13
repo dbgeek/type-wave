@@ -629,7 +629,7 @@ pub fn historyRevealedLabel(buf: []u8, entry: HistoryEntry, text: []const u8, no
 // snapshot value matching no preset simply shows no checkmark in that group); the rest are
 // the closed enums. The table lives here rather than in menu.zig because it *describes the
 // Status Item* — the checkmark each group shows is presentation, decided by `settingsView`
-// below. menu.zig still owns the write path (ADR-0011) and reads the table from here.
+// below. menu.zig routes the selected typed value to Settings Snapshot Publication.
 //
 // `specs` is the source of truth and `groups` is derived from it. They are two names on
 // purpose, and collapsing them back into one homogeneous array is the regression to avoid:
@@ -642,7 +642,7 @@ pub fn historyRevealedLabel(buf: []u8, entry: HistoryEntry, text: []const u8, no
 // =====================================================================================
 
 /// One curated option: the row's label and the typed value it writes. There is deliberately
-/// no `config.zon` text here — see `zonText`.
+/// no `config.zon` text here — publication derives it from the value.
 fn Choice(comptime T: type) type {
     return struct { label: [*:0]const u8, value: T };
 }
@@ -653,30 +653,8 @@ fn Spec(comptime T: type) type {
         pub const Value = T;
         title: [*:0]const u8,
         field: []const u8, // the config.zon field name — checked against Settings at comptime
-        session_shaped: bool,
         openai_only: bool = false,
         opts: []const Choice(T),
-    };
-}
-
-/// The `config.zon` text for a curated value, **derived** rather than written down: enums
-/// serialize as `.tag`, strings as a quoted literal — the two shapes `config.Settings` holds.
-/// Deriving it is what makes it impossible for the bytes `commitSettings` persists to
-/// disagree with the value `applyOption` applied; `config.zonValid` re-parses every write, so
-/// a wrong rule here fails loudly at write time rather than corrupting the file quietly.
-fn zonText(comptime T: type, comptime value: T) []const u8 {
-    return switch (@typeInfo(T)) {
-        .@"enum" => "." ++ @tagName(value),
-        .pointer => |p| blk: {
-            if (p.size != .slice or p.child != u8)
-                @compileError("no ZON form for " ++ @typeName(T));
-            for (value) |c| {
-                if (c == '"' or c == '\\')
-                    @compileError("curated option needs ZON escaping: " ++ value);
-            }
-            break :blk "\"" ++ value ++ "\"";
-        },
-        else => @compileError("no ZON form for " ++ @typeName(T)),
     };
 }
 
@@ -684,57 +662,58 @@ fn zonText(comptime T: type, comptime value: T) []const u8 {
 /// #31-decided values; the rest are the closed enums. A value whose type does not match its
 /// `field` on `config.Settings` — or a `field` naming nothing — is a compile error.
 pub const specs = .{
-    Spec(backend.Backend){ .title = "Transcription Backend", .field = "transcription_backend", .session_shaped = false, .opts = &.{
+    Spec(backend.Backend){ .title = "Transcription Backend", .field = "transcription_backend", .opts = &.{
         .{ .label = "OpenAI", .value = .openai },
         .{ .label = "Local — Whisper Large v3 Turbo", .value = .local },
     } },
-    Spec(tapmod.TalkKey){ .title = "Talk Key", .field = "talk_key", .session_shaped = false, .opts = &.{
+    Spec(tapmod.TalkKey){ .title = "Talk Key", .field = "talk_key", .opts = &.{
         .{ .label = "Right Option", .value = .right_option },
         .{ .label = "Left Option", .value = .left_option },
         .{ .label = "Globe (fn)", .value = .globe },
     } },
     // gpt-live-transcribe first: the #303 default. gpt-realtime-whisper stays curated as
     // the config-only rollback (pin it to keep the pre-0.4.0 behavior).
-    Spec([]const u8){ .title = "Model", .field = "model", .session_shaped = true, .openai_only = true, .opts = &.{
+    Spec([]const u8){ .title = "Model", .field = "model", .openai_only = true, .opts = &.{
         .{ .label = "gpt-live-transcribe", .value = "gpt-live-transcribe" },
         .{ .label = "gpt-realtime-whisper", .value = "gpt-realtime-whisper" },
     } },
-    Spec([]const u8){ .title = "Language", .field = "language", .session_shaped = true, .opts = &.{
-        .{ .label = "en", .value = "en" },
-        .{ .label = "sv", .value = "sv" },
-        .{ .label = "auto-detect", .value = "" }, // "" = auto-detect (session omits the field)
-    } },
+    Spec([]const u8){
+        .title = "Language",
+        .field = "language",
+        .opts = &.{
+            .{ .label = "en", .value = "en" },
+            .{ .label = "sv", .value = "sv" },
+            .{ .label = "auto-detect", .value = "" }, // "" = auto-detect (session omits the field)
+        },
+    },
     // "minimal" earned its slot via the issue #36 benchmark: ~30-50ms faster to Final
     // Transcript than "low" but measurably worse WER on quiet speech, so "low" stays the
     // default and "minimal" is the one-click latency escape hatch ("xhigh" stays
     // hand-edit-only). See docs/research/delay-tier-benchmark.md.
-    Spec([]const u8){ .title = "Delay", .field = "delay", .session_shaped = true, .openai_only = true, .opts = &.{
+    Spec([]const u8){ .title = "Delay", .field = "delay", .openai_only = true, .opts = &.{
         .{ .label = "minimal", .value = "minimal" },
         .{ .label = "low", .value = "low" },
         .{ .label = "medium", .value = "medium" },
         .{ .label = "high", .value = "high" },
     } },
-    Spec(config.Settings.NoiseReduction){ .title = "Noise reduction", .field = "noise_reduction", .session_shaped = true, .openai_only = true, .opts = &.{
+    Spec(config.Settings.NoiseReduction){ .title = "Noise reduction", .field = "noise_reduction", .openai_only = true, .opts = &.{
         .{ .label = "near field", .value = .near_field },
         .{ .label = "far field", .value = .far_field },
         .{ .label = "off", .value = .off },
     } },
-    Spec(insertmod.Method){ .title = "Insertion", .field = "insertion", .session_shaped = false, .opts = &.{
+    Spec(insertmod.Method){ .title = "Insertion", .field = "insertion", .opts = &.{
         .{ .label = "paste", .value = .paste },
         .{ .label = "keystroke", .value = .keystroke },
     } },
 };
 
 /// The homogeneous, runtime-indexable projection of one spec: everything the presentation
-/// side needs, with each option's `config.zon` text derived from its typed value.
+/// side needs; publication owns the serialization and change classification.
 pub const Opt = struct {
     label: [*:0]const u8,
-    zon: []const u8, // the value text written into config.zon — derived, see `zonText`
 };
 pub const GroupDef = struct {
     title: [*:0]const u8,
-    field: []const u8, // the config.zon field name
-    session_shaped: bool,
     openai_only: bool = false,
     opts: []const Opt,
 };
@@ -748,14 +727,12 @@ fn deriveGroup(comptime spec: anytype) GroupDef {
             " but config.Settings holds " ++ @typeName(@FieldType(config.Settings, spec.field)));
     const opts = comptime blk: {
         var out: [spec.opts.len]Opt = undefined;
-        for (spec.opts, 0..) |c, i| out[i] = .{ .label = c.label, .zon = zonText(T, c.value) };
+        for (spec.opts, 0..) |c, i| out[i] = .{ .label = c.label };
         const frozen = out;
         break :blk frozen;
     };
     return .{
         .title = spec.title,
-        .field = spec.field,
-        .session_shaped = spec.session_shaped,
         .openai_only = spec.openai_only,
         .opts = &opts,
     };
@@ -852,7 +829,7 @@ pub fn settingsView(s: *const config.Settings) SettingsView {
 
 /// Which option of group `gi` the live snapshot has selected, or null when a hand-edited
 /// value matches no curated preset (that group then shows no checkmark). The read half of
-/// the table; `menu.applyOption` is the write half, generated from the same `specs`.
+/// the table; `menu.editOption` routes the write half from the same `specs`.
 fn currentOption(s: *const config.Settings, gi: usize) ?u8 {
     inline for (specs, 0..) |spec, i| {
         if (gi == i) {
@@ -2361,31 +2338,6 @@ test "a pinned gpt-realtime-whisper still resolves to its own picker row" {
     // Configs that pinned the old default keep behaving — and keep their checkmark.
     const pinned = config.Settings{ .model = "gpt-realtime-whisper" };
     try std.testing.expectEqual(@as(?u8, 1), settingsView(&pinned).selected[2]);
-}
-
-test "every curated option's derived ZON text parses back to its own value" {
-    // The one check the compiler cannot make. Label/value/field drift is now structurally
-    // impossible (one literal per option, `zon` derived, both directions generated from
-    // `specs`) — but nothing so far proves the derived *text* is what std.zon reads back.
-    // This is the whole persistence contract: `commitSettings` writes these bytes into
-    // config.zon and the next load parses them into Settings, so a wrong `zonText` rule
-    // would apply one value live and reload a different one.
-    inline for (specs) |spec| {
-        const T = @TypeOf(spec).Value;
-        inline for (0..spec.opts.len) |j| {
-            const c = comptime spec.opts[j];
-            const text = comptime ".{ ." ++ spec.field ++ " = " ++ zonText(T, c.value) ++ " }";
-            // An arena, not `std.zon.parse.free`: this is a partial file, so the omitted
-            // fields keep static-default string pointers that `free` would fault on
-            // (config.zig's `expectZonParses` carries the same note).
-            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-            defer arena.deinit();
-            var diag: std.zon.parse.Diagnostics = .{};
-            const parsed = std.zon.parse.fromSliceAlloc(config.Settings, arena.allocator(), text, &diag, .{}) catch
-                return error.CuratedOptionDidNotParse;
-            try std.testing.expect(valueEql(T, @field(parsed, spec.field), c.value));
-        }
-    }
 }
 
 test "a group's option count matches its rendered rows" {
