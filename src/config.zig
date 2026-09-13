@@ -13,13 +13,14 @@
 //! there is auto-migrated into the keychain once, and the plaintext file is then taken off
 //! disk by the daemon rather than left for the user to delete (#282).
 //!
-//! Resilience (issue #10's self-healing ethos): a missing OR malformed config.zon
+//! Startup resilience (issue #10's self-healing ethos): a missing OR malformed config.zon
 //! yields all defaults with a logged warning — a config typo must never keep the
 //! daemon from starting. A missing secret never stops startup either: the daemon's
-//! self-heal supervisor polls `loadApiKeyOnly` until a key appears.
+//! self-heal supervisor polls `loadApiKeyOnly` until a key appears. Live reload is strict:
+//! readSettingsAt returns an error, letting publication keep the last accepted snapshot.
 //!
 //! Lifetime: settings are load-and-leak, published as **immutable snapshots** through
-//! `Store` (wayfinder #32/#34): the menu — the sole writer, on the main thread — builds
+//! `Store` (wayfinder #32/#34): Settings Snapshot Publication, on the main thread, builds
 //! a complete fresh `Settings` per change and atomically swaps the pointer; every reader
 //! acquire-loads once and reads fields off its coherent snapshot. Old snapshots are
 //! intentionally never freed — and `std.zon.parse.free` must NOT be called on a parsed
@@ -30,7 +31,7 @@
 //!
 //! This module also owns the `config.zon` **write** path (wayfinder #32): a targeted
 //! single-field textual patch that preserves comments and hand-formatting byte-for-byte,
-//! with a full re-serialize only when the file is absent or malformed; both write
+//! with a full re-serialize only when the file is absent; both write
 //! atomically (temp file + rename).
 
 const std = @import("std");
@@ -149,6 +150,21 @@ pub fn clampVocabulary(gpa: std.mem.Allocator, list: []const []const u8) ?[]cons
 pub fn loadSettingsOnly(io: std.Io, gpa: std.mem.Allocator) Settings {
     const home = homeDir() orelse return .{};
     return loadSettings(io, gpa, home);
+}
+
+/// The canonical settings address; publication resolves it without reading the file.
+pub fn settingsPath(buf: []u8) ?[]const u8 {
+    const home = homeDir() orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ home, config_rel }) catch null;
+}
+
+/// Strict reload. The caller owns an arena for the parsed strings (omitted fields
+/// borrow static defaults). Unlike startup, every read/parse/clamp failure is an error.
+pub fn readSettingsAt(io: std.Io, alloc: std.mem.Allocator, path: []const u8) !Settings {
+    const src = try std.Io.Dir.cwd().readFileAllocOptions(io, path, alloc, .limited(max_file), .of(u8), 0);
+    var parsed = try std.zon.parse.fromSliceAlloc(Settings, alloc, src, null, .{});
+    parsed.vocabulary = clampVocabulary(alloc, parsed.vocabulary) orelse return error.OutOfMemory;
+    return parsed;
 }
 
 /// Re-read just the OpenAI secret — null while still absent. The daemon's self-heal
@@ -488,8 +504,8 @@ fn parseEnvKey(text: []const u8) ?[]const u8 {
 // the config.zon write path.
 // ============================================================================
 
-/// The immutable-snapshot pointer swap. One instance lives on the Daemon; the menu is
-/// the only writer (main thread), every other thread reads via `current`. Snapshots
+/// The immutable-snapshot pointer swap. One instance lives on the Daemon; Settings
+/// Snapshot Publication is the only writer (main thread). Readers use `current`. Snapshots
 /// leak by design (see the module doc), so a reader may hold one indefinitely.
 pub const Store = struct {
     ptr: std.atomic.Value(usize),
@@ -552,36 +568,52 @@ fn vocabularyEql(a: []const []const u8, b: []const []const u8) bool {
     return true;
 }
 
-/// Write one field into `config.zon` (wayfinder #32): read the file fresh (so a menu
-/// write never clobbers a hand-edit elsewhere in it), patch just that field's value
-/// textually, validate the result parses, and rename it into place. An absent or
-/// malformed file — or a patch that somehow fails to validate — falls back to a full
-/// re-serialize of `current` (which the caller has already updated with the new value).
-/// Best-effort: failures are logged and the in-memory snapshot stays authoritative.
-pub fn writeField(io: std.Io, gpa: std.mem.Allocator, field: []const u8, value: []const u8, current: Settings) bool {
-    const home = homeDir() orelse return false;
-    var path_buf: [4096]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ home, config_rel }) catch return false;
+/// Serialize the typed edit itself: callers never pair a value with independent ZON.
+pub fn fieldValueAlloc(alloc: std.mem.Allocator, comptime field: []const u8, value: @FieldType(Settings, field)) ![]const u8 {
+    var out = std.Io.Writer.Allocating.init(alloc);
+    defer out.deinit();
+    try writeFieldValue(&out.writer, field, value);
+    return try alloc.dupe(u8, out.written());
+}
 
-    var text: ?[:0]const u8 = null;
-    if (std.Io.Dir.cwd().readFileAllocOptions(io, path, gpa, .limited(max_file), .of(u8), 0)) |src| {
-        if (patchZonField(gpa, src, field, value)) |patched| {
-            if (zonValid(gpa, patched)) text = patched;
-        }
-    } else |_| {}
-    if (text == null) {
-        const full = serializeSettings(gpa, current) orelse return false;
-        if (!zonValid(gpa, full)) {
-            std.debug.print("config: refusing to write {s} — serialized settings did not validate\n", .{path});
-            return false;
-        }
-        text = full;
+fn writeFieldValue(w: *std.Io.Writer, comptime field: []const u8, value: @FieldType(Settings, field)) std.Io.Writer.Error!void {
+    if (comptime std.mem.eql(u8, field, "vocabulary")) {
+        try writeVocabularyValue(w, value);
+    } else switch (@typeInfo(@TypeOf(value))) {
+        .@"enum" => try w.print(".{s}", .{@tagName(value)}),
+        .bool => try w.writeAll(if (value) "true" else "false"),
+        .int => try w.print("{d}", .{value}),
+        .pointer => try writeZonString(w, value),
+        else => @compileError("unsupported settings field: " ++ field),
     }
-    if (!atomicWrite(io, path, text.?)) {
-        std.debug.print("config: could not write {s} — the change applies live but is not persisted\n", .{path});
-        return false;
-    }
-    return true;
+}
+
+/// Patch only the selected field. An existing file is never replaced by a full
+/// serialization: unreadable, malformed or unpatchable means unsaved, not erased.
+/// The caller supplies scratch storage for parse/patch allocations.
+pub fn writeFieldAt(io: std.Io, alloc: std.mem.Allocator, path: []const u8, comptime field: []const u8, value: []const u8, current: Settings) !void {
+    const src = std.Io.Dir.cwd().readFileAllocOptions(io, path, alloc, .limited(max_file), .of(u8), 0) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    const text = if (src) |existing| blk: {
+        var expected = try std.zon.parse.fromSliceAlloc(Settings, alloc, existing, null, .{});
+        @field(expected, field) = @field(current, field);
+        const patched = patchZonField(alloc, existing, field, value) orelse return error.UnpatchableSettings;
+        const actual = try std.zon.parse.fromSliceAlloc(Settings, alloc, patched, null, .{});
+        if (diffSettings(&expected, &actual).any) return error.UnpatchableSettings;
+        break :blk patched;
+    } else blk: {
+        const full = serializeSettings(alloc, current) orelse return error.OutOfMemory;
+        if (!zonValid(alloc, full)) return error.InvalidSettings;
+        if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
+        break :blk full;
+    };
+    var tmp_buf: [4096 + 8]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = text });
+    try std.Io.Dir.rename(.cwd(), tmp, .cwd(), path, io);
 }
 
 /// Make sure `config.zon` exists (serializing the current snapshot if not) and return
@@ -592,7 +624,7 @@ pub fn ensureConfigFile(io: std.Io, gpa: std.mem.Allocator, current: Settings, b
     const path = std.fmt.bufPrint(buf, "{s}/{s}", .{ home, config_rel }) catch return null;
     if (std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_file))) |_| {
         return path;
-    } else |_| {}
+    } else |err| if (err != error.FileNotFound) return null;
     const full = serializeSettings(gpa, current) orelse return null;
     if (!atomicWrite(io, path, full)) return null;
     return path;
@@ -639,7 +671,7 @@ fn findZonField(src: []const u8, field: []const u8) ?FieldSpan {
             // Array literal `.{ ... }` (vocabulary, spec §1): scan to the matching '}'
             // on THIS line, tracking "…" so a string-internal comma or brace doesn't cut
             // the span. A multi-line hand-formatted array never closes on this line ⇒
-            // return null ⇒ full re-serialize fallback (same as the next-line case above).
+            // return null ⇒ refuse the field patch (same as the next-line case above).
             vend += 2;
             var depth: usize = 1;
             var in_str = false;
@@ -681,7 +713,7 @@ fn findZonField(src: []const u8, field: []const u8) ?FieldSpan {
 /// Rewrite `.field`'s value to `value` in `src`, inserting `    .field = value,` before
 /// the closing `}` when the field is absent. Everything else — comments, ordering,
 /// hand-formatting — passes through byte-for-byte. Null when `src` has no top-level
-/// struct to patch (the caller then falls back to a full re-serialize).
+/// struct to patch (publication reports that the edit was not saved).
 fn patchZonField(gpa: std.mem.Allocator, src: []const u8, field: []const u8, value: []const u8) ?[:0]u8 {
     if (findZonField(src, field)) |span| {
         const out = gpa.allocSentinel(u8, src.len - (span.end - span.start) + value.len, 0) catch return null;
@@ -693,12 +725,16 @@ fn patchZonField(gpa: std.mem.Allocator, src: []const u8, field: []const u8, val
     // Field absent: insert a fresh line before the line holding the final '}'.
     const close = std.mem.lastIndexOfScalar(u8, src, '}') orelse return null;
     const line_start = if (std.mem.lastIndexOfScalar(u8, src[0..close], '\n')) |nl| nl + 1 else 0;
-    var line_buf: [256]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "    .{s} = {s},\n", .{ field, value }) catch return null;
+    // A compact `.{}' has content before its closing brace. Insert at the brace
+    // rather than before the struct; full-file validation below catches unsafe shapes.
+    const compact = std.mem.trim(u8, src[line_start..close], " \t").len != 0;
+    const insertion = if (compact) close else line_start;
+    const line = std.fmt.allocPrint(gpa, "{s}    .{s} = {s},\n", .{ if (compact) "\n" else "", field, value }) catch return null;
+    defer gpa.free(line);
     const out = gpa.allocSentinel(u8, src.len + line.len, 0) catch return null;
-    @memcpy(out[0..line_start], src[0..line_start]);
-    @memcpy(out[line_start..][0..line.len], line);
-    @memcpy(out[line_start + line.len ..], src[line_start..]);
+    @memcpy(out[0..insertion], src[0..insertion]);
+    @memcpy(out[insertion..][0..line.len], line);
+    @memcpy(out[insertion + line.len ..], src[insertion..]);
     return out;
 }
 
@@ -721,7 +757,7 @@ fn serializeInto(w: *std.Io.Writer, s: Settings) std.Io.Writer.Error!void {
     try w.print(
         \\// type-wave settings. Hand-edit freely — the menu bar rewrites single fields in
         \\// place and picks hand-edits up when the menu opens (or on restart). This full
-        \\// version was generated because the file was absent or malformed.
+        \\// version was generated because the file was absent.
         \\//
         \\//   .talk_key        = .right_option | .left_option | .globe
         \\//   .transcription_backend = .openai | .local  (.local = pinned offline Whisper model)
@@ -736,23 +772,15 @@ fn serializeInto(w: *std.Io.Writer, s: Settings) std.Io.Writer.Error!void {
         \\//   .log_transcripts = true | false  (log the spoken words, not just that an Utterance resolved — off: the log is unrotated plaintext)
         \\//   .vocabulary      = .{{ "term", ... }}  (phrase biasing on both backends — OpenAI only on a keywords-capable model; empty = off)
         \\.{{
-        \\    .transcription_backend = .{s},
-        \\    .talk_key = .{s},
-        \\    .model = "{s}",
-        \\    .language = "{s}",
-        \\    .delay = "{s}",
-        \\    .noise_reduction = .{s},
-        \\    .insertion = .{s},
-        \\    .pre_paste_ms = {d},
-        \\    .overlay = {},
-        \\    .backtrack = {},
-        \\    .log_transcripts = {},
         \\
-    , .{
-        @tagName(s.transcription_backend), @tagName(s.talk_key),  s.model,        s.language, s.delay,
-        @tagName(s.noise_reduction),       @tagName(s.insertion), s.pre_paste_ms, s.overlay,
-        s.backtrack,                       s.log_transcripts,
-    });
+    , .{});
+    inline for (@typeInfo(Settings).@"struct".field_names) |field| {
+        if (comptime !std.mem.eql(u8, field, "vocabulary")) {
+            try w.writeAll("    ." ++ field ++ " = ");
+            try writeFieldValue(w, field, @field(s, field));
+            try w.writeAll(",\n");
+        }
+    }
     try serializeVocabulary(w, s.vocabulary);
     try w.writeAll("}\n");
 }
@@ -776,17 +804,6 @@ fn writeVocabularyValue(w: *std.Io.Writer, vocab: []const []const u8) std.Io.Wri
         try writeZonString(w, item);
     }
     try w.writeAll(if (vocab.len == 0) "}" else " }");
-}
-
-/// Serialize a vocabulary list to the ZON array value the menu hands `writeField` on Save
-/// (spec §3) — `.{}` / `.{ "a", "b" }`, one line, escaped, caller-owned (NUL-terminated so
-/// it drops straight into an ObjC string too). Null on OOM. Single-homes the value format
-/// and escaping with the full-file serializer via `writeVocabularyValue`.
-pub fn serializeVocabularyValue(gpa: std.mem.Allocator, vocab: []const []const u8) ?[:0]u8 {
-    var out = std.Io.Writer.Allocating.init(gpa);
-    defer out.deinit();
-    writeVocabularyValue(&out.writer, vocab) catch return null;
-    return gpa.dupeSentinel(u8, out.written(), 0) catch null;
 }
 
 /// Write `s` as a ZON string literal, escaping so an item holding a quote, backslash or
@@ -1252,21 +1269,6 @@ test "clampVocabulary drops the overflow tail beyond the whole-list cap" {
     try std.testing.expectEqual(@as(usize, vocab_max_items), clamped.len);
 }
 
-test "serializeVocabularyValue emits the bare array the menu patch feeds writeField" {
-    const empty = serializeVocabularyValue(talloc, &.{}) orelse return error.SerializeFailed;
-    defer talloc.free(empty);
-    try std.testing.expectEqualStrings(".{}", empty);
-
-    const populated = serializeVocabularyValue(talloc, &.{ "type-wave", "whisper.cpp" }) orelse return error.SerializeFailed;
-    defer talloc.free(populated);
-    try std.testing.expectEqualStrings(".{ \"type-wave\", \"whisper.cpp\" }", populated);
-
-    // A value carrying a quote/backslash stays escaped so the patched file re-parses.
-    const tricky = serializeVocabularyValue(talloc, &.{"a\"b\\c"}) orelse return error.SerializeFailed;
-    defer talloc.free(tricky);
-    try std.testing.expectEqualStrings(".{ \"a\\\"b\\\\c\" }", tricky);
-}
-
 test "serializeSettings writes an empty vocabulary explicitly and round-trips" {
     const text = serializeSettings(talloc, Settings{}) orelse return error.SerializeFailed;
     defer talloc.free(text);
@@ -1337,10 +1339,10 @@ test "patchZonField: an array value's inner comma does not cut the span" {
     );
 }
 
-test "findZonField returns null on a multi-line vocabulary array (full re-serialize fallback)" {
+test "findZonField returns null on a multi-line vocabulary array (preserve existing file)" {
     // The single-line patch deliberately cannot handle a hand-formatted multi-line array:
     // the value opens with `.{` but never closes on its line, so findZonField returns null
-    // and writeField falls back to a full re-serialize instead of corrupting the file.
+    // and publication refuses the write instead of replacing the existing file.
     const src =
         \\.{
         \\    .vocabulary = .{

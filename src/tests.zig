@@ -18,6 +18,7 @@ test {
     _ = @import("whisper_supervisor.zig");
     _ = @import("signing_identity.zig"); // the Signing Identity gate: the proof a spawn demands (#284)
     _ = @import("config.zig");
+    _ = @import("settings_publication.zig");
     _ = @import("api_key.zig"); // the Key Holder: the daemon's one plaintext key copy (#254)
     _ = @import("feedback.zig"); // the log's transcript-redaction policy + rendering (#250)
     _ = @import("vocab.zig"); // the pure vocabulary helpers: buildPrompt glossary + budget estimation

@@ -2,20 +2,14 @@
 //! prototypes/menu-bar, #31). The daemon's face: a dictation icon near the clock whose
 //! two tiers show healthy vs. needs-attention, and a menu that edits every `config.zon`
 //! setting live (checkmark radio submenus writing the canonical file through
-//! config.writeField), manages the API key (NSAlert + secure field → Keychain), and
+//! Settings Snapshot Publication), manages the API key (NSAlert + secure field → Keychain), and
 //! offers Pause dictation / Open config file / Quit.
 //!
-//! Division of labour (the #32 live-apply design):
-//!   - **This module is the settings writer.** A menu action builds a complete fresh
-//!     `Settings`, swaps it into the daemon's `config.Store` (readers pick it up at
-//!     next use), and patches `config.zon` — all on the main thread, the sole writer.
-//!   - **The daemon reacts through the `Host` seam** — mark the Transcription Session
-//!     params-dirty, flip the overlay HUD, store the key, pause, quit. menu.zig knows
-//!     AppKit and the Store; it never touches the Session or the Coordinator directly.
-//!   - **No file watcher:** `menuWillOpen:` re-reads `config.zon`, diffs, and swaps, so
-//!     the checkmarks never lie and menu writes never clobber hand-edits (the write
-//!     path also re-reads the file at write time). Hand-edits bind on the next menu
-//!     open or restart, whichever comes first.
+//! Settings edits and file reloads go through Settings Snapshot Publication. This
+//! AppKit adapter collects typed intent, displays outcomes, and refreshes presentation;
+//! publication owns the immutable snapshot and all resulting daemon effects.
+//! No file watcher: hand edits bind on menu-open or restart. Failed reloads keep the
+//! live snapshot; explicit edits patch only their own field on disk.
 //!
 //! Action dispatch is the #31-proven runtime-minted class: `TWMenuTarget : NSObject`
 //! with C-ABI Zig fns as its methods (`objc_allocateClassPair` + `class_addMethod`).
@@ -29,6 +23,7 @@ const std = @import("std");
 const appkit = @import("appkit.zig");
 const backend = @import("transcription_backend.zig");
 const config = @import("config.zig");
+const settings_publication = @import("settings_publication.zig");
 const status_item = @import("status_item.zig");
 const keychain = @import("keychain.zig");
 const feedback = @import("feedback.zig");
@@ -198,18 +193,7 @@ pub const Host = struct {
     ctx: *anyopaque,
     /// Current independent state axes for the compact hierarchy.
     status: *const fn (ctx: *anyopaque) status_item.Snapshot,
-    /// A complete Settings Snapshot with a new authoritative backend was published.
-    selectBackend: *const fn (ctx: *anyopaque, selected: @import("transcription_backend.zig").Backend) void,
-    /// A session-shaped setting changed (menu write or hand-edit found on open) —
-    /// mark the Transcription Session dirty so it cycles when idle.
-    markSessionDirty: *const fn (ctx: *anyopaque) void,
-    /// The vocabulary changed (menu edit or hand-edit found on open) — ask the warm
-    /// OpenAI session to re-bind `keywords` at its next idle tick: a session.update
-    /// push, never a cycle (openai-biasing-spec §1). The local path is untouched
-    /// (read-at-use, Lease-pinned at press).
-    markSessionRebias: *const fn (ctx: *anyopaque) void,
-    /// The Overlay toggle changed — lazy-build / enable / disable the HUD.
-    setOverlay: *const fn (ctx: *anyopaque, on: bool) void,
+    settings: settings_publication.Effects,
     setPaused: *const fn (ctx: *anyopaque, paused: bool) void,
     /// Store the API key (Keychain). Returns whether the store succeeded.
     storeApiKey: *const fn (ctx: *anyopaque, key: []const u8) bool,
@@ -254,24 +238,18 @@ pub const Host = struct {
 
 const groups = status_item.groups;
 
-/// Set group `gi`'s option `oi` on a Settings under construction — the write half of the
-/// radio table (ADR-0011 keeps it here; the table itself is presentation and lives in
-/// status_item.zig). Generated from the same `specs` `currentOption` reads back, so the two
-/// directions cannot drift: the option's label, the field it writes and the `config.zon`
-/// bytes that persist are one literal, and a `field` naming nothing is a compile error.
-fn applyOption(s: *config.Settings, gi: usize, oi: usize) void {
+/// Route the selected preset as one typed edit; the publication module derives
+/// serialization and effects from that value, never from radio-table metadata.
+fn editOption(publication: *settings_publication.Publication, gi: usize, oi: usize) !settings_publication.EditResult {
     inline for (status_item.specs, 0..) |spec, i| {
         if (gi == i) {
             inline for (spec.opts, 0..) |c, j| {
-                if (oi == j) {
-                    @field(s, spec.field) = c.value;
-                    return;
-                }
+                if (oi == j) return publication.edit(spec.field, c.value);
             }
-            unreachable; // the tag was encoded from this group's own opts
+            return error.InvalidOption;
         }
     }
-    unreachable;
+    return error.InvalidOption;
 }
 
 // =====================================================================================
@@ -315,7 +293,7 @@ fn prefillText(gpa: std.mem.Allocator, list: []const []const u8) ?[:0]u8 {
 /// (spec §3) — names the count and the caps so the user sees why terms vanished.
 fn droppedItemsMessage(buf: []u8, dropped: usize) [:0]const u8 {
     const unit = if (dropped == 1) "term" else "terms";
-    return std.fmt.bufPrintSentinel(buf, "Dropped {d} {s} over the limit (100 characters per term, 128 terms max). The rest were saved.", .{ dropped, unit }, 0) catch "Some terms over the limit were dropped.";
+    return std.fmt.bufPrintSentinel(buf, "Dropped {d} {s} over the limit (100 characters per term, 128 terms max). The accepted list is active now.", .{ dropped, unit }, 0) catch "Some terms over the limit were dropped.";
 }
 
 // =====================================================================================
@@ -504,6 +482,8 @@ pub const Menu = struct {
     alloc: std.mem.Allocator = undefined,
     store: *config.Store = undefined,
     host: Host = undefined,
+    publication: settings_publication.Publication = undefined,
+    settings_path: [4096]u8 = undefined,
 
     /// False until `init` succeeds; false forever on a headless start. The daemon then
     /// runs without a status item (and blocks on plain CFRunLoopRun, not [NSApp run]).
@@ -540,6 +520,13 @@ pub const Menu = struct {
         self.alloc = alloc;
         self.store = store;
         self.host = host;
+        self.publication = .{
+            .alloc = alloc,
+            .io = io,
+            .store = store,
+            .effects = host.settings,
+            .path = config.settingsPath(&self.settings_path),
+        };
         self.chrome = .{ .host = host };
         self.pump = .init(&self.chrome);
         g_menu = self;
@@ -756,16 +743,19 @@ pub const Menu = struct {
         self.chrome.history_submenu = sub;
     }
 
-    // ---- the settings write path (menu action → snapshot swap → config.zon) ---------
-
-    /// Publish `next` as the live snapshot and persist `field = value` to config.zon.
-    fn commitSettings(self: *Menu, next: config.Settings, field: []const u8, value: []const u8, session_shaped: bool) void {
-        const heap = self.alloc.create(config.Settings) catch return;
-        heap.* = next; // leaks by design — see config.Store
-        self.store.swap(heap);
-        _ = config.writeField(self.io, self.alloc, field, value, next);
-        self.host.selectBackend(self.host.ctx, next.transcription_backend);
-        if (session_shaped) self.host.markSessionDirty(self.host.ctx);
+    /// Keep presentation and failure wording on the AppKit side of publication.
+    fn reportEdit(self: *Menu, outcome: anyerror!settings_publication.EditResult) ?settings_publication.EditResult {
+        const result = outcome catch |err| {
+            feedback.log("  menu: settings change not applied: {s}\n", .{@errorName(err)});
+            acknowledge(.{ .title = "Couldn't apply settings", .detail = "Your settings are unchanged. Try the edit again.", .button = "OK" });
+            return null;
+        };
+        self.refreshSettings();
+        if (result.save_error) |err| {
+            feedback.log("  menu: settings applied but not saved: {s}\n", .{@errorName(err)});
+            acknowledge(.{ .title = "Applied, but couldn't save", .detail = "The setting is active now, but config.zon was not saved. A later reload or restart may replace it. Check the file and try saving again.", .button = "OK" });
+        }
+        return result;
     }
 };
 
@@ -797,38 +787,22 @@ fn onRadio(_: id, _: SEL, sender: id) callconv(.c) void {
     const oi: usize = @intCast(@rem(tag, 100));
     const g = &groups[gi];
 
-    var next = m.store.current().*;
-    applyOption(&next, gi, oi);
-    m.commitSettings(next, g.field, g.opts[oi].zon, g.session_shaped);
-    // One apply re-checkmarks the group and re-words everything that tracks the settings —
-    // the Backtrack disclosure line, and the Vocabulary item's `— local only` suffix, which
-    // follows the backend *and* the picked model's keywords capability
-    // (§4; openai-biasing-spec §3, #328).
-    m.refreshSettings();
-    feedback.log("  menu: {s} → {s}{s}\n", .{
-        g.title,                                                                 g.opts[oi].label,
-        if (g.session_shaped) " (binds at the next idle session cycle)" else "",
-    });
+    _ = m.reportEdit(editOption(&m.publication, gi, oi)) orelse return;
+    feedback.log("  menu: {s} → {s}\n", .{ g.title, g.opts[oi].label });
 }
 
 fn onOverlay(_: id, _: SEL, _: id) callconv(.c) void {
     const m = g_menu orelse return;
-    var next = m.store.current().*;
-    next.overlay = !next.overlay;
-    m.commitSettings(next, "overlay", if (next.overlay) "true" else "false", false);
-    m.host.setOverlay(m.host.ctx, next.overlay);
-    m.refreshSettings();
-    feedback.log("  menu: Overlay HUD → {s}\n", .{if (next.overlay) "on" else "off"});
+    const on = !m.store.current().overlay;
+    _ = m.reportEdit(m.publication.edit("overlay", on)) orelse return;
+    feedback.log("  menu: Overlay HUD → {s}\n", .{if (on) "on" else "off"});
 }
 
 fn onBacktrack(_: id, _: SEL, _: id) callconv(.c) void {
     const m = g_menu orelse return;
-    var next = m.store.current().*;
-    next.backtrack = !next.backtrack;
-    // Read-at-use / pinned at Talk Key press — no Host callback, no session cycle.
-    m.commitSettings(next, "backtrack", if (next.backtrack) "true" else "false", false);
-    m.refreshSettings(); // toggle checkmark + line-2 wording (sharpens on Local + on)
-    feedback.log("  menu: Backtrack → {s}\n", .{if (next.backtrack) "on" else "off"});
+    const on = !m.store.current().backtrack;
+    _ = m.reportEdit(m.publication.edit("backtrack", on)) orelse return;
+    feedback.log("  menu: Backtrack → {s}\n", .{if (on) "on" else "off"});
 }
 
 /// Pause/resume, flipping the state the **displayed** Presentation reported (ADR-0011) rather
@@ -1045,20 +1019,6 @@ fn runAlert(content: Confirmation, second_button: ?[*:0]const u8) c_long {
     return msgLongR(alert, "runModal");
 }
 
-test "every radio row a click can set reads back as that same row" {
-    // The write half (here) and the read half (status_item.currentOption) are generated from
-    // one table, so this mostly re-proves the compiler — but it is what pins the *pairing*:
-    // clicking row `oi` of group `gi` must leave the snapshot showing row `oi` checked, or
-    // the menu re-renders a different option than the one the user picked.
-    inline for (status_item.specs, 0..) |spec, gi| {
-        inline for (spec.opts, 0..) |_, oi| {
-            var s = config.Settings{};
-            applyOption(&s, gi, oi);
-            try std.testing.expectEqual(@as(?u8, @intCast(oi)), status_item.settingsView(&s).selected[gi]);
-        }
-    }
-}
-
 test "Install confirmation names the pinned large artifact and its privacy boundary" {
     const copy = confirmationForModelAction(.install).?;
 
@@ -1163,6 +1123,7 @@ test "droppedItemsMessage pluralizes and names the structural caps" {
     var buf: [160]u8 = undefined;
     try std.testing.expect(std.mem.indexOf(u8, droppedItemsMessage(&buf, 1), "Dropped 1 term ") != null);
     const many = droppedItemsMessage(&buf, 5);
+    try std.testing.expect(std.mem.indexOf(u8, many, "saved") == null);
     try std.testing.expect(std.mem.indexOf(u8, many, "Dropped 5 terms ") != null);
     try std.testing.expect(std.mem.indexOf(u8, many, "128 terms max") != null);
 }
@@ -1223,7 +1184,7 @@ fn onSetApiKey(_: id, _: SEL, _: id) callconv(.c) void {
 
 /// The Vocabulary editor (spec §3): NSAlert + a multi-line NSTextView-in-NSScrollView
 /// accessory pre-filled with the current (clamped) list, one term per line. Save parses →
-/// trims → drops blanks → applies the §1 structural clamp → commits `session_shaped = false`
+/// trims → drops blanks → submits a typed edit; publication owns clamping and effects
 /// (no session cycle; Whisper reads the list fresh at the next Talk-Key press, and a warm
 /// OpenAI session re-binds `keywords` via an idle push — openai-biasing-spec §1). Cancel is
 /// a no-op. When the clamp dropped items, a follow-up alert names the count.
@@ -1281,23 +1242,15 @@ fn onVocabulary(_: id, _: SEL, _: id) callconv(.c) void {
 
     if (msgLongR(alert, "runModal") != NSAlertFirstButtonReturn) return; // Cancel — no-op
 
-    // Read → split/trim/drop-blank → structural clamp. Terms are duped into m.alloc so they
-    // outlive this pool inside the leaked snapshot; dropped = entered − committed (§3).
-    const entered = parseVocabularyLines(m.alloc, std.mem.span(utf8(msg(text_view, "string")))) orelse return;
-    const committed = config.clampVocabulary(m.alloc, entered) orelse return;
-    const dropped = entered.len - committed.len;
-
-    var next = current.*;
-    next.vocabulary = committed;
-    const value = config.serializeVocabularyValue(m.alloc, committed) orelse return;
-    defer m.alloc.free(value);
-    const rebias = config.diffSettings(current, &next).rebias; // before the swap replaces `current`'s peer
-    m.commitSettings(next, "vocabulary", value, false); // read-at-use — never session_shaped (§4)
-    // A real change re-binds the warm OpenAI session's keywords at the next idle tick
-    // (openai-biasing-spec §1) — a push, not a cycle; Save-without-change stays a no-op.
-    if (rebias) m.host.markSessionRebias(m.host.ctx);
-    m.refreshSettings();
-    feedback.log("  menu: Vocabulary → {d} terms{s}\n", .{ committed.len, if (dropped > 0) " (clamped)" else "" });
+    var scratch = std.heap.ArenaAllocator.init(m.alloc);
+    defer scratch.deinit();
+    const entered = parseVocabularyLines(scratch.allocator(), std.mem.span(utf8(msg(text_view, "string")))) orelse {
+        _ = m.reportEdit(error.OutOfMemory);
+        return;
+    };
+    const result = m.reportEdit(m.publication.edit("vocabulary", entered)) orelse return;
+    const dropped = result.dropped;
+    feedback.log("  menu: Vocabulary → {d} terms{s}\n", .{ m.store.current().vocabulary.len, if (dropped > 0) " (clamped)" else "" });
 
     if (dropped > 0) {
         var note_buf: [160]u8 = undefined;
@@ -1320,19 +1273,11 @@ fn onQuit(_: id, _: SEL, _: id) callconv(.c) void {
 /// status line, and the pause title so the menu never lies.
 fn onMenuWillOpen(_: id, _: SEL, _: id) callconv(.c) void {
     const m = g_menu orelse return;
-    const fresh = config.loadSettingsOnly(m.io, m.alloc);
-    const cur = m.store.current();
-    const d = config.diffSettings(cur, &fresh);
-    if (d.any) {
-        const heap = m.alloc.create(config.Settings) catch return;
-        heap.* = fresh;
-        m.store.swap(heap);
-        feedback.log("  menu: picked up hand-edited config.zon\n", .{});
-        if (d.backend_selection) m.host.selectBackend(m.host.ctx, fresh.transcription_backend);
-        if (d.session_shaped) m.host.markSessionDirty(m.host.ctx);
-        if (d.rebias) m.host.markSessionRebias(m.host.ctx);
-        if (d.overlay) m.host.setOverlay(m.host.ctx, fresh.overlay);
-    }
+    const changed = m.publication.reload() catch |err| blk: {
+        feedback.log("  menu: config.zon reload failed: {s} — keeping live settings\n", .{@errorName(err)});
+        break :blk false;
+    };
+    if (changed) feedback.log("  menu: picked up hand-edited config.zon\n", .{});
     // Apply unconditionally: the Recent Insertions relative times are the one thing the
     // Presentation deliberately does not carry, so an unchanged value would still render stale
     // ("2m ago" on a row that is now an hour old). Everything else — checkmarks, hand-edited
@@ -1377,4 +1322,41 @@ fn makeTarget() id {
 fn chromeTick(_: CFRunLoopTimerRef, info: ?*anyopaque) callconv(.c) void {
     const self: *Menu = @ptrCast(@alignCast(info.?));
     self.refresh();
+}
+
+test "every radio edit publishes and persists the value its displayed row names" {
+    const NoEffects = struct {
+        fn select(_: *anyopaque, _: backend.Backend) void {}
+        fn dirty(_: *anyopaque) void {}
+        fn rebias(_: *anyopaque) void {}
+        fn overlay(_: *anyopaque, _: bool) void {}
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root: [4096]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &root);
+    var path_buf: [4096]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/config.zon", .{root[0..n]});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit(); // all test readers end together, unlike process-lifetime production readers
+    const first = config.Settings{};
+    var store = config.Store.init(&first);
+    var publication = settings_publication.Publication{
+        .alloc = arena.allocator(),
+        .io = std.testing.io,
+        .store = &store,
+        .path = path,
+        .effects = .{ .ctx = &store, .selectBackend = NoEffects.select, .markSessionDirty = NoEffects.dirty, .markSessionRebias = NoEffects.rebias, .setOverlay = NoEffects.overlay },
+    };
+    inline for (status_item.specs, 0..) |spec, gi| {
+        inline for (spec.opts, 0..) |_, oi| {
+            const result = try editOption(&publication, gi, oi);
+            try std.testing.expect(result.save_error == null);
+            try std.testing.expectEqual(@as(?u8, @intCast(oi)), status_item.settingsView(store.current()).selected[gi]);
+            var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer scratch.deinit();
+            const disk = try config.readSettingsAt(std.testing.io, scratch.allocator(), path);
+            try std.testing.expectEqual(@as(?u8, @intCast(oi)), status_item.settingsView(&disk).selected[gi]);
+        }
+    }
 }
