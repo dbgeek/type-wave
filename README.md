@@ -15,7 +15,7 @@ foreground while developing, or as a signed per-user LaunchAgent for daily use.
        width="640">
 </p>
 
-> **Status:** experimental research project, `v0.4.2`, Apple Silicon macOS only.
+> **Status:** experimental research project, `v0.4.4`, Apple Silicon macOS only.
 > Single-maintainer, no support or SLA — small fixes welcome, larger changes worth
 > discussing first. The hold-to-talk -> transcribe -> insert pipeline works end-to-end
 > on either backend. Distribution hardening (hardened runtime, entitlements,
@@ -54,6 +54,10 @@ pins that Utterance to the selected **Transcription Backend** and to the setting
 at press time. On release it commits the Utterance and waits for the **Final Transcript** —
 the only text ever inserted — then the **Insertion Runner** places it at the **Focused
 Target** cursor through either a clipboard-swap paste or synthetic keystrokes.
+The runner compares the frontmost app at Talk Key release with the app just before
+Insertion. A positive change refuses the Insertion and shows a red refuse cue; the
+transcript remains in Recent Insertions for **Re-insert here**, unless its text was
+withheld under Secure Event Input. An unreadable app identity allows Insertion to proceed.
 
 The two backends reach that same Final Transcript by different routes. **OpenAI**
 streams: it emits revisable **Partial Transcripts** live, then commits the Final
@@ -90,15 +94,17 @@ one **Insert Worker** thread (dictation first, Undo last), which is what keeps a
 from landing in the middle of an Insertion. Nothing here is ever written to disk; the ring
 is cleared when the daemon quits.
 
-One Utterance is deliberately not remembered: one spoken while any app holds **Secure Event
-Input**, the session-wide mode a password field puts macOS into. type-wave probes at both Talk
-Key press and release, and a positive reading on either edge withholds that Insertion Record
-from the ring and keeps the transcript out of the log even under the `.log_transcripts` opt-in.
-The text still lands at the cursor — it is simply never retained, so it cannot be revealed,
-copied, re-inserted, or undone. While Secure Event Input is held the WindowServer also withholds
-key events from every event tap, so the `⌃⌘⌫` chord never reaches the daemon at all; the menu
-bar reports that state rather than leaving you to infer it from a chord that silently does
-nothing.
+An Utterance spoken while any app holds **Secure Event Input**, the session-wide mode a
+password field puts macOS into, has its transcript text withheld. type-wave probes at both
+Talk Key press and release, and a positive reading on either edge keeps both the inserted
+and raw text out of the ring and the transcript out of the log even under the
+`.log_transcripts` opt-in. Insertion still follows the usual rules. The Insertion Record
+retains its outcome, timestamp, App Identity, and grapheme-cluster count, but has no text to
+reveal, copy, or re-insert. Once Secure Event Input clears, **Undo** can use that count to
+delete the newest Insertion, subject to the usual app, permission, and single-shot gates.
+While Secure Event Input is held the WindowServer also withholds key events from every
+event tap, so the `⌃⌘⌫` chord never reaches the daemon at all; the menu bar reports that state
+rather than leaving you to infer it from a chord that silently does nothing.
 
 Across the whole lifecycle the **Utterance Coordinator** owns the state machine from
 Talk Key press to a resolved Insertion. The floating **HUD** is silent visual feedback
@@ -242,7 +248,7 @@ Run `--verify-model` for a full offline integrity check of the active Model Inst
 It hashes every model byte and reports the exact corrupt metadata/artifact class without
 reading credentials or using the network. Run `--repair-model` to verify first and preserve
 valid local data; metadata-only damage is rebuilt offline, while missing or invalid artifact
-data requires typing `yes` before authenticated acquisition begins. A helper load failure
+data requires typing `yes` before a credential-free download begins. A helper load failure
 performs this same offline verification before type-wave offers Repair for corruption or
 runtime Retry for a verified installation that still cannot load.
 
