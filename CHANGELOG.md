@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.6](https://github.com/dbgeek/type-wave/compare/v0.4.5...v0.4.6) (2026-09-25)
+
+
+### Features
+
+* **hud:** MetalChrome draws the Scene at display rate ([#359](https://github.com/dbgeek/type-wave/issues/359)) ([#365](https://github.com/dbgeek/type-wave/issues/365)) ([ea1a92b](https://github.com/dbgeek/type-wave/commit/ea1a92b7741828d9498b411390a445780bda06d5))
+
 ## [0.4.5](https://github.com/dbgeek/type-wave/compare/v0.4.4...v0.4.5) (2026-09-25)
 
 
