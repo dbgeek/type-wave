@@ -1,55 +1,52 @@
 //! hud.zig — the silent waveform pill, driven PURELY through the ObjC runtime
 //! C API (objc_getClass / sel_registerName / objc_msgSend) from Zig. No Swift, no
 //! ObjC shim .m files. The panel + focus-avoidance recipe graduated from
-//! prototypes/overlay-hud (wayfinder #20/#22); the waveform mechanism — a fixed row
-//! of plain CALayers whose frames the render pump pokes each tick — graduated from
-//! prototypes/waveform-hud (wayfinder #25, into the daemon by #27); the bare-marks
-//! v3 look — labelColor bars / secondaryLabelColor dots in a 300×22 sliver, no
-//! glass, no accent design (ADR 0002, #41/#44); and the
-//! native motion — fade show/hide, bars→dots crossfade, all at the locked 0.7×
-//! timings (#44/#47, landed by #51): a pure `Sequencer`
-//! decides each tick's transition, `render` executes it via explicit
-//! NSAnimationContext / actions-enabled CATransaction groupings. The HUD
-//! shows **no text, ever**: while recording it scrolls live mic volume as bars; after
-//! the Talk Key release three neutral dots bounce until the Insertion resolves.
+//! prototypes/overlay-hud (wayfinder #20/#22); the bare-marks look — labelColor bars /
+//! secondaryLabelColor dots in a 300×22 sliver, no glass, no accent design — from ADR 0002
+//! (#41/#44); and the micro-motion from prototypes/hud-micro-motion (ADR-0014, map #355):
+//! every mark drawn by one Metal SDF pass at display rate, melting together through a
+//! smooth-union goo and carrying a soft glow in its own colour. The HUD shows **no text,
+//! ever**: while recording it scrolls live mic volume as bars; after the Talk Key release
+//! the bars gather into three neutral dots that bounce until the Insertion resolves.
 //!
 //! The msgSend pattern (cast &objc_msgSend to a typed fn-pointer per call site) is
 //! the exact one proven for NSPasteboard in src/insert.zig, extended to NSPanel /
-//! NSColor / NSScreen / CALayer / CATransaction.
+//! NSColor / NSScreen / CAMetalLayer / CADisplayLink / the Metal pipeline (spike #356).
 //!
 //! # How it composes with the daemon
 //!
 //!   - **The module is split at the HUD Chrome seam.** `Hud(Chrome)` is the pump: the
 //!     mutex-guarded state producers publish into, the pure `Sequencer`, and the per-tick
 //!     composition rules — it holds no AppKit handle, takes `now` as a parameter, and
-//!     hands the Chrome exactly one comparable `Frame`. `AppKitChrome` is the production
+//!     hands the Chrome exactly one comparable `Frame`. `MetalChrome` is the production
 //!     adapter and the only place ObjC is spoken; `FakeChrome` (below, in the tests)
 //!     records frames. The rules that decide what the user actually sees — the cue arming
 //!     guard, the recording/processing preemption, the degraded-pulse downgrade, the
 //!     pulse-to-hide handoff — therefore all run under `zig build test`.
-//!   - **Every Frame carries a Scene** (ADR-0014, #358): the locked micro-motion as a pure
-//!     list of shapes. The pump stamps the Sequencer's decisions into a `SceneState` as
-//!     timestamps, and `SceneState.scene(now, reduce_motion)` turns them into geometry for any
-//!     `now`, so a display-rate Chrome draws without deciding anything. `AppKitChrome` still
-//!     draws the legacy `marks` / `content` until `MetalChrome` replaces it (#359).
-//!   - **All AppKit calls stay on the main thread.** The daemon's main thread runs
-//!     `CFRunLoopRun` (src/tap.zig) servicing the Talk Key tap; the Chrome adds a
-//!     `CFRunLoopTimer` render pump to that same loop (no `[NSApp run]` — proven by
-//!     #20, and 20 Hz proven smooth for the scroll by #25). `AppKitChrome.init` +
-//!     `startPump` + every `paint` run there; the timer reads the clock and trampolines
-//!     into `Hud.render(now)`.
+//!   - **Every Frame is a window op plus a Scene** (ADR-0014, #358): the locked micro-motion
+//!     as a pure list of shapes. The pump stamps the Sequencer's decisions into a
+//!     `SceneState` as timestamps, and `SceneState.scene(now, reduce_motion)` turns them into
+//!     geometry for any `now`, so the display-rate Chrome draws without deciding anything.
+//!   - **All AppKit calls stay on the main thread.** The daemon's main thread runs the loop
+//!     servicing the Talk Key tap — plain `CFRunLoopRun` (src/tap.zig, proven by #20), or
+//!     `[NSApp run]` under the status item (src/appkit.zig). The Chrome adds two things to
+//!     that same loop: `NSScreen`'s display link, which
+//!     runs the pump once per display frame while the pill is on screen and is paused
+//!     otherwise, and a run-loop source the pump's `wake` signals from any thread, so a hidden
+//!     pill renders on the publishing edge. `MetalChrome.init` + `startPump` + every `paint`
+//!     run there; the cadence reads the clock and trampolines into `Hud.render(now)`.
 //!   - **Producers publish from any thread.** `publish(state)` sets the lifecycle
 //!     state; `pushLevel(rms)` queues one raw linear RMS sample per 50 ms Capture
 //!     buffer from the audio queue's thread. Both are mutex-guarded, no AppKit.
-//!     The render pump drains the queue and pokes the layers — a queue, not a
-//!     latest-value slot, so the scroll advances exactly one bar per buffer
-//!     regardless of pump jitter (#26).
-//!   - **Headless degrades cleanly.** `AppKitChrome.init` returns `false` when there is no
-//!     display (`[NSScreen mainScreen]` is nil — e.g. a bare-SSH run); the daemon then
-//!     never starts the pump and leaves it disabled, so `isOn` reports the truth and the
-//!     Feedback Surface falls back to sound-only (#18) without failing startup. That fact
-//!     lives in the adapter, where it belongs — it is a fact about AppKit handles, not
-//!     about the pump.
+//!     The pump drains the queue into the Scene's scroll — a queue, not a latest-value
+//!     slot, so the scroll advances exactly one bar per buffer regardless of frame
+//!     jitter (#26) — and the Scene glides between samples at display rate.
+//!   - **Headless and Metal-less degrade cleanly.** `MetalChrome.init` fails when there is
+//!     no display (`[NSScreen mainScreen]` is nil — e.g. a bare-SSH run), no Metal device,
+//!     or a shader that will not build; the daemon then never starts the pump and leaves it
+//!     disabled, so `isOn` reports the truth and the Feedback Surface falls back to
+//!     sound-only (#18) without failing startup. That fact lives in the adapter, where it
+//!     belongs — it is a fact about AppKit and Metal handles, not about the pump.
 //!
 //! ABI note: Apple Silicon (arm64) only. NSRect is a homogeneous aggregate of four
 //! CGFloat(=f64), so it rides in v0–v3 and plain objc_msgSend handles both passing and
@@ -66,6 +63,10 @@ extern "c" fn sel_registerName(name: [*:0]const u8) SEL;
 extern "c" fn objc_msgSend() void; // never called directly — cast per call site
 extern "c" fn objc_autoreleasePoolPush() ?*anyopaque;
 extern "c" fn objc_autoreleasePoolPop(pool: ?*anyopaque) void;
+// The display link's runtime-minted target class (the menu.zig recipe).
+extern "c" fn objc_allocateClassPair(superclass: id, name: [*:0]const u8, extra: usize) id;
+extern "c" fn objc_registerClassPair(c: id) void;
+extern "c" fn class_addMethod(c: id, name: SEL, imp: *const anyopaque, types: [*:0]const u8) bool;
 
 inline fn cls(name: [*:0]const u8) id {
     return objc_getClass(name);
@@ -88,6 +89,11 @@ inline fn msg(self: id, op: [*:0]const u8) id {
 inline fn msgv(self: id, op: [*:0]const u8) void {
     const f: *const fn (id, SEL) callconv(.c) void = @ptrCast(&objc_msgSend);
     f(self, sel_registerName(op));
+}
+// [self op]  -> double
+inline fn msgF64(self: id, op: [*:0]const u8) f64 {
+    const f: *const fn (id, SEL) callconv(.c) f64 = @ptrCast(&objc_msgSend);
+    return f(self, sel_registerName(op));
 }
 // [self op:a]  (id arg) -> void
 inline fn msg1v(self: id, op: [*:0]const u8, a: id) void {
@@ -114,14 +120,14 @@ inline fn msgULong(self: id, op: [*:0]const u8, n: c_ulong) void {
     const f: *const fn (id, SEL, c_ulong) callconv(.c) void = @ptrCast(&objc_msgSend);
     f(self, sel_registerName(op), n);
 }
+// [self op:n]  (NSUInteger) -> id — objectAtIndexedSubscript:
+inline fn msgIdx(self: id, op: [*:0]const u8, n: c_ulong) id {
+    const f: *const fn (id, SEL, c_ulong) callconv(.c) id = @ptrCast(&objc_msgSend);
+    return f(self, sel_registerName(op), n);
+}
 // [self op:x]  (CGFloat) -> void
 inline fn msgDouble(self: id, op: [*:0]const u8, x: f64) void {
     const f: *const fn (id, SEL, f64) callconv(.c) void = @ptrCast(&objc_msgSend);
-    f(self, sel_registerName(op), x);
-}
-// [self op:x]  (C float) -> void — CALayer.opacity is a plain float, not CGFloat.
-inline fn msgFloat(self: id, op: [*:0]const u8, x: f32) void {
-    const f: *const fn (id, SEL, f32) callconv(.c) void = @ptrCast(&objc_msgSend);
     f(self, sel_registerName(op), x);
 }
 // [self op:rect]  (NSRect/CGRect) -> void
@@ -129,30 +135,26 @@ inline fn msgRect(self: id, op: [*:0]const u8, r: NSRect) void {
     const f: *const fn (id, SEL, NSRect) callconv(.c) void = @ptrCast(&objc_msgSend);
     f(self, sel_registerName(op), r);
 }
-// [self op:x ofColor:a]  (CGFloat, id) -> id — NSColor blendedColorWithFraction:ofColor:.
-inline fn msgDoubleId(self: id, op: [*:0]const u8, x: f64, a: id) id {
-    const f: *const fn (id, SEL, f64, id) callconv(.c) id = @ptrCast(&objc_msgSend);
-    return f(self, sel_registerName(op), x, a);
+// [self respondsToSelector:@selector(op)]
+inline fn respondsTo(self: id, op: [*:0]const u8) bool {
+    const f: *const fn (id, SEL, SEL) callconv(.c) bool = @ptrCast(&objc_msgSend);
+    return f(self, sel_registerName("respondsToSelector:"), sel_registerName(op));
+}
+// [NSString stringWithUTF8String:s] — autoreleased.
+inline fn nsString(s: [*:0]const u8) id {
+    const f: *const fn (id, SEL, [*:0]const u8) callconv(.c) id = @ptrCast(&objc_msgSend);
+    return f(cls("NSString"), sel_registerName("stringWithUTF8String:"), s);
 }
 
 // ---- Cocoa geometry ---------------------------------------------------------
 /// NSRect == {origin{x,y}, size{w,h}}; flat here, identical layout. Four f64 = an HFA,
 /// so it is passed/returned in SIMD regs by the arm64 C ABI (Zig lowers this for us).
 const NSRect = extern struct { x: f64, y: f64, w: f64, h: f64 };
+/// CGSize, MTLClearColor and CAFrameRateRange ride by value the same way (HFAs).
+const CGSize = extern struct { w: f64, h: f64 };
+const MTLClearColor = extern struct { r: f64, g: f64, b: f64, a: f64 };
+const CAFrameRateRange = extern struct { minimum: f32, maximum: f32, preferred: f32 };
 
-/// A semantic NSColor (`labelColor`, `secondaryLabelColor`, …) pinned to sRGB.
-/// Dynamic system colors must be converted to a component color space before
-/// CGColor use, and the conversion resolves against the *current* appearance —
-/// so re-resolving per recolor pass is what makes the marks track light/dark
-/// with no notification wiring (ADR 0002).
-inline fn systemColor(name: [*:0]const u8) id {
-    const dynamic = msg(cls("NSColor"), name);
-    return msg1(dynamic, "colorUsingColorSpace:", msg(cls("NSColorSpace"), "sRGBColorSpace"));
-}
-/// CGColorRef from an NSColor — CALayer.backgroundColor wants the CG flavour.
-inline fn cgColor(nscolor: id) id {
-    return msg(nscolor, "CGColor");
-}
 /// [[NSPanel alloc] initWithContentRect:styleMask:backing:defer:]
 inline fn makePanel(rect: NSRect, style: c_ulong, backing: c_ulong) id {
     const allocd = msg(cls("NSPanel"), "alloc");
@@ -162,43 +164,6 @@ inline fn makePanel(rect: NSRect, style: c_ulong, backing: c_ulong) id {
 /// [NSScreen mainScreen] — nil when there is no display (the headless signal).
 inline fn mainScreen() id {
     return msg(cls("NSScreen"), "mainScreen");
-}
-
-// ---- animation helpers (#44/#47, graduated as-is): explicit groupings, immune
-// to the pump's per-tick setDisableActions — window animator changes are
-// explicit animations, and the nested transaction re-enables implicit actions
-// for the raw bar/dot layers we own. CA interpolates in the render server.
-fn easeOut() id {
-    const f: *const fn (id, SEL, f32, f32, f32, f32) callconv(.c) id = @ptrCast(&objc_msgSend);
-    return f(cls("CAMediaTimingFunction"), sel_registerName("functionWithControlPoints::::"), ease_ctl[0], ease_ctl[1], ease_ctl[2], ease_ctl[3]);
-}
-
-/// NSAnimationContext grouping for window animator properties (panel
-/// alphaValue). Pair with animEnd().
-fn animBegin(dur: f64) void {
-    msgv(cls("CATransaction"), "begin");
-    msgBool(cls("CATransaction"), "setDisableActions:", false);
-    msgv(cls("NSAnimationContext"), "beginGrouping");
-    const ctx = msg(cls("NSAnimationContext"), "currentContext");
-    msgDouble(ctx, "setDuration:", dur);
-    msgBool(ctx, "setAllowsImplicitAnimation:", true);
-    msg1v(ctx, "setTimingFunction:", easeOut());
-}
-fn animEnd() void {
-    msgv(cls("NSAnimationContext"), "endGrouping");
-    msgv(cls("CATransaction"), "commit");
-}
-
-/// Nested CATransaction with implicit actions ON — property pokes on our raw
-/// CALayers (opacity) animate over `dur`. Pair with layerAnimEnd().
-fn layerAnimBegin(dur: f64) void {
-    msgv(cls("CATransaction"), "begin");
-    msgBool(cls("CATransaction"), "setDisableActions:", false);
-    msgDouble(cls("CATransaction"), "setAnimationDuration:", dur);
-    msg1v(cls("CATransaction"), "setAnimationTimingFunction:", easeOut());
-}
-fn layerAnimEnd() void {
-    msgv(cls("CATransaction"), "commit");
 }
 /// [screen frame] — NSRect returned by value (HFA, v0–v3).
 inline fn screenFrame(screen: id) NSRect {
@@ -216,33 +181,38 @@ const NSWindowCollectionBehaviorCanJoinAllSpaces: c_ulong = 1 << 0;
 const NSWindowCollectionBehaviorStationary: c_ulong = 1 << 4;
 const NSWindowCollectionBehaviorFullScreenAuxiliary: c_ulong = 1 << 8;
 
-// ---- CFRunLoopTimer render pump (main thread) -------------------------------
-const CFRunLoopTimerRef = ?*anyopaque;
+// ---- Metal / QuartzCore (ADR-0014) -------------------------------------------
+extern "c" fn MTLCreateSystemDefaultDevice() id;
+extern "c" fn CACurrentMediaTime() f64; // the display link's clock
+extern "c" fn CGColorSpaceCreateWithName(name: ?*anyopaque) ?*anyopaque;
+extern var kCGColorSpaceSRGB: ?*anyopaque;
+const MTLPixelFormatBGRA8Unorm: c_ulong = 80;
+const MTLLoadActionClear: c_ulong = 2;
+const MTLStoreActionStore: c_ulong = 1;
+const MTLPrimitiveTypeTriangle: c_ulong = 3;
+
+// ---- the wake source (CFRunLoopSource, version 0) -----------------------------
+// Signalled from any thread, performed on the main run loop — how a publish reaches a
+// hidden pill whose display link is paused.
 const CFRunLoopRef = ?*anyopaque;
-const CFRunLoopTimerContext = extern struct {
+const CFRunLoopSourceContext = extern struct {
     version: c_long = 0,
     info: ?*anyopaque = null,
     retain: ?*const anyopaque = null,
     release: ?*const anyopaque = null,
     copyDescription: ?*const anyopaque = null,
+    equal: ?*const anyopaque = null,
+    hash: ?*const anyopaque = null,
+    schedule: ?*const anyopaque = null,
+    cancel: ?*const anyopaque = null,
+    perform: ?*const fn (?*anyopaque) callconv(.c) void = null,
 };
-extern "c" fn CFAbsoluteTimeGetCurrent() f64;
 extern "c" fn CFRunLoopGetCurrent() CFRunLoopRef;
-extern "c" fn CFRunLoopAddTimer(rl: CFRunLoopRef, timer: CFRunLoopTimerRef, mode: ?*anyopaque) void;
-extern "c" fn CFRunLoopTimerCreate(
-    alloc: ?*anyopaque,
-    fireDate: f64,
-    interval: f64,
-    flags: c_ulong,
-    order: c_long,
-    callout: *const fn (CFRunLoopTimerRef, ?*anyopaque) callconv(.c) void,
-    context: ?*CFRunLoopTimerContext,
-) CFRunLoopTimerRef;
+extern "c" fn CFRunLoopSourceCreate(alloc: ?*anyopaque, order: c_long, context: *CFRunLoopSourceContext) ?*anyopaque;
+extern "c" fn CFRunLoopAddSource(rl: CFRunLoopRef, source: ?*anyopaque, mode: ?*anyopaque) void;
+extern "c" fn CFRunLoopSourceSignal(source: ?*anyopaque) void;
+extern "c" fn CFRunLoopWakeUp(rl: CFRunLoopRef) void;
 extern var kCFRunLoopCommonModes: ?*anyopaque;
-
-/// How often the render pump pokes the layers. 20 Hz — proven smooth for the scroll
-/// with implicit animations off (#25), cheap on an idle (hidden) tick.
-const render_interval_s: f64 = 0.05;
 
 // ---- the look (HUD v3 bare marks — ADR 0002, HITL-locked in #41/#44; fixed, no
 // config knob). Constants recorded in docs/hud-v3-graduation.md. ------------------
@@ -264,7 +234,7 @@ const dots_row_w: f64 = 3 * dot_size + 2 * dot_gap; // the three-dot row, centre
 
 // The Undo confirm/refuse cue's single centred mark (ADR-0007, #216/#226): a ~6×14 pt
 // rounded bar, deliberately unlike the 26 recording bars and the 3 processing dots so an
-// Undo outcome never reads as recording/thinking. Its own net-new layer family — the pill
+// Undo outcome never reads as recording/thinking. Its own net-new shape family — the pill
 // is `hidden` when it plays, so the distinct single-mark shape is what makes the cue
 // unmistakable. Green still-bloom = confirmed, red bloom + horizontal shake = refused.
 const mark_w: f64 = 6;
@@ -274,7 +244,7 @@ const mark_h: f64 = 14;
 /// 50 ms Capture buffer, n_bars/20 seconds scroll across it (26 bars ≈ 1.3 s).
 const n_bars: usize = @intFromFloat(@floor((pill_w - 2 * pad_x + bar_gap) / (bar_w + bar_gap)));
 
-/// What the pill is doing — drives which layer family is visible. The daemon maps its
+/// What the pill is doing — drives which mark family the Scene draws. The daemon maps its
 /// Utterance lifecycle onto these: `recording` on Talk Key press (scrolling waveform),
 /// `processing` on release (bouncing dots, held over the whole Insertion), `hidden`
 /// once the Utterance resolves (inserted, abandoned, empty, or timed out).
@@ -314,7 +284,7 @@ fn pulseEnvelope(elapsed: f64) f32 {
 // The cue is driven from `hidden` and owns its own show→bloom→hold→hide window (unlike the
 // amber pulse, which piggybacks an in-flight processing pill). These pure functions turn
 // cue-time into the mark's bloom weight and horizontal shake offset; the Sequencer below
-// orchestrates the window and the render pump paints the mark. Unit-tested below.
+// orchestrates the window and the Scene draws the mark. Unit-tested below.
 
 /// How long the mark blooms in / the shake plays — reuses the ~300 ms pulse feel.
 const cue_bloom_dur: f64 = 0.30;
@@ -345,9 +315,9 @@ fn cueShake(elapsed: f64) f64 {
 
 /// The PURE decision half of the pill's motion (the #47 prototype shape,
 /// graduated): fed (published state, now) once per pump tick, it decides which
-/// transition starts this tick; the AppKit executor in `render` performs it.
-/// It owns the window lifecycle (shown / hide deadline), so the executor
-/// carries no motion state of its own. Unit-tested below by feeding
+/// transition starts this tick; `render` stamps it into the Scene and the Chrome
+/// orders the window. It owns the window lifecycle (shown / hide deadline), so
+/// neither carries lifecycle state of its own. Unit-tested below by feeding
 /// (state, clock) sequences and asserting decisions.
 pub const Sequencer = struct {
     /// Edge detection: published state != prev_mode starts a transition.
@@ -384,7 +354,7 @@ pub const Sequencer = struct {
         order_out, // the hide fade has played — take the panel out, exactly once
         cancel_hide, // re-shown mid-hide-fade: snap alpha back to 1, panel never left
     };
-    /// Which layer-family flip this tick performs.
+    /// Which mark-family flip this tick performs.
     pub const MarksFx = enum {
         keep, // steady state — no visibility pokes
         bars, // cut to the waveform (a fresh Utterance)
@@ -433,29 +403,21 @@ pub const Sequencer = struct {
         return .{ .window = window, .marks = marks };
     }
 
-    /// One tick of the degraded-insertion pulse (ADR-0004). Independent of `step`: the
-    /// pulse tints the dots while the pill is still `.processing`; when it elapses the
-    /// pump resolves the pill to `.hidden` and `step` plays the ordinary fade around the
-    /// frozen amber dots.
-    pub const Pulse = struct {
-        /// Weight (0 none .. 1 full systemOrangeColor) to blend into the dots this tick.
-        amber: f32 = 0,
-        /// True on the single tick the pulse elapses — the caller resolves to the hide fade.
-        ended: bool = false,
-    };
-
     /// Arm the one-shot amber pulse: it plays for `pulse_dur` from `now`.
     pub fn startPulse(self: *Sequencer, now: f64) void {
         self.pulse_at = now + pulse_dur;
     }
 
-    /// The amber weight for `now`, and whether the pulse just elapsed. Idle (`.{}`) when
-    /// no pulse is armed. Clears the deadline on the ending tick so it fires exactly once.
-    pub fn pulseStep(self: *Sequencer, now: f64) Pulse {
-        const until = self.pulse_at orelse return .{};
-        if (now < until) return .{ .amber = pulseEnvelope(now - (until - pulse_dur)) };
+    /// One tick of the degraded-insertion pulse (ADR-0004). Independent of `step`: the
+    /// Scene tints the dots while the pill is still `.processing`; this returns true on the
+    /// single tick the pulse elapses, and the pump then resolves the pill to `.hidden` so
+    /// `step` plays the ordinary hide around the amber dots. False when none is armed.
+    /// Clears the deadline on the ending tick so it fires exactly once.
+    pub fn pulseStep(self: *Sequencer, now: f64) bool {
+        const until = self.pulse_at orelse return false;
+        if (now < until) return false;
         self.pulse_at = null;
-        return .{ .amber = 1.0, .ended = true };
+        return true;
     }
 
     // ---- the Undo confirm/refuse cue (ADR-0007, #226) -----------------------
@@ -467,20 +429,16 @@ pub const Sequencer = struct {
     pub const CueKind = enum { confirm, refuse };
 
     /// One tick of the Undo cue. `owns` is true whenever a cue is in progress — the pump
-    /// takes this path and skips `step` — through the trailing order-out. `paint` marks the
-    /// visible phase (show / bloom / hold): the pump paints the mark with `bloom` weight and,
-    /// for a refuse, `shake_px` horizontal offset. During the hide fade `owns` stays true but
-    /// `paint` is false — the mark freezes and rides the panel fade out, like the dots do.
+    /// takes this path and skips `step` — through the trailing order-out. `window` is the
+    /// cue's own show / hide / order-out; the bloom and the refuse shake are the Scene's,
+    /// computed from when the mark showed.
     pub const Cue = struct {
         owns: bool = false,
         kind: CueKind = .confirm,
         window: WindowFx = .none,
-        paint: bool = false,
-        bloom: f32 = 0,
-        shake_px: f64 = 0,
     };
 
-    /// Arm the one-shot Undo cue of `kind`, played from `now`. The caller (render pump) only
+    /// Arm the one-shot Undo cue of `kind`, played from `now`. The caller (the pump) only
     /// arms it while the pill is `.hidden` and no cue is already in progress; `cueStep` then
     /// owns the window until it orders out.
     pub fn startCue(self: *Sequencer, now: f64, kind: CueKind) void {
@@ -508,8 +466,8 @@ pub const Sequencer = struct {
         const start = self.cue_at orelse return .{};
         var out = Cue{ .owns = true, .kind = self.cue_kind };
 
-        // Hiding phase: the hold has ended, the panel is fading out. Order out once past the
-        // deadline (clearing the cue), else a frozen no-paint tick while CA plays the fade.
+        // Hiding phase: the hold has ended, the mark is fading out. Order out once past the
+        // deadline (clearing the cue), else an owned tick with nothing to decide.
         if (self.cue_hide_at) |deadline| {
             if (now >= deadline) {
                 self.cue_at = null;
@@ -525,18 +483,12 @@ pub const Sequencer = struct {
             self.cue_shown = true;
             out.window = .show_fade;
         }
-        const t = now - start;
-        if (t >= cue_shown_dur) {
-            // Hold done → start the hide fade. No paint: the mark is already at full bloom from
-            // the hold ticks, so — like the dots on a resolution — it freezes in place and the
-            // panel fade carries it out (ADR-0007's "the ordinary hide fade carries it out").
+        if (now - start >= cue_shown_dur) {
+            // Hold done → start the hide fade: the mark, at full bloom by now, fades where it
+            // is (ADR-0007's "the ordinary hide fade carries it out").
             self.cue_hide_at = now + hide_dur;
             out.window = .hide_fade;
-            return out;
         }
-        out.paint = true;
-        out.bloom = cueBloom(t);
-        out.shake_px = if (self.cue_kind == .refuse) cueShake(t) else 0.0;
         return out;
     }
 };
@@ -569,12 +521,13 @@ const level_queue_cap = 64;
 // the pump's decisions stay where they are. Locked options that need no code of their own:
 // "interpolate" is carried by the glide (with the scroll gliding, the prototype never lerps
 // heights), "display-rate dots" is the bounce computed from `now` below, and "show on the
-// press" is cadence — the Chrome renders on the publishing edge (#359).
+// press" is cadence — the pump wakes the Chrome, which renders on the publishing edge.
 
-/// The panel region the Scene draws in: the 300×22 pill plus room for the glow halo and the
-/// unfurl spring — the prototype's 340×50 region. Provisional: map #355 leaves the panel
-/// footprint open, and MetalChrome (#359) confirms it against the glow. Scene coordinates are
-/// region points, origin bottom-left, y up (the panel's own convention).
+/// The panel region the Scene draws in, and the panel's own size: the 300×22 pill plus room
+/// for the glow halo and the unfurl spring — the prototype's 340×50 region, which held the
+/// glow in #359's smoke run; shapes are pinned inside it by "nothing draws outside the panel
+/// region".
+/// Scene coordinates are region points, origin bottom-left, y up (the panel's convention).
 pub const region_w: f64 = 340;
 pub const region_h: f64 = 50;
 const region_ox: f64 = (region_w - pill_w) / 2.0; // the pill's origin inside the region
@@ -600,11 +553,11 @@ const cull_size: f64 = 0.02;
 /// "Not yet" for a SceneState timestamp — far enough back that every envelope has settled.
 const never: f64 = -1e9;
 
-/// The easeOut() control points, cubic-bezier(0.17, 0.7, 0.3, 1.0) — shared by Core
-/// Animation's timing function and the Scene's own `easeCurve`, so both ease alike.
+/// The pill's ease-out, cubic-bezier(0.17, 0.7, 0.3, 1.0) — the curve the Core Animation
+/// pill's fades used (#44/#47), kept so the Scene's fades ease alike.
 const ease_ctl = [4]f32{ 0.17, 0.7, 0.3, 1.0 };
 
-/// The easeOut() bezier solved for y at x (Newton on x(t), as the prototype does). Clamped.
+/// The ease-out bezier solved for y at x (Newton on x(t), as the prototype does). Clamped.
 fn easeCurve(x: f64) f64 {
     if (x <= 0.0) return 0.0;
     if (x >= 1.0) return 1.0;
@@ -1017,50 +970,34 @@ fn dotCX(j: f64) f64 {
 
 
 // ============================================================================
-// The HUD Chrome seam — one method, `paint(Frame)`.
+// The HUD Chrome seam — `paint(Frame)`, plus the `wake()` nudge for its cadence.
 // ============================================================================
 
 /// One tick's complete, comparable description of what the pill shows. The pump computes
 /// it; the Chrome draws it and decides nothing. Fixed-size and `std.meta.eql`-comparable
 /// by construction, so a test asserts on emitted values rather than on a log of calls.
 pub const Frame = struct {
-    /// What the panel window does this tick.
+    /// What the panel window does this tick: order it in on `show_fade`, out on `order_out`.
+    /// Every fade is already folded into the Scene's alphas, so nothing else is the window's.
     window: Sequencer.WindowFx = .none,
-    /// Which layer-family flip to perform. Always `.keep` on a window-only tick — a hide
-    /// from `.processing` must freeze the dots and fade out around them.
-    marks: Sequencer.MarksFx = .keep,
-    /// What the pill carries this tick.
-    content: Content = .none,
     /// The micro-motion geometry at this tick's `now` (ADR-0014, #358): every shape the pill
-    /// shows, with the window fade folded into each shape's alpha. `MetalChrome` (#359) draws
-    /// only this. `AppKitChrome` still draws `marks` and `content`, and both fields go when it does.
+    /// shows, with the window fade folded into each shape's alpha.
     scene: Scene = .{},
-
-    pub const Content = union(enum) {
-        /// Nothing painted: a window-only tick (hidden, or a cue riding the fade out).
-        none,
-        /// The waveform — normalized bar heights, newest rightmost. Points are the
-        /// Chrome's business; loudness is the pump's.
-        bars: [n_bars]f32,
-        /// The processing dots: each dot's vertical bounce offset in points, plus the
-        /// degraded-insertion amber blend (ADR-0004; 0 on every ordinary tick).
-        dots: Dots,
-        /// The Undo cue's single mark (ADR-0007, #226).
-        mark: Mark,
-        /// The cue's order-out tick: take the panel out, then return the mark to its
-        /// hidden, full-opacity, un-shaken resting state for the next cue.
-        mark_reset,
-    };
-    pub const Dots = struct { offsets: [3]f64 = @splat(0), amber: f32 = 0.0 };
-    pub const Mark = struct { kind: Sequencer.CueKind = .confirm, bloom: f32 = 0.0, shake_px: f64 = 0.0 };
 };
 
 /// The Chrome seam's contract. Invoked by `Hud(Chrome)` itself below — unlike
 /// `local_backend.assertHelper` and `session.assertTransport`, which are never called by
 /// the generic types they protect, so a production adapter can slip through unasserted.
+///
+/// `paint(Frame)` draws one tick. `wake()` is the pump telling the Chrome's cadence that
+/// published input changed: it is called from any thread, after the pump's lock is
+/// released, and must be cheap and thread-safe. The cadence is the adapter's (ADR-0014): it
+/// idles while the pill is hidden, and a wake makes it render on the publishing edge.
 pub fn assertChrome(comptime Chrome: type) void {
-    if (!@hasDecl(Chrome, "paint"))
-        @compileError("type '" ++ @typeName(Chrome) ++ "' is not a Chrome: missing method 'paint'");
+    inline for (.{ "paint", "wake" }) |method| {
+        if (!@hasDecl(Chrome, method))
+            @compileError("type '" ++ @typeName(Chrome) ++ "' is not a Chrome: missing method '" ++ method ++ "'");
+    }
 }
 
 /// The floating waveform pill's **pump**: the mutex-guarded state producers publish into,
@@ -1099,8 +1036,7 @@ pub fn Hud(comptime Chrome: type) type {
         /// The motion's decision half (#51): edge detection, window lifecycle, hide-fade
         /// deadline, the pulse and cue envelopes.
         seq: Sequencer = .{},
-        /// The timestamps the Scene is computed from, stamped as the Sequencer decides. Its
-        /// scroll buffer is also what `content.bars` carries, so the two never disagree.
+        /// The timestamps the Scene is computed from, stamped as the Sequencer decides.
         scene_state: SceneState = .{},
 
         pub fn init(chrome: *Chrome) Self {
@@ -1117,18 +1053,22 @@ pub fn Hud(comptime Chrome: type) type {
         /// Publish a lifecycle state. Thread-safe, no AppKit — called from the run-loop
         /// thread (Talk Key press/release) and wherever the Utterance resolves. A state
         /// change clears the level queue so a stale sample never bleeds into the next
-        /// Utterance.
+        /// Utterance. An accepted publish wakes the Chrome, so a press shows the pill on
+        /// the publishing edge rather than on some later tick.
         pub fn publish(self: *Self, state: State) void {
-            os_unfair_lock_lock(&self.mu);
-            defer os_unfair_lock_unlock(&self.mu);
-            if (!self.enabled and state != .hidden) return; // switched off from the menu
-            if (state != self.pending_state) self.qlen = 0;
-            self.pending_state = state;
+            {
+                os_unfair_lock_lock(&self.mu);
+                defer os_unfair_lock_unlock(&self.mu);
+                if (!self.enabled and state != .hidden) return; // switched off from the menu
+                if (state != self.pending_state) self.qlen = 0;
+                self.pending_state = state;
+            }
+            self.chrome.wake(); // after the unlock: never call out under the spinlock
         }
 
-        /// The menu's live Overlay toggle. Disable hides the pill immediately (the pump
-        /// keeps ticking — a hidden tick is just the lock and a state check); enable lets
-        /// the next Utterance show it again.
+        /// The menu's live Overlay toggle. Disable hides the pill immediately (a shown pill
+        /// is being drawn every frame, so the next one takes it down); enable lets the next
+        /// Utterance show it again.
         pub fn setEnabled(self: *Self, on: bool) void {
             os_unfair_lock_lock(&self.mu);
             defer os_unfair_lock_unlock(&self.mu);
@@ -1163,14 +1103,15 @@ pub fn Hud(comptime Chrome: type) type {
         /// processing pill to pulse (overlay off, or nothing in flight) it degrades to a
         /// plain hide so the pill never stays up.
         pub fn pulseDegraded(self: *Self) void {
-            os_unfair_lock_lock(&self.mu);
-            defer os_unfair_lock_unlock(&self.mu);
-            if (!self.enabled or self.pending_state != .processing) {
-                self.pending_state = .hidden; // nothing to pulse — just take the pill down
-                self.qlen = 0;
-                return;
+            {
+                os_unfair_lock_lock(&self.mu);
+                defer os_unfair_lock_unlock(&self.mu);
+                if (!self.enabled or self.pending_state != .processing) {
+                    self.pending_state = .hidden; // nothing to pulse — just take the pill down
+                    self.qlen = 0;
+                } else self.pulse_pending = true;
             }
-            self.pulse_pending = true;
+            self.chrome.wake();
         }
 
         /// Fire the Undo **confirm** cue (ADR-0007, #226): the single mark blooms
@@ -1188,10 +1129,13 @@ pub fn Hud(comptime Chrome: type) type {
         }
 
         fn requestCue(self: *Self, kind: Sequencer.CueKind) void {
-            os_unfair_lock_lock(&self.mu);
-            defer os_unfair_lock_unlock(&self.mu);
-            if (!self.enabled) return; // overlay off — no visual surface for the cue
-            self.cue_pending = kind;
+            {
+                os_unfair_lock_lock(&self.mu);
+                defer os_unfair_lock_unlock(&self.mu);
+                if (!self.enabled) return; // overlay off — no visual surface for the cue
+                self.cue_pending = kind;
+            }
+            self.chrome.wake(); // a cue arms from a hidden pill, whose cadence is idle
         }
 
         /// Queue one raw linear RMS sample (0..1 of full scale) — one Capture buffer's
@@ -1210,7 +1154,7 @@ pub fn Hud(comptime Chrome: type) type {
 
         /// One pump tick: drain the published state, decide what this tick shows, and hand
         /// the Chrome exactly one `Frame`. `now` comes in from the caller (the Chrome's
-        /// timer in production, a fed value in tests) — the pump reads no clock of its own.
+        /// cadence in production, a fed value in tests) — the pump reads no clock of its own.
         pub fn render(self: *Self, now: f64) void {
             // Snapshot + drain under the lock, then release it before handing anything to
             // the Chrome — never message ObjC while holding the spinlock (it would stall
@@ -1250,9 +1194,7 @@ pub fn Hud(comptime Chrome: type) type {
                         .order_out => ss.orderOut(),
                         .none, .cancel_hide => {},
                     }
-                    var frame = cueFrame(cue);
-                    frame.scene = ss.scene(now, rm);
-                    self.chrome.paint(frame);
+                    self.chrome.paint(.{ .window = cue.window, .scene = ss.scene(now, rm) });
                     return;
                 }
             } else if (self.seq.cue_at != null) {
@@ -1269,8 +1211,7 @@ pub fn Hud(comptime Chrome: type) type {
                 self.seq.startPulse(now);
                 ss.startAmber(now);
             }
-            const pulse = self.seq.pulseStep(now);
-            if (pulse.ended and st == .processing) {
+            if (self.seq.pulseStep(now) and st == .processing) {
                 os_unfair_lock_lock(&self.mu);
                 if (self.pending_state == .processing) self.pending_state = .hidden;
                 os_unfair_lock_unlock(&self.mu);
@@ -1280,9 +1221,8 @@ pub fn Hud(comptime Chrome: type) type {
             const decision = self.seq.step(st, now);
 
             if (st == .hidden) {
-                // Only window motion happens while hidden; the legacy marks are never touched,
-                // so a hide from processing freezes the dots and fades out around them. The
-                // Scene plays the converge (or, under Reduce Motion, the fade) instead.
+                // Only window motion happens while hidden: no family cut, no scroll. The Scene
+                // plays the converge (or, under Reduce Motion, the fade) around what was shown.
                 switch (decision.window) {
                     .hide_fade => ss.startHide(now, !rm),
                     .order_out => ss.orderOut(),
@@ -1309,98 +1249,363 @@ pub fn Hud(comptime Chrome: type) type {
                 .none, .hide_fade, .order_out => {},
             }
 
-            var frame: Frame = .{ .window = decision.window, .marks = decision.marks };
-            switch (st) {
-                .hidden => unreachable,
-                .recording => frame.content = .{ .bars = ss.hist[1..].* },
-                .processing => {
-                    // Three bouncing neutral dots, phase-offset — held until the Insertion
-                    // resolves and the daemon publishes `.hidden`.
-                    var dots: Frame.Dots = .{ .amber = pulse.amber };
-                    for (&dots.offsets, 0..) |*off, j| {
-                        const fj: f64 = @floatFromInt(j);
-                        off.* = dot_bounce * @sin(dotPhase(now, fj));
-                    }
-                    frame.content = .{ .dots = dots };
-                },
-            }
-            frame.scene = ss.scene(now, rm);
-            self.chrome.paint(frame);
+            self.chrome.paint(.{ .window = decision.window, .scene = ss.scene(now, rm) });
         }
     };
 }
 
-/// One tick of the Undo cue as a Frame. Mirrors the two shapes the cue has: a window-only
-/// tick during the hide fade / order-out (the mark frozen, riding the panel fade out, like
-/// the dots do on a resolution), and a paint tick during the visible show/bloom/hold phase.
-fn cueFrame(cue: Sequencer.Cue) Frame {
-    if (!cue.paint) return .{
-        .window = cue.window,
-        .content = if (cue.window == .order_out) .mark_reset else .none,
+// ============================================================================
+// The shader's input — MetalChrome's pure half (ADR-0014, #359).
+// ============================================================================
+
+/// The locked track-B look (ADR-0014): goo **Always** at a 5 pt blend radius, soft glow 0.75.
+/// Fixed, no config knob, like the rest of the pill.
+const goo_k: f32 = 5.0;
+const glow_strength: f32 = 0.75;
+
+/// The semantic colours one frame resolves, as straight sRGB + alpha. The Chrome re-resolves
+/// them every frame against the current appearance (ADR-0002's property, at display rate).
+pub const Palette = struct {
+    label: [4]f32, // labelColor — the recording bars
+    secondary: [4]f32, // secondaryLabelColor — the processing dots
+    orange: [4]f32, // systemOrangeColor — the degraded pulse (ADR-0004)
+    green: [4]f32, // systemGreenColor — the Undo confirm (ADR-0007)
+    red: [4]f32, // systemRedColor — the Undo refuse (ADR-0007)
+
+    fn of(self: Palette, s: Shape) [4]f32 {
+        const base = switch (s.role) {
+            .label => self.label,
+            .secondary => self.secondary,
+            .confirm => self.green,
+            .refuse => self.red,
+        };
+        if (s.amber <= 0) return base;
+        var c: [4]f32 = undefined;
+        for (&c, base, self.orange) |*out, b, o| out.* = b * (1 - s.amber) + o * s.amber; // exact at both ends
+        return c;
+    }
+};
+
+/// The shader's shape capacity: `MAXP` in hud.metal. Checked against the source below.
+const max_shapes = 32;
+
+/// One frame's uniforms, handed to the fragment function by `setFragmentBytes` (well under
+/// its 4 KB limit). Byte for byte the `U` struct in hud.metal.
+const Uniforms = extern struct {
+    res: [2]f32 = .{ 0, 0 },
+    px: f32 = 1,
+    count: i32 = 0,
+    k: f32 = goo_k,
+    glow: f32 = glow_strength,
+    _pad: [2]f32 = .{ 0, 0 },
+    geo: [max_shapes][4]f32 = @splat(@splat(0)),
+    col: [max_shapes][4]f32 = @splat(@splat(0)),
+    fade: [max_shapes]f32 = @splat(0),
+};
+
+const msl_source = @embedFile("hud.metal");
+
+comptime {
+    std.debug.assert(@sizeOf(Uniforms) == 1184);
+    std.debug.assert(@offsetOf(Uniforms, "geo") == 32);
+    std.debug.assert(scene_cap <= max_shapes);
+    std.debug.assert(std.mem.indexOf(u8, msl_source, std.fmt.comptimePrint("#define MAXP {d}\n", .{max_shapes})) != null);
+}
+
+/// Turn one Scene into the shader's input: flip it y-down for Metal's top-left fragment
+/// origin, colour each shape from its role (blending in its amber), and fold the shape's
+/// alpha into the colour. Pure — the one place a Scene becomes GPU bytes, unit-tested below.
+fn packUniforms(scene: *const Scene, palette: Palette, scale: f64) Uniforms {
+    var u: Uniforms = .{
+        .res = .{ @floatCast(region_w * scale), @floatCast(region_h * scale) },
+        .px = @floatCast(scale),
+        .count = @intCast(scene.len),
     };
-    return .{
-        .window = cue.window,
-        .content = .{ .mark = .{ .kind = cue.kind, .bloom = cue.bloom, .shake_px = cue.shake_px } },
-    };
+    for (scene.items(), 0..) |s, i| {
+        const c = palette.of(s);
+        u.geo[i] = .{ s.cx, @as(f32, @floatCast(region_h)) - s.cy, s.w, s.h };
+        u.col[i] = .{ c[0], c[1], c[2], c[3] * s.alpha };
+        u.fade[i] = std.math.clamp(s.alpha, 0, 1);
+    }
+    return u;
 }
 
 // ============================================================================
-// AppKitChrome — the production adapter. Every ObjC call in the HUD lives here.
+// MetalChrome — the production adapter (ADR-0014, #359). Every ObjC call in the HUD lives here.
 // ============================================================================
 
-/// The panel, the CALayers, the transaction batching, and the headless bail. AppKit objects
-/// are owned by the view/window hierarchy once wired up; this caches the layer handles the
-/// pump's frames poke. Main thread only.
+/// What the Chrome does with one Frame, given whether its display link is running — that
+/// is, whether the pill is on screen. Pure and keyed only on the frame's window op, so the
+/// adapter decides nothing; unit-tested below, which is where "a hidden pill costs nothing"
+/// is pinned.
+const ChromePlan = struct {
+    /// Encode and present the frame's Scene.
+    draw: bool = false,
+    order_front: bool = false,
+    order_out: bool = false,
+    /// Whether the display link runs after this frame.
+    running: bool = false,
+
+    fn of(running: bool, fx: Sequencer.WindowFx) ChromePlan {
+        return switch (fx) {
+            // Draw before ordering in, so the panel never shows a stale drawable.
+            .show_fade => .{ .draw = true, .order_front = true, .running = true },
+            // The order-out frame's Scene is empty: drawing it leaves the layer clear.
+            .order_out => .{ .draw = true, .order_out = true },
+            .none, .hide_fade, .cancel_hide => .{ .draw = running, .running = running },
+        };
+    }
+};
+
+/// The pump's entry point, bound by the daemon: `now` on the display link's clock
+/// (`CACurrentMediaTime`) and the system's Reduce Motion setting, both read by the Chrome
+/// so the pump reads neither.
+pub const Tick = *const fn (ctx: *anyopaque, now: f64, reduce_motion: bool) void;
+
+/// The panel, the transparent `CAMetalLayer` and its SDF pipeline, the display-link cadence,
+/// the wake source, and the headless / Metal-less bail. AppKit and Metal objects live for the
+/// process once built. Main thread only, except `wake`.
 ///
 /// `init` / `isBuilt` / `startPump` are the daemon's construction surface, not the Chrome
-/// seam: the pump only ever calls `paint`.
-pub const AppKitChrome = struct {
+/// seam: the pump only ever calls `paint` and `wake`.
+///
+/// The cadence (ADR-0014): while the pill is on screen, `NSScreen`'s display link calls the
+/// pump once per display frame. While it is hidden the link is paused and nothing runs at all
+/// until the pump `wake`s the Chrome — a run-loop source signalled from whichever thread
+/// published — and the Chrome renders once, right then. If that frame shows the pill, the
+/// link starts. The 20 Hz Capture cadence and the level queue are the pump's, and unchanged.
+pub const MetalChrome = struct {
     panel: id = null,
-    bars: [n_bars]id = @splat(null), // the waveform — heights poked per tick
-    dots: [3]id = @splat(null), // the processing animation
-    mark: id = null, // the Undo confirm/refuse single mark (ADR-0007, #226)
+    layer: id = null, // the CAMetalLayer the pass presents into
+    queue: id = null,
+    pipeline: id = null,
+    link: id = null, // NSScreen's CADisplayLink — unpaused only while the pill is on screen
+    scale: f64 = 2, // the screen's backing scale: drawable px per pt
 
-    /// False until `init` succeeds; false forever on a headless start. `paint` no-ops while
-    /// false, so nothing downstream needs to special-case a display-less box.
+    /// False until `init` succeeds; false forever on a headless or Metal-less start.
+    /// `paint` no-ops while false, so nothing downstream special-cases either.
     active: bool = false,
+    /// The display link is unpaused. Main thread only.
+    running: bool = false,
+    /// A Metal or display-link failure, kept so a later Overlay toggle fails fast instead of
+    /// recompiling the shader (~640 ms) on the Talk Key tap's thread. Headless is not kept:
+    /// it bails before any compile, and a display may be attached later.
+    failed: ?InitError = null,
+    /// The last clock handed to the pump. The display link passes the *next* vsync's
+    /// timestamp and a wake passes the current time, so a wake right after an order-out
+    /// could otherwise step `now` backwards.
+    last_now: f64 = 0,
 
-    /// Backs the CFRunLoopTimer's context (it borrows `&self.pump`); lives as long as the
-    /// Chrome, i.e. the process. Set in `startPump`.
-    pump: Pump = .{},
-    timer_ctx: CFRunLoopTimerContext = .{},
+    ctx: ?*anyopaque = null,
+    tick: ?Tick = null,
+    /// The wake source. `wake` loads it from any thread, and the lazy Overlay-toggle build
+    /// may store it while an Utterance's `hide` is already publishing — hence atomic.
+    source: std.atomic.Value(?*anyopaque) = .init(null),
+    run_loop: CFRunLoopRef = null,
 
-    const Pump = struct {
-        ctx: ?*anyopaque = null,
-        tick: ?*const fn (*anyopaque, f64) void = null,
+    /// Why the Chrome could not be built. Every one of them means sound-only, like headless.
+    pub const InitError = error{
+        /// No display: `[NSScreen mainScreen]` is nil (e.g. a bare-SSH run).
+        Headless,
+        /// No default Metal device, or the shader or its pipeline failed to build.
+        NoMetal,
+        /// `NSScreen` has no display link (before macOS 14).
+        NoDisplayLink,
     };
 
-    /// Build the panel + all layers (hidden) and bring AppKit up as an accessory app.
-    /// Returns `false` when there is no display (headless) — the daemon then stays
-    /// sound-only. MUST run on the main thread, before the run loop starts. Idempotent
-    /// guard: a second call is a no-op.
-    pub fn init(self: *AppKitChrome) bool {
-        if (self.active) return true;
+    /// Build the Metal pipeline, the display link and the panel (hidden), and bring AppKit up
+    /// as an accessory app. The MSL compile (~640 ms, spike #356) happens here, never on the
+    /// first press. MUST run on the main thread, before the run loop starts. A second call
+    /// is a no-op.
+    pub fn init(self: *MetalChrome) InitError!void {
+        if (self.active) return;
+        if (self.failed) |err| return err;
         const pool = objc_autoreleasePoolPush();
         defer objc_autoreleasePoolPop(pool);
 
-        // Shared, accessory-policy app (appkit.zig — also used by the menu-bar status
-        // item, #34). Order matters — the policy is set before finishLaunching so no
-        // Dock icon ever flashes.
+        // Shared, accessory-policy app (appkit.zig — also used by the menu-bar status item,
+        // #34). The policy is set before finishLaunching so no Dock icon ever flashes.
         _ = appkit.app();
 
-        // No display => no HUD. Bail before finishLaunching / any window work so a headless
-        // run degrades to sound-only instead of failing (wayfinder #22).
+        // No display => no HUD. Bail before finishLaunching, and before the shader compile.
         const screen = mainScreen();
-        if (screen == null) return false;
+        if (screen == null) return error.Headless;
+        if (!respondsTo(screen, "displayLinkWithTarget:selector:")) return self.fail(error.NoDisplayLink);
 
         // finishLaunching wires up AppKit enough to draw whether the loop is the headless
         // CFRunLoopRun (proven by #20) or [NSApp run] under the status item (#31/#34).
         appkit.ensureLaunched();
 
-        // Bottom-centre of the main screen — the Wispr-Flow pill position.
-        const sf = screenFrame(screen);
-        const rect = NSRect{ .x = sf.x + (sf.w - pill_w) / 2.0, .y = sf.y + 140, .w = pill_w, .h = pill_h };
+        self.scale = msgF64(screen, "backingScaleFactor");
+        self.buildPipeline() catch |err| return self.fail(err);
+        self.buildLink(screen) catch |err| return self.fail(err);
+        self.buildPanel(screen);
+        self.active = true;
+    }
 
+    fn fail(self: *MetalChrome, err: InitError) InitError {
+        self.failed = err;
+        return err;
+    }
+
+    /// Whether the Chrome built. The daemon reads this to decide whether the Overlay toggle
+    /// can honestly be turned on: an unbuilt Chrome keeps the pump's `enabled` false, so
+    /// `isOn` reports the truth and the Feedback Surface falls back to sound.
+    pub fn isBuilt(self: *MetalChrome) bool {
+        return self.active;
+    }
+
+    /// Bind the pump and add the wake source to the CURRENT run loop (the daemon's main
+    /// thread, before its CFRunLoopRun). No-op if the Chrome isn't built.
+    pub fn startPump(self: *MetalChrome, ctx: *anyopaque, tick: Tick) void {
+        if (!self.active) return;
+        self.ctx = ctx;
+        self.tick = tick;
+        self.run_loop = CFRunLoopGetCurrent();
+        var sctx = CFRunLoopSourceContext{ .info = self, .perform = wakePerform };
+        const src = CFRunLoopSourceCreate(null, 0, &sctx); // copies the context
+        CFRunLoopAddSource(self.run_loop, src, kCFRunLoopCommonModes);
+        self.source.store(src, .release);
+    }
+
+    /// **The Chrome seam**, cadence half: published input changed. Any thread. Signals the
+    /// wake source so the main thread renders on the publishing edge; a no-op before
+    /// `startPump` (headless, Metal-less, or not yet built).
+    pub fn wake(self: *MetalChrome) void {
+        const src = self.source.load(.acquire) orelse return;
+        CFRunLoopSourceSignal(src);
+        CFRunLoopWakeUp(self.run_loop);
+    }
+
+    /// **The Chrome seam**, drawing half. Decides nothing: `ChromePlan` keys every step on
+    /// the frame's window op. Hidden frames return before any ObjC or GPU work.
+    pub fn paint(self: *MetalChrome, frame: Frame) void {
+        if (!self.active) return;
+        const plan = ChromePlan.of(self.running, frame.window);
+        if (plan.draw) self.draw(&frame.scene);
+        if (plan.order_front) msgv(self.panel, "orderFrontRegardless"); // never makeKey — #20's recipe
+        if (plan.order_out) msg1v(self.panel, "orderOut:", null);
+        if (plan.running != self.running) {
+            msgBool(self.link, "setPaused:", !plan.running);
+            self.running = plan.running;
+        }
+    }
+
+    /// Run the pump for one frame at `now`. The autorelease pool covers the whole frame —
+    /// plain CFRunLoopRun drains none of its own — so the per-frame Metal churn never piles up.
+    fn runFrame(self: *MetalChrome, now: f64) void {
+        const tick = self.tick orelse return;
+        const pool = objc_autoreleasePoolPush();
+        defer objc_autoreleasePoolPop(pool);
+        self.last_now = @max(self.last_now, now);
+        tick(self.ctx.?, self.last_now, reduceMotion());
+    }
+
+    /// The wake source's perform callback, on the main thread. While the link runs it picks
+    /// the change up on its next frame, so only a hidden pill renders here.
+    fn wakePerform(info: ?*anyopaque) callconv(.c) void {
+        const self: *MetalChrome = @ptrCast(@alignCast(info.?));
+        if (!self.running) self.runFrame(CACurrentMediaTime());
+    }
+
+    /// The display link's callback, once per display frame while the pill is on screen.
+    fn linkFired(_: id, _: SEL, link: id) callconv(.c) void {
+        const self = g_metal_chrome orelse return;
+        self.runFrame(msgF64(link, "targetTimestamp"));
+    }
+
+    /// Encode and present one Scene: one full-screen triangle through the SDF pass, the
+    /// shapes as fragment bytes. The semantic colours re-resolve every frame, so the pill
+    /// tracks light/dark with no notification wiring (ADR-0002, ADR-0014).
+    fn draw(self: *MetalChrome, scene: *const Scene) void {
+        const u = packUniforms(scene, resolvePalette(), self.scale);
+        // Nil only when no drawable frees up within a second — skip it, the next frame catches up.
+        const drawable = msg(self.layer, "nextDrawable");
+        if (drawable == null) return;
+
+        const rpd = msg(cls("MTLRenderPassDescriptor"), "renderPassDescriptor");
+        const att = msgIdx(msg(rpd, "colorAttachments"), "objectAtIndexedSubscript:", 0);
+        msg1v(att, "setTexture:", msg(drawable, "texture"));
+        msgULong(att, "setLoadAction:", MTLLoadActionClear);
+        msgULong(att, "setStoreAction:", MTLStoreActionStore);
+        const setClear: *const fn (id, SEL, MTLClearColor) callconv(.c) void = @ptrCast(&objc_msgSend);
+        setClear(att, sel_registerName("setClearColor:"), .{ .r = 0, .g = 0, .b = 0, .a = 0 });
+
+        const cb = msg(self.queue, "commandBuffer");
+        const enc = msg1(cb, "renderCommandEncoderWithDescriptor:", rpd);
+        msg1v(enc, "setRenderPipelineState:", self.pipeline);
+        const setBytes: *const fn (id, SEL, *const anyopaque, c_ulong, c_ulong) callconv(.c) void = @ptrCast(&objc_msgSend);
+        setBytes(enc, sel_registerName("setFragmentBytes:length:atIndex:"), &u, @sizeOf(Uniforms), 0);
+        const drawPrims: *const fn (id, SEL, c_ulong, c_ulong, c_ulong) callconv(.c) void = @ptrCast(&objc_msgSend);
+        drawPrims(enc, sel_registerName("drawPrimitives:vertexStart:vertexCount:"), MTLPrimitiveTypeTriangle, 0, 3);
+        msgv(enc, "endEncoding");
+        msg1v(cb, "presentDrawable:", drawable);
+        msgv(cb, "commit");
+    }
+
+    /// The device, the runtime-compiled SDF pass, its pipeline and command queue, and the
+    /// transparent layer it presents into. Any failure is `NoMetal`: sound-only, no fallback
+    /// Chrome (ADR-0014).
+    fn buildPipeline(self: *MetalChrome) error{NoMetal}!void {
+        const device = MTLCreateSystemDefaultDevice() orelse return error.NoMetal;
+        var err: id = null;
+        const newLibrary: *const fn (id, SEL, id, id, *id) callconv(.c) id = @ptrCast(&objc_msgSend);
+        const lib = newLibrary(device, sel_registerName("newLibraryWithSource:options:error:"), nsString(msl_source), null, &err) orelse
+            return error.NoMetal;
+        defer msgv(lib, "release");
+        const vs = msg1(lib, "newFunctionWithName:", nsString("vs"));
+        defer msgv(vs, "release");
+        const fs = msg1(lib, "newFunctionWithName:", nsString("fs"));
+        defer msgv(fs, "release");
+
+        const desc = msg(msg(cls("MTLRenderPipelineDescriptor"), "alloc"), "init");
+        defer msgv(desc, "release");
+        msg1v(desc, "setVertexFunction:", vs);
+        msg1v(desc, "setFragmentFunction:", fs);
+        msgULong(msgIdx(msg(desc, "colorAttachments"), "objectAtIndexedSubscript:", 0), "setPixelFormat:", MTLPixelFormatBGRA8Unorm);
+        const newPipeline: *const fn (id, SEL, id, *id) callconv(.c) id = @ptrCast(&objc_msgSend);
+        self.pipeline = newPipeline(device, sel_registerName("newRenderPipelineStateWithDescriptor:error:"), desc, &err) orelse
+            return error.NoMetal;
+        self.queue = msg(device, "newCommandQueue");
+
+        // Premultiplied BGRA over whatever is behind the panel — proven clean by spike #356.
+        const layer = msg(cls("CAMetalLayer"), "layer");
+        msg1v(layer, "setDevice:", device);
+        msgULong(layer, "setPixelFormat:", MTLPixelFormatBGRA8Unorm);
+        msgBool(layer, "setOpaque:", false);
+        msgBool(layer, "setFramebufferOnly:", true);
+        // Tag the output sRGB — the space the palette resolves into — so WindowServer colour-
+        // matches it. Untagged, sRGB values would show as display-native: oversaturated on P3.
+        msg1v(layer, "setColorspace:", CGColorSpaceCreateWithName(kCGColorSpaceSRGB));
+        msgDouble(layer, "setContentsScale:", self.scale);
+        msgRect(layer, "setFrame:", .{ .x = 0, .y = 0, .w = region_w, .h = region_h });
+        const setSize: *const fn (id, SEL, CGSize) callconv(.c) void = @ptrCast(&objc_msgSend);
+        setSize(layer, sel_registerName("setDrawableSize:"), .{ .w = region_w * self.scale, .h = region_h * self.scale });
+        self.layer = msg(layer, "retain"); // the panel's layer tree retains it too, once built
+    }
+
+    /// `NSScreen`'s display link, targeting a runtime-minted class (the `menu.zig` recipe),
+    /// added paused to the main run loop. A 120 Hz timer is ruled out: `nextDrawable` blocks
+    /// the main thread — the Talk Key tap's thread — while it waits (spike #356).
+    fn buildLink(self: *MetalChrome, screen: id) error{NoDisplayLink}!void {
+        const target = msg(msg(linkTargetClass(), "alloc"), "init");
+        const mk: *const fn (id, SEL, id, SEL) callconv(.c) id = @ptrCast(&objc_msgSend);
+        const link = mk(screen, sel_registerName("displayLinkWithTarget:selector:"), target, sel_registerName("onFrame:")) orelse
+            return error.NoDisplayLink;
+        self.link = msg(link, "retain");
+        g_metal_chrome = self;
+        const setRange: *const fn (id, SEL, CAFrameRateRange) callconv(.c) void = @ptrCast(&objc_msgSend);
+        setRange(link, sel_registerName("setPreferredFrameRateRange:"), .{ .minimum = 60, .maximum = 120, .preferred = 120 });
+        msgBool(link, "setPaused:", true);
+        const add: *const fn (id, SEL, id, ?*anyopaque) callconv(.c) void = @ptrCast(&objc_msgSend);
+        add(link, sel_registerName("addToRunLoop:forMode:"), msg(cls("NSRunLoop"), "currentRunLoop"), kCFRunLoopCommonModes);
+    }
+
+    /// The panel: the Scene's region, placed so the pill sits where it always has
+    /// (bottom-centre of the main screen, 140 pt up), with the focus-avoidance recipe.
+    fn buildPanel(self: *MetalChrome, screen: id) void {
+        const sf = screenFrame(screen);
+        const rect = NSRect{ .x = sf.x + (sf.w - region_w) / 2.0, .y = sf.y + 140 - region_oy, .w = region_w, .h = region_h };
         const panel = makePanel(
             rect,
             NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
@@ -1421,288 +1626,61 @@ pub const AppKitChrome = struct {
                 NSWindowCollectionBehaviorFullScreenAuxiliary,
         );
 
-        // Fully transparent window — no pill background, and no shadow: a window shadow
-        // around an invisible pill draws a ghost outline (#25). Only the bars/dots show.
+        // Fully transparent window — nothing behind the marks, and no shadow: a window shadow
+        // around an invisible pill draws a ghost outline (#25). Only the shader's output shows.
         msgBool(panel, "setOpaque:", false);
         msg1v(panel, "setBackgroundColor:", msg(cls("NSColor"), "clearColor"));
         msgBool(panel, "setHasShadow:", false);
 
         const content = msg(panel, "contentView");
         msgBool(content, "setWantsLayer:", true);
-        const layer = msg(content, "layer");
-
-        // The whole mechanism (#25): a fixed row of plain CALayers. [CALayer layer]
-        // returns autoreleased; addSublayer: retains, so the hierarchy owns them after
-        // this. Geometry is fixed here; colors are semantic (labelColor bars,
-        // secondaryLabelColor dots — ADR 0002) and land in applyMarkColors, which
-        // re-resolves them on every visible tick so they track light/dark appearance.
-        const row_w = @as(f64, @floatFromInt(n_bars)) * (bar_w + bar_gap) - bar_gap;
-        const x0 = (pill_w - row_w) / 2.0;
-        for (&self.bars, 0..) |*bar, i| {
-            bar.* = msg(cls("CALayer"), "layer");
-            msgBool(bar.*, "setHidden:", true);
-            msgDouble(bar.*, "setCornerRadius:", bar_w / 2.0);
-            msgRect(bar.*, "setFrame:", barFrame(i, min_bar_h, x0));
-            msg1v(layer, "addSublayer:", bar.*);
-        }
-        for (&self.dots, 0..) |*dot, j| {
-            dot.* = msg(cls("CALayer"), "layer");
-            msgBool(dot.*, "setHidden:", true);
-            msgDouble(dot.*, "setCornerRadius:", dot_size / 2.0);
-            const fj: f64 = @floatFromInt(j);
-            msgRect(dot.*, "setFrame:", .{
-                .x = (pill_w - dots_row_w) / 2.0 + fj * (dot_size + dot_gap),
-                .y = (pill_h - dot_size) / 2.0,
-                .w = dot_size,
-                .h = dot_size,
-            });
-            msg1v(layer, "addSublayer:", dot.*);
-        }
-
-        // The Undo cue's single centred mark (ADR-0007, #226): one more plain CALayer, built
-        // hidden alongside the bars/dots. Geometry is fixed here (a 6x14 pt rounded bar,
-        // centred); its color is semantic (systemGreen/systemRed), resolved at paint time in
-        // applyCueMark so it tracks light/dark like every other mark.
-        self.mark = msg(cls("CALayer"), "layer");
-        msgBool(self.mark, "setHidden:", true);
-        msgDouble(self.mark, "setCornerRadius:", mark_w / 2.0);
-        msgRect(self.mark, "setFrame:", markFrame(0.0));
-        msg1v(layer, "addSublayer:", self.mark);
-
-        // Built hidden — the daemon orders it in on the first Talk Key press.
-        self.active = true;
-        return true;
-    }
-
-    /// Whether the panel and layers exist. The daemon reads this to decide whether the
-    /// Overlay toggle can honestly be turned on: a headless box keeps the pump's `enabled`
-    /// false, so `isOn` reports the truth and the Feedback Surface falls back to sound.
-    pub fn isBuilt(self: *AppKitChrome) bool {
-        return self.active;
-    }
-
-    /// Add the render pump to the CURRENT run loop (the daemon's main thread, before its
-    /// CFRunLoopRun). No-op if the Chrome isn't built. The timer fires on the main thread,
-    /// reads the clock, and calls `tick` — so the pump never reads a clock itself and every
-    /// AppKit call stays here.
-    pub fn startPump(self: *AppKitChrome, ctx: *anyopaque, tick: *const fn (*anyopaque, f64) void) void {
-        if (!self.active) return;
-        self.pump = .{ .ctx = ctx, .tick = tick };
-        self.timer_ctx = .{ .info = &self.pump };
-        const timer = CFRunLoopTimerCreate(
-            null,
-            CFAbsoluteTimeGetCurrent() + render_interval_s,
-            render_interval_s,
-            0,
-            0,
-            renderTick,
-            &self.timer_ctx,
-        );
-        CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopCommonModes);
-    }
-
-    /// CFRunLoopTimer callout — reads the clock and trampolines into the pump.
-    fn renderTick(_: CFRunLoopTimerRef, info: ?*anyopaque) callconv(.c) void {
-        const p: *Pump = @ptrCast(@alignCast(info.?));
-        if (p.tick) |t| t(p.ctx.?, CFAbsoluteTimeGetCurrent());
-    }
-
-    /// **The Chrome seam.** Draw one frame. Decides nothing: every branch below is keyed on
-    /// what the frame says, and an autorelease pool keeps the per-tick ObjC churn from
-    /// piling up.
-    pub fn paint(self: *AppKitChrome, frame: Frame) void {
-        if (!self.active) return;
-        const pool = objc_autoreleasePoolPush();
-        defer objc_autoreleasePoolPop(pool);
-
-        switch (frame.content) {
-            // Window-only ticks: nothing on screen, or mid-fade with CA playing it.
-            .none => {
-                self.paintWindow(frame.window);
-                return;
-            },
-            .mark_reset => {
-                self.paintWindow(frame.window);
-                if (frame.window == .order_out) {
-                    // Reset the mark for the next cue: hidden, full opacity, un-shaken.
-                    msgBool(self.mark, "setHidden:", true);
-                    msgFloat(self.mark, "setOpacity:", 1.0);
-                    msgRect(self.mark, "setFrame:", markFrame(0.0));
-                }
-                return;
-            },
-            else => {},
-        }
-
-        // Batch every layer poke into one transaction with implicit animations off — at
-        // 20 Hz, CA's 0.25 s implicit fades would smear the scroll (#25). The transition
-        // paths nest their own actions-enabled groupings inside it.
-        msgv(cls("CATransaction"), "begin");
-        msgBool(cls("CATransaction"), "setDisableActions:", true);
-        defer msgv(cls("CATransaction"), "commit");
-
-        if (frame.window == .cancel_hide) {
-            // A press mid-hide-fade: snap the pill back before anything repaints. The
-            // direct set (not an animator group) is the prototype-proven cancel — it
-            // retargets the in-flight fade rather than racing it (#47).
-            msgDouble(self.panel, "setAlphaValue:", 1.0);
-        }
-
-        switch (frame.content) {
-            .none, .mark_reset => unreachable, // handled above
-            .mark => |m| self.applyCueMark(m),
-            .bars => |levels| {
-                self.applyMarkColors(0.0);
-                self.applyMarks(frame.marks);
-                const row_w = @as(f64, @floatFromInt(n_bars)) * (bar_w + bar_gap) - bar_gap;
-                const x0 = (pill_w - row_w) / 2.0;
-                for (levels, 0..) |lv, i| {
-                    const h = min_bar_h + @as(f64, @floatCast(lv)) * (max_bar_h - min_bar_h);
-                    msgRect(self.bars[i], "setFrame:", barFrame(i, h, x0));
-                }
-            },
-            .dots => |d| {
-                self.applyMarkColors(d.amber);
-                self.applyMarks(frame.marks);
-                for (self.dots, 0..) |dot, j| {
-                    const fj: f64 = @floatFromInt(j);
-                    msgRect(dot, "setFrame:", .{
-                        .x = (pill_w - dots_row_w) / 2.0 + fj * (dot_size + dot_gap),
-                        .y = (pill_h - dot_size) / 2.0 + d.offsets[j],
-                        .w = dot_size,
-                        .h = dot_size,
-                    });
-                }
-            },
-        }
-
-        if (frame.window == .show_fade) {
-            // This tick's content is already rendered, so nothing stale flashes.
-            msgDouble(self.panel, "setAlphaValue:", 0.0);
-            msgv(self.panel, "orderFrontRegardless"); // never makeKey — #20's recipe
-            animBegin(show_dur);
-            defer animEnd();
-            msgDouble(msg(self.panel, "animator"), "setAlphaValue:", 1.0);
-        }
-    }
-
-    /// The window half of a tick, outside any layer transaction.
-    fn paintWindow(self: *AppKitChrome, fx: Sequencer.WindowFx) void {
-        switch (fx) {
-            .hide_fade => {
-                animBegin(hide_dur);
-                defer animEnd();
-                msgDouble(msg(self.panel, "animator"), "setAlphaValue:", 0.0);
-            },
-            .order_out => {
-                msgv(self.panel, "orderOut:");
-                // Reset the animated alpha so the next show starts clean.
-                msgDouble(self.panel, "setAlphaValue:", 1.0);
-            },
-            // `.none` is the idle tick; `.show_fade` / `.cancel_hide` never reach a
-            // content-less frame.
-            .none, .show_fade, .cancel_hide => {},
-        }
-    }
-
-    /// Re-resolve the semantic mark colors and repaint every layer: labelColor bars,
-    /// secondaryLabelColor dots (ADR 0002). Runs every visible tick — recoloring ON
-    /// REPAINT is the whole appearance-tracking mechanism, so a light/dark switch lands
-    /// within one tick even mid-recording or during a long processing hold, with no
-    /// notification wiring.
-    fn applyMarkColors(self: *AppKitChrome, amber: f32) void {
-        const bar_color = cgColor(systemColor("labelColor"));
-        var dot_ns = systemColor("secondaryLabelColor");
-        if (amber > 0.0) {
-            // Degraded pulse (ADR-0004): blend `amber` of systemOrangeColor into the dots.
-            // Both colors resolve HERE, at paint time, so the pulse tracks light/dark like
-            // every other mark — no accent-refresh machinery (the property ADR-0002 keeps).
-            dot_ns = msgDoubleId(dot_ns, "blendedColorWithFraction:ofColor:", @as(f64, amber), systemColor("systemOrangeColor"));
-        }
-        const dot_color = cgColor(dot_ns);
-        for (self.bars) |bar| msg1v(bar, "setBackgroundColor:", bar_color);
-        for (self.dots) |dot| msg1v(dot, "setBackgroundColor:", dot_color);
-    }
-
-    /// Perform the frame's layer-family flip. Cuts run inside the enclosing
-    /// disabled-actions transaction (instant); the crossfade nests an actions-enabled
-    /// transaction so CA interpolates the opacities in the render server. Steady-state
-    /// ticks (`keep`) skip every visibility poke.
-    fn applyMarks(self: *AppKitChrome, fx: Sequencer.MarksFx) void {
-        // The Undo cue mark only ever shows during a cue (which owns the pill on its own
-        // path). Any family flip means the pill is now carrying an Utterance, so the mark
-        // must be down — this also clears an abandoned mark if a Talk Key press preempted
-        // an in-flight cue (ADR-0007, #226).
-        if (fx != .keep) msgBool(self.mark, "setHidden:", true);
-        switch (fx) {
-            .keep => {},
-            .bars => {
-                for (self.bars) |bar| {
-                    msgFloat(bar, "setOpacity:", 1.0); // undo a played crossfade
-                    msgBool(bar, "setHidden:", false);
-                }
-                for (self.dots) |dot| msgBool(dot, "setHidden:", true);
-            },
-            .dots => {
-                for (self.bars) |bar| msgBool(bar, "setHidden:", true);
-                for (self.dots) |dot| {
-                    msgFloat(dot, "setOpacity:", 1.0);
-                    msgBool(dot, "setHidden:", false);
-                }
-            },
-            .crossfade => {
-                // Dots start transparent, in place — instant, actions are off in the
-                // enclosing transaction — then both families animate.
-                for (self.dots) |dot| {
-                    msgFloat(dot, "setOpacity:", 0.0);
-                    msgBool(dot, "setHidden:", false);
-                }
-                layerAnimBegin(cross_dur);
-                defer layerAnimEnd();
-                for (self.bars) |bar| msgFloat(bar, "setOpacity:", 0.0);
-                for (self.dots) |dot| msgFloat(dot, "setOpacity:", 1.0);
-            },
-        }
-    }
-
-    /// Paint the Undo cue's single mark this tick: force the bars/dots hidden, resolve the
-    /// semantic outcome color at paint time (systemGreen confirmed / systemRed refused — so
-    /// it tracks light/dark with no accent-refresh machinery, the property ADR-0002/0004
-    /// protect), bloom it in via the layer opacity, and offset it horizontally for the
-    /// refuse shake.
-    fn applyCueMark(self: *AppKitChrome, m: Frame.Mark) void {
-        for (self.bars) |bar| msgBool(bar, "setHidden:", true);
-        for (self.dots) |dot| msgBool(dot, "setHidden:", true);
-        const color = systemColor(if (m.kind == .confirm) "systemGreenColor" else "systemRedColor");
-        msg1v(self.mark, "setBackgroundColor:", cgColor(color));
-        msgFloat(self.mark, "setOpacity:", m.bloom);
-        msgRect(self.mark, "setFrame:", markFrame(m.shake_px));
-        msgBool(self.mark, "setHidden:", false);
+        msg1v(msg(content, "layer"), "addSublayer:", self.layer);
+        // Built hidden — the first frame that shows the pill orders it in.
     }
 };
 
-/// The frame of bar `i` at height `h`, vertically centred. Bars never move in x/w —
-/// only their height (and the y that keeps them centred) is poked per tick.
-fn barFrame(i: usize, h: f64, x0: f64) NSRect {
-    const fi: f64 = @floatFromInt(i);
+/// The one MetalChrome, for the display link's target to find. The daemon owns a single
+/// Chrome for the process lifetime, as `menu.zig` does its `g_menu`.
+var g_metal_chrome: ?*MetalChrome = null;
+
+/// `TWHudLinkTarget : NSObject`, whose `onFrame:` is `MetalChrome.linkFired`. Minted once.
+fn linkTargetClass() id {
+    if (cls("TWHudLinkTarget")) |c| return c;
+    const c = objc_allocateClassPair(cls("NSObject"), "TWHudLinkTarget", 0);
+    _ = class_addMethod(c, sel_registerName("onFrame:"), @ptrCast(&MetalChrome.linkFired), "v@:@");
+    objc_registerClassPair(c);
+    return c;
+}
+
+/// The five semantic colours, resolved against the current appearance. Per frame (ADR-0014).
+fn resolvePalette() Palette {
     return .{
-        .x = x0 + fi * (bar_w + bar_gap),
-        .y = (pill_h - h) / 2.0,
-        .w = bar_w,
-        .h = h,
+        .label = srgb("labelColor"),
+        .secondary = srgb("secondaryLabelColor"),
+        .orange = srgb("systemOrangeColor"),
+        .green = srgb("systemGreenColor"),
+        .red = srgb("systemRedColor"),
     };
 }
 
-/// The Undo cue mark's frame (ADR-0007, #226): a fixed 6×14 pt bar centred in the pill,
-/// shifted `dx` points horizontally for the refuse shake (0 for confirm and at rest).
-fn markFrame(dx: f64) NSRect {
-    return .{
-        .x = (pill_w - mark_w) / 2.0 + dx,
-        .y = (pill_h - mark_h) / 2.0,
-        .w = mark_w,
-        .h = mark_h,
-    };
+/// A semantic NSColor pinned to sRGB, as straight components. Dynamic system colours must be
+/// converted to a component colour space before their components can be read, and the
+/// conversion resolves against the *current* appearance.
+fn srgb(name: [*:0]const u8) [4]f32 {
+    const c = msg1(msg(cls("NSColor"), name), "colorUsingColorSpace:", msg(cls("NSColorSpace"), "sRGBColorSpace"));
+    var rgba: [4]f64 = .{ 0, 0, 0, 0 };
+    const f: *const fn (id, SEL, *f64, *f64, *f64, *f64) callconv(.c) void = @ptrCast(&objc_msgSend);
+    f(c, sel_registerName("getRed:green:blue:alpha:"), &rgba[0], &rgba[1], &rgba[2], &rgba[3]);
+    return .{ @floatCast(rgba[0]), @floatCast(rgba[1]), @floatCast(rgba[2]), @floatCast(rgba[3]) };
 }
+
+/// The system's Reduce Motion setting (ADR-0014). Read per frame, so flipping it mid-dictation
+/// takes effect on the next one.
+fn reduceMotion() bool {
+    const f: *const fn (id, SEL) callconv(.c) bool = @ptrCast(&objc_msgSend);
+    return f(msg(cls("NSWorkspace"), "sharedWorkspace"), sel_registerName("accessibilityDisplayShouldReduceMotion"));
+}
+
 test "bare-marks geometry: 26 bars derive from the 300 pt pill" {
     // 6 pt bars / 4 pt gaps in 300−2×20 usable points → exactly 26 bars (ADR 0002).
     try std.testing.expectEqual(@as(usize, 26), n_bars);
@@ -1866,22 +1844,19 @@ test "pulseEnvelope: ramps from 0 to full amber and clamps at both ends" {
     }
 }
 
-test "pulse 1: an armed pulse tints, then ends exactly once, then goes idle" {
+test "pulse 1: an armed pulse ends exactly once, on its deadline, then goes idle" {
     var seq = Sequencer{};
     // No pulse armed → idle.
-    try std.testing.expectEqual(Sequencer.Pulse{}, seq.pulseStep(50.0));
+    try std.testing.expect(!seq.pulseStep(50.0));
 
     seq.startPulse(100.0);
-    // Mid-pulse ticks carry a rising amber weight and never end.
-    const a = seq.pulseStep(100.0);
-    try std.testing.expect(!a.ended and a.amber == 0.0); // envelope(0) == 0
-    const b = seq.pulseStep(100.15);
-    try std.testing.expect(!b.ended and b.amber > a.amber); // ramping up
-    // The first tick at/after the deadline ends the pulse at full amber…
-    const end = seq.pulseStep(100.0 + pulse_dur);
-    try std.testing.expect(end.ended and end.amber == 1.0);
+    // Mid-pulse ticks never end it (the Scene is tinting the dots meanwhile).
+    try std.testing.expect(!seq.pulseStep(100.0));
+    try std.testing.expect(!seq.pulseStep(100.15));
+    // The first tick at/after the deadline ends the pulse…
+    try std.testing.expect(seq.pulseStep(100.0 + pulse_dur));
     // …and only once: the deadline is cleared, so subsequent ticks are idle again.
-    try std.testing.expectEqual(Sequencer.Pulse{}, seq.pulseStep(100.0 + pulse_dur + 0.05));
+    try std.testing.expect(!seq.pulseStep(100.0 + pulse_dur + 0.05));
 }
 
 
@@ -1932,58 +1907,46 @@ test "cue 1: a confirm cue shows, blooms, holds, then self-hides exactly once" {
     try std.testing.expectEqual(Sequencer.Cue{}, seq.cueStep(100.0));
 
     seq.startCue(100.0, .confirm);
-    // First tick brings the pill up around the mark at bloom 0 (easeOut(0) == 0).
+    // First tick brings the pill up around the mark.
     const a = seq.cueStep(100.0);
-    try std.testing.expect(a.owns and a.paint and a.window == .show_fade);
+    try std.testing.expect(a.owns and a.window == .show_fade);
     try std.testing.expectEqual(Sequencer.CueKind.confirm, a.kind);
-    try std.testing.expectEqual(@as(f32, 0.0), a.bloom);
-    try std.testing.expectEqual(@as(f64, 0.0), a.shake_px); // confirm never shakes
 
-    // Mid-bloom: the mark paints with a rising weight, the show fade is not re-issued.
-    const b = seq.cueStep(100.0 + cue_bloom_dur / 2.0);
-    try std.testing.expect(b.owns and b.paint and b.window == .none);
-    try std.testing.expect(b.bloom > a.bloom);
+    // Mid-bloom and held after it: owned, and the show fade is not re-issued.
+    try std.testing.expectEqual(Sequencer.Cue{ .owns = true }, seq.cueStep(100.0 + cue_bloom_dur / 2.0));
+    try std.testing.expectEqual(Sequencer.Cue{ .owns = true }, seq.cueStep(100.0 + cue_bloom_dur + 0.05));
 
-    // Held after the bloom completes — still painting at full, no window change.
-    const c = seq.cueStep(100.0 + cue_bloom_dur + 0.05);
-    try std.testing.expect(c.owns and c.paint and c.window == .none);
-    try std.testing.expectEqual(@as(f32, 1.0), c.bloom);
-
-    // The hold elapses → the hide fade starts and arms the order-out. The tick is NOT a paint
-    // tick: the mark froze at full bloom during the hold, so `renderCue` takes its window-only
-    // (`!paint`) branch and actually issues the panel fade — a paint tick here would repaint
-    // the mark and skip the fade, snapping the pill out (the ADR-0007 hide-fade regression).
-    // A tick safely past the hold boundary (the wall clock crosses it within a tick or two).
+    // The hold elapses → the hide fade starts and arms the order-out. A tick safely past the
+    // hold boundary (the clock crosses it within a frame or two).
     const hide_start = 100.0 + cue_shown_dur + 0.01;
     const d = seq.cueStep(hide_start);
-    try std.testing.expect(d.owns and !d.paint and d.window == .hide_fade);
+    try std.testing.expect(d.owns and d.window == .hide_fade);
     try std.testing.expectEqual(@as(?f64, hide_start + hide_dur), seq.cue_hide_at);
 
-    // Mid hide-fade: still owned, but frozen (no paint) — the mark rides the panel fade out.
-    const e = seq.cueStep(hide_start + hide_dur / 2.0);
-    try std.testing.expect(e.owns and !e.paint and e.window == .none);
+    // Mid hide-fade: still owned, nothing to decide.
+    try std.testing.expectEqual(Sequencer.Cue{ .owns = true }, seq.cueStep(hide_start + hide_dur / 2.0));
 
     // Past the deadline: order out exactly once, clearing the cue…
     const f = seq.cueStep(hide_start + hide_dur);
-    try std.testing.expect(f.owns and !f.paint and f.window == .order_out);
+    try std.testing.expect(f.owns and f.window == .order_out);
     try std.testing.expectEqual(@as(?f64, null), seq.cue_at);
     // …and from here the pump is back on the normal path.
     try std.testing.expectEqual(Sequencer.Cue{}, seq.cueStep(hide_start + hide_dur + 0.05));
 }
 
-test "cue 2: a refuse cue carries a horizontal shake where a confirm does not" {
-    var refuse = Sequencer{};
-    refuse.startCue(200.0, .refuse);
-    _ = refuse.cueStep(200.0); // show tick (shake starts at 0)
-    const r = refuse.cueStep(200.0 + cue_bloom_dur / 4.0);
-    try std.testing.expectEqual(Sequencer.CueKind.refuse, r.kind);
-    try std.testing.expect(r.paint and r.shake_px != 0.0); // motion carries the outcome
+test "cue 2: a refuse mark shakes where a confirm mark holds still" {
+    const centre: f32 = @floatCast(region_ox + pill_cx);
+    var refuse: SceneState = .{};
+    refuse.showMark(200.0, .refuse);
+    const r = refuse.scene(200.0 + cue_bloom_dur / 4.0, false);
+    try std.testing.expectEqual(Shape.Role.refuse, r.shapes[0].role);
+    try std.testing.expect(@abs(r.shapes[0].cx - centre) > 0.5); // motion carries the outcome
 
-    var confirm = Sequencer{};
-    confirm.startCue(200.0, .confirm);
-    _ = confirm.cueStep(200.0);
-    const g = confirm.cueStep(200.0 + cue_bloom_dur / 4.0);
-    try std.testing.expectEqual(@as(f64, 0.0), g.shake_px); // green still-bloom, no shake
+    var confirm: SceneState = .{};
+    confirm.showMark(200.0, .confirm);
+    const g = confirm.scene(200.0 + cue_bloom_dur / 4.0, false);
+    try std.testing.expectEqual(Shape.Role.confirm, g.shapes[0].role);
+    try std.testing.expectEqual(centre, g.shapes[0].cx); // green still-bloom, no shake
 }
 
 test "cue: cancelCue abandons an in-flight cue so it never resumes on a later hidden tick" {
@@ -2005,12 +1968,13 @@ test "cue: cancelCue abandons an in-flight cue so it never resumes on a later hi
 // seam they were either modelled in prose or not written at all.
 // ============================================================================
 
-/// Records the frames the pump emits. The Chrome seam is one method, so the fake is one
-/// method too — and because a Frame is a plain comparable value, assertions are equality
-/// checks rather than a call log.
+/// Records the frames the pump emits, and counts the wakes. Because a Frame is a plain
+/// comparable value, assertions are equality checks and counts over the Scene rather than a
+/// call log.
 const FakeChrome = struct {
     frames: [64]Frame = @splat(.{}),
     n: usize = 0,
+    wakes: usize = 0,
 
     pub fn paint(self: *FakeChrome, frame: Frame) void {
         if (self.n < self.frames.len) {
@@ -2018,13 +1982,36 @@ const FakeChrome = struct {
             self.n += 1;
         }
     }
+    pub fn wake(self: *FakeChrome) void {
+        self.wakes += 1;
+    }
     fn last(self: *const FakeChrome) Frame {
         return self.frames[self.n - 1];
     }
-    fn marks(self: *const FakeChrome) usize {
+    /// How many of the last frame's shapes carry `role`.
+    fn count(self: *const FakeChrome, role: Shape.Role) usize {
+        var c: usize = 0;
+        for (self.last().scene.items()) |s| {
+            if (s.role == role) c += 1;
+        }
+        return c;
+    }
+    /// The strongest amber in the last frame (ADR-0004).
+    fn amber(self: *const FakeChrome) f32 {
+        var a: f32 = 0;
+        for (self.last().scene.items()) |s| a = @max(a, s.amber);
+        return a;
+    }
+    /// How many emitted frames drew an Undo mark (ADR-0007).
+    fn cues(self: *const FakeChrome) usize {
         var c: usize = 0;
         for (self.frames[0..self.n]) |f| {
-            if (f.content == .mark) c += 1;
+            for (f.scene.items()) |s| {
+                if (s.role == .confirm or s.role == .refuse) {
+                    c += 1;
+                    break;
+                }
+            }
         }
         return c;
     }
@@ -2032,20 +2019,26 @@ const FakeChrome = struct {
 
 const TestHud = Hud(FakeChrome);
 
-test "pump: a press shows the pill and paints bars; a release crossfades to dots" {
+/// The tallest a silent bar gets: the floor plus the silence ripple.
+const ripple_ceiling: f32 = @floatCast(min_bar_h + ripple_amp);
+
+test "pump: a press shows the pill and draws bars; a release gathers them into dots" {
     var chrome = FakeChrome{};
     var h = TestHud.init(&chrome);
 
     h.publish(.recording);
     h.render(100.0);
     try std.testing.expectEqual(Sequencer.WindowFx.show_fade, chrome.last().window);
-    try std.testing.expectEqual(Sequencer.MarksFx.bars, chrome.last().marks);
-    try std.testing.expect(chrome.last().content == .bars);
+    h.render(100.3); // the unfurl has played
+    try std.testing.expect(chrome.count(.label) > n_bars / 2);
+    try std.testing.expectEqual(@as(usize, 0), chrome.count(.secondary));
 
     h.publish(.processing);
-    h.render(100.05);
-    try std.testing.expectEqual(Sequencer.MarksFx.crossfade, chrome.last().marks);
-    try std.testing.expect(chrome.last().content == .dots);
+    h.render(100.35);
+    try std.testing.expect(chrome.count(.label) > 0); // the frozen bars start to gather
+    h.render(100.35 + 0.6);
+    try std.testing.expectEqual(@as(usize, 0), chrome.count(.label));
+    try std.testing.expectEqual(@as(usize, 3), chrome.count(.secondary));
 }
 
 test "pump: a queued level scrolls into the newest bar, and a fresh Utterance starts flat" {
@@ -2055,21 +2048,26 @@ test "pump: a queued level scrolls into the newest bar, and a fresh Utterance st
     h.publish(.recording);
     h.pushLevel(0.1); // well above the −60 dB floor
     h.render(100.0);
+    h.render(100.3);
 
-    const bars = chrome.last().content.bars;
-    try std.testing.expect(bars[n_bars - 1] > 0.0); // newest is rightmost
-    try std.testing.expectEqual(@as(f32, 0.0), bars[0]);
+    // The newest bar is the rightmost, and it stands clear of the silence ripple.
+    var newest: Shape = .{};
+    for (chrome.last().scene.items()) |s| {
+        if (s.cx > newest.cx) newest = s;
+    }
+    try std.testing.expect(newest.h > ripple_ceiling + 1.0);
 
     // A second Utterance cuts back to `.bars`, which zeroes the scroll before this tick's
     // samples land — no bleed from the previous one.
     h.publish(.hidden);
-    h.render(100.05);
+    h.render(100.35);
     h.publish(.recording);
-    h.render(100.10);
-    try std.testing.expectEqual(@as(f32, 0.0), chrome.last().content.bars[n_bars - 1]);
+    h.render(100.40);
+    h.render(100.70);
+    for (chrome.last().scene.items()) |s| try std.testing.expect(s.h <= ripple_ceiling + 1e-4);
 }
 
-test "pump: a level pushed while not recording is dropped, never painted" {
+test "pump: a level pushed while not recording is dropped, never drawn" {
     var chrome = FakeChrome{};
     var h = TestHud.init(&chrome);
 
@@ -2077,10 +2075,11 @@ test "pump: a level pushed while not recording is dropped, never painted" {
     h.pushLevel(0.9); // a straggler buffer flushed by capture.stop
     h.render(100.0);
 
-    try std.testing.expect(chrome.last().content == .dots);
+    try std.testing.expectEqual(@as([n_bars + 1]f32, @splat(0)), h.scene_state.hist);
+    try std.testing.expectEqual(@as(usize, 0), chrome.count(.label));
 }
 
-test "pump: a hidden tick paints window motion only — the dots freeze and fade around it" {
+test "pump: a hidden tick carries the window op and the Scene — the dots converge out" {
     var chrome = FakeChrome{};
     var h = TestHud.init(&chrome);
 
@@ -2089,11 +2088,9 @@ test "pump: a hidden tick paints window motion only — the dots freeze and fade
     h.publish(.hidden);
     h.render(100.05);
 
-    // marks stays `.keep` and no content is painted, so whatever was on screen freezes. The
-    // Scene, meanwhile, keeps drawing the dots as they converge.
     const scene = h.scene_state.scene(100.05, false);
     try std.testing.expectEqual(@as(usize, 3), scene.len);
-    try std.testing.expectEqual(Frame{ .window = .hide_fade, .marks = .keep, .content = .none, .scene = scene }, chrome.last());
+    try std.testing.expectEqual(Frame{ .window = .hide_fade, .scene = scene }, chrome.last());
 }
 
 test "pump: the degraded pulse tints the dots amber, then resolves the pill to hidden (ADR-0004)" {
@@ -2104,16 +2101,16 @@ test "pump: the degraded pulse tints the dots amber, then resolves the pill to h
     h.render(100.0);
     h.pulseDegraded();
     h.render(100.05); // arms the envelope — still untinted at t = 0
-    try std.testing.expectEqual(@as(f32, 0.0), chrome.last().content.dots.amber);
+    try std.testing.expectEqual(@as(usize, 3), chrome.count(.secondary));
+    try std.testing.expectEqual(@as(f32, 0.0), chrome.amber());
     h.render(100.05 + pulse_dur / 2.0); // ramped in
-    try std.testing.expect(chrome.last().content.dots.amber > 0.0);
+    try std.testing.expect(chrome.amber() > 0.0);
 
     // Once the ~300 ms envelope elapses the pump resolves `.processing` to `.hidden` itself
-    // and the ordinary fade carries the frozen amber dots out.
+    // and the converge carries the amber dots out.
     h.render(100.05 + pulse_dur);
     try std.testing.expectEqual(Sequencer.WindowFx.hide_fade, chrome.last().window);
-    try std.testing.expectEqual(Sequencer.MarksFx.keep, chrome.last().marks);
-    try std.testing.expect(chrome.last().content == .none);
+    try std.testing.expectEqual(@as(f32, 1.0), chrome.amber());
 }
 
 test "pump: a degraded resolution with no processing pill degrades to a plain hide" {
@@ -2126,8 +2123,8 @@ test "pump: a degraded resolution with no processing pill degrades to a plain hi
     h.pulseDegraded(); // nothing to pulse — the pill is showing bars, not dots
     h.render(100.05);
 
-    try std.testing.expect(chrome.last().content == .none); // hidden path: window only
     try std.testing.expectEqual(Sequencer.WindowFx.hide_fade, chrome.last().window);
+    try std.testing.expectEqual(@as(?f64, null), h.scene_state.amber_since);
 }
 
 test "pump: an Undo cue arms from a hidden pill, blooms, and self-hides exactly once" {
@@ -2137,16 +2134,17 @@ test "pump: an Undo cue arms from a hidden pill, blooms, and self-hides exactly 
     h.undoConfirm();
     h.render(200.0);
     try std.testing.expectEqual(Sequencer.WindowFx.show_fade, chrome.last().window);
-    try std.testing.expectEqual(Sequencer.CueKind.confirm, chrome.last().content.mark.kind);
 
     h.render(200.0 + cue_bloom_dur);
-    try std.testing.expect(chrome.last().content.mark.bloom > 0.9);
+    try std.testing.expectEqual(@as(usize, 1), chrome.last().scene.len);
+    try std.testing.expectEqual(@as(usize, 1), chrome.count(.confirm));
+    try std.testing.expect(chrome.last().scene.shapes[0].alpha > 0.9);
 
-    // Hold elapses → hide fade, then the deferred order-out resets the mark for next time.
+    // Hold elapses → hide fade, then the deferred order-out on an empty Scene.
     h.render(200.0 + cue_shown_dur);
     try std.testing.expectEqual(Sequencer.WindowFx.hide_fade, chrome.last().window);
     h.render(200.0 + cue_shown_dur + hide_dur);
-    try std.testing.expectEqual(Frame{ .window = .order_out, .content = .mark_reset }, chrome.last());
+    try std.testing.expectEqual(Frame{ .window = .order_out }, chrome.last());
 }
 
 test "pump: a refuse cue shakes where a confirm does not (ADR-0007)" {
@@ -2157,8 +2155,8 @@ test "pump: a refuse cue shakes where a confirm does not (ADR-0007)" {
     h.render(200.0);
     h.render(200.0 + 0.04);
 
-    try std.testing.expectEqual(Sequencer.CueKind.refuse, chrome.last().content.mark.kind);
-    try std.testing.expect(@abs(chrome.last().content.mark.shake_px) > 0.0);
+    try std.testing.expectEqual(@as(usize, 1), chrome.count(.refuse));
+    try std.testing.expect(@abs(chrome.last().scene.shapes[0].cx - region_w / 2.0) > 0.5);
 }
 
 test "pump: a second cue request while one is playing does not restart it" {
@@ -2172,11 +2170,11 @@ test "pump: a second cue request while one is playing does not restart it" {
     h.render(200.0 + 0.04);
 
     // Still the SAME confirm cue: the refuse never displaced it, and never queued behind it.
-    try std.testing.expectEqual(Sequencer.CueKind.confirm, chrome.last().content.mark.kind);
+    try std.testing.expectEqual(@as(usize, 1), chrome.count(.confirm));
     h.render(200.0 + cue_shown_dur);
     h.render(200.0 + cue_shown_dur + hide_dur);
     h.render(200.0 + cue_shown_dur + hide_dur + 0.05);
-    try std.testing.expect(chrome.last().content != .mark); // nothing replayed the refuse
+    try std.testing.expectEqual(Frame{}, chrome.last()); // nothing replayed the refuse
 }
 
 test "pump: a cue arriving while a pill is up is dropped, not queued" {
@@ -2188,15 +2186,15 @@ test "pump: a cue arriving while a pill is up is dropped, not queued" {
     h.publish(.recording);
     h.render(100.0);
     h.undoConfirm(); // an Undo resolves while the user is mid-Utterance
-    h.render(100.05);
-    try std.testing.expect(chrome.last().content == .bars); // the pill keeps the waveform
+    h.render(100.3);
+    try std.testing.expect(chrome.count(.label) > 0); // the pill keeps the waveform
 
     // …and it never appears afterwards either.
     h.publish(.hidden);
-    h.render(100.10);
-    h.render(100.15);
-    h.render(100.20);
-    try std.testing.expectEqual(@as(usize, 0), chrome.marks());
+    h.render(100.35);
+    h.render(100.70);
+    h.render(100.75);
+    try std.testing.expectEqual(@as(usize, 0), chrome.cues());
 }
 
 test "pump: a Talk Key press preempts an in-flight cue and shows the pill this tick" {
@@ -2205,15 +2203,18 @@ test "pump: a Talk Key press preempts an in-flight cue and shows the pill this t
 
     h.undoConfirm();
     h.render(200.0);
-    try std.testing.expect(chrome.last().content == .mark);
+    h.render(200.04);
+    try std.testing.expectEqual(@as(usize, 1), chrome.count(.confirm));
 
     h.publish(.recording);
-    h.render(200.04);
+    h.render(200.08);
 
-    // The cue is cancelled and the family flip hides the abandoned mark as the bars come up.
-    try std.testing.expect(chrome.last().content == .bars);
-    try std.testing.expectEqual(Sequencer.MarksFx.bars, chrome.last().marks);
+    // The cue is cancelled and the pill cuts to the waveform: the abandoned mark is gone.
+    try std.testing.expectEqual(Sequencer.WindowFx.show_fade, chrome.last().window);
+    try std.testing.expectEqual(@as(usize, 0), chrome.count(.confirm));
     try std.testing.expect(h.seq.cue_at == null);
+    h.render(200.4);
+    try std.testing.expect(chrome.count(.label) > 0);
 }
 
 test "pump: an overlay-disabled HUD publishes nothing, cues nothing, and reports isOn false" {
@@ -2226,9 +2227,10 @@ test "pump: an overlay-disabled HUD publishes nothing, cues nothing, and reports
     h.publish(.recording);
     h.undoConfirm();
     h.render(100.0);
+    h.render(100.3);
 
-    try std.testing.expect(chrome.last().content == .none);
-    try std.testing.expectEqual(@as(usize, 0), chrome.marks());
+    try std.testing.expectEqual(Frame{}, chrome.last());
+    try std.testing.expectEqual(@as(usize, 0), chrome.cues());
 }
 
 test "pump: re-enabling the overlay lets the next Utterance show the pill again" {
@@ -2242,7 +2244,30 @@ test "pump: re-enabling the overlay lets the next Utterance show the pill again"
     h.publish(.recording);
     h.render(100.05);
 
-    try std.testing.expect(chrome.last().content == .bars);
+    try std.testing.expectEqual(Sequencer.WindowFx.show_fade, chrome.last().window);
+}
+
+test "pump: every accepted publish-side change wakes the Chrome; level samples do not" {
+    // The Chrome's cadence idles while the pill is hidden, so a press, a resolution or a
+    // cue must nudge it to render on the publishing edge ("show on the press").
+    var chrome = FakeChrome{};
+    var h = TestHud.init(&chrome);
+
+    h.publish(.recording);
+    try std.testing.expectEqual(@as(usize, 1), chrome.wakes);
+    h.pushLevel(0.1); // the display link is already running while recording
+    try std.testing.expectEqual(@as(usize, 1), chrome.wakes);
+    h.publish(.processing);
+    h.pulseDegraded();
+    h.hide();
+    h.undoConfirm();
+    try std.testing.expectEqual(@as(usize, 5), chrome.wakes);
+
+    // Switched off from the menu: the publish and the cue are dropped, so nothing to render.
+    h.setEnabled(false);
+    h.publish(.recording);
+    h.undoRefuse();
+    try std.testing.expectEqual(@as(usize, 5), chrome.wakes);
 }
 
 // ============================================================================
@@ -2280,6 +2305,7 @@ const SceneChrome = struct {
             if (s.role == .label) self.tallest_bar = @max(self.tallest_bar, s.h);
         }
     }
+    pub fn wake(_: *SceneChrome) void {}
 };
 
 const SceneHud = Hud(SceneChrome);
@@ -2463,4 +2489,80 @@ test "scene: a whisper still lifts the bars above the silence ripple's ceiling" 
     chrome.tallest_bar = 0;
     _ = runFor(&h, t, 1.5, 0.00631);
     try std.testing.expect(chrome.tallest_bar > ceiling + 1.0);
+}
+
+// ============================================================================
+// MetalChrome's pure half (#359): what one Scene becomes as shader input.
+// ============================================================================
+
+const test_palette = Palette{
+    .label = .{ 1, 1, 1, 0.85 },
+    .secondary = .{ 1, 1, 1, 0.55 },
+    .orange = .{ 1, 0.62, 0.04, 1 },
+    .green = .{ 0.2, 0.84, 0.29, 1 },
+    .red = .{ 1, 0.27, 0.23, 1 },
+};
+
+test "uniforms: shapes land y-down in the drawable, one slot each, with the locked goo and glow" {
+    var scene: Scene = .{};
+    scene.shapes[0] = .{ .cx = 20, .cy = 10, .w = 6, .h = 14, .role = .label, .alpha = 1 };
+    scene.shapes[1] = .{ .cx = 170, .cy = 40, .w = 8, .h = 8, .role = .secondary, .alpha = 0.5 };
+    scene.len = 2;
+
+    const u = packUniforms(&scene, test_palette, 2.0);
+    try std.testing.expectEqual(@as(i32, 2), u.count);
+    try std.testing.expectEqual([2]f32{ region_w * 2, region_h * 2 }, u.res);
+    try std.testing.expectEqual(@as(f32, 2), u.px);
+    try std.testing.expectEqual(goo_k, u.k);
+    try std.testing.expectEqual(glow_strength, u.glow);
+    // The Scene is y-up (the panel's convention); Metal's fragment origin is top-left.
+    try std.testing.expectEqual([4]f32{ 20, region_h - 10, 6, 14 }, u.geo[0]);
+    try std.testing.expectEqual([4]f32{ 170, region_h - 40, 8, 8 }, u.geo[1]);
+    // Unused slots stay zeroed, so no stale shape can ride along.
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, u.geo[2]);
+}
+
+test "uniforms: each role takes its own semantic colour, with the shape's alpha folded in" {
+    var scene: Scene = .{};
+    const roles = [_]Shape.Role{ .label, .secondary, .confirm, .refuse };
+    for (roles, 0..) |role, i| scene.shapes[i] = .{ .w = 6, .h = 6, .role = role, .alpha = 0.5 };
+    scene.len = roles.len;
+
+    const u = packUniforms(&scene, test_palette, 2.0);
+    const want = [_][4]f32{ test_palette.label, test_palette.secondary, test_palette.green, test_palette.red };
+    for (want, 0..) |c, i| {
+        try std.testing.expectEqual([4]f32{ c[0], c[1], c[2], c[3] * 0.5 }, u.col[i]);
+        try std.testing.expectEqual(@as(f32, 0.5), u.fade[i]);
+    }
+}
+
+test "uniforms: the amber weight blends systemOrange into the dot, alpha included (ADR-0004)" {
+    var scene: Scene = .{};
+    scene.shapes[0] = .{ .w = 6, .h = 6, .role = .secondary, .alpha = 1, .amber = 1 };
+    scene.shapes[1] = .{ .w = 6, .h = 6, .role = .secondary, .alpha = 1, .amber = 0.5 };
+    scene.len = 2;
+
+    const u = packUniforms(&scene, test_palette, 1.0);
+    try std.testing.expectEqual(test_palette.orange, u.col[0]);
+    for (0..4) |c| {
+        const mid = (test_palette.secondary[c] + test_palette.orange[c]) / 2;
+        try std.testing.expectApproxEqAbs(mid, u.col[1][c], 1e-6);
+    }
+}
+
+test "uniforms: every Scene fits the shader's shape array" {
+    try std.testing.expect(scene_cap <= max_shapes);
+}
+
+test "chrome plan: a hidden pill costs nothing — no draw, no link, until a frame shows it" {
+    // Idle hidden frames (a wake for a `.hidden` publish, a switched-off overlay) do no GPU work.
+    try std.testing.expectEqual(ChromePlan{}, ChromePlan.of(false, .none));
+    // The show: draw first (so nothing stale flashes), order in, start the display link.
+    try std.testing.expectEqual(ChromePlan{ .draw = true, .order_front = true, .running = true }, ChromePlan.of(false, .show_fade));
+    // Shown: every frame draws, whatever the window op — the fades live in the Scene.
+    for ([_]Sequencer.WindowFx{ .none, .hide_fade, .cancel_hide }) |fx|
+        try std.testing.expectEqual(ChromePlan{ .draw = true, .running = true }, ChromePlan.of(true, fx));
+    // The order-out: draw the empty Scene (so the layer holds nothing), take the panel out,
+    // and stop the link — the pill is hidden, and hidden costs nothing.
+    try std.testing.expectEqual(ChromePlan{ .draw = true, .order_out = true }, ChromePlan.of(true, .order_out));
 }

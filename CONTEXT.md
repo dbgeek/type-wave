@@ -537,47 +537,43 @@ the async rearm/probe nudges stay visible in the loop.
 _Avoid_: manager, controller, self-heal loop (that names the daemon thread, not the decider)
 
 **HUD**:
-The transient feedback pill — a 300×22 borderless panel near the bottom of the screen that
-shows **no text, ever** (ADR-0002): a scrolling waveform of mic level while an Utterance is
-being spoken, three bouncing dots while it resolves, a one-shot amber tint on a degraded
-Insertion (ADR-0004), and a single green/red mark for an Undo's confirm or refuse
-(ADR-0007). It carries only *in-flight* feedback and never status — that is the Status
-Item's job. Off by config or headless, everything falls back to the sound cues. Its
-decisions are pure: the `Sequencer` owns the lifecycle (show, hide and order-out deadlines, the bars→dots
-handover, the pulse and cue envelopes) and the render pump composes one **Frame** per tick
-from the published state, both in `src/hud.zig`, driven by a fed clock rather than a live
-run loop. **Decided, not yet shipped** (ADR-0014, map #355): the marks move into one Metal SDF
-pass drawn at display rate while visible, melting together with a smooth-union goo and
-carrying a soft glow in their own colour. The glass, text and accent verdicts are unchanged,
-and a Mac without Metal falls back to sound, as a headless one does. The geometry for it is
-already computed as a **Scene** (#358), and the drawing lands with `MetalChrome` (#359).
+The transient feedback pill — a 300×22 sliver near the bottom of the screen, in a 340×50
+borderless panel that leaves room for its glow, that shows **no text, ever** (ADR-0002): a
+scrolling waveform of mic level while an Utterance is being spoken, three bouncing dots while
+it resolves, a one-shot amber tint on a degraded Insertion (ADR-0004), and a single
+green/red mark for an Undo's confirm or refuse (ADR-0007). The marks are drawn by one Metal
+SDF pass at display rate while visible, melting together with a smooth-union goo and
+carrying a soft glow in their own colour (ADR-0014). It carries only *in-flight* feedback
+and never status — that is the Status Item's job. Off by config, headless, or without
+Metal, everything falls back to the sound cues. Its decisions are pure: the `Sequencer`
+owns the lifecycle (show, hide and order-out deadlines, the bars→dots handover, the pulse
+and cue deadlines) and the pump composes one **Frame** per display frame from the published
+state, both in `src/hud.zig`, driven by a fed clock rather than a live run loop.
 _Avoid_: overlay (that names the on/off setting, not the thing), toast, notification, pill
 (fine informally, but the marks are the subject)
 
 **HUD Chrome**:
-The seam the HUD paints through: one method, `paint(Frame)`, where a Frame is the complete,
-fixed-size, `std.meta.eql`-comparable description of one tick — window op plus the **Scene**
-at that tick's clock. Until `AppKitChrome` goes (#359) it also carries the legacy layer-family
-flip, bar heights, dot offsets with the amber blend, or the Undo mark. The production
-adapter is `AppKitChrome` (the panel, the CALayers, the `CATransaction` batching, the
-CFRunLoopTimer pump, and the headless bail — every ObjC call in the HUD lives there); a
-`FakeChrome` records emitted Frames, so the pump's composition rules are asserted as values.
-Whether anything is drawn at all is the adapter's business: the daemon leaves the pump
-disabled when the Chrome could not be built, which is what makes `isOn` report honestly to
-the Feedback Surface. ADR-0014 replaces the adapter with a `MetalChrome` (#359), which will
-own a transparent `CAMetalLayer` and SDF pipeline, a display-link cadence that runs only while
-the panel is visible, and a Metal-less bail that behaves like headless. The seam's shape
-survives: the Frame's Scene is the list of shapes it draws. It carries no policy — the Sequencer decides, the pump composes, the
-Chrome only draws — and `Hud(Chrome)` asserts the contract itself, unlike the Helper and
-Session Transport seams, whose contracts nothing invokes. The **Status Item Chrome** is its
+The seam the HUD paints through: `paint(Frame)`, where a Frame is the complete,
+fixed-size, `std.meta.eql`-comparable description of one tick — the window op (order in,
+order out) plus the **Scene** at that tick's clock — and `wake()`, the thread-safe nudge an
+accepted publish sends so the Chrome's cadence renders on the publishing edge. The
+production adapter is `MetalChrome` (#359): the panel, a transparent `CAMetalLayer` and its
+SDF pipeline, the per-frame semantic colours and Reduce Motion read, a display link that
+runs only while the pill is on screen, the wake source, and the headless / Metal-less bail —
+every ObjC call in the HUD lives there. A `FakeChrome` records emitted Frames and counts
+wakes, so the pump's composition rules are asserted as values. Whether anything is drawn at
+all is the adapter's business: the daemon leaves the pump disabled when the Chrome could not
+be built, which is what makes `isOn` report honestly to the Feedback Surface. It carries no
+policy — the Sequencer decides, the pump composes, the Chrome only draws — and `Hud(Chrome)`
+asserts the contract itself, unlike the Helper and Session Transport seams, whose contracts
+nothing invokes. The **Status Item Chrome** is its
 twin one tier up, on the same three-part shape: pure decider, composing pump, drawing-only
 adapter.
 _Avoid_: renderer, painter (mechanism); view, layer, window (AppKit nouns)
 
 **Scene**:
 Everything the HUD shows at one instant (ADR-0014, #358). It is a fixed-size,
-`std.meta.eql`-comparable list of rounded-rect shapes in the panel region (provisionally the
-prototype's 340×50; map #355 leaves the footprint open). Each shape
+`std.meta.eql`-comparable list of rounded-rect shapes in the 340×50 panel region. Each shape
 has a centre, a size, a colour role (label, secondary, confirm, refuse), an alpha with the
 window fade folded in, and an amber weight (ADR-0004). The Scene also carries the goo envelope.
 It is pure: `SceneState.scene(now, reduce_motion)` turns the timestamps the pump stamped as the

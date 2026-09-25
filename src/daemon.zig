@@ -566,14 +566,31 @@ const InsertionRunner = insertion_runner.InsertionRunner(RealInsertionDeps);
 /// halves it arbitrates. Both are generic so the pump's composition rules and the
 /// arbitration are exercised against fakes under `zig build test`; the daemon is where the
 /// real adapters get named.
-const Hud = hud_mod.Hud(hud_mod.AppKitChrome);
+const Hud = hud_mod.Hud(hud_mod.MetalChrome);
 const Surface = surface.Surface(Hud, feedback.Cues);
 
-/// The Chrome's render timer fires here on the main thread with the clock it read, and the
-/// pump does the rest. The one reverse edge the HUD needs.
-fn hudRenderTramp(ctx: *anyopaque, now: f64) void {
+/// The Chrome's cadence (its display link, or a wake) fires here on the main thread with the
+/// clock and the Reduce Motion setting it read, and the pump does the rest. The one reverse
+/// edge the HUD needs.
+fn hudRenderTramp(ctx: *anyopaque, now: f64, reduce_motion: bool) void {
     const self: *Daemon = @ptrCast(@alignCast(ctx));
+    self.hud.setReduceMotion(reduce_motion);
     self.hud.render(now);
+}
+
+/// Build the HUD's Chrome and start its pump, or say why the pill stays sound-only. Every
+/// failure degrades the same way (ADR-0014): the caller leaves the pump disabled.
+fn hudBringUp(self: *Daemon) bool {
+    self.hud_chrome.init() catch |err| {
+        feedback.log("  overlay HUD: enabled but {s} — sound-only feedback\n", .{switch (err) {
+            error.Headless => "no display detected",
+            error.NoMetal => "Metal is unavailable (no device, or the HUD shader failed to build)",
+            error.NoDisplayLink => "the screen has no display link (macOS 14+)",
+        }});
+        return false;
+    };
+    self.hud_chrome.startPump(self, hudRenderTramp);
+    return true;
 }
 
 /// Real dependencies for the **Undo Runner** (undo.zig, ADR-0008). The Runner owns the whole
@@ -829,10 +846,10 @@ const Daemon = struct {
     capture: cap.Capture = .{},
     inserter: insertmod.Inserter = .{},
     cues: feedback.Cues = .{},
-    /// The HUD's production Chrome (hud.zig): the panel, the CALayers, the CFRunLoopTimer
-    /// pump. Owned by the daemon rather than by the pump so `run()` and the Overlay toggle
-    /// can build it and read whether it built — the pump itself only ever hands it frames.
-    hud_chrome: hud_mod.AppKitChrome = .{},
+    /// The HUD's production Chrome (hud.zig): the panel, the Metal SDF pass, the display
+    /// link. Owned by the daemon rather than by the pump so `run()` and the Overlay toggle
+    /// can build it and read whether it built — the pump itself only hands it frames and wakes.
+    hud_chrome: hud_mod.MetalChrome = .{},
     hud: Hud = undefined,
     menu: menu_mod.Menu = .{},
     tap: tapmod.Tap = undefined, // built in run()
@@ -1339,12 +1356,7 @@ const Daemon = struct {
     /// the built HUD and just stops showing it.
     fn menuSetOverlay(ctx: *anyopaque, on: bool) void {
         const self: *Daemon = @ptrCast(@alignCast(ctx));
-        if (on and !self.hud_chrome.isBuilt()) {
-            if (self.hud_chrome.init())
-                self.hud_chrome.startPump(self, hudRenderTramp)
-            else
-                feedback.log("  overlay HUD: enabled but no display detected — sound-only feedback\n", .{});
-        }
+        if (on and !self.hud_chrome.isBuilt()) _ = hudBringUp(self);
         // A Chrome that never built cannot carry feedback, so the pump stays off and `isOn`
         // keeps reporting the truth to the Feedback Surface.
         self.hud.setEnabled(on and self.hud_chrome.isBuilt());
@@ -1468,25 +1480,19 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     daemon.inserter.init();
     daemon.cues.init();
 
-    // ---- overlay HUD (wayfinder #22): the Chrome is built on the main thread so its
-    //      CFRunLoopTimer pump joins the SAME run loop the tap will block on. Off by config,
-    //      or headless with no display, both degrade to the sound cues without failing
-    //      startup. The pump is constructed FIRST: the Chrome's timer trampolines into it,
-    //      and both arms below publish into it. ----
+    // ---- overlay HUD (wayfinder #22, ADR-0014): the Chrome is built on the main thread so
+    //      its display link and wake source join the SAME run loop the tap will block on.
+    //      Off by config, headless, or Metal-less, all degrade to the sound cues without
+    //      failing startup. The pump is constructed FIRST: the Chrome's cadence trampolines
+    //      into it, and both arms below publish into it. ----
     daemon.hud = Hud.init(&daemon.hud_chrome);
-    // AppKitChrome only plays fades and the crossfade — the Reduce Motion fallback — so the
-    // pump keeps their timings (a `hide_dur` order-out, not converge & drop's) until
-    // MetalChrome (#359) draws the Scene and hands in the system's real setting.
-    daemon.hud.setReduceMotion(true);
     if (settings.overlay) {
-        if (daemon.hud_chrome.init()) {
-            daemon.hud_chrome.startPump(&daemon, hudRenderTramp);
+        if (hudBringUp(&daemon)) {
             feedback.log("  overlay HUD: on — the waveform pill carries start/processing feedback; the error cue is kept\n", .{});
         } else {
-            // No display: leave the pump disabled so `isOn` reports honestly and the
-            // Feedback Surface falls back to the sound cues, exactly like overlay=false.
+            // No display or no Metal: leave the pump disabled so `isOn` reports honestly and
+            // the Feedback Surface falls back to the sound cues, exactly like overlay=false.
             daemon.hud.setEnabled(false);
-            feedback.log("  overlay HUD: enabled but no display detected — sound-only feedback\n", .{});
         }
     } else {
         daemon.hud.setEnabled(false);

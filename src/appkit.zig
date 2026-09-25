@@ -8,7 +8,7 @@
 //! bare `CFRunLoopRun()` spins the main run loop but never runs AppKit's
 //! `nextEvent → sendEvent:` dispatch, so status-item clicks are never routed and the menu
 //! never pops. `[NSApp run]` drives the SAME main run loop — the CGEventTap source
-//! (tap.zig) and the HUD's CFRunLoopTimer keep firing under it — plus the event dispatch
+//! (tap.zig) and the HUD's display link keep firing under it — plus the event dispatch
 //! the status item needs. `run`/`stop` here are that swap; the headless daemon path (no
 //! display, no status item) keeps blocking on plain CFRunLoopRun via tap.run().
 //!

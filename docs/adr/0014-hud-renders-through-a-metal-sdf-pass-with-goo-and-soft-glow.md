@@ -123,7 +123,8 @@ not yet specified.
   Animation fallback Chrome**. Metal is present on every supported Mac, so a second drawing path
   would be untested weight.
 - **The HUD Chrome seam keeps its shape.** It still has one `paint(Frame)` method with no
-  policy: the Sequencer decides, the pump composes, and the Chrome only draws. The Frame stays
+  policy (#359 added a second, `wake()`: the thread-safe nudge an accepted publish sends so
+  the display-link cadence, paused while hidden, renders on the publishing edge): the Sequencer decides, the pump composes, and the Chrome only draws. The Frame stays
   fixed-size and `std.meta.eql`-comparable, so `FakeChrome` still asserts composition as
   values. The Frame's new shape belongs to
   [#358](https://github.com/dbgeek/type-wave/issues/358). The goo, glow and pacing live in the
