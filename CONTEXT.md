@@ -543,19 +543,21 @@ being spoken, three bouncing dots while it resolves, a one-shot amber tint on a 
 Insertion (ADR-0004), and a single green/red mark for an Undo's confirm or refuse
 (ADR-0007). It carries only *in-flight* feedback and never status — that is the Status
 Item's job. Off by config or headless, everything falls back to the sound cues. Its
-decisions are pure: the `Sequencer` owns the motion (show/hide fades, the bars→dots
-crossfade, the pulse and cue envelopes) and the render pump composes one **Frame** per tick
+decisions are pure: the `Sequencer` owns the lifecycle (show, hide and order-out deadlines, the bars→dots
+handover, the pulse and cue envelopes) and the render pump composes one **Frame** per tick
 from the published state, both in `src/hud.zig`, driven by a fed clock rather than a live
 run loop. **Decided, not yet shipped** (ADR-0014, map #355): the marks move into one Metal SDF
 pass drawn at display rate while visible, melting together with a smooth-union goo and
 carrying a soft glow in their own colour. The glass, text and accent verdicts are unchanged,
-and a Mac without Metal falls back to sound, as a headless one does.
+and a Mac without Metal falls back to sound, as a headless one does. The geometry for it is
+already computed as a **Scene** (#358), and the drawing lands with `MetalChrome` (#359).
 _Avoid_: overlay (that names the on/off setting, not the thing), toast, notification, pill
 (fine informally, but the marks are the subject)
 
 **HUD Chrome**:
 The seam the HUD paints through: one method, `paint(Frame)`, where a Frame is the complete,
-fixed-size, `std.meta.eql`-comparable description of one tick — window op, layer-family
+fixed-size, `std.meta.eql`-comparable description of one tick — window op plus the **Scene**
+at that tick's clock. Until `AppKitChrome` goes (#359) it also carries the legacy layer-family
 flip, bar heights, dot offsets with the amber blend, or the Undo mark. The production
 adapter is `AppKitChrome` (the panel, the CALayers, the `CATransaction` batching, the
 CFRunLoopTimer pump, and the headless bail — every ObjC call in the HUD lives there); a
@@ -565,12 +567,24 @@ disabled when the Chrome could not be built, which is what makes `isOn` report h
 the Feedback Surface. ADR-0014 replaces the adapter with a `MetalChrome` (#359), which will
 own a transparent `CAMetalLayer` and SDF pipeline, a display-link cadence that runs only while
 the panel is visible, and a Metal-less bail that behaves like headless. The seam's shape
-survives: the Frame becomes a list of shapes (#358). It carries no policy — the Sequencer decides, the pump composes, the
+survives: the Frame's Scene is the list of shapes it draws. It carries no policy — the Sequencer decides, the pump composes, the
 Chrome only draws — and `Hud(Chrome)` asserts the contract itself, unlike the Helper and
 Session Transport seams, whose contracts nothing invokes. The **Status Item Chrome** is its
 twin one tier up, on the same three-part shape: pure decider, composing pump, drawing-only
 adapter.
 _Avoid_: renderer, painter (mechanism); view, layer, window (AppKit nouns)
+
+**Scene**:
+Everything the HUD shows at one instant (ADR-0014, #358). It is a fixed-size,
+`std.meta.eql`-comparable list of rounded-rect shapes in the panel region (provisionally the
+prototype's 340×50; map #355 leaves the footprint open). Each shape
+has a centre, a size, a colour role (label, secondary, confirm, refuse), an alpha with the
+window fade folded in, and an amber weight (ADR-0004). The Scene also carries the goo envelope.
+It is pure: `SceneState.scene(now, reduce_motion)` turns the timestamps the pump stamped as the
+Sequencer decided into geometry, so the Chrome can draw at display rate without making any
+decision. Every micro-motion option locked in `prototypes/hud-micro-motion` lives here. Under
+Reduce Motion, unfurl, gather, converge, squash and ripple give way to fades and the crossfade.
+_Avoid_: frame (that is the whole tick), layers, render list
 
 **Feedback Surface**:
 The one seam the Utterance Coordinator addresses in lifecycle verbs (`listening`,

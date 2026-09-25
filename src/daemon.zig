@@ -1474,6 +1474,10 @@ pub fn run(io: std.Io, alloc: std.mem.Allocator, process_environ: *const std.pro
     //      startup. The pump is constructed FIRST: the Chrome's timer trampolines into it,
     //      and both arms below publish into it. ----
     daemon.hud = Hud.init(&daemon.hud_chrome);
+    // AppKitChrome only plays fades and the crossfade — the Reduce Motion fallback — so the
+    // pump keeps their timings (a `hide_dur` order-out, not converge & drop's) until
+    // MetalChrome (#359) draws the Scene and hands in the system's real setting.
+    daemon.hud.setReduceMotion(true);
     if (settings.overlay) {
         if (daemon.hud_chrome.init()) {
             daemon.hud_chrome.startPump(&daemon, hudRenderTramp);

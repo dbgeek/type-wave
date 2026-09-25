@@ -27,6 +27,11 @@
 //!     records frames. The rules that decide what the user actually sees — the cue arming
 //!     guard, the recording/processing preemption, the degraded-pulse downgrade, the
 //!     pulse-to-hide handoff — therefore all run under `zig build test`.
+//!   - **Every Frame carries a Scene** (ADR-0014, #358): the locked micro-motion as a pure
+//!     list of shapes. The pump stamps the Sequencer's decisions into a `SceneState` as
+//!     timestamps, and `SceneState.scene(now, reduce_motion)` turns them into geometry for any
+//!     `now`, so a display-rate Chrome draws without deciding anything. `AppKitChrome` still
+//!     draws the legacy `marks` / `content` until `MetalChrome` replaces it (#359).
 //!   - **All AppKit calls stay on the main thread.** The daemon's main thread runs
 //!     `CFRunLoopRun` (src/tap.zig) servicing the Talk Key tap; the Chrome adds a
 //!     `CFRunLoopTimer` render pump to that same loop (no `[NSApp run]` — proven by
@@ -165,7 +170,7 @@ inline fn mainScreen() id {
 // for the raw bar/dot layers we own. CA interpolates in the render server.
 fn easeOut() id {
     const f: *const fn (id, SEL, f32, f32, f32, f32) callconv(.c) id = @ptrCast(&objc_msgSend);
-    return f(cls("CAMediaTimingFunction"), sel_registerName("functionWithControlPoints::::"), 0.17, 0.7, 0.3, 1.0);
+    return f(cls("CAMediaTimingFunction"), sel_registerName("functionWithControlPoints::::"), ease_ctl[0], ease_ctl[1], ease_ctl[2], ease_ctl[3]);
 }
 
 /// NSAnimationContext grouping for window animator properties (panel
@@ -341,7 +346,7 @@ fn cueShake(elapsed: f64) f64 {
 /// The PURE decision half of the pill's motion (the #47 prototype shape,
 /// graduated): fed (published state, now) once per pump tick, it decides which
 /// transition starts this tick; the AppKit executor in `render` performs it.
-/// It owns the window lifecycle (shown / hide-fade deadline), so the executor
+/// It owns the window lifecycle (shown / hide deadline), so the executor
 /// carries no motion state of its own. Unit-tested below by feeding
 /// (state, clock) sequences and asserting decisions.
 pub const Sequencer = struct {
@@ -367,11 +372,15 @@ pub const Sequencer = struct {
     cue_shown: bool = false,
     cue_hide_at: ?f64 = null,
 
+    /// Reduce Motion (ADR-0014). Off, a resolution plays converge & drop for `converge_dur`
+    /// before the order-out; on, it falls back to ADR-0002's `hide_dur` fade. Set by the pump.
+    reduce_motion: bool = false,
+
     /// What happens to the panel window this tick.
     pub const WindowFx = enum {
         none,
         show_fade, // alpha 0 → order front → fade to 1 (≈0.14 s)
-        hide_fade, // fade to 0 (≈0.11 s); the order-out waits for the deadline
+        hide_fade, // converge & drop (0.30 s), or under Reduce Motion a fade to 0 (≈0.11 s); the order-out waits for the deadline
         order_out, // the hide fade has played — take the panel out, exactly once
         cancel_hide, // re-shown mid-hide-fade: snap alpha back to 1, panel never left
     };
@@ -393,7 +402,7 @@ pub const Sequencer = struct {
 
         if (published == .hidden) {
             if (self.shown and self.hide_at == null) {
-                self.hide_at = now + hide_dur;
+                self.hide_at = now + (if (self.reduce_motion) hide_dur else converge_dur);
                 return .{ .window = .hide_fade };
             }
             if (self.hide_at) |deadline| {
@@ -550,6 +559,462 @@ fn levelToNorm(rms: f32) f32 {
 /// produces 20/s, so this only buffers pump jitter; overflow drops the newest sample.
 const level_queue_cap = 64;
 
+// ============================================================================
+// The Scene — the micro-motion geometry (ADR-0014, #358). Pure.
+// ============================================================================
+// A port of `prototypes/hud-micro-motion`'s `Engine.barGeom` / `Engine.frame` with every
+// locked option on, at the prototype's constants. The Sequencer keeps the lifecycle; the pump
+// stamps each of its decisions into a `SceneState` as timestamps; `SceneState.scene` turns
+// those timestamps into shapes for any `now`, so the Chrome can draw at display rate while
+// the pump's decisions stay where they are. Locked options that need no code of their own:
+// "interpolate" is carried by the glide (with the scroll gliding, the prototype never lerps
+// heights), "display-rate dots" is the bounce computed from `now` below, and "show on the
+// press" is cadence — the Chrome renders on the publishing edge (#359).
+
+/// The panel region the Scene draws in: the 300×22 pill plus room for the glow halo and the
+/// unfurl spring — the prototype's 340×50 region. Provisional: map #355 leaves the panel
+/// footprint open, and MetalChrome (#359) confirms it against the glow. Scene coordinates are
+/// region points, origin bottom-left, y up (the panel's own convention).
+pub const region_w: f64 = 340;
+pub const region_h: f64 = 50;
+const region_ox: f64 = (region_w - pill_w) / 2.0; // the pill's origin inside the region
+const region_oy: f64 = (region_h - pill_h) / 2.0;
+
+const pill_cx: f64 = pill_w / 2.0;
+const pill_cy: f64 = pill_h / 2.0;
+const slot: f64 = bar_w + bar_gap; // one bar's pitch — how far the scroll glides per sample
+const bar_row_w: f64 = @as(f64, @floatFromInt(n_bars)) * slot - bar_gap;
+const bar_row_x0: f64 = (pill_w - bar_row_w) / 2.0;
+
+/// One level sample per Capture buffer: the glide crosses one slot in this long.
+const capture_interval_s: f64 = 0.05;
+/// Converge & drop on insert: the dots merge, swell and drop, then the panel orders out.
+/// Replaces the hide fade's `hide_dur` unless Reduce Motion is on.
+const converge_dur: f64 = 0.30;
+/// Silence ripple amplitude (pt): a quiet bar breathes up to `min_bar_h + ripple_amp`, and
+/// never higher — a whisper has to clear that ceiling to read as voice.
+const ripple_amp: f64 = 1.6;
+/// Shapes this faint or thin never reach the Chrome (the prototype renderer's cull).
+const cull_alpha: f64 = 0.003;
+const cull_size: f64 = 0.02;
+/// "Not yet" for a SceneState timestamp — far enough back that every envelope has settled.
+const never: f64 = -1e9;
+
+/// The easeOut() control points, cubic-bezier(0.17, 0.7, 0.3, 1.0) — shared by Core
+/// Animation's timing function and the Scene's own `easeCurve`, so both ease alike.
+const ease_ctl = [4]f32{ 0.17, 0.7, 0.3, 1.0 };
+
+/// The easeOut() bezier solved for y at x (Newton on x(t), as the prototype does). Clamped.
+fn easeCurve(x: f64) f64 {
+    if (x <= 0.0) return 0.0;
+    if (x >= 1.0) return 1.0;
+    const x1: f64 = ease_ctl[0];
+    const y1: f64 = ease_ctl[1];
+    const x2: f64 = ease_ctl[2];
+    const y2: f64 = ease_ctl[3];
+    const cx = 3.0 * x1;
+    const bx = 3.0 * (x2 - x1) - cx;
+    const ax = 1.0 - cx - bx;
+    const cy = 3.0 * y1;
+    const by = 3.0 * (y2 - y1) - cy;
+    const ay = 1.0 - cy - by;
+    var t = x;
+    for (0..8) |_| {
+        const e = ((ax * t + bx) * t + cx) * t - x;
+        const d = (3.0 * ax * t + 2.0 * bx) * t + cx;
+        if (@abs(e) < 1e-6 or @abs(d) < 1e-6) break;
+        t -= e / d;
+    }
+    t = clamp01(t);
+    return ((ay * t + by) * t + cy) * t;
+}
+
+fn clamp01(x: f64) f64 {
+    return std.math.clamp(x, 0.0, 1.0);
+}
+fn lerp(a: f64, b: f64, f: f64) f64 {
+    return a + (b - a) * f;
+}
+fn smoothstep(e0: f64, e1: f64, x: f64) f64 {
+    const t = clamp01((x - e0) / (e1 - e0));
+    return t * t * (3.0 - 2.0 * t);
+}
+/// A damped spring from 0 to 1 that overshoots once (~12 %) and settles — the unfurl.
+fn springOut(p: f64) f64 {
+    if (p <= 0.0) return 0.0;
+    if (p >= 1.0) return 1.0;
+    return 1.0 - @exp(-6.0 * p) * @cos(9.0 * p);
+}
+/// Back-out ease (overshoot 1.7): the newest bar springs in, the dots pop in on gather.
+fn backOut(x: f64) f64 {
+    const s = 1.7;
+    const p = clamp01(x) - 1.0;
+    return 1.0 + (s + 1.0) * p * p * p + s * p * p;
+}
+
+/// One mark of the Scene: a rounded rect (corner radius `min(w, h) / 2`, the Chrome's
+/// business) centred at (cx, cy) in region points. `role` names the semantic colour the
+/// Chrome resolves per frame; `amber` blends systemOrange into it (ADR-0004); `alpha` already
+/// carries the window fade.
+pub const Shape = struct {
+    cx: f32 = 0,
+    cy: f32 = 0,
+    w: f32 = 0,
+    h: f32 = 0,
+    role: Role = .label,
+    alpha: f32 = 0,
+    amber: f32 = 0,
+
+    pub const Role = enum {
+        label, // the recording bars — labelColor
+        secondary, // the processing dots — secondaryLabelColor
+        confirm, // the Undo confirm mark — systemGreen (ADR-0007)
+        refuse, // the Undo refuse mark — systemRed (ADR-0007)
+    };
+};
+
+/// The most shapes one Scene carries: the bar row plus the bar gliding off, frozen at release
+/// while the three dots come in. The Undo mark only ever shows alone.
+const scene_cap = (n_bars + 1) + 3;
+
+/// Everything the pill shows at one instant: fixed-size and `std.meta.eql`-comparable, like
+/// the Frame that carries it. Unused slots stay default, so equal Scenes compare equal.
+pub const Scene = struct {
+    shapes: [scene_cap]Shape = @splat(.{}),
+    len: usize = 0,
+    /// The prototype's transitions-only goo envelope (0..1): up through the unfurl, the
+    /// release gather and the converge. The locked setting is goo **Always** (ADR-0014), so
+    /// the Chrome may ignore it; it is here so the envelope stays with the geometry.
+    goo: f32 = 0,
+
+    pub fn items(self: *const Scene) []const Shape {
+        return self.shapes[0..self.len];
+    }
+};
+
+/// A mark before the pill-level transform: pill points, y up.
+const Prim = struct {
+    cx: f64,
+    cy: f64,
+    w: f64,
+    h: f64,
+    a: f64,
+    role: Shape.Role,
+    amber: f64 = 0,
+};
+
+/// One waveform bar's geometry before the pill-level transform. `i` is the slot, −1 for the
+/// bar gliding off the left edge.
+const Bar = struct { i: i32 = 0, cx: f64 = 0, w: f64 = 0, h: f64 = 0, a: f64 = 0 };
+
+/// An eased window-alpha tween. The default holds at 1.
+const Tween = struct {
+    from: f64 = 1,
+    to: f64 = 1,
+    t0: f64 = 0,
+    dur: f64 = 1,
+
+    fn at(self: Tween, t: f64) f64 {
+        return lerp(self.from, self.to, easeCurve((t - self.t0) / self.dur));
+    }
+};
+
+/// The timestamps the Scene is computed from — the prototype engine's "chrome-ish" state.
+/// The pump writes it as the Sequencer decides (one call per decision, below); `scene` only
+/// reads it. Pump-thread-only.
+pub const SceneState = struct {
+    family: Family = .none,
+    /// Normalized heights after the organic envelope: `hist[n_bars]` is the newest bar,
+    /// `hist[0]` the one gliding off the left edge.
+    hist: [n_bars + 1]f32 = @splat(0),
+    /// The organic envelope: fast attack, eased release.
+    env: f32 = 0,
+    /// When the last batch of samples scrolled in, and how many — the glide's origin.
+    shift_at: f64 = never,
+    shift_n: usize = 0,
+    show_at: f64 = never,
+    /// The release handover: the bars frozen where they were, and when.
+    release_at: f64 = never,
+    snap: [n_bars + 1]Bar = @splat(.{}),
+    dots_since: f64 = never,
+    /// The hide: when it started, and whether it converges (else the window alpha fades).
+    hide_start: f64 = never,
+    hide_converge: bool = false,
+    win: Tween = .{},
+    /// The degraded pulse's start (ADR-0004). Kept until the order-out, so the amber rides
+    /// the converge out.
+    amber_since: ?f64 = null,
+    mark_kind: Sequencer.CueKind = .confirm,
+    mark_at: f64 = never,
+
+    pub const Family = enum { none, bars, dots, mark };
+
+    // ---- the pump's writes, one per Sequencer decision ----
+
+    fn show(self: *SceneState, now: f64) void {
+        self.show_at = now;
+        self.win = .{ .from = 0, .to = 1, .t0 = now, .dur = show_dur };
+        self.hide_start = never;
+    }
+    fn cancelHide(self: *SceneState) void {
+        self.win = .{};
+        self.hide_start = never;
+    }
+    fn cutToBars(self: *SceneState) void {
+        self.family = .bars;
+        self.hist = @splat(0);
+        self.env = 0;
+        self.shift_at = never;
+        self.shift_n = 0;
+        self.release_at = never;
+        self.amber_since = null;
+    }
+    fn cutToDots(self: *SceneState, now: f64) void {
+        self.family = .dots;
+        self.release_at = never;
+        self.dots_since = now;
+    }
+    fn release(self: *SceneState, now: f64, reduce_motion: bool) void {
+        self.snap = self.barGeom(now, reduce_motion);
+        self.family = .dots;
+        self.release_at = now;
+        self.dots_since = now;
+    }
+    /// Scroll one batch of drained samples in. The organic envelope rides here, on the
+    /// samples, so the scroll buffer already holds what the bars show.
+    fn scroll(self: *SceneState, now: f64, rms: []const f32) void {
+        for (rms) |r| {
+            const n = levelToNorm(r);
+            self.env = if (n >= self.env) n else self.env + (n - self.env) * 0.5;
+            std.mem.copyForwards(f32, self.hist[0..n_bars], self.hist[1..]);
+            self.hist[n_bars] = self.env;
+        }
+        self.shift_at = now;
+        self.shift_n = rms.len;
+    }
+    fn startAmber(self: *SceneState, now: f64) void {
+        self.amber_since = now;
+    }
+    fn startHide(self: *SceneState, now: f64, converge: bool) void {
+        self.hide_start = now;
+        self.hide_converge = converge;
+        if (!converge) self.win = .{ .from = self.win.at(now), .to = 0, .t0 = now, .dur = hide_dur };
+    }
+    fn showMark(self: *SceneState, now: f64, kind: Sequencer.CueKind) void {
+        self.* = .{ .family = .mark, .mark_kind = kind, .mark_at = now };
+        self.win = .{ .from = 0, .to = 1, .t0 = now, .dur = show_dur };
+    }
+    fn orderOut(self: *SceneState) void {
+        self.* = .{};
+    }
+
+    // ---- the pure read ----
+
+    /// The waveform's bars at `t`: content only, no window alpha or pill-level transform.
+    fn barGeom(self: *const SceneState, t: f64, reduce_motion: bool) [n_bars + 1]Bar {
+        var out: [n_bars + 1]Bar = undefined;
+        const p = clamp01((t - self.shift_at) / capture_interval_s);
+        const glide_off = @as(f64, @floatFromInt(self.shift_n)) * slot * (1.0 - p);
+        for (&out, self.hist, 0..) |*bar, level, k| {
+            const i: i32 = @as(i32, @intCast(k)) - 1;
+            const fi: f64 = @floatFromInt(i);
+            var norm: f64 = level;
+            // Organic envelope: the newest bar springs in from the floor.
+            if (k == n_bars) norm *= backOut((t - self.shift_at) / 0.09);
+            var h = min_bar_h + @max(0.0, norm) * (max_bar_h - min_bar_h);
+            var w: f64 = bar_w;
+            var a: f64 = 1;
+            const cx = bar_row_x0 + fi * slot + bar_w / 2.0 + glide_off;
+            if (!reduce_motion) {
+                // Silence ripple: quiet bars breathe, phase-offset along the row.
+                const quiet = 1.0 - smoothstep(0.02, 0.10, norm);
+                const fade_in = smoothstep(0.15, 0.5, t - self.show_at);
+                h += ripple_amp * quiet * fade_in * (0.5 + 0.5 * @sin(2.0 * std.math.pi * 1.2 * t - fi * 0.55));
+            }
+            if (k == 0) a *= 1.0 - p; // the bar gliding off fades as it goes
+            a *= 0.42 + 0.58 * std.math.pow(f64, clamp01(norm), 0.6); // loudness opacity
+            // Edge dissolve: history thins out to the left, the newest bar fades in on the right.
+            a *= smoothstep(bar_row_x0 - 4.0, bar_row_x0 + 64.0, cx) *
+                (1.0 - smoothstep(bar_row_x0 + bar_row_w - bar_w / 2.0, bar_row_x0 + bar_row_w + slot, cx));
+            if (!reduce_motion) {
+                // Unfurl: springs out from the centre, staggered by distance.
+                const d = @abs(fi - @as(f64, n_bars - 1) / 2.0) * 0.009;
+                const q = clamp01((t - self.show_at - d) / 0.26);
+                const s = springOut(q);
+                w *= s;
+                h *= s;
+                a *= clamp01(q * 3.0);
+            }
+            bar.* = .{ .i = i, .cx = cx, .w = w, .h = h, .a = a };
+        }
+        return out;
+    }
+
+    /// Everything the pill shows at `now`. Pure: the same state and `now` give the same
+    /// Scene. `reduce_motion` turns off unfurl, gather, converge, squash and ripple; their
+    /// moments fall back to ADR-0002's fades and crossfade.
+    pub fn scene(self: *const SceneState, now: f64, reduce_motion: bool) Scene {
+        const t = now;
+        var prims: [scene_cap]Prim = undefined;
+        var n: usize = 0;
+
+        const hiding = self.hide_start > never and self.hide_converge;
+        const hc = if (hiding) clamp01((t - self.hide_start) / converge_dur) else 0.0;
+
+        switch (self.family) {
+            .none => return .{},
+            .bars => {
+                // Converge from recording: the row pulls in to the centre and flattens.
+                const p = if (hiding) easeCurve(hc / 0.85) else 0.0;
+                for (self.barGeom(t, reduce_motion)) |b| {
+                    prims[n] = .{
+                        .cx = pill_cx + (b.cx - pill_cx) * (1.0 - 0.85 * p),
+                        .cy = pill_cy,
+                        .w = b.w,
+                        .h = lerp(b.h, min_bar_h, p),
+                        .a = b.a * (1.0 - p),
+                        .role = .label,
+                    };
+                    n += 1;
+                }
+            },
+            .dots => {
+                // The release handover: the frozen bars gather into the dots, or crossfade out.
+                if (self.release_at > never) {
+                    const tr = t - self.release_at;
+                    for (self.snap) |b| {
+                        if (!reduce_motion) {
+                            if (tr > 0.5) continue;
+                            const j = std.math.clamp(@divFloor(b.i * 3, @as(i32, n_bars)), 0, 2);
+                            const target = dotCX(@floatFromInt(j));
+                            const dist = @abs(b.cx - target);
+                            const p = easeCurve(tr / (0.15 + 0.15 * @min(1.0, dist / 100.0)));
+                            prims[n] = .{
+                                .cx = lerp(b.cx, target, p),
+                                .cy = pill_cy,
+                                .w = lerp(b.w, dot_size * 0.7, p),
+                                .h = lerp(b.h, dot_size * 0.7, p),
+                                .a = b.a * (1.0 - smoothstep(0.5, 1.0, p)),
+                                .role = .label,
+                            };
+                        } else {
+                            if (tr > cross_dur + 0.02) continue;
+                            prims[n] = .{ .cx = b.cx, .cy = pill_cy, .w = b.w, .h = b.h, .a = b.a * (1.0 - easeCurve(tr / cross_dur)), .role = .label };
+                        }
+                        n += 1;
+                    }
+                }
+
+                const tr = t - self.dots_since;
+                var appear_a: f64 = 1;
+                var appear_s: f64 = 1;
+                var amp: f64 = dot_bounce;
+                if (self.release_at > never) {
+                    if (!reduce_motion) {
+                        // Gather: the dots pop in as the bars arrive, the bounce eases up.
+                        const q = clamp01((tr - 0.10) / 0.22);
+                        appear_s = @max(0.0, backOut(q));
+                        appear_a = clamp01(q * 2.5);
+                        amp = dot_bounce * smoothstep(0.18, 0.55, tr);
+                    } else appear_a = easeCurve(tr / cross_dur);
+                }
+                const amber: f64 = if (self.amber_since) |since| pulseEnvelope(t - since) else 0.0;
+                for (0..3) |j| {
+                    const fj: f64 = @floatFromInt(j);
+                    const ph = dotPhase(t, fj);
+                    var off = amp * @sin(ph);
+                    var w: f64 = dot_size;
+                    var h: f64 = dot_size;
+                    var cx = dotCX(fj);
+                    var a = appear_a;
+                    if (!reduce_motion) {
+                        // Squash & stretch, in step with the bounce.
+                        const k = amp / dot_bounce;
+                        const s = @abs(@sin(ph));
+                        const c = @abs(@cos(ph));
+                        h *= 1.0 + k * (0.14 * c - 0.08 * s);
+                        w *= 1.0 - k * (0.07 * c - 0.08 * s);
+                    }
+                    w *= appear_s;
+                    h *= appear_s;
+                    if (hiding) {
+                        // Converge & drop: merge on the middle dot, swell, drop 4 pt, vanish.
+                        const p1 = easeCurve(hc / 0.5);
+                        cx = lerp(cx, dotCX(1), p1);
+                        off *= 1.0 - p1;
+                        if (j != 1) a *= 1.0 - smoothstep(0.6, 1.0, p1);
+                        const p2 = clamp01((hc - 0.4) / 0.6);
+                        const sc = if (p2 < 0.3) 1.0 + 0.18 * (p2 / 0.3) else 1.18 * (1.0 - easeCurve((p2 - 0.3) / 0.7));
+                        w *= sc;
+                        h *= sc;
+                        off -= 4.0 * easeCurve(p2);
+                        a *= 1.0 - smoothstep(0.55, 1.0, p2);
+                    }
+                    prims[n] = .{ .cx = cx, .cy = pill_cy + off, .w = w, .h = h, .a = a, .role = .secondary, .amber = amber };
+                    n += 1;
+                }
+            },
+            .mark => {
+                // The Undo cue (ADR-0007): one mark blooms in; a refuse also shakes.
+                const e = t - self.mark_at;
+                prims[n] = .{
+                    .cx = pill_cx + (if (self.mark_kind == .refuse) cueShake(e) else 0.0),
+                    .cy = pill_cy,
+                    .w = mark_w,
+                    .h = mark_h,
+                    .a = cueBloom(e),
+                    .role = if (self.mark_kind == .confirm) .confirm else .refuse,
+                };
+                n += 1;
+            },
+        }
+
+        // The pill-level transform: the unfurl's whole-pill spring, and the window alpha.
+        const gs = if (!reduce_motion and self.family != .mark)
+            0.93 + 0.07 * springOut(clamp01((t - self.show_at) / 0.4))
+        else
+            1.0;
+        const wa = self.win.at(t);
+        var out: Scene = .{};
+        for (prims[0..n]) |p| {
+            const w = p.w * gs;
+            const h = p.h * gs;
+            const a = p.a * wa;
+            if (a <= cull_alpha or w <= cull_size or h <= cull_size) continue;
+            out.shapes[out.len] = .{
+                .cx = @floatCast(region_ox + pill_cx + (p.cx - pill_cx) * gs),
+                .cy = @floatCast(region_oy + pill_cy + (p.cy - pill_cy) * gs),
+                .w = @floatCast(w),
+                .h = @floatCast(h),
+                .role = p.role,
+                .alpha = @floatCast(a),
+                .amber = @floatCast(p.amber),
+            };
+            out.len += 1;
+        }
+
+        var goo: f64 = 0;
+        if (self.family == .dots and self.release_at > never) {
+            const tr = t - self.release_at;
+            goo = smoothstep(0.0, 0.06, tr) * (1.0 - smoothstep(0.35, 0.7, tr));
+        }
+        if (hiding) goo = 1;
+        if (!reduce_motion) goo = @max(goo, 1.0 - smoothstep(0.2, 0.45, t - self.show_at));
+        out.goo = @floatCast(goo);
+        return out;
+    }
+};
+
+/// Dot `j`'s bounce phase at `now` (radians): ~0.8 Hz, each dot 0.8 rad behind the last.
+fn dotPhase(now: f64, j: f64) f64 {
+    return now * 5.0 + j * 0.8;
+}
+
+/// Dot `j`'s centre x in pill points.
+fn dotCX(j: f64) f64 {
+    return (pill_w - dots_row_w) / 2.0 + j * (dot_size + dot_gap) + dot_size / 2.0;
+}
+
 
 // ============================================================================
 // The HUD Chrome seam — one method, `paint(Frame)`.
@@ -566,6 +1031,10 @@ pub const Frame = struct {
     marks: Sequencer.MarksFx = .keep,
     /// What the pill carries this tick.
     content: Content = .none,
+    /// The micro-motion geometry at this tick's `now` (ADR-0014, #358): every shape the pill
+    /// shows, with the window fade folded into each shape's alpha. `MetalChrome` (#359) draws
+    /// only this. `AppKitChrome` still draws `marks` and `content`, and both fields go when it does.
+    scene: Scene = .{},
 
     pub const Content = union(enum) {
         /// Nothing painted: a window-only tick (hidden, or a cue riding the fade out).
@@ -630,12 +1099,19 @@ pub fn Hud(comptime Chrome: type) type {
         /// The motion's decision half (#51): edge detection, window lifecycle, hide-fade
         /// deadline, the pulse and cue envelopes.
         seq: Sequencer = .{},
-        /// Scroll buffer of NORMALIZED heights: `levels[n_bars-1]` is the newest (rightmost)
-        /// bar. Bars themselves never move — heights march left, one slot per sample.
-        levels: [n_bars]f32 = @splat(0),
+        /// The timestamps the Scene is computed from, stamped as the Sequencer decides. Its
+        /// scroll buffer is also what `content.bars` carries, so the two never disagree.
+        scene_state: SceneState = .{},
 
         pub fn init(chrome: *Chrome) Self {
             return .{ .chrome = chrome };
+        }
+
+        /// Reduce Motion (ADR-0014), read from the system by the Chrome and handed in on the
+        /// pump's thread before `render`. On, unfurl, gather, converge, squash and the silence
+        /// ripple fall back to fades and the crossfade.
+        pub fn setReduceMotion(self: *Self, on: bool) void {
+            self.seq.reduce_motion = on;
         }
 
         /// Publish a lifecycle state. Thread-safe, no AppKit — called from the run-loop
@@ -760,13 +1236,23 @@ pub fn Hud(comptime Chrome: type) type {
             // fights a live recording/processing pill and an overlapping request cannot
             // restart a playing one. While it owns the pill the cue is a self-contained
             // path — no step/marks work at all.
+            const rm = self.seq.reduce_motion;
+            const ss = &self.scene_state;
             if (st == .hidden) {
                 if (cue_req) |kind| {
                     if (self.seq.cue_at == null) self.seq.startCue(now, kind);
                 }
                 const cue = self.seq.cueStep(now);
                 if (cue.owns) {
-                    self.chrome.paint(cueFrame(cue));
+                    switch (cue.window) {
+                        .show_fade => ss.showMark(now, cue.kind),
+                        .hide_fade => ss.startHide(now, false), // a cue fades; converge is the Insertion's
+                        .order_out => ss.orderOut(),
+                        .none, .cancel_hide => {},
+                    }
+                    var frame = cueFrame(cue);
+                    frame.scene = ss.scene(now, rm);
+                    self.chrome.paint(frame);
                     return;
                 }
             } else if (self.seq.cue_at != null) {
@@ -779,7 +1265,10 @@ pub fn Hud(comptime Chrome: type) type {
             // Degraded-insertion pulse (ADR-0004): arm on request while a processing pill
             // is up, tint the dots amber over ~300 ms, then resolve to `.hidden` so the
             // ordinary hide fade carries the frozen amber dots out.
-            if (pulse_req and st == .processing) self.seq.startPulse(now);
+            if (pulse_req and st == .processing) {
+                self.seq.startPulse(now);
+                ss.startAmber(now);
+            }
             const pulse = self.seq.pulseStep(now);
             if (pulse.ended and st == .processing) {
                 os_unfair_lock_lock(&self.mu);
@@ -791,39 +1280,51 @@ pub fn Hud(comptime Chrome: type) type {
             const decision = self.seq.step(st, now);
 
             if (st == .hidden) {
-                // Only window motion happens while hidden; the marks are never touched, so
-                // a hide from processing freezes the dots and fades out around them.
-                self.chrome.paint(.{ .window = decision.window });
+                // Only window motion happens while hidden; the legacy marks are never touched,
+                // so a hide from processing freezes the dots and fades out around them. The
+                // Scene plays the converge (or, under Reduce Motion, the fade) instead.
+                switch (decision.window) {
+                    .hide_fade => ss.startHide(now, !rm),
+                    .order_out => ss.orderOut(),
+                    .none, .show_fade, .cancel_hide => {},
+                }
+                self.chrome.paint(.{ .window = decision.window, .scene = ss.scene(now, rm) });
                 return;
             }
 
             // A fresh Utterance starts from a flat line — zeroed before this tick's samples
             // scroll in, exactly as the family cut lands.
-            if (decision.marks == .bars) self.levels = @splat(0);
+            switch (decision.marks) {
+                .keep => {},
+                .bars => ss.cutToBars(),
+                .dots => ss.cutToDots(now),
+                .crossfade => ss.release(now, rm),
+            }
+            // One drained sample = the scroll advances one bar. The dB mapping is applied
+            // here, as levels come off the queue (#26).
+            if (st == .recording and n > 0) ss.scroll(now, drained[0..n]);
+            switch (decision.window) {
+                .show_fade => ss.show(now),
+                .cancel_hide => ss.cancelHide(),
+                .none, .hide_fade, .order_out => {},
+            }
 
             var frame: Frame = .{ .window = decision.window, .marks = decision.marks };
             switch (st) {
                 .hidden => unreachable,
-                .recording => {
-                    // One drained sample = the scroll advances one bar. The dB mapping is
-                    // applied here, as levels come off the queue (#26).
-                    for (drained[0..n]) |rms| {
-                        std.mem.copyForwards(f32, self.levels[0 .. n_bars - 1], self.levels[1..]);
-                        self.levels[n_bars - 1] = levelToNorm(rms);
-                    }
-                    frame.content = .{ .bars = self.levels };
-                },
+                .recording => frame.content = .{ .bars = ss.hist[1..].* },
                 .processing => {
                     // Three bouncing neutral dots, phase-offset — held until the Insertion
                     // resolves and the daemon publishes `.hidden`.
                     var dots: Frame.Dots = .{ .amber = pulse.amber };
                     for (&dots.offsets, 0..) |*off, j| {
                         const fj: f64 = @floatFromInt(j);
-                        off.* = dot_bounce * @sin(now * 5.0 + fj * 0.8);
+                        off.* = dot_bounce * @sin(dotPhase(now, fj));
                     }
                     frame.content = .{ .dots = dots };
                 },
             }
+            frame.scene = ss.scene(now, rm);
             self.chrome.paint(frame);
         }
     };
@@ -1283,30 +1784,31 @@ test "motion 3: resolution starts the hide fade, order-out deferred to its deadl
     var seq = Sequencer{};
     _ = seq.step(.recording, 100.0);
     _ = seq.step(.processing, 100.05);
-    // The Utterance resolves → the fade starts; the marks stay untouched, so a
-    // hide from processing freezes the dots and fades out around them.
+    // The Utterance resolves → the hide starts; the marks stay untouched, so a
+    // hide from processing freezes the dots and fades out around them. The
+    // order-out waits for converge & drop (ADR-0014) to play.
     try std.testing.expectEqual(
         Sequencer.Decision{ .window = .hide_fade, .marks = .keep },
         seq.step(.hidden, 100.10),
     );
-    try std.testing.expectEqual(@as(?f64, 100.10 + hide_dur), seq.hide_at);
+    try std.testing.expectEqual(@as(?f64, 100.10 + converge_dur), seq.hide_at);
 }
 
 test "motion 4: order-out fires exactly once, only past the deadline" {
     var seq = Sequencer{};
     _ = seq.step(.recording, 100.0);
     _ = seq.step(.processing, 100.05);
-    _ = seq.step(.hidden, 100.10); // hide fade starts; deadline 100.10 + hide_dur
+    _ = seq.step(.hidden, 100.10); // hide starts; deadline 100.10 + converge_dur
     // Mid-fade ticks decide nothing — the pill never disappears before the
     // fade completes.
     try std.testing.expectEqual(Sequencer.Decision{}, seq.step(.hidden, 100.15));
     // First tick at/past the deadline orders out…
     try std.testing.expectEqual(
         Sequencer.Decision{ .window = .order_out, .marks = .keep },
-        seq.step(.hidden, 100.10 + hide_dur),
+        seq.step(.hidden, 100.10 + converge_dur),
     );
     // …and only that tick: hidden is idle again from here on.
-    try std.testing.expectEqual(Sequencer.Decision{}, seq.step(.hidden, 100.30));
+    try std.testing.expectEqual(Sequencer.Decision{}, seq.step(.hidden, 100.45));
     try std.testing.expectEqual(Sequencer.Decision{}, seq.step(.hidden, 200.0));
 }
 
@@ -1332,7 +1834,18 @@ test "motion 5: a press during the hide fade cancels it and records normally" {
     );
     try std.testing.expectEqual(
         Sequencer.Decision{ .window = .order_out, .marks = .keep },
-        seq.step(.hidden, 100.40 + hide_dur),
+        seq.step(.hidden, 100.40 + converge_dur),
+    );
+}
+
+test "motion 6: under Reduce Motion the hide is the plain fade, ordered out on its deadline" {
+    var seq = Sequencer{ .reduce_motion = true };
+    _ = seq.step(.processing, 100.0);
+    _ = seq.step(.hidden, 100.05);
+    try std.testing.expectEqual(@as(?f64, 100.05 + hide_dur), seq.hide_at);
+    try std.testing.expectEqual(
+        Sequencer.Decision{ .window = .order_out, .marks = .keep },
+        seq.step(.hidden, 100.05 + hide_dur),
     );
 }
 
@@ -1576,8 +2089,11 @@ test "pump: a hidden tick paints window motion only — the dots freeze and fade
     h.publish(.hidden);
     h.render(100.05);
 
-    // marks stays `.keep` and no content is painted, so whatever was on screen freezes.
-    try std.testing.expectEqual(Frame{ .window = .hide_fade, .marks = .keep, .content = .none }, chrome.last());
+    // marks stays `.keep` and no content is painted, so whatever was on screen freezes. The
+    // Scene, meanwhile, keeps drawing the dots as they converge.
+    const scene = h.scene_state.scene(100.05, false);
+    try std.testing.expectEqual(@as(usize, 3), scene.len);
+    try std.testing.expectEqual(Frame{ .window = .hide_fade, .marks = .keep, .content = .none, .scene = scene }, chrome.last());
 }
 
 test "pump: the degraded pulse tints the dots amber, then resolves the pill to hidden (ADR-0004)" {
@@ -1727,4 +2243,224 @@ test "pump: re-enabling the overlay lets the next Utterance show the pill again"
     h.render(100.05);
 
     try std.testing.expect(chrome.last().content == .bars);
+}
+
+// ============================================================================
+// The Scene (ADR-0014, #358). The pump runs at display rate here, as it will under
+// MetalChrome, so every in-between frame the Chrome could draw is exercised.
+// ============================================================================
+
+test "easeCurve: pinned at both ends and never dips" {
+    try std.testing.expectEqual(@as(f64, 0.0), easeCurve(0.0));
+    try std.testing.expectEqual(@as(f64, 1.0), easeCurve(1.0));
+    var prev: f64 = 0.0;
+    for (1..20) |i| {
+        const v = easeCurve(@as(f64, @floatFromInt(i)) / 20.0);
+        try std.testing.expect(v > prev and v < 1.0);
+        prev = v;
+    }
+}
+
+const frame_dt: f64 = 1.0 / 120.0; // a ProMotion display link
+
+/// Watches every Scene the pump emits: counts shapes that escape the panel region, tracks
+/// the tallest recording bar, and keeps the latest Frame.
+const SceneChrome = struct {
+    last: Frame = .{},
+    shapes: usize = 0,
+    escaped: usize = 0,
+    tallest_bar: f32 = 0,
+
+    pub fn paint(self: *SceneChrome, frame: Frame) void {
+        self.last = frame;
+        for (frame.scene.items()) |s| {
+            self.shapes += 1;
+            if (s.cx - s.w / 2 < 0 or s.cx + s.w / 2 > region_w or
+                s.cy - s.h / 2 < 0 or s.cy + s.h / 2 > region_h) self.escaped += 1;
+            if (s.role == .label) self.tallest_bar = @max(self.tallest_bar, s.h);
+        }
+    }
+};
+
+const SceneHud = Hud(SceneChrome);
+
+/// Render at display rate for `dur` seconds from `t0`, pushing one `rms` sample per Capture
+/// buffer (dropped by the pump unless recording). Returns the clock where it stopped.
+fn runFor(h: *SceneHud, t0: f64, dur: f64, rms: ?f32) f64 {
+    var t = t0;
+    var next_level = t0;
+    while (t < t0 + dur) : (t += frame_dt) {
+        if (rms) |r| if (t >= next_level) {
+            h.pushLevel(r);
+            next_level += capture_interval_s;
+        };
+        h.render(t);
+    }
+    return t;
+}
+
+test "scene: nothing draws outside the panel region" {
+    for ([_]bool{ false, true }) |rm| {
+        var chrome = SceneChrome{};
+        var h = SceneHud.init(&chrome);
+        h.setReduceMotion(rm);
+        var t: f64 = 1000.0;
+
+        // A full-scale Utterance, then a stalled pump that drains a burst of buffers in one
+        // tick, a release, and a degraded Insertion that converges out amber.
+        h.publish(.recording);
+        t = runFor(&h, t, 0.8, 1.0);
+        for (0..8) |_| h.pushLevel(1.0);
+        t = runFor(&h, t, 0.3, 0.00631);
+        h.publish(.processing);
+        t = runFor(&h, t, 0.8, null);
+        h.pulseDegraded();
+        t = runFor(&h, t, 1.0, null);
+        // A silent Utterance abandoned mid-recording (the bars converge), re-pressed mid-hide,
+        // abandoned again, then a refuse cue shaking at full amplitude.
+        h.publish(.recording);
+        t = runFor(&h, t, 0.6, 0.0);
+        h.hide();
+        t = runFor(&h, t, 0.1, null);
+        h.publish(.recording);
+        t = runFor(&h, t, 0.4, 0.05);
+        h.hide();
+        t = runFor(&h, t, 0.5, null);
+        h.undoRefuse();
+        t = runFor(&h, t, 1.0, null);
+
+        try std.testing.expect(chrome.shapes > 1000); // the Scene really was drawing
+        try std.testing.expectEqual(@as(usize, 0), chrome.escaped);
+    }
+}
+
+test "scene: converge ends at zero alpha, on the Sequencer's order-out deadline" {
+    // From the dots (an Insertion) and from the bars (an abandoned Utterance).
+    for ([_]State{ .processing, .recording }) |from| {
+        var chrome = SceneChrome{};
+        var h = SceneHud.init(&chrome);
+        h.publish(from);
+        const t = runFor(&h, 1000.0, 0.6, 0.1);
+        h.hide();
+        h.render(t); // converge & drop starts
+        try std.testing.expectEqual(Sequencer.WindowFx.hide_fade, chrome.last.window);
+
+        // Mid-converge the marks are still on screen, gathering on the centre…
+        try std.testing.expect(h.scene_state.scene(t + converge_dur / 2.0, false).len > 0);
+        // …and at the deadline every one has faded to nothing, so none is emitted.
+        try std.testing.expectEqual(@as(usize, 0), h.scene_state.scene(t + converge_dur, false).len);
+        h.render(t + converge_dur);
+        try std.testing.expectEqual(Sequencer.WindowFx.order_out, chrome.last.window);
+    }
+}
+
+test "scene: the degraded pulse's amber carries through converge (ADR-0004)" {
+    var chrome = SceneChrome{};
+    var h = SceneHud.init(&chrome);
+    h.publish(.processing);
+    var t = runFor(&h, 1000.0, 0.6, null);
+    h.pulseDegraded();
+    // Run until the pulse elapses and the pump hands the pill to the hide.
+    while (chrome.last.window != .hide_fade) : (t += frame_dt) h.render(t);
+
+    // Every frame of the converge carries the dots at full amber, right up to the order-out.
+    var dots_seen: usize = 0;
+    while (chrome.last.window != .order_out) : (t += frame_dt) {
+        for (chrome.last.scene.items()) |s| {
+            try std.testing.expectEqual(Shape.Role.secondary, s.role);
+            try std.testing.expectEqual(@as(f32, 1.0), s.amber);
+            dots_seen += 1;
+        }
+        h.render(t);
+    }
+    try std.testing.expect(dots_seen > 30);
+}
+
+/// Every shape in `b` is the same shape in `a` with its alpha scaled by `k`.
+fn expectFaded(a: Scene, b: Scene, k: f64) !void {
+    try std.testing.expectEqual(a.len, b.len);
+    for (a.items(), b.items()) |x, y| {
+        try std.testing.expectEqual(x.cx, y.cx);
+        try std.testing.expectEqual(x.w, y.w);
+        try std.testing.expectEqual(x.h, y.h);
+        try std.testing.expectApproxEqAbs(@as(f64, x.alpha) * k, @as(f64, y.alpha), 1e-4);
+    }
+}
+
+test "scene: reduce_motion reproduces the fade + crossfade, with no unfurl, gather or converge" {
+    var chrome = SceneChrome{};
+    var h = SceneHud.init(&chrome);
+    h.setReduceMotion(true);
+    const ss = &h.scene_state;
+
+    // Show: a plain eased fade. Nothing scales in — every bar is its full 6 pt from the start.
+    h.publish(.recording);
+    for (0..n_bars) |_| h.pushLevel(0.05);
+    const t0 = 1000.0;
+    h.render(t0);
+    const settled = t0 + 0.1; // past the glide and the newest bar's spring
+    const shown = ss.scene(settled + show_dur, true);
+    try std.testing.expect(shown.len > n_bars / 2);
+    for (shown.items()) |s| try std.testing.expectEqual(@as(f32, bar_w), s.w);
+    const frac = 0.1 / show_dur;
+    try expectFaded(shown, ss.scene(settled, true), easeCurve(frac));
+
+    // Release: the frozen bars crossfade out in place while the dots fade in at full size.
+    const t1 = t0 + 1.0;
+    h.publish(.processing);
+    h.render(t1);
+    const snap = ss.scene(t1, true); // the dots start transparent, so this is the bars alone
+    for (snap.items()) |s| try std.testing.expectEqual(Shape.Role.label, s.role);
+    const mid = ss.scene(t1 + cross_dur / 4.0, true);
+    var bars_mid: Scene = .{};
+    var dots_mid: usize = 0;
+    for (mid.items()) |s| switch (s.role) {
+        .label => {
+            bars_mid.shapes[bars_mid.len] = s;
+            bars_mid.len += 1;
+        },
+        else => {
+            try std.testing.expectEqual(@as(f32, @floatCast(dot_size)), s.w); // no squash, no pop-in
+            try std.testing.expectApproxEqAbs(easeCurve(0.25), @as(f64, s.alpha), 1e-4);
+            dots_mid += 1;
+        },
+    };
+    try std.testing.expectEqual(@as(usize, 3), dots_mid);
+    try expectFaded(snap, bars_mid, 1.0 - easeCurve(0.25));
+    const after = ss.scene(t1 + cross_dur + 0.03, true);
+    try std.testing.expectEqual(@as(usize, 3), after.len); // the bars are gone, the dots stay
+
+    // Hide: the dots fade where they are over `hide_dur` — no merge, no drop.
+    const t2 = t1 + 1.0;
+    h.hide();
+    h.render(t2);
+    try std.testing.expectEqual(@as(?f64, t2 + hide_dur), h.seq.hide_at);
+    const fading = ss.scene(t2 + hide_dur / 2.0, true);
+    try std.testing.expectEqual(@as(usize, 3), fading.len);
+    for (fading.items(), 0..) |s, j| {
+        try std.testing.expectApproxEqAbs(@as(f32, @floatCast(region_ox + dotCX(@floatFromInt(j)))), s.cx, 1e-4);
+        try std.testing.expectEqual(@as(f32, @floatCast(dot_size)), s.w);
+        try std.testing.expectApproxEqAbs(1.0 - easeCurve(0.5), @as(f64, s.alpha), 1e-4);
+    }
+    h.render(t2 + hide_dur);
+    try std.testing.expectEqual(Sequencer.WindowFx.order_out, chrome.last.window);
+}
+
+test "scene: a whisper still lifts the bars above the silence ripple's ceiling" {
+    var chrome = SceneChrome{};
+    var h = SceneHud.init(&chrome);
+    const ceiling: f32 = @floatCast(min_bar_h + ripple_amp);
+
+    // Silence: once the unfurl has settled, the ripple breathes but never clears its ceiling.
+    h.publish(.recording);
+    var t = runFor(&h, 1000.0, 0.6, 0.0);
+    chrome.tallest_bar = 0;
+    t = runFor(&h, t, 1.5, 0.0);
+    try std.testing.expect(chrome.tallest_bar > min_bar_h + 0.5); // it does move
+    try std.testing.expect(chrome.tallest_bar <= ceiling + 1e-4);
+
+    // A whisper (~−44 dBFS) stands clear of it.
+    chrome.tallest_bar = 0;
+    _ = runFor(&h, t, 1.5, 0.00631);
+    try std.testing.expect(chrome.tallest_bar > ceiling + 1.0);
 }
