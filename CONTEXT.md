@@ -578,8 +578,9 @@ has a centre, a size, a colour role (label, secondary, confirm, refuse), an alph
 window fade folded in, and an amber weight (ADR-0004). The Scene also carries the goo envelope.
 It is pure: `SceneState.scene(now, reduce_motion)` turns the timestamps the pump stamped as the
 Sequencer decided into geometry, so the Chrome can draw at display rate without making any
-decision. Every micro-motion option locked in `prototypes/hud-micro-motion` lives here. Under
-Reduce Motion, unfurl, gather, converge, squash and ripple give way to fades and the crossfade.
+decision. Every micro-motion option locked in the retired `prototypes/hud-micro-motion` lives
+here. Under Reduce Motion, unfurl, gather, converge, squash and ripple give way to fades and the
+crossfade.
 _Avoid_: frame (that is the whole tick), layers, render list
 
 **Feedback Surface**:
