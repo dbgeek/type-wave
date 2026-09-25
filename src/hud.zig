@@ -27,9 +27,10 @@
 //!     as a pure list of shapes. The pump stamps the Sequencer's decisions into a
 //!     `SceneState` as timestamps, and `SceneState.scene(now, reduce_motion)` turns them into
 //!     geometry for any `now`, so the display-rate Chrome draws without deciding anything.
-//!   - **All AppKit calls stay on the main thread.** The daemon's main thread runs
-//!     `CFRunLoopRun` (src/tap.zig) servicing the Talk Key tap (no `[NSApp run]` — proven by
-//!     #20). The Chrome adds two things to that same loop: `NSScreen`'s display link, which
+//!   - **All AppKit calls stay on the main thread.** The daemon's main thread runs the loop
+//!     servicing the Talk Key tap — plain `CFRunLoopRun` (src/tap.zig, proven by #20), or
+//!     `[NSApp run]` under the status item (src/appkit.zig). The Chrome adds two things to
+//!     that same loop: `NSScreen`'s display link, which
 //!     runs the pump once per display frame while the pill is on screen and is paused
 //!     otherwise, and a run-loop source the pump's `wake` signals from any thread, so a hidden
 //!     pill renders on the publishing edge. `MetalChrome.init` + `startPump` + every `paint`
@@ -183,6 +184,8 @@ const NSWindowCollectionBehaviorFullScreenAuxiliary: c_ulong = 1 << 8;
 // ---- Metal / QuartzCore (ADR-0014) -------------------------------------------
 extern "c" fn MTLCreateSystemDefaultDevice() id;
 extern "c" fn CACurrentMediaTime() f64; // the display link's clock
+extern "c" fn CGColorSpaceCreateWithName(name: ?*anyopaque) ?*anyopaque;
+extern var kCGColorSpaceSRGB: ?*anyopaque;
 const MTLPixelFormatBGRA8Unorm: c_ulong = 80;
 const MTLLoadActionClear: c_ulong = 2;
 const MTLStoreActionStore: c_ulong = 1;
@@ -231,7 +234,7 @@ const dots_row_w: f64 = 3 * dot_size + 2 * dot_gap; // the three-dot row, centre
 
 // The Undo confirm/refuse cue's single centred mark (ADR-0007, #216/#226): a ~6×14 pt
 // rounded bar, deliberately unlike the 26 recording bars and the 3 processing dots so an
-// Undo outcome never reads as recording/thinking. Its own net-new layer family — the pill
+// Undo outcome never reads as recording/thinking. Its own net-new shape family — the pill
 // is `hidden` when it plays, so the distinct single-mark shape is what makes the cue
 // unmistakable. Green still-bloom = confirmed, red bloom + horizontal shake = refused.
 const mark_w: f64 = 6;
@@ -241,7 +244,7 @@ const mark_h: f64 = 14;
 /// 50 ms Capture buffer, n_bars/20 seconds scroll across it (26 bars ≈ 1.3 s).
 const n_bars: usize = @intFromFloat(@floor((pill_w - 2 * pad_x + bar_gap) / (bar_w + bar_gap)));
 
-/// What the pill is doing — drives which layer family is visible. The daemon maps its
+/// What the pill is doing — drives which mark family the Scene draws. The daemon maps its
 /// Utterance lifecycle onto these: `recording` on Talk Key press (scrolling waveform),
 /// `processing` on release (bouncing dots, held over the whole Insertion), `hidden`
 /// once the Utterance resolves (inserted, abandoned, empty, or timed out).
@@ -351,7 +354,7 @@ pub const Sequencer = struct {
         order_out, // the hide fade has played — take the panel out, exactly once
         cancel_hide, // re-shown mid-hide-fade: snap alpha back to 1, panel never left
     };
-    /// Which layer-family flip this tick performs.
+    /// Which mark-family flip this tick performs.
     pub const MarksFx = enum {
         keep, // steady state — no visibility pokes
         bars, // cut to the waveform (a fresh Utterance)
@@ -521,8 +524,9 @@ const level_queue_cap = 64;
 // press" is cadence — the pump wakes the Chrome, which renders on the publishing edge.
 
 /// The panel region the Scene draws in, and the panel's own size: the 300×22 pill plus room
-/// for the glow halo and the unfurl spring — the prototype's 340×50 region, confirmed against
-/// the glow by MetalChrome (#359), and pinned by "nothing draws outside the panel region".
+/// for the glow halo and the unfurl spring — the prototype's 340×50 region, which held the
+/// glow in #359's smoke run; shapes are pinned inside it by "nothing draws outside the panel
+/// region".
 /// Scene coordinates are region points, origin bottom-left, y up (the panel's convention).
 pub const region_w: f64 = 340;
 pub const region_h: f64 = 50;
@@ -1150,7 +1154,7 @@ pub fn Hud(comptime Chrome: type) type {
 
         /// One pump tick: drain the published state, decide what this tick shows, and hand
         /// the Chrome exactly one `Frame`. `now` comes in from the caller (the Chrome's
-        /// timer in production, a fed value in tests) — the pump reads no clock of its own.
+        /// cadence in production, a fed value in tests) — the pump reads no clock of its own.
         pub fn render(self: *Self, now: f64) void {
             // Snapshot + drain under the lock, then release it before handing anything to
             // the Chrome — never message ObjC while holding the spinlock (it would stall
@@ -1383,6 +1387,14 @@ pub const MetalChrome = struct {
     active: bool = false,
     /// The display link is unpaused. Main thread only.
     running: bool = false,
+    /// A Metal or display-link failure, kept so a later Overlay toggle fails fast instead of
+    /// recompiling the shader (~640 ms) on the Talk Key tap's thread. Headless is not kept:
+    /// it bails before any compile, and a display may be attached later.
+    failed: ?InitError = null,
+    /// The last clock handed to the pump. The display link passes the *next* vsync's
+    /// timestamp and a wake passes the current time, so a wake right after an order-out
+    /// could otherwise step `now` backwards.
+    last_now: f64 = 0,
 
     ctx: ?*anyopaque = null,
     tick: ?Tick = null,
@@ -1407,6 +1419,7 @@ pub const MetalChrome = struct {
     /// is a no-op.
     pub fn init(self: *MetalChrome) InitError!void {
         if (self.active) return;
+        if (self.failed) |err| return err;
         const pool = objc_autoreleasePoolPush();
         defer objc_autoreleasePoolPop(pool);
 
@@ -1417,17 +1430,22 @@ pub const MetalChrome = struct {
         // No display => no HUD. Bail before finishLaunching, and before the shader compile.
         const screen = mainScreen();
         if (screen == null) return error.Headless;
-        if (!respondsTo(screen, "displayLinkWithTarget:selector:")) return error.NoDisplayLink;
+        if (!respondsTo(screen, "displayLinkWithTarget:selector:")) return self.fail(error.NoDisplayLink);
 
         // finishLaunching wires up AppKit enough to draw whether the loop is the headless
         // CFRunLoopRun (proven by #20) or [NSApp run] under the status item (#31/#34).
         appkit.ensureLaunched();
 
         self.scale = msgF64(screen, "backingScaleFactor");
-        try self.buildPipeline();
-        try self.buildLink(screen);
+        self.buildPipeline() catch |err| return self.fail(err);
+        self.buildLink(screen) catch |err| return self.fail(err);
         self.buildPanel(screen);
         self.active = true;
+    }
+
+    fn fail(self: *MetalChrome, err: InitError) InitError {
+        self.failed = err;
+        return err;
     }
 
     /// Whether the Chrome built. The daemon reads this to decide whether the Overlay toggle
@@ -1479,7 +1497,8 @@ pub const MetalChrome = struct {
         const tick = self.tick orelse return;
         const pool = objc_autoreleasePoolPush();
         defer objc_autoreleasePoolPop(pool);
-        tick(self.ctx.?, now, reduceMotion());
+        self.last_now = @max(self.last_now, now);
+        tick(self.ctx.?, self.last_now, reduceMotion());
     }
 
     /// The wake source's perform callback, on the main thread. While the link runs it picks
@@ -1555,6 +1574,9 @@ pub const MetalChrome = struct {
         msgULong(layer, "setPixelFormat:", MTLPixelFormatBGRA8Unorm);
         msgBool(layer, "setOpaque:", false);
         msgBool(layer, "setFramebufferOnly:", true);
+        // Tag the output sRGB — the space the palette resolves into — so WindowServer colour-
+        // matches it. Untagged, sRGB values would show as display-native: oversaturated on P3.
+        msg1v(layer, "setColorspace:", CGColorSpaceCreateWithName(kCGColorSpaceSRGB));
         msgDouble(layer, "setContentsScale:", self.scale);
         msgRect(layer, "setFrame:", .{ .x = 0, .y = 0, .w = region_w, .h = region_h });
         const setSize: *const fn (id, SEL, CGSize) callconv(.c) void = @ptrCast(&objc_msgSend);
@@ -1566,12 +1588,12 @@ pub const MetalChrome = struct {
     /// added paused to the main run loop. A 120 Hz timer is ruled out: `nextDrawable` blocks
     /// the main thread — the Talk Key tap's thread — while it waits (spike #356).
     fn buildLink(self: *MetalChrome, screen: id) error{NoDisplayLink}!void {
-        g_metal_chrome = self;
         const target = msg(msg(linkTargetClass(), "alloc"), "init");
         const mk: *const fn (id, SEL, id, SEL) callconv(.c) id = @ptrCast(&objc_msgSend);
         const link = mk(screen, sel_registerName("displayLinkWithTarget:selector:"), target, sel_registerName("onFrame:")) orelse
             return error.NoDisplayLink;
         self.link = msg(link, "retain");
+        g_metal_chrome = self;
         const setRange: *const fn (id, SEL, CAFrameRateRange) callconv(.c) void = @ptrCast(&objc_msgSend);
         setRange(link, sel_registerName("setPreferredFrameRateRange:"), .{ .minimum = 60, .maximum = 120, .preferred = 120 });
         msgBool(link, "setPaused:", true);
