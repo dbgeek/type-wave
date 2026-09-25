@@ -546,7 +546,10 @@ Item's job. Off by config or headless, everything falls back to the sound cues. 
 decisions are pure: the `Sequencer` owns the motion (show/hide fades, the bars→dots
 crossfade, the pulse and cue envelopes) and the render pump composes one **Frame** per tick
 from the published state, both in `src/hud.zig`, driven by a fed clock rather than a live
-run loop.
+run loop. **Decided, not yet shipped** (ADR-0014, map #355): the marks move into one Metal SDF
+pass drawn at display rate while visible, melting together with a smooth-union goo and
+carrying a soft glow in their own colour. The glass, text and accent verdicts are unchanged,
+and a Mac without Metal falls back to sound, as a headless one does.
 _Avoid_: overlay (that names the on/off setting, not the thing), toast, notification, pill
 (fine informally, but the marks are the subject)
 
@@ -559,7 +562,10 @@ CFRunLoopTimer pump, and the headless bail — every ObjC call in the HUD lives 
 `FakeChrome` records emitted Frames, so the pump's composition rules are asserted as values.
 Whether anything is drawn at all is the adapter's business: the daemon leaves the pump
 disabled when the Chrome could not be built, which is what makes `isOn` report honestly to
-the Feedback Surface. It carries no policy — the Sequencer decides, the pump composes, the
+the Feedback Surface. ADR-0014 replaces the adapter with a `MetalChrome` (#359), which will
+own a transparent `CAMetalLayer` and SDF pipeline, a display-link cadence that runs only while
+the panel is visible, and a Metal-less bail that behaves like headless. The seam's shape
+survives: the Frame becomes a list of shapes (#358). It carries no policy — the Sequencer decides, the pump composes, the
 Chrome only draws — and `Hud(Chrome)` asserts the contract itself, unlike the Helper and
 Session Transport seams, whose contracts nothing invokes. The **Status Item Chrome** is its
 twin one tier up, on the same three-part shape: pure decider, composing pump, drawing-only
