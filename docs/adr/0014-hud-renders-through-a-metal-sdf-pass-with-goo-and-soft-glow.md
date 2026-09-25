@@ -3,7 +3,9 @@
 - Status: accepted (2026-09-25; wayfinder map [#355](https://github.com/dbgeek/type-wave/issues/355),
   look locked HITL in `prototypes/hud-micro-motion`, feasibility proven by spike
   [#356](https://github.com/dbgeek/type-wave/issues/356), recorded in
-  [#357](https://github.com/dbgeek/type-wave/issues/357))
+  [#357](https://github.com/dbgeek/type-wave/issues/357)). Both prototypes were retired in
+  [#360](https://github.com/dbgeek/type-wave/issues/360), once the daemon became the reference;
+  they remain readable at commit `d32c427`.
 - Amends: [ADR-0002](0002-hud-v3-is-bare-marks-no-glass.md) — "HUD v3 is bare marks, no
   glass", specifically **how the marks are drawn** (one CALayer per mark), their **motion**
   (fade + crossfade), and the unglowing bare look. Its glass, capsule, text and accent
