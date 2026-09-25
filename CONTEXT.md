@@ -537,35 +537,35 @@ the async rearm/probe nudges stay visible in the loop.
 _Avoid_: manager, controller, self-heal loop (that names the daemon thread, not the decider)
 
 **HUD**:
-The transient feedback pill — bare marks laid out in a 300×22 pill on a borderless panel near
-the bottom of the screen, showing **no text, ever** (ADR-0002): a scrolling waveform of mic
-level while an Utterance is being spoken, three bouncing dots while it resolves, a one-shot
-amber tint on a degraded Insertion (ADR-0004), and a single green/red mark for an Undo's
-confirm or refuse (ADR-0007). The marks are drawn by one Metal SDF pass at display rate
-while visible (ADR-0014): they melt into each other with a smooth-union goo and carry a soft
-glow in their own colour. There is still no glass, no capsule, and no accent beyond those two
-cues. It carries only *in-flight* feedback and never status — that is the Status Item's job.
-Off by config, headless, or without Metal, everything falls back to the sound cues. Its
-decisions are pure: the `Sequencer` owns the lifecycle (show / hide / order-out, the pulse and
-cue envelopes), the micro-motion geometry (unfurl, glide, gather, converge & drop, and the
-rest; fades and a crossfade under Reduce Motion) is a pure function of the clock, and the
-render pump composes one **Frame** per tick from the published state. All of it lives in
-`src/hud.zig` and is driven by a fed clock rather than a live run loop.
+The transient feedback pill — a 300×22 borderless panel near the bottom of the screen that
+shows **no text, ever** (ADR-0002): a scrolling waveform of mic level while an Utterance is
+being spoken, three bouncing dots while it resolves, a one-shot amber tint on a degraded
+Insertion (ADR-0004), and a single green/red mark for an Undo's confirm or refuse
+(ADR-0007). It carries only *in-flight* feedback and never status — that is the Status
+Item's job. Off by config or headless, everything falls back to the sound cues. Its
+decisions are pure: the `Sequencer` owns the motion (show/hide fades, the bars→dots
+crossfade, the pulse and cue envelopes) and the render pump composes one **Frame** per tick
+from the published state, both in `src/hud.zig`, driven by a fed clock rather than a live
+run loop. **Decided, not yet shipped** (ADR-0014, map #355): the marks move into one Metal SDF
+pass drawn at display rate while visible, melting together with a smooth-union goo and
+carrying a soft glow in their own colour. The glass, text and accent verdicts are unchanged,
+and a Mac without Metal falls back to sound, as a headless one does.
 _Avoid_: overlay (that names the on/off setting, not the thing), toast, notification, pill
 (fine informally, but the marks are the subject)
 
 **HUD Chrome**:
 The seam the HUD paints through: one method, `paint(Frame)`, where a Frame is the complete,
-fixed-size, `std.meta.eql`-comparable description of one tick: the window op plus the marks
-as shapes (bars, dots with the amber blend, or the Undo mark). The production adapter is
-`MetalChrome` (ADR-0014). It owns the panel, the transparent `CAMetalLayer` and SDF pipeline
-with the goo and glow, the display-link cadence that runs only while the pill is visible, and
-the headless and Metal-less bail. Every ObjC call in the HUD lives there. Until #359 lands,
-the shipped adapter is still `AppKitChrome`, with one CALayer per mark and a 20 Hz
-CFRunLoopTimer pump. A `FakeChrome` records emitted Frames, so the pump's composition rules
-are asserted as values. Whether anything is drawn at all is the adapter's business: the daemon
-leaves the pump disabled when the Chrome could not be built (headless, or no Metal device,
-shader or pipeline), which is what makes `isOn` report honestly to the Feedback Surface. It carries no policy — the Sequencer decides, the pump composes, the
+fixed-size, `std.meta.eql`-comparable description of one tick — window op, layer-family
+flip, bar heights, dot offsets with the amber blend, or the Undo mark. The production
+adapter is `AppKitChrome` (the panel, the CALayers, the `CATransaction` batching, the
+CFRunLoopTimer pump, and the headless bail — every ObjC call in the HUD lives there); a
+`FakeChrome` records emitted Frames, so the pump's composition rules are asserted as values.
+Whether anything is drawn at all is the adapter's business: the daemon leaves the pump
+disabled when the Chrome could not be built, which is what makes `isOn` report honestly to
+the Feedback Surface. ADR-0014 replaces the adapter with a `MetalChrome` (#359), which will
+own a transparent `CAMetalLayer` and SDF pipeline, a display-link cadence that runs only while
+the panel is visible, and a Metal-less bail that behaves like headless. The seam's shape
+survives: the Frame becomes a list of shapes (#358). It carries no policy — the Sequencer decides, the pump composes, the
 Chrome only draws — and `Hud(Chrome)` asserts the contract itself, unlike the Helper and
 Session Transport seams, whose contracts nothing invokes. The **Status Item Chrome** is its
 twin one tier up, on the same three-part shape: pure decider, composing pump, drawing-only
