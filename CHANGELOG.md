@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.5](https://github.com/dbgeek/type-wave/compare/v0.4.4...v0.4.5) (2026-09-25)
+
+
+### Features
+
+* **hud:** port the micro-motion Scene to pure Zig ([#358](https://github.com/dbgeek/type-wave/issues/358)) ([#363](https://github.com/dbgeek/type-wave/issues/363)) ([77d1dcb](https://github.com/dbgeek/type-wave/commit/77d1dcbed0f7a6410b0dc00469e44ffc9f285812))
+
 ## [0.4.4](https://github.com/dbgeek/type-wave/compare/v0.4.3...v0.4.4) (2026-09-10)
 
 
