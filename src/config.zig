@@ -23,11 +23,12 @@
 //! `Store` (wayfinder #32/#34): Settings Snapshot Publication, on the main thread, builds
 //! a complete fresh `Settings` per change and atomically swaps the pointer; every reader
 //! acquire-loads once and reads fields off its coherent snapshot. Old snapshots are
-//! intentionally never freed — and `std.zon.parse.free` must NOT be called on a parsed
-//! `Settings`: fields omitted from the file keep their struct-default value, which
-//! points at a static string literal, and `free` would fault trying to release it
-//! (verified against this Zig nightly). That leak is also what makes a stale snapshot
-//! held across a menu change (e.g. a Session keeping the old `model` pointer) safe.
+//! intentionally never freed: the parse arena behind a `Settings` is leaked on purpose
+//! (`std.zon.parse` has no `free` — strings live and die with the arena it is given),
+//! and fields omitted from the file keep their struct-default value, which points at a
+//! static string literal no per-field free could release. That leak is also what makes
+//! a stale snapshot held across a menu change (e.g. a Session keeping the old `model`
+//! pointer) safe.
 //!
 //! This module also owns the `config.zon` **write** path (wayfinder #32): a targeted
 //! single-field textual patch that preserves comments and hand-formatting byte-for-byte,
@@ -162,9 +163,17 @@ pub fn settingsPath(buf: []u8) ?[]const u8 {
 /// borrow static defaults). Unlike startup, every read/parse/clamp failure is an error.
 pub fn readSettingsAt(io: std.Io, alloc: std.mem.Allocator, path: []const u8) !Settings {
     const src = try std.Io.Dir.cwd().readFileAllocOptions(io, path, alloc, .limited(max_file), .of(u8), 0);
-    var parsed = try std.zon.parse.fromSliceAlloc(Settings, alloc, src, null, .{});
+    var parsed = try parseSettings(alloc, alloc, src);
     parsed.vocabulary = clampVocabulary(alloc, parsed.vocabulary) orelse return error.OutOfMemory;
     return parsed;
+}
+
+/// Parse `Settings` from ZON text; strings land in `arena`, `gpa` is parse scratch.
+/// Diagnostics are dropped — `loadSettings` reports them, so it calls
+/// `std.zon.parse.fromSlice` itself.
+fn parseSettings(gpa: std.mem.Allocator, arena: std.mem.Allocator, src: [:0]const u8) error{ OutOfMemory, ParseZon }!Settings {
+    var diag: std.zon.parse.Diagnostics = undefined;
+    return std.zon.parse.fromSlice(Settings, .{ .gpa = gpa, .arena = arena, .source = src, .diagnostics = &diag });
 }
 
 /// Re-read just the OpenAI secret — null while still absent. The daemon's self-heal
@@ -198,12 +207,16 @@ fn loadSettings(io: std.Io, gpa: std.mem.Allocator, home: []const u8) Settings {
     // src is intentionally not freed (parsed strings are copied out of it, but this is
     // a one-time load and the whole Config leaks for the process lifetime by design).
 
-    var diag: std.zon.parse.Diagnostics = .{};
-    var parsed = std.zon.parse.fromSliceAlloc(Settings, gpa, src, &diag, .{}) catch {
+    // The parse arena backs the returned strings, so a good parse leaks it (by design);
+    // only the malformed path releases it.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    var diag: std.zon.parse.Diagnostics = .{ .errors = &.{} };
+    var parsed = std.zon.parse.fromSlice(Settings, .{ .gpa = gpa, .arena = arena.allocator(), .source = src, .diagnostics = &diag }) catch {
         var buf: [1024]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        diag.format(&w) catch {};
+        w.print("{f}", .{diag.fmt(path)}) catch {};
         std.debug.print("config: {s} is malformed — using defaults.\n  {s}\n", .{ path, w.buffered() });
+        arena.deinit();
         return .{};
     };
     // Structural clamp of the vocabulary (spec §1): per-field and non-destructive — a
@@ -597,10 +610,10 @@ pub fn writeFieldAt(io: std.Io, alloc: std.mem.Allocator, path: []const u8, comp
         else => return err,
     };
     const text = if (src) |existing| blk: {
-        var expected = try std.zon.parse.fromSliceAlloc(Settings, alloc, existing, null, .{});
+        var expected = try parseSettings(alloc, alloc, existing);
         @field(expected, field) = @field(current, field);
         const patched = patchZonField(alloc, existing, field, value) orelse return error.UnpatchableSettings;
-        const actual = try std.zon.parse.fromSliceAlloc(Settings, alloc, patched, null, .{});
+        const actual = try parseSettings(alloc, alloc, patched);
         if (diffSettings(&expected, &actual).any) return error.UnpatchableSettings;
         break :blk patched;
     } else blk: {
@@ -825,8 +838,9 @@ fn writeZonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
 /// Does this text parse back into `Settings`? The guard that keeps a bad patch (or a
 /// pathological string value) from ever landing in the file.
 fn zonValid(gpa: std.mem.Allocator, text: [:0]const u8) bool {
-    var diag: std.zon.parse.Diagnostics = .{};
-    _ = std.zon.parse.fromSliceAlloc(Settings, gpa, text, &diag, .{}) catch return false;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    _ = parseSettings(gpa, arena.allocator(), text) catch return false;
     return true;
 }
 
@@ -1123,11 +1137,9 @@ test "serializeSettings round-trips through the ZON parser" {
     const s = Settings{ .transcription_backend = .local, .talk_key = .left_option, .language = "", .delay = "high", .overlay = false, .pre_paste_ms = 42, .backtrack = true, .log_transcripts = true };
     const text = serializeSettings(talloc, s) orelse return error.SerializeFailed;
     defer talloc.free(text);
-    var diag: std.zon.parse.Diagnostics = .{};
-    defer diag.deinit(talloc);
-    const parsed = try std.zon.parse.fromSliceAlloc(Settings, talloc, text, &diag, .{});
-    // free the parsed strings (all fields present in the file, so no static defaults)
-    defer std.zon.parse.free(talloc, parsed);
+    var arena = std.heap.ArenaAllocator.init(talloc);
+    defer arena.deinit();
+    const parsed = try parseSettings(talloc, arena.allocator(), text);
     try std.testing.expectEqual(Settings.NoiseReduction.near_field, parsed.noise_reduction);
     try std.testing.expectEqual(@import("transcription_backend.zig").Backend.local, parsed.transcription_backend);
     try std.testing.expectEqual(tap.TalkKey.left_option, parsed.talk_key);
@@ -1141,9 +1153,9 @@ test "serializeSettings round-trips through the ZON parser" {
 }
 
 test "log_transcripts parses from config.zon and defaults to redacted when absent" {
-    var diag: std.zon.parse.Diagnostics = .{};
-    defer diag.deinit(talloc);
-    const parsed = try std.zon.parse.fromSliceAlloc(Settings, talloc, ".{ .log_transcripts = true }", &diag, .{});
+    var arena = std.heap.ArenaAllocator.init(talloc);
+    defer arena.deinit();
+    const parsed = try parseSettings(talloc, arena.allocator(), ".{ .log_transcripts = true }");
     try std.testing.expect(parsed.log_transcripts);
     try std.testing.expect(!(Settings{}).log_transcripts); // the log carries no words by default
 }
@@ -1173,9 +1185,9 @@ test "diffSettings flags a log_transcripts change as plain (the swap republishes
 }
 
 test "backtrack parses from config.zon and defaults off when absent" {
-    var diag: std.zon.parse.Diagnostics = .{};
-    defer diag.deinit(talloc);
-    const parsed = try std.zon.parse.fromSliceAlloc(Settings, talloc, ".{ .backtrack = true }", &diag, .{});
+    var arena = std.heap.ArenaAllocator.init(talloc);
+    defer arena.deinit();
+    const parsed = try parseSettings(talloc, arena.allocator(), ".{ .backtrack = true }");
     try std.testing.expect(parsed.backtrack);
     try std.testing.expect(!(Settings{}).backtrack);
 }
@@ -1189,16 +1201,16 @@ test "diffSettings flags a backtrack change as plain (pinned at press with the L
 }
 
 test "OpenAI is the default Transcription Backend when config omits selection" {
-    var diag: std.zon.parse.Diagnostics = .{};
-    defer diag.deinit(talloc);
-    const parsed = try std.zon.parse.fromSliceAlloc(Settings, talloc, ".{}", &diag, .{});
+    var arena = std.heap.ArenaAllocator.init(talloc);
+    defer arena.deinit();
+    const parsed = try parseSettings(talloc, arena.allocator(), ".{}");
     try std.testing.expectEqual(@import("transcription_backend.zig").Backend.openai, parsed.transcription_backend);
 }
 
 test "pre_paste_ms parses from config.zon and defaults when absent" {
-    var diag: std.zon.parse.Diagnostics = .{};
-    defer diag.deinit(talloc);
-    const parsed = try std.zon.parse.fromSliceAlloc(Settings, talloc, ".{ .pre_paste_ms = 100 }", &diag, .{});
+    var arena = std.heap.ArenaAllocator.init(talloc);
+    defer arena.deinit();
+    const parsed = try parseSettings(talloc, arena.allocator(), ".{ .pre_paste_ms = 100 }");
     try std.testing.expectEqual(@as(u32, 100), parsed.pre_paste_ms);
     try std.testing.expectEqual(insert.default_pre_paste_ms, (Settings{}).pre_paste_ms);
 }
@@ -1214,14 +1226,11 @@ test "diffSettings flags a pre_paste_ms change as plain (read-at-use)" {
 // ---- vocabulary: schema, load-time clamp, round-trip (wayfinder #171) ----------
 
 /// Test helper: assert `text` parses back into `Settings`, freeing every allocation via
-/// an arena. (`std.zon.parse.free` must not be called on a partial file — omitted fields
-/// keep static-default string pointers that `free` would fault on; see the module doc.
-/// `zonValid` leaks under the testing allocator for the same reason it leaks in prod.)
+/// an arena.
 fn expectZonParses(text: [:0]const u8) !void {
     var arena = std.heap.ArenaAllocator.init(talloc);
     defer arena.deinit();
-    var diag: std.zon.parse.Diagnostics = .{};
-    _ = std.zon.parse.fromSliceAlloc(Settings, arena.allocator(), text, &diag, .{}) catch
+    _ = parseSettings(talloc, arena.allocator(), text) catch
         return error.ZonDidNotParse;
 }
 
@@ -1239,10 +1248,9 @@ fn repeated(comptime c: u8, comptime n: usize) []const u8 {
 }
 
 test "vocabulary parses from config.zon and defaults empty when absent" {
-    var arena = std.heap.ArenaAllocator.init(talloc); // partial file → no manual free
+    var arena = std.heap.ArenaAllocator.init(talloc);
     defer arena.deinit();
-    var diag: std.zon.parse.Diagnostics = .{};
-    const parsed = try std.zon.parse.fromSliceAlloc(Settings, arena.allocator(), ".{ .vocabulary = .{ \"type-wave\", \"whisper.cpp\" } }", &diag, .{});
+    const parsed = try parseSettings(talloc, arena.allocator(), ".{ .vocabulary = .{ \"type-wave\", \"whisper.cpp\" } }");
     try std.testing.expectEqual(@as(usize, 2), parsed.vocabulary.len);
     try std.testing.expectEqualStrings("type-wave", parsed.vocabulary[0]);
     try std.testing.expectEqualStrings("whisper.cpp", parsed.vocabulary[1]);
@@ -1299,10 +1307,9 @@ test "writeZonString escapes quotes and backslashes so the item round-trips" {
     const s = Settings{ .vocabulary = &.{"a\"b\\c"} };
     const text = serializeSettings(talloc, s) orelse return error.SerializeFailed;
     defer talloc.free(text);
-    var arena = std.heap.ArenaAllocator.init(talloc); // full file, but arena keeps it simple
+    var arena = std.heap.ArenaAllocator.init(talloc);
     defer arena.deinit();
-    var diag: std.zon.parse.Diagnostics = .{};
-    const parsed = try std.zon.parse.fromSliceAlloc(Settings, arena.allocator(), text, &diag, .{});
+    const parsed = try parseSettings(talloc, arena.allocator(), text);
     try std.testing.expectEqualStrings("a\"b\\c", parsed.vocabulary[0]);
 }
 
